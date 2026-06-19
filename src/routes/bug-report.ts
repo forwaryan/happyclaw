@@ -166,12 +166,16 @@ function sanitizeLogs(text: string): string {
   // ("apiKey": "v") and shell (APIKEY=v) forms are both covered. Runs AFTER the
   // format passes above, so a `Authorization: Bearer <token>` already has its
   // token masked and this only collapses the leftover `Authorization:` prefix.
-  // The value part is: a quoted string (so JSON values containing commas are
-  // masked whole), OR an unquoted run that keeps comma-joined segments
-  // (`cookie=a,b,c` → `cookie=***`, no post-comma leak) but stops at whitespace
-  // so a space-separated neighbour like `key=v, region=us` keeps `region=us`.
+  // The value part matches, in order: a double/single-quoted string with an
+  // OPTIONAL closing quote (`"[^"]*"?`) — so a mid-line-truncated log such as
+  // `"app_secret": "cli_abc` (readRecentLogs slices the buffer and routinely
+  // cuts inside a quoted value) is still masked whole, and JSON values
+  // containing commas are masked without leaking neighbours; OR an unquoted run
+  // `[^\s"']+` that keeps comma-joined segments (`cookie=a,b,c` → `cookie=***`,
+  // including a leading comma) but stops at whitespace so a space-separated
+  // neighbour like `apikey=v, region=us` keeps `region=us`.
   const sensitivePattern =
-    /(\b\w*(?:token|password|passwd|secret|api[_-]?key|auth[_-]?token|authorization|cookie|credential|private[_-]?key|access[_-]?key|app[_-]?secret)\w*)["']?\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s"',]+(?:,[^\s"',]+)*)/gi;
+    /(\b\w*(?:token|password|passwd|secret|api[_-]?key|auth[_-]?token|authorization|cookie|credential|private[_-]?key|access[_-]?key|app[_-]?secret)\w*)["']?\s*[=:]\s*(?:"[^"]*"?|'[^']*'?|[^\s"']+)/gi;
   result = result.replace(sensitivePattern, '$1=***');
 
   return result;

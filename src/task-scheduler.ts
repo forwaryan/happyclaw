@@ -301,6 +301,37 @@ function safeComputeNextRun(task: ScheduledTask, manualRun?: boolean): string | 
 }
 
 /**
+ * Persist a finished task run. The single rule for every run path (normal,
+ * error early-exit, manual, script, group-mode): a RECURRING task that can't
+ * compute a next run is PAUSED, never silently 'completed'. updateTaskAfterRun
+ * flips status to 'completed' when nextRun is null — correct for once-tasks, but
+ * for a recurring task (corrupted schedule_value, transient cron parse failure)
+ * it permanently disables it. Pausing records this run's last_run/last_result
+ * and lets PATCH /api/tasks/:id recompute next_run on resume. Routing ALL finalize
+ * sites through here keeps error/manual/script/group paths from re-introducing
+ * the silent-disable this batch set out to remove.
+ */
+function finalizeRecurringRun(
+  task: ScheduledTask,
+  nextRun: string | null,
+  resultSummary: string,
+): void {
+  if (nextRun === null && task.schedule_type !== 'once') {
+    logger.error(
+      {
+        taskId: task.id,
+        scheduleType: task.schedule_type,
+        scheduleValue: task.schedule_value,
+      },
+      'Recurring task has null next_run; pausing instead of completing (fix schedule to resume)',
+    );
+    pauseTaskAfterRun(task.id, resultSummary);
+  } else {
+    updateTaskAfterRun(task.id, nextRun, resultSummary);
+  }
+}
+
+/**
  * 包装 updateTaskRunLog 让 SQLite 临时抛错（WAL busy / 磁盘满 / migration
  * 期间 schema 锁）不会冒泡出函数体，否则会跳过下面 runningTaskIds.delete
  * 让任务永久卡在 running set。
@@ -386,7 +417,7 @@ async function runTaskInner(
     });
     try {
       const nextRun = safeComputeNextRun(task, options?.manualRun);
-      updateTaskAfterRun(task.id, nextRun, `Error: Workspace group not found: ${workspace.jid}`);
+      finalizeRecurringRun(task, nextRun, `Error: Workspace group not found: ${workspace.jid}`);
     } catch (err) {
       logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in early-exit');
     } finally {
@@ -429,7 +460,7 @@ async function runTaskInner(
       });
       try {
         const nextRun = safeComputeNextRun(task, options?.manualRun);
-        updateTaskAfterRun(task.id, nextRun, 'Error: 账户已禁用');
+        finalizeRecurringRun(task, nextRun, 'Error: 账户已禁用');
       } catch (err) {
         logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in owner-gate');
       } finally {
@@ -464,7 +495,7 @@ async function runTaskInner(
         try {
           // Still compute next run so the task isn't stuck (but preserve for manual runs)
           const nextRun = safeComputeNextRun(task, options?.manualRun);
-          updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
+          finalizeRecurringRun(task, nextRun, `Error: 计费限制: ${reason}`);
         } catch (err) {
           logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in billing-gate');
         } finally {
@@ -655,29 +686,12 @@ async function runTaskInner(
         ? result.slice(0, 200)
         : 'Completed';
     nextRun = safeComputeNextRun(task, options?.manualRun);
-    if (!options?.manualRun && nextRun === null && task.schedule_type !== 'once' && !error) {
-      // A recurring task that can't compute its next run (bad schedule_value,
-      // transient cron parse failure) must NOT be silently marked completed by
-      // updateTaskAfterRun(null) — that permanently disables it. Pause it so the
-      // owner can fix the schedule, recording THIS run's last_run/last_result.
-      logger.error(
-        { taskId: task.id, scheduleType: task.schedule_type, scheduleValue: task.schedule_value },
-        'Recurring task produced null next_run; pausing instead of completing',
-      );
-      try {
-        pauseTaskAfterRun(task.id, resultSummary);
-      } catch (err) {
-        logger.error({ taskId: task.id, err }, 'Failed to pause task with null next_run');
-      }
-    } else {
-      try {
-        updateTaskAfterRun(task.id, nextRun, resultSummary);
-      } catch (err) {
-        logger.error(
-          { taskId: task.id, err },
-          'updateTaskAfterRun failed',
-        );
-      }
+    try {
+      // Routes through finalizeRecurringRun so an error/manual run that yields a
+      // null next_run for a recurring task is paused, not silently completed.
+      finalizeRecurringRun(task, nextRun, resultSummary);
+    } catch (err) {
+      logger.error({ taskId: task.id, err }, 'Failed to finalize task run');
     }
   } finally {
     runningTaskIds.delete(task.id);
@@ -782,7 +796,7 @@ async function runScriptTaskInner(
         runningTaskIds.delete(task.id);
         const nextRun = safeComputeNextRun(task, manualRun);
         try {
-          updateTaskAfterRun(task.id, nextRun, 'Error: 账户已禁用');
+          finalizeRecurringRun(task, nextRun, 'Error: 账户已禁用');
         } catch (err) {
           logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in script owner-gate');
         }
@@ -819,7 +833,7 @@ async function runScriptTaskInner(
           runningTaskIds.delete(task.id);
           const nextRun = safeComputeNextRun(task, manualRun);
           try {
-            updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
+            finalizeRecurringRun(task, nextRun, `Error: 计费限制: ${reason}`);
           } catch (err) {
             logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in script billing-gate');
           }
@@ -845,7 +859,7 @@ async function runScriptTaskInner(
     });
     try {
       const nextRun = safeComputeNextRun(task, manualRun);
-      updateTaskAfterRun(task.id, nextRun, 'Error: script_command is empty');
+      finalizeRecurringRun(task, nextRun, 'Error: script_command is empty');
     } catch (err) {
       logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in script no-command');
     } finally {
@@ -941,7 +955,7 @@ async function runScriptTaskInner(
         ? result.slice(0, 200)
         : 'Completed';
     try {
-      updateTaskAfterRun(task.id, nextRun, resultSummary);
+      finalizeRecurringRun(task, nextRun, resultSummary);
     } catch (err) {
       logger.error(
         { taskId: task.id, err },
@@ -1016,7 +1030,7 @@ async function runGroupModeTask(
   } finally {
     try {
       const nextRun = safeComputeNextRun(task, manualRun);
-      updateTaskAfterRun(task.id, nextRun, resultSummary);
+      finalizeRecurringRun(task, nextRun, resultSummary);
     } catch (err) {
       logger.error({ taskId: task.id, err }, 'updateTaskAfterRun failed in group-mode');
     } finally {

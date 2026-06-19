@@ -316,8 +316,21 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     );
   }
 
-  // Auto-recalculate next_run when schedule changes (avoid pulling cron-parser into frontend)
-  if (patchData.schedule_type !== undefined || patchData.schedule_value !== undefined) {
+  // Auto-recalculate next_run when the schedule changes (avoid pulling
+  // cron-parser into the frontend), OR when resuming a task whose next_run was
+  // cleared. A recurring task that couldn't compute a next run is paused with
+  // next_run=NULL; the UI resume sends only {status:'active'}, so without this
+  // it would flip to active-but-never-scheduled (getDueTasks requires next_run
+  // IS NOT NULL). If the schedule is genuinely corrupt the recompute throws and
+  // returns 400, telling the owner to fix schedule_value before resuming.
+  const scheduleChanged =
+    patchData.schedule_type !== undefined ||
+    patchData.schedule_value !== undefined;
+  const resumingWithoutNextRun =
+    patchData.status === 'active' &&
+    existing.status !== 'active' &&
+    existing.next_run == null;
+  if (scheduleChanged || resumingWithoutNextRun) {
     const schedType = patchData.schedule_type ?? existing.schedule_type;
     const schedValue = patchData.schedule_value ?? existing.schedule_value;
     try {

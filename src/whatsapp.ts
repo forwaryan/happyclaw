@@ -915,10 +915,18 @@ export function getWhatsAppAuthDir(
 export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
   let inner = content;
   for (let i = 0; i < 5; i++) {
+    // Mirror baileys' getFutureProofMessage (Utils/messages.js): a captioned
+    // document arrives as documentWithCaptionMessage; edits/view-once-extension
+    // wrap too. Missing any of these drops the message — e.g. a PDF WITH a
+    // caption (documentWithCaptionMessage) would extract no text and detect no
+    // media, while the same PDF without a caption (bare documentMessage) works.
     const next =
       inner.ephemeralMessage?.message ||
       inner.viewOnceMessage?.message ||
-      inner.viewOnceMessageV2?.message;
+      inner.viewOnceMessageV2?.message ||
+      inner.viewOnceMessageV2Extension?.message ||
+      inner.documentWithCaptionMessage?.message ||
+      inner.editedMessage?.message;
     if (!next) break;
     inner = next;
   }

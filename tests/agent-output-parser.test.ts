@@ -209,6 +209,38 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
     expect(out[1].result).toBe('done');
   });
 
+  test('resyncs past a non-object frame and still emits a following valid frame', async () => {
+    // A broken (non-`{`) payload that is fully delimited, followed by a valid
+    // frame. The parser must skip the broken frame (not stall until the size
+    // cap) and emit the trailing valid one. Guards the resyncPastBrokenFrame
+    // non-object branch — a regression (reverting `continue` to `break`) would
+    // drop the valid frame.
+    const out = await runParser([
+      `${S}42${E}${S}${JSON.stringify({ status: 'success', result: 'ok' })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe('ok');
+  });
+
+  test('skips a fully-delimited non-object frame with nothing following (no stall)', async () => {
+    // START + a bare string + END, no later START. Must resync past this frame's
+    // END (it is fully delimited) rather than waiting for a non-existent next
+    // START. Asserting it returns (no hang) and emits nothing.
+    const out = await runParser([`${S}"just a string"${E}`]);
+    expect(out).toHaveLength(0);
+  });
+
+  test('resyncs past balanced-but-invalid JSON and emits the next valid frame', async () => {
+    // Balanced braces but not parseable JSON → parse-failure branch resyncs by
+    // the already-located END index (knownEnd), not by scanning for a later
+    // START. The following valid frame must still be emitted.
+    const out = await runParser([
+      `${S}{not valid json}${E}${S}${JSON.stringify({ status: 'success', result: 'after' })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe('after');
+  });
+
   test('parses a complete frame whose payload contains the literal START marker', async () => {
     // Symmetric to the embedded-END case: the reply text mentions the START
     // marker. The real terminator is present, so it must parse normally.
