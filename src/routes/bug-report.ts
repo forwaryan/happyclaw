@@ -122,24 +122,18 @@ function readRecentLogs(folder: string, maxLines = 50): string {
   }
 }
 
-/** Mask environment variable values in log text */
-function sanitizeLogs(text: string): string {
-  // Cap per-line length BEFORE the keyword regex runs. The credential pattern's
-  // prefix `\b\w*(?:keyword)\w*` backtracks O(n²) on a long separator-less,
-  // keyword-dense line (e.g. a member-influenced agent stdout dump written
-  // untruncated on a failing run); a ~100KB line stalls the single-threaded
-  // event loop for ~1-2s. Bug reports never need multi-KB single lines, so a
-  // per-line cap keeps masking linear. Splitting per line also stops an
-  // unterminated quote in one line from over-masking the lines that follow it.
-  const MAX_LINE = 2000;
-  let result = text
-    .split('\n')
-    .map((line) =>
-      line.length > MAX_LINE ? line.slice(0, MAX_LINE) + '…[truncated]' : line,
-    )
-    .join('\n');
+/**
+ * Mask environment variable values, credentials, and absolute paths in log text
+ * before it is embedded in a bug report. Exported for unit testing — this is a
+ * security boundary and must keep a regression safety net.
+ */
+export function sanitizeLogs(text: string): string {
+  let result = text;
 
-  // Replace absolute paths to project root and home directory with placeholders
+  // Replace absolute paths to project root and home directory with placeholders.
+  // Done BEFORE the per-line truncation below: replaceAll is a linear literal
+  // match (no ReDoS risk on long input), and running it first ensures a path
+  // straddling the truncation point isn't sliced mid-string and left unredacted.
   const projectRoot = path.resolve(process.cwd());
   const homeDir = os.homedir();
   // Replace longer path first to avoid partial replacement
@@ -150,6 +144,21 @@ function sanitizeLogs(text: string): string {
     result = result.replaceAll(homeDir, '<home>');
     result = result.replaceAll(projectRoot, '<project>');
   }
+
+  // Cap per-line length BEFORE the keyword regex runs. The credential pattern's
+  // prefix `\b\w*(?:keyword)\w*` backtracks O(n²) on a long separator-less,
+  // keyword-dense line (e.g. a member-influenced agent stdout dump written
+  // untruncated on a failing run); a ~100KB line stalls the single-threaded
+  // event loop for ~1-2s. Bug reports never need multi-KB single lines, so a
+  // per-line cap keeps masking linear. Splitting per line also stops an
+  // unterminated quote in one line from over-masking the lines that follow it.
+  const MAX_LINE = 2000;
+  result = result
+    .split('\n')
+    .map((line) =>
+      line.length > MAX_LINE ? line.slice(0, MAX_LINE) + '…[truncated]' : line,
+    )
+    .join('\n');
 
   // Mask known credential FORMATS and Authorization schemes BEFORE the generic
   // keyword pattern below. The generic pattern's keyword list includes

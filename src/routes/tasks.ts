@@ -339,6 +339,22 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     existing.next_run == null &&
     existing.schedule_type !== 'once' &&
     patchData.next_run === undefined;
+  // A completed once-task can't be "resumed": its schedule is a past one-shot
+  // timestamp. Re-activating it would either re-fire the one-shot action or
+  // (with the once guard above suppressing recompute) strand it active-but-never
+  // -scheduled (getDueTasks needs next_run IS NOT NULL). Reject unless the caller
+  // also changes the schedule, which makes it a deliberate fresh run.
+  if (
+    patchData.status === 'active' &&
+    existing.status === 'completed' &&
+    existing.schedule_type === 'once' &&
+    !scheduleChanged
+  ) {
+    return c.json(
+      { error: '已完成的一次性任务无法重新启用，请修改其调度时间或新建任务。' },
+      400,
+    );
+  }
   if (scheduleChanged || resumingWithoutNextRun) {
     const schedType = patchData.schedule_type ?? existing.schedule_type;
     const schedValue = patchData.schedule_value ?? existing.schedule_value;
