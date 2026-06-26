@@ -287,6 +287,37 @@ function computeNextRun(task: ScheduledTask): string | null {
   return null;
 }
 
+/**
+ * 为「新建 / 修改任务」计算 next_run（now 为锚点）。与上面的 computeNextRun 不同：
+ * 后者按 task.next_run 为锚点推进周期（调度循环用），这里是从当前时刻起算第一次触发
+ * （创建/更新时用）。非法 schedule 抛错，由调用方决定如何回执。
+ */
+export function computeNextRunForSchedule(
+  type: 'cron' | 'interval' | 'once',
+  value: string,
+): string {
+  if (type === 'cron') {
+    const iso = CronExpressionParser.parse(value, { tz: TIMEZONE })
+      .next()
+      .toISOString();
+    if (!iso) throw new Error(`Invalid cron expression: ${value}`);
+    return iso;
+  }
+  if (type === 'interval') {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new Error(`Invalid interval (must be positive milliseconds): ${value}`);
+    }
+    return new Date(Date.now() + ms).toISOString();
+  }
+  // once：value 为不带 Z 的本地时间串，按进程本地时区解释再转 UTC 存储。
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) {
+    throw new Error(`Invalid timestamp: ${value}`);
+  }
+  return d.toISOString();
+}
+
 function safeComputeNextRun(task: ScheduledTask, manualRun?: boolean): string | null {
   if (manualRun) return task.next_run ?? null;
   try {

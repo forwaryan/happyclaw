@@ -161,7 +161,7 @@ import type {
   WhatsAppConnectConfig,
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
-import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
+import { startSchedulerLoop, triggerTaskNow, computeNextRunForSchedule } from './task-scheduler.js';
 import {
   checkBillingAccessFresh,
   formatBillingAccessDeniedMessage,
@@ -5332,6 +5332,11 @@ function startIpcWatcher(): void {
           'install_skill_result_',
           'uninstall_skill_result_',
           'list_tasks_result_',
+          'schedule_task_result_',
+          'cancel_task_result_',
+          'pause_task_result_',
+          'resume_task_result_',
+          'update_task_result_',
           'discord_get_history_result_',
           'discord_get_channel_info_result_',
           'discord_get_server_info_result_',
@@ -5454,6 +5459,40 @@ function startIpcWatcher(): void {
   logger.info('IPC watcher started (event-driven + 5s fallback)');
 }
 
+/**
+ * 把任务类 IPC 工具（schedule/pause/resume/cancel/update_task）的处理结果原子写回到
+ * data/ipc/{sourceGroup}/tasks/{type}_result_{requestId}.json，供容器侧 pollIpcResult 读取。
+ * 带 requestId 合法性 + 路径穿越校验；写失败仅记日志不抛。requestId 缺失时直接跳过
+ * （兼容旧的 fire-and-forget 客户端，旧镜像不带 requestId 时退回原静默语义）。
+ */
+function writeTaskResult(
+  sourceGroup: string,
+  type: string,
+  requestId: string | undefined,
+  payload: Record<string, unknown>,
+): void {
+  if (!requestId) return;
+  if (!SAFE_REQUEST_ID_RE.test(requestId)) {
+    logger.warn({ sourceGroup, type, requestId }, 'Rejected task result with invalid requestId');
+    return;
+  }
+  const dir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+  const dirResolved = path.resolve(dir);
+  const resultFilePath = path.resolve(dir, `${type}_result_${requestId}.json`);
+  if (!resultFilePath.startsWith(`${dirResolved}${path.sep}`)) {
+    logger.warn({ sourceGroup, type, requestId, resultFilePath }, 'Rejected task result with unsafe path');
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+    const tmpPath = `${resultFilePath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload));
+    fs.renameSync(tmpPath, resultFilePath);
+  } catch (err) {
+    logger.error({ sourceGroup, type, requestId, err }, 'Failed to write task IPC result');
+  }
+}
+
 async function processTaskIpc(
   data: {
     type: string;
@@ -5494,7 +5533,14 @@ async function processTaskIpc(
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
 ): Promise<void> {
   switch (data.type) {
-    case 'schedule_task':
+    case 'schedule_task': {
+      const failSchedule = (error: string): void => {
+        logger.warn({ sourceGroup, error }, 'schedule_task rejected');
+        writeTaskResult(sourceGroup, 'schedule_task', data.requestId, {
+          success: false,
+          error,
+        });
+      };
       if (data.schedule_type && data.schedule_value && data.targetJid) {
         const execType =
           data.execution_type === 'script'
@@ -5503,20 +5549,17 @@ async function processTaskIpc(
 
         // Script tasks require prompt OR script_command; agent tasks require prompt
         if (execType === 'agent' && !data.prompt) {
-          logger.warn('schedule_task: agent mode requires prompt');
+          failSchedule('Agent mode requires a prompt.');
           break;
         }
         if (execType === 'script' && !data.script_command) {
-          logger.warn('schedule_task: script mode requires script_command');
+          failSchedule('Script mode requires script_command.');
           break;
         }
 
         // Only admin home can create script tasks
         if (execType === 'script' && !isAdminHome) {
-          logger.warn(
-            { sourceGroup },
-            'Non-admin container attempted to create script task',
-          );
+          failSchedule('Only the admin home container can create script tasks.');
           break;
         }
 
@@ -5525,10 +5568,7 @@ async function processTaskIpc(
         const targetGroupEntry = registeredGroups[targetJid];
 
         if (!targetGroupEntry) {
-          logger.warn(
-            { targetJid },
-            'Cannot schedule task: target group not registered',
-          );
+          failSchedule(`Target group is not registered: ${targetJid}`);
           break;
         }
 
@@ -5536,10 +5576,7 @@ async function processTaskIpc(
 
         // Authorization: non-admin-home groups can only schedule for themselves
         if (!isAdminHome && targetFolder !== sourceGroup) {
-          logger.warn(
-            { sourceGroup, targetFolder },
-            'Unauthorized schedule_task attempt blocked',
-          );
+          failSchedule('Not authorized to schedule tasks for another group.');
           break;
         }
 
@@ -5553,32 +5590,48 @@ async function processTaskIpc(
             });
             nextRun = interval.next().toISOString();
           } catch {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid cron expression',
-            );
+            failSchedule(`Invalid cron expression: ${data.schedule_value}`);
             break;
           }
         } else if (scheduleType === 'interval') {
           const ms = Number(data.schedule_value);
           if (!Number.isFinite(ms) || ms <= 0) {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid interval',
-            );
+            failSchedule(`Invalid interval (must be positive ms): ${data.schedule_value}`);
             break;
           }
           nextRun = new Date(Date.now() + ms).toISOString();
         } else if (scheduleType === 'once') {
           const scheduled = new Date(data.schedule_value);
           if (isNaN(scheduled.getTime())) {
-            logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid timestamp',
-            );
+            failSchedule(`Invalid timestamp: ${data.schedule_value}`);
             break;
           }
           nextRun = scheduled.toISOString();
+        }
+
+        // 幂等去重：同一 folder 下已存在内容完全相同的活动任务时不重复创建，
+        // 直接返回已有任务。挡住超时重试与 #564 触发回放导致的重复增殖。
+        const dupExisting = getAllTasks().find(
+          (t) =>
+            t.group_folder === targetFolder &&
+            t.status === 'active' &&
+            t.prompt === (data.prompt || '') &&
+            t.schedule_type === scheduleType &&
+            t.schedule_value === data.schedule_value &&
+            t.execution_type === execType,
+        );
+        if (dupExisting) {
+          logger.info(
+            { sourceGroup, taskId: dupExisting.id },
+            'schedule_task: identical active task already exists, returning existing',
+          );
+          writeTaskResult(sourceGroup, 'schedule_task', data.requestId, {
+            success: true,
+            taskId: dupExisting.id,
+            nextRun: dupExisting.next_run,
+            duplicate: true,
+          });
+          break;
         }
 
         const taskId = crypto.randomUUID();
@@ -5637,8 +5690,16 @@ async function processTaskIpc(
           { taskId, sourceGroup, targetFolder, contextMode, execType },
           'Task created via IPC',
         );
+        writeTaskResult(sourceGroup, 'schedule_task', data.requestId, {
+          success: true,
+          taskId,
+          nextRun,
+        });
+      } else {
+        failSchedule('Missing schedule_type, schedule_value, or target group.');
       }
       break;
+    }
 
     case 'pause_task':
       if (data.taskId) {
@@ -5649,12 +5710,25 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
           );
+          writeTaskResult(sourceGroup, 'pause_task', data.requestId, {
+            success: true,
+            taskId: data.taskId,
+          });
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task pause attempt',
           );
+          writeTaskResult(sourceGroup, 'pause_task', data.requestId, {
+            success: false,
+            error: task ? 'Not authorized to pause this task.' : 'Task not found.',
+          });
         }
+      } else {
+        writeTaskResult(sourceGroup, 'pause_task', data.requestId, {
+          success: false,
+          error: 'Missing task_id.',
+        });
       }
       break;
 
@@ -5667,12 +5741,25 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
           );
+          writeTaskResult(sourceGroup, 'resume_task', data.requestId, {
+            success: true,
+            taskId: data.taskId,
+          });
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task resume attempt',
           );
+          writeTaskResult(sourceGroup, 'resume_task', data.requestId, {
+            success: false,
+            error: task ? 'Not authorized to resume this task.' : 'Task not found.',
+          });
         }
+      } else {
+        writeTaskResult(sourceGroup, 'resume_task', data.requestId, {
+          success: false,
+          error: 'Missing task_id.',
+        });
       }
       break;
 
@@ -5685,14 +5772,101 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
           );
+          writeTaskResult(sourceGroup, 'cancel_task', data.requestId, {
+            success: true,
+            taskId: data.taskId,
+          });
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task cancel attempt',
           );
+          writeTaskResult(sourceGroup, 'cancel_task', data.requestId, {
+            success: false,
+            error: task ? 'Not authorized to cancel this task.' : 'Task not found.',
+          });
         }
+      } else {
+        writeTaskResult(sourceGroup, 'cancel_task', data.requestId, {
+          success: false,
+          error: 'Missing task_id.',
+        });
       }
       break;
+
+    case 'update_task': {
+      const failUpdate = (error: string): void => {
+        logger.warn({ sourceGroup, taskId: data.taskId, error }, 'update_task rejected');
+        writeTaskResult(sourceGroup, 'update_task', data.requestId, {
+          success: false,
+          error,
+        });
+      };
+      if (!data.taskId) {
+        failUpdate('Missing task_id.');
+        break;
+      }
+      const task = getTaskById(data.taskId);
+      if (!task) {
+        failUpdate('Task not found.');
+        break;
+      }
+      // 授权：仅本组（admin home 可跨组），与 pause/cancel 同款，用 host 派生的 isAdminHome。
+      if (!isAdminHome && task.group_folder !== sourceGroup) {
+        failUpdate('Not authorized to update this task.');
+        break;
+      }
+      const patch: Parameters<typeof updateTask>[1] = {};
+      if (data.execution_type !== undefined) {
+        if (data.execution_type === 'script' && !isAdminHome) {
+          failUpdate('Only the admin home container can set script execution.');
+          break;
+        }
+        patch.execution_type = data.execution_type === 'script' ? 'script' : 'agent';
+      }
+      if (data.execution_mode !== undefined) {
+        if (data.execution_mode === 'host' && !isAdminHome) {
+          failUpdate('Only the admin home container can set host execution mode.');
+          break;
+        }
+        patch.execution_mode = data.execution_mode === 'host' ? 'host' : 'container';
+      }
+      if (data.prompt !== undefined) patch.prompt = data.prompt;
+      if (data.script_command !== undefined) patch.script_command = data.script_command;
+      if (data.context_mode !== undefined) {
+        patch.context_mode = data.context_mode === 'group' ? 'group' : 'isolated';
+      }
+      // schedule 变更 → 用 now 锚点重算 next_run
+      let updatedNextRun = task.next_run;
+      if (data.schedule_type !== undefined || data.schedule_value !== undefined) {
+        const newType = (data.schedule_type ?? task.schedule_type) as
+          | 'cron'
+          | 'interval'
+          | 'once';
+        const newValue = data.schedule_value ?? task.schedule_value;
+        try {
+          updatedNextRun = computeNextRunForSchedule(newType, newValue);
+        } catch (err) {
+          failUpdate(
+            `Invalid schedule: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          break;
+        }
+        patch.schedule_type = newType;
+        patch.schedule_value = newValue;
+        patch.next_run = updatedNextRun;
+        // 改了 schedule 的已完成 once 任务，复活为 active
+        if (task.status === 'completed') patch.status = 'active';
+      }
+      updateTask(data.taskId, patch);
+      logger.info({ taskId: data.taskId, sourceGroup }, 'Task updated via IPC');
+      writeTaskResult(sourceGroup, 'update_task', data.requestId, {
+        success: true,
+        taskId: data.taskId,
+        nextRun: updatedNextRun,
+      });
+      break;
+    }
 
     case 'list_tasks':
       if (data.requestId) {
