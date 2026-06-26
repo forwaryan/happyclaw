@@ -451,6 +451,12 @@ class MessageStream {
       effectiveText = `[用户发送了 ${originalImageCount} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
     }
 
+    // 每条 user message 前置当前本地时间，让 agent 能正确推理相对时间 / schedule_task 的
+    // once/cron 取值（#563）。刻意放在 user message（缓存前缀之后的未缓存区）而非 system
+    // prompt：① 不会因每 turn 时间不同而击穿整段 system+历史的 prompt cache；② 长会话里
+    // 每个 turn 都拿到新鲜时间，而非会话启动那一刻的陈旧时间。
+    effectiveText = `[当前时间: ${formatLocalNow()}]\n${effectiveText}`;
+
     let content:
       | string
       | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }>;
@@ -1313,13 +1319,6 @@ async function runQuery(
     : null;
 
   const promptPieces: PromptPiece[] = [
-    {
-      name: 'runtime-context',
-      text:
-        `<runtime-context>\n当前时间：${formatLocalNow()}\n` +
-        `所有相对时间（如“明天9点”“10分钟后”“每隔N分钟”）以及 schedule_task 的 once/cron 取值，都以上面这个本地时间和时区为准；不要假设是 UTC。\n` +
-        `</runtime-context>`,
-    },
     { name: 'interaction.md', text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>` },
     { name: 'skill-routing.md', text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>` },
     { name: 'security-rules.md', text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>` },

@@ -5376,16 +5376,20 @@ function startIpcWatcher(): void {
           .map((entry) => entry.name);
         for (const file of taskFiles) {
           const filePath = path.join(tasksDir, file);
+          let parsedData: { type?: string; requestId?: string } | undefined;
           try {
             const raw = await fsp.readFile(filePath, 'utf-8');
             const data = JSON.parse(raw);
-            // Pass source group identity to processTaskIpc for authorization
+            parsedData = data;
+            // Pass source group identity to processTaskIpc for authorization.
+            // tasksDir 是请求文件被读出的那个 ipcRoot/tasks，回执必须写回同一目录。
             await processTaskIpc(
               data,
               sourceGroup,
               isAdminHome,
               isHome,
               sourceGroupEntry,
+              tasksDir,
               ipcAgentId,
             );
             await fsp.unlink(filePath);
@@ -5394,6 +5398,18 @@ function startIpcWatcher(): void {
               { file, sourceGroup, err },
               'Error processing IPC task',
             );
+            // 兜底：带 requestId 的任务请求若在处理中抛异常（如 DB 锁/损坏），也写一条
+            // 失败回执，避免容器侧 pollIpcResult 空等满 30s 超时。
+            if (
+              parsedData?.requestId &&
+              typeof parsedData.type === 'string' &&
+              parsedData.type.endsWith('_task')
+            ) {
+              writeTaskResult(tasksDir, parsedData.type, parsedData.requestId, {
+                success: false,
+                error: 'Internal error while processing task request.',
+              });
+            }
             const errorDir = path.join(ipcBaseDir, 'errors');
             await fsp.mkdir(errorDir, { recursive: true });
             try {
@@ -5461,26 +5477,28 @@ function startIpcWatcher(): void {
 
 /**
  * 把任务类 IPC 工具（schedule/pause/resume/cancel/update_task）的处理结果原子写回到
- * data/ipc/{sourceGroup}/tasks/{type}_result_{requestId}.json，供容器侧 pollIpcResult 读取。
+ * 「请求文件被读出的那个 tasksDir」/{type}_result_{requestId}.json，供容器侧 pollIpcResult
+ * 读取。必须用请求所在的 tasksDir 而非按 folder 重算主 root——会话子 agent
+ * （ipc/{folder}/agents/{id}/tasks）与 isolated 任务（ipc/{folder}/tasks-run/{id}/tasks）
+ * 各有自己的嵌套 IPC root，写到主 root 会让它们永远读不到回执而空等超时。
  * 带 requestId 合法性 + 路径穿越校验；写失败仅记日志不抛。requestId 缺失时直接跳过
  * （兼容旧的 fire-and-forget 客户端，旧镜像不带 requestId 时退回原静默语义）。
  */
 function writeTaskResult(
-  sourceGroup: string,
+  tasksDir: string,
   type: string,
   requestId: string | undefined,
   payload: Record<string, unknown>,
 ): void {
   if (!requestId) return;
   if (!SAFE_REQUEST_ID_RE.test(requestId)) {
-    logger.warn({ sourceGroup, type, requestId }, 'Rejected task result with invalid requestId');
+    logger.warn({ tasksDir, type, requestId }, 'Rejected task result with invalid requestId');
     return;
   }
-  const dir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
-  const dirResolved = path.resolve(dir);
-  const resultFilePath = path.resolve(dir, `${type}_result_${requestId}.json`);
+  const dirResolved = path.resolve(tasksDir);
+  const resultFilePath = path.resolve(tasksDir, `${type}_result_${requestId}.json`);
   if (!resultFilePath.startsWith(`${dirResolved}${path.sep}`)) {
-    logger.warn({ sourceGroup, type, requestId, resultFilePath }, 'Rejected task result with unsafe path');
+    logger.warn({ tasksDir, type, requestId, resultFilePath }, 'Rejected task result with unsafe path');
     return;
   }
   try {
@@ -5489,7 +5507,7 @@ function writeTaskResult(
     fs.writeFileSync(tmpPath, JSON.stringify(payload));
     fs.renameSync(tmpPath, resultFilePath);
   } catch (err) {
-    logger.error({ sourceGroup, type, requestId, err }, 'Failed to write task IPC result');
+    logger.error({ tasksDir, type, requestId, err }, 'Failed to write task IPC result');
   }
 }
 
@@ -5530,13 +5548,14 @@ async function processTaskIpc(
   isAdminHome: boolean, // Whether source is admin home container
   isHome: boolean, // Whether source is a home container
   sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
+  tasksDir: string, // The exact ipcRoot/tasks dir the request was read from (for result write-back)
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
 ): Promise<void> {
   switch (data.type) {
     case 'schedule_task': {
       const failSchedule = (error: string): void => {
         logger.warn({ sourceGroup, error }, 'schedule_task rejected');
-        writeTaskResult(sourceGroup, 'schedule_task', data.requestId, {
+        writeTaskResult(tasksDir, 'schedule_task', data.requestId, {
           success: false,
           error,
         });
@@ -5609,23 +5628,34 @@ async function processTaskIpc(
           nextRun = scheduled.toISOString();
         }
 
-        // 幂等去重：同一 folder 下已存在内容完全相同的活动任务时不重复创建，
-        // 直接返回已有任务。挡住超时重试与 #564 触发回放导致的重复增殖。
-        const dupExisting = getAllTasks().find(
-          (t) =>
-            t.group_folder === targetFolder &&
-            t.status === 'active' &&
-            t.prompt === (data.prompt || '') &&
-            t.schedule_type === scheduleType &&
-            t.schedule_value === data.schedule_value &&
-            t.execution_type === execType,
-        );
+        const contextMode =
+          data.context_mode === 'group' || data.context_mode === 'isolated'
+            ? data.context_mode
+            : 'isolated';
+
+        // 幂等去重：仅对 agent 任务生效。#564 的递归增殖只发生在 agent 触发回放路径；
+        // 而 script 任务真正承载工作的是 script_command（prompt 常为空），prompt/schedule
+        // 相同但命令不同的多个 script 任务是合法的，按 prompt 去重会静默丢任务。故只去重
+        // agent 任务，并把 context_mode 纳入判定（group/isolated 视为不同任务）。
+        const dupExisting =
+          execType === 'agent'
+            ? getAllTasks().find(
+                (t) =>
+                  t.group_folder === targetFolder &&
+                  t.status === 'active' &&
+                  t.execution_type === 'agent' &&
+                  t.prompt === (data.prompt || '') &&
+                  t.schedule_type === scheduleType &&
+                  t.schedule_value === data.schedule_value &&
+                  t.context_mode === contextMode,
+              )
+            : undefined;
         if (dupExisting) {
           logger.info(
             { sourceGroup, taskId: dupExisting.id },
-            'schedule_task: identical active task already exists, returning existing',
+            'schedule_task: identical active agent task already exists, returning existing',
           );
-          writeTaskResult(sourceGroup, 'schedule_task', data.requestId, {
+          writeTaskResult(tasksDir, 'schedule_task', data.requestId, {
             success: true,
             taskId: dupExisting.id,
             nextRun: dupExisting.next_run,
@@ -5635,10 +5665,6 @@ async function processTaskIpc(
         }
 
         const taskId = crypto.randomUUID();
-        const contextMode =
-          data.context_mode === 'group' || data.context_mode === 'isolated'
-            ? data.context_mode
-            : 'isolated';
         // Inherit execution_mode from the source workspace.
         // - Source is host: default host, allow explicit container downgrade.
         // - Source is container: default container, REJECT explicit host
@@ -5690,7 +5716,7 @@ async function processTaskIpc(
           { taskId, sourceGroup, targetFolder, contextMode, execType },
           'Task created via IPC',
         );
-        writeTaskResult(sourceGroup, 'schedule_task', data.requestId, {
+        writeTaskResult(tasksDir, 'schedule_task', data.requestId, {
           success: true,
           taskId,
           nextRun,
@@ -5710,7 +5736,7 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
           );
-          writeTaskResult(sourceGroup, 'pause_task', data.requestId, {
+          writeTaskResult(tasksDir, 'pause_task', data.requestId, {
             success: true,
             taskId: data.taskId,
           });
@@ -5719,13 +5745,13 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task pause attempt',
           );
-          writeTaskResult(sourceGroup, 'pause_task', data.requestId, {
+          writeTaskResult(tasksDir, 'pause_task', data.requestId, {
             success: false,
             error: task ? 'Not authorized to pause this task.' : 'Task not found.',
           });
         }
       } else {
-        writeTaskResult(sourceGroup, 'pause_task', data.requestId, {
+        writeTaskResult(tasksDir, 'pause_task', data.requestId, {
           success: false,
           error: 'Missing task_id.',
         });
@@ -5741,7 +5767,7 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
           );
-          writeTaskResult(sourceGroup, 'resume_task', data.requestId, {
+          writeTaskResult(tasksDir, 'resume_task', data.requestId, {
             success: true,
             taskId: data.taskId,
           });
@@ -5750,13 +5776,13 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task resume attempt',
           );
-          writeTaskResult(sourceGroup, 'resume_task', data.requestId, {
+          writeTaskResult(tasksDir, 'resume_task', data.requestId, {
             success: false,
             error: task ? 'Not authorized to resume this task.' : 'Task not found.',
           });
         }
       } else {
-        writeTaskResult(sourceGroup, 'resume_task', data.requestId, {
+        writeTaskResult(tasksDir, 'resume_task', data.requestId, {
           success: false,
           error: 'Missing task_id.',
         });
@@ -5772,7 +5798,7 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
           );
-          writeTaskResult(sourceGroup, 'cancel_task', data.requestId, {
+          writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
             success: true,
             taskId: data.taskId,
           });
@@ -5781,13 +5807,13 @@ async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task cancel attempt',
           );
-          writeTaskResult(sourceGroup, 'cancel_task', data.requestId, {
+          writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
             success: false,
             error: task ? 'Not authorized to cancel this task.' : 'Task not found.',
           });
         }
       } else {
-        writeTaskResult(sourceGroup, 'cancel_task', data.requestId, {
+        writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
           success: false,
           error: 'Missing task_id.',
         });
@@ -5797,7 +5823,7 @@ async function processTaskIpc(
     case 'update_task': {
       const failUpdate = (error: string): void => {
         logger.warn({ sourceGroup, taskId: data.taskId, error }, 'update_task rejected');
-        writeTaskResult(sourceGroup, 'update_task', data.requestId, {
+        writeTaskResult(tasksDir, 'update_task', data.requestId, {
           success: false,
           error,
         });
@@ -5858,9 +5884,19 @@ async function processTaskIpc(
         // 改了 schedule 的已完成 once 任务，复活为 active
         if (task.status === 'completed') patch.status = 'active';
       }
+      // 与 schedule_task 一致：最终为 script 执行的任务必须有 script_command，
+      // 否则每次触发都会在 script 空命令分支静默失败，而 agent 收到的却是 success。
+      const finalExecType = patch.execution_type ?? task.execution_type;
+      if (finalExecType === 'script') {
+        const finalScript = patch.script_command ?? task.script_command;
+        if (!finalScript || !finalScript.trim()) {
+          failUpdate('Script execution requires a non-empty script_command.');
+          break;
+        }
+      }
       updateTask(data.taskId, patch);
       logger.info({ taskId: data.taskId, sourceGroup }, 'Task updated via IPC');
-      writeTaskResult(sourceGroup, 'update_task', data.requestId, {
+      writeTaskResult(tasksDir, 'update_task', data.requestId, {
         success: true,
         taskId: data.taskId,
         nextRun: updatedNextRun,
@@ -5878,7 +5914,9 @@ async function processTaskIpc(
           );
           break;
         }
-        const listTasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+        // 用请求所在的 tasksDir（可能是会话子 agent / isolated 任务的嵌套 root），
+        // 而非按 sourceGroup 重算主 root，否则嵌套场景回执读不到。
+        const listTasksDir = tasksDir;
         const listTasksDirResolved = path.resolve(listTasksDir);
         const resultFileName = `list_tasks_result_${requestId}.json`;
         const resultFilePath = path.resolve(listTasksDir, resultFileName);
