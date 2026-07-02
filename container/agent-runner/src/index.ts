@@ -51,10 +51,12 @@ const WORKSPACE_GLOBAL = process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/g
 const WORKSPACE_MEMORY = process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory';
 const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 
-// 模型配置：支持别名（opus/sonnet/haiku）或完整模型 ID
-// 别名自动解析为最新版本，如 opus → Opus 4.6
-// [1m] 后缀启用 1M 上下文窗口（CLI 内部 jG() 识别后缀，sM() 返回 1M 窗口）
-const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'opus[1m]';
+// 模型由 provider 配置经 ANTHROPIC_MODEL 注入（runtime-config 的 mergeClaudeEnvConfig
+// → host/docker spawn env）。这是硬契约：不再用官方模型（opus 等）兜底——HappyClaw 默认
+// 跑第三方 provider，兜底值在第三方端点下必然 4xx，且会误导"默认 opus"。缺失时由 main()
+// 入口 fail-fast，明确报配置错误，而不是发一个注定失败的请求。
+// 取值支持别名（opus/sonnet/haiku）或完整模型 ID；[1m] 后缀启用 1M 上下文窗口。
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL?.trim() ?? '';
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -1883,6 +1885,18 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+    });
+    process.exit(1);
+  }
+
+  // 模型是 provider 配置的硬契约（经 ANTHROPIC_MODEL 注入）。缺失即配置错误——
+  // 明确 fail-fast，而不是用官方模型兜底向第三方端点发出必然失败的请求。
+  if (!CLAUDE_MODEL) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error:
+        '未配置模型：当前 provider 缺少模型名（ANTHROPIC_MODEL 未注入）。请在 Claude 供应商设置中为该 provider 填写模型名（anthropicModel）后重试。',
     });
     process.exit(1);
   }
