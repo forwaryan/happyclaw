@@ -21,6 +21,7 @@ import {
 } from './config.js';
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
+import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
 import {
   AvailableGroup,
   ContainerInput,
@@ -722,43 +723,16 @@ const activeImReplyRoutes = new Map<string, string | null>();
 // （周期定时任务每次报告相同文案、用户明确要求重发同一句话）。因此始终记录
 // 每条 send 的指纹，但仅当该源 group 当前正处于失败重试轮次（retryCount>0）
 // 时，命中已记录的指纹才抑制——正常首轮永不抑制。
-const IPC_SEND_DEDUP_TTL_MS = 10 * 60_000;
-const IPC_SEND_DEDUP_MAX = 500;
-const recentIpcSends = new Map<string, number>(); // key → expireAt
+const ipcSendDedup = createIpcSendDeduplicator({
+  getRetryCount: (jid) => queue.getRetryCount(jid),
+  getJidsByFolder,
+});
 function isRetryDuplicateIpcSend(
   sourceGroup: string,
   chatJid: string,
   text: string,
 ): boolean {
-  const key = `${sourceGroup}|${chatJid}|${crypto
-    .createHash('md5')
-    .update(text)
-    .digest('hex')}`;
-  const now = Date.now();
-  const exp = recentIpcSends.get(key);
-  // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
-  // retryCount 挂在「入队时的原始 chatJid」上——对直连 IM 群组是带前缀的
-  // IM jid（如 feishu:oc_xxx），仅查 web:{folder}/{folder} 会漏掉它们导致
-  // 去重对所有 IM 来源失效。故用 folder 反查其全部注册 jid 逐一检查。
-  let inRetry =
-    queue.getRetryCount(`web:${sourceGroup}`) > 0 ||
-    queue.getRetryCount(sourceGroup) > 0;
-  if (!inRetry) {
-    for (const jid of getJidsByFolder(sourceGroup)) {
-      if (queue.getRetryCount(jid) > 0) {
-        inRetry = true;
-        break;
-      }
-    }
-  }
-  const isDup = !!(exp && exp > now) && inRetry;
-  recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
-  // 容量控制：Map 迭代为插入序，先进先出淘汰
-  for (const k of recentIpcSends.keys()) {
-    if (recentIpcSends.size <= IPC_SEND_DEDUP_MAX) break;
-    recentIpcSends.delete(k);
-  }
-  return isDup;
+  return ipcSendDedup.isRetryDuplicate(sourceGroup, chatJid, text);
 }
 
 // Track consecutive IM send failures per JID for auto-unbind
