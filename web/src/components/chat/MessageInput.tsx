@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   TerminalSquare,
   Loader2,
+  Upload,
 } from 'lucide-react';
 import { useFileStore } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
@@ -61,12 +62,16 @@ export function MessageInput({
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const prevGroupJidRef = useRef<string | undefined>(groupJid);
+  const groupJidRef = useRef(groupJid);
+  groupJidRef.current = groupJid;
 
   const { uploadFiles, uploading, uploadProgress } = useFileStore();
   const { drafts, saveDraft, clearDraft } = useChatStore();
@@ -351,6 +356,180 @@ export function MessageInput({
     }
   };
 
+  // --- Drag and drop helpers ---
+
+  /** Recursively traverse a dropped directory entry and collect all files */
+  const readEntriesRecursively = (entry: FileSystemDirectoryEntry): Promise<File[]> => {
+    return new Promise((resolve, reject) => {
+      const reader = entry.createReader();
+      const allFiles: File[] = [];
+
+      const readBatch = () => {
+        reader.readEntries(
+          async (entries) => {
+            if (entries.length === 0) {
+              resolve(allFiles);
+              return;
+            }
+            for (const e of entries) {
+              if (e.isFile) {
+                const file = await new Promise<File>((res, rej) =>
+                  (e as FileSystemFileEntry).file(res, (err) => rej(err)),
+                );
+                // Attach relative path for display
+                Object.defineProperty(file, 'webkitRelativePath', {
+                  value: e.fullPath.slice(1), // remove leading "/"
+                  writable: false,
+                });
+                allFiles.push(file);
+              } else if (e.isDirectory) {
+                const subFiles = await readEntriesRecursively(e as FileSystemDirectoryEntry);
+                allFiles.push(...subFiles);
+              }
+            }
+            // readEntries may return partial results; keep reading until empty
+            readBatch();
+          },
+          (err) => reject(err),
+        );
+      };
+      readBatch();
+    });
+  };
+
+  // --- Drag and drop handlers ---
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current += 1;
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    // Only handle file drops; let text/URL drops through to the textarea
+    if (!e.dataTransfer.types.includes('Files')) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current = 0;
+    setIsDragOver(false);
+
+    // Guard: respect disabled/sending/uploading state
+    if (!groupJid || disabled || sending || uploading) return;
+
+    // Capture groupJid at drop time to prevent stale-chat attachment
+    const targetGroupJid = groupJid;
+
+    // Collect files, expanding directories via webkitGetAsEntry.
+    // 同步提取所有 item 的 entry/file，避免 drop 事件结束后 DataTransferItemList
+    // 被浏览器清理（Firefox/Safari）导致后续 item 返回 null 而静默丢失。
+    const items = Array.from(e.dataTransfer.items);
+    const collected: Array<{ entry: FileSystemEntry | null; file: File | null }> = [];
+    for (const item of items) {
+      collected.push({
+        entry: item.webkitGetAsEntry?.() ?? null,
+        file: item.getAsFile(),
+      });
+    }
+
+    const allFiles: File[] = [];
+    let hasDirectory = false;
+
+    for (const { entry, file } of collected) {
+      if (entry?.isDirectory) {
+        hasDirectory = true;
+        try {
+          const dirFiles = await readEntriesRecursively(entry as FileSystemDirectoryEntry);
+          allFiles.push(...dirFiles);
+        } catch (err) {
+          setSendError('读取文件夹失败');
+          setTimeout(() => setSendError(null), 4000);
+          console.warn('读取文件夹失败:', err);
+          return;
+        }
+      } else if (file) {
+        allFiles.push(file);
+      }
+    }
+
+    if (allFiles.length === 0) return;
+
+    // If a directory was dropped, upload ALL files to workspace (including images)
+    // to match the button-based folder upload behavior.
+    if (hasDirectory) {
+      const ok = await uploadFiles(targetGroupJid, allFiles);
+      if (ok && targetGroupJid === groupJidRef.current) {
+        const newPending = allFiles.map((f) => ({
+          label: (f as unknown as { webkitRelativePath?: string }).webkitRelativePath || f.name,
+        }));
+        setPendingFiles((prev) => [...prev, ...newPending]);
+      }
+      return;
+    }
+
+    // For individual files: split images (inline) from regular files (workspace)
+    const imageFiles: File[] = [];
+    const regularFiles: File[] = [];
+    allFiles.forEach((file) => {
+      if (file.type.startsWith('image/')) {
+        imageFiles.push(file);
+      } else {
+        regularFiles.push(file);
+      }
+    });
+
+    // Process images inline (same as handleImageSelect)
+    if (imageFiles.length > 0) {
+      const newImages: PendingImage[] = [];
+      for (const file of imageFiles) {
+        try {
+          const base64 = await readFileAsBase64(file);
+          newImages.push({
+            name: file.name,
+            data: base64,
+            mimeType: file.type,
+            preview: URL.createObjectURL(file),
+          });
+        } catch (err) {
+          console.warn('跳过图片:', err instanceof Error ? err.message : err);
+        }
+      }
+      // Verify groupJid hasn't changed during async processing (use ref for live value)
+      if (targetGroupJid === groupJidRef.current) {
+        setPendingImages((prev) => [...prev, ...newImages]);
+      } else {
+        // Conversation switched — revoke preview URLs to avoid memory leak
+        newImages.forEach((img) => URL.revokeObjectURL(img.preview));
+      }
+    }
+
+    // Upload non-image files to workspace (same as handleFileSelect)
+    if (regularFiles.length > 0) {
+      const ok = await uploadFiles(targetGroupJid, regularFiles);
+      if (ok && targetGroupJid === groupJidRef.current) {
+        const newPending = regularFiles.map((f) => ({ label: f.name }));
+        setPendingFiles((prev) => [...prev, ...newPending]);
+      }
+    }
+  }, [groupJid, disabled, sending, uploading, uploadFiles]);
+
   const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!groupJid) return;
     const fileList = e.target.files;
@@ -399,9 +578,22 @@ export function MessageInput({
 
   return (
     <div
-      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40"
+      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40 relative"
       style={{ paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))` }}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
+      {/* Drag overlay */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-primary/5 dark:bg-primary/10 backdrop-blur-[2px] border-2 border-dashed border-primary rounded-xl pointer-events-none">
+          <div className="flex flex-col items-center gap-2 text-primary">
+            <Upload className="w-8 h-8" />
+            <span className="text-sm font-medium">松开上传文件</span>
+          </div>
+        </div>
+      )}
       {/* lg:pl-[60px] = avatar w-8 (32px) + gap-3 (12px) + visual balance (16px), aligns input left edge with message card content */}
       <div className={isCompact ? 'mx-auto px-4' : 'max-w-4xl mx-auto px-4 lg:pl-[60px]'}>
         {/* Upload progress bar */}
