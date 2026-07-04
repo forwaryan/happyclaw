@@ -360,35 +360,38 @@ export function MessageInput({
 
   /** Recursively traverse a dropped directory entry and collect all files */
   const readEntriesRecursively = (entry: FileSystemDirectoryEntry): Promise<File[]> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const reader = entry.createReader();
       const allFiles: File[] = [];
 
       const readBatch = () => {
-        reader.readEntries(async (entries) => {
-          if (entries.length === 0) {
-            resolve(allFiles);
-            return;
-          }
-          for (const e of entries) {
-            if (e.isFile) {
-              const file = await new Promise<File>((res) =>
-                (e as FileSystemFileEntry).file(res),
-              );
-              // Attach relative path for display
-              Object.defineProperty(file, 'webkitRelativePath', {
-                value: e.fullPath.slice(1), // remove leading "/"
-                writable: false,
-              });
-              allFiles.push(file);
-            } else if (e.isDirectory) {
-              const subFiles = await readEntriesRecursively(e as FileSystemDirectoryEntry);
-              allFiles.push(...subFiles);
+        reader.readEntries(
+          async (entries) => {
+            if (entries.length === 0) {
+              resolve(allFiles);
+              return;
             }
-          }
-          // readEntries may return partial results; keep reading until empty
-          readBatch();
-        });
+            for (const e of entries) {
+              if (e.isFile) {
+                const file = await new Promise<File>((res, rej) =>
+                  (e as FileSystemFileEntry).file(res, (err) => rej(err)),
+                );
+                // Attach relative path for display
+                Object.defineProperty(file, 'webkitRelativePath', {
+                  value: e.fullPath.slice(1), // remove leading "/"
+                  writable: false,
+                });
+                allFiles.push(file);
+              } else if (e.isDirectory) {
+                const subFiles = await readEntriesRecursively(e as FileSystemDirectoryEntry);
+                allFiles.push(...subFiles);
+              }
+            }
+            // readEntries may return partial results; keep reading until empty
+            readBatch();
+          },
+          (err) => reject(err),
+        );
       };
       readBatch();
     });
@@ -434,20 +437,35 @@ export function MessageInput({
     // Capture groupJid at drop time to prevent stale-chat attachment
     const targetGroupJid = groupJid;
 
-    // Collect files, expanding directories via webkitGetAsEntry
+    // Collect files, expanding directories via webkitGetAsEntry.
+    // 同步提取所有 item 的 entry/file，避免 drop 事件结束后 DataTransferItemList
+    // 被浏览器清理（Firefox/Safari）导致后续 item 返回 null 而静默丢失。
     const items = Array.from(e.dataTransfer.items);
+    const collected: Array<{ entry: FileSystemEntry | null; file: File | null }> = [];
+    for (const item of items) {
+      collected.push({
+        entry: item.webkitGetAsEntry?.() ?? null,
+        file: item.getAsFile(),
+      });
+    }
+
     const allFiles: File[] = [];
     let hasDirectory = false;
 
-    for (const item of items) {
-      const entry = item.webkitGetAsEntry?.();
+    for (const { entry, file } of collected) {
       if (entry?.isDirectory) {
         hasDirectory = true;
-        const dirFiles = await readEntriesRecursively(entry as FileSystemDirectoryEntry);
-        allFiles.push(...dirFiles);
-      } else {
-        const file = item.getAsFile();
-        if (file) allFiles.push(file);
+        try {
+          const dirFiles = await readEntriesRecursively(entry as FileSystemDirectoryEntry);
+          allFiles.push(...dirFiles);
+        } catch (err) {
+          setSendError('读取文件夹失败');
+          setTimeout(() => setSendError(null), 4000);
+          console.warn('读取文件夹失败:', err);
+          return;
+        }
+      } else if (file) {
+        allFiles.push(file);
       }
     }
 
@@ -489,8 +507,8 @@ export function MessageInput({
             mimeType: file.type,
             preview: URL.createObjectURL(file),
           });
-        } catch {
-          // Skip oversized or failed images
+        } catch (err) {
+          console.warn('跳过图片:', err instanceof Error ? err.message : err);
         }
       }
       // Verify groupJid hasn't changed during async processing (use ref for live value)
