@@ -36,7 +36,7 @@ import type {
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
-import { sanitizeFilename, generateFallbackName, formatLocalNow } from './utils.js';
+import { sanitizeFilename, generateFallbackName, formatLocalNow, isSuspectTruncatedStreamResult } from './utils.js';
 import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
@@ -1232,7 +1232,7 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }>; suspectTruncatedTail?: string }> {
   const stream = new MessageStream();
   // Track messages piped into this query.  When the query is interrupted,
   // these messages would otherwise be lost (consumed by the aborted query).
@@ -1300,6 +1300,10 @@ async function runQuery(
   const isResumedQuery = !!sessionId;
   const replayedUuids = isResumedQuery ? collectTranscriptUuids(sessionId!) : null;
   let sawLiveTurnActivity = false;
+  // 疑似截断流的 partial 结尾片段（最后 ~200 字符）：最后一条 result 命中
+  // 零 usage 指纹时置位，healthy result 到达即清空。随返回值交给会话循环
+  // 触发自动续写（见 isSuspectTruncatedStreamResult）。
+  let suspectTruncatedTail: string | undefined;
   // Usage delta 化基线：SDK result.usage 是 query 级累计值，单 query 多 result
   // 时需做差上报，否则主进程按事件入账会重复计费。
   let lastReportedUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0, durationMs: 0, numTurns: 0 };
@@ -1842,13 +1846,30 @@ async function runQuery(
 
       const { effectiveResult } = processor.processResult(textResult);
       const finalText = canonicalAssistantText || effectiveResult;
+      // ── emit 前置计算：截断指纹 + 后台任务数 ──
+      // finalizationReason / pendingBgTasks 必须随本条 result 一起送达主进程，
+      // 主进程据此决定流式卡片是定稿「已完成」还是保持「后台任务运行中/自动续写中」。
+      // 事后补发的 status 事件到达时卡片可能已定稿轮换（提示会被静默吞掉），
+      // 这正是"卡片显示已完成但后台还在跑"的可见性 bug 的根源。
+      const resultMsg = message as Record<string, unknown>;
+      const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
+      const suspectTruncated =
+        emitOutput && !!finalText && isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
+      const pendingBgTasks = emitOutput ? processor.getPendingSdkTaskCount() : 0;
+      if (suspectTruncated && finalText) {
+        log(`Result #${resultCount} suspected truncated stream (zero-usage success, ${finalText.length} chars), will auto-continue`);
+        suspectTruncatedTail = finalText.slice(-200);
+      } else {
+        suspectTruncatedTail = undefined;
+      }
       emit({
         status: 'success',
         result: finalText,
         newSessionId,
         sdkMessageUuid: canonicalAssistantUuid || lastAssistantUuid,
         sourceKind: sourceKindOverride ?? 'sdk_final',
-        finalizationReason: 'completed',
+        finalizationReason: suspectTruncated ? 'truncated' : 'completed',
+        pendingBgTasks,
       });
       // After emitting an sdk_final result, rotate turnId so that if
       // another result is emitted within the same query (e.g. user sent
@@ -1865,8 +1886,7 @@ async function runQuery(
       //（mid-query follow-up、后台任务唤醒的汇总 turn）每条 result 都携带全量累计，
       // 直接上报会让主进程按事件入账造成重复计费（实测 4 result 场景虚增 4 倍）。
       // 这里对上次已上报的累计值做差，只上报本 turn 的增量。
-      const resultMsg = message as Record<string, unknown>;
-      const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
+      //（resultMsg / sdkUsage 已在上方 emit 前置计算处声明）
       const sdkModelUsage = resultMsg.modelUsage as Record<string, Record<string, number>> | undefined;
       if (sdkUsage) {
         const delta = (cur: number, prev: number) => Math.max(0, (cur || 0) - (prev || 0));
@@ -1951,7 +1971,7 @@ async function runQuery(
       // 不面向用户，挂起等待只会阻塞主循环。
       // 常驻型后台任务（dev server 等）永不 settle，流保持打开直到
       // IDLE_TIMEOUT / CONTAINER_TIMEOUT 兜底回收——用户已收到回复，无消息损失。
-      const pendingBgTasks = emitOutput ? processor.getPendingSdkTaskCount() : 0;
+      //（pendingBgTasks 已在上方 emit 前置计算处取值，与 result 携带的字段一致）
       if (pendingBgTasks > 0) {
         resultReceivedAt = null;
         log(`Result #${resultCount} emitted; holding stream open for ${pendingBgTasks} background task(s): ${processor.describePendingSdkTasks().join(' | ')}`);
@@ -1976,7 +1996,7 @@ async function runQuery(
   processor.cleanup();
 
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery, suspectTruncatedTail };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
 
@@ -2444,10 +2464,12 @@ async function main(): Promise<void> {
       // Guard: if compaction keeps firing repeatedly (e.g. system prompt alone
       // nearly fills the context window), stop auto-continuing to avoid an
       // infinite loop that burns API tokens without producing useful work.
+      let ranCompactionContinue = false;
       if (hadCompaction) {
         hadCompaction = false;
         consecutiveCompactions++;
         if (consecutiveCompactions <= MAX_CONSECUTIVE_COMPACTIONS) {
+          ranCompactionContinue = true;
           log(`Auto-continuing after compaction (${consecutiveCompactions}/${MAX_CONSECUTIVE_COMPACTIONS})`);
           const autoContinuePrompt = [
             '继续。',
@@ -2525,6 +2547,106 @@ async function main(): Promise<void> {
         }
       } else {
         consecutiveCompactions = 0;
+      }
+
+      // ── 截断续写：上游断流的 partial 自动补全 ──
+      // runQuery 检出「零 usage 成功 + 正文非空」指纹（上游网关长文本生成中断流，
+      // SDK 把半截缓冲当 success 收口）时返回 suspectTruncatedTail。此处仿照压缩
+      // auto-continue 的模式自动开续写 turn，把没写完的内容以后续消息补发——否则
+      // 半截回复会被当成完整回复交付，进程空转到 IDLE_TIMEOUT 才死。
+      // 上限 2 次防止网关持续断流时无限烧 token；压缩 auto-continue 本轮已跑过
+      // 新 query 时跳过（模型已经继续过了）。
+      let truncatedTail = ranCompactionContinue ? undefined : queryResult.suspectTruncatedTail;
+      let truncationContinues = 0;
+      const MAX_TRUNCATION_CONTINUES = 2;
+      let closedDuringTruncationContinue = false;
+      while (truncatedTail && truncationContinues < MAX_TRUNCATION_CONTINUES) {
+        truncationContinues++;
+        log(`Auto-continuing after suspected truncated stream (${truncationContinues}/${MAX_TRUNCATION_CONTINUES})`);
+        const truncationContinuePrompt = [
+          '你的上一条回复在生成过程中被上游截断，用户看到的内容在以下结尾处戛然而止：',
+          '```',
+          truncatedTail,
+          '```',
+          '请从中断处直接继续写完剩余内容。不要重复已输出的部分，不要重新开头，不要道歉或解释截断，直接衔接上文继续。',
+        ].join('\n');
+        containerInput.turnId = generateTurnId();
+        const contResult = await runQuery(
+          truncationContinuePrompt,
+          sessionId,
+          mcpServerConfig,
+          containerInput,
+          memoryRecallPrompt,
+          resumeAt,
+          true,
+          DEFAULT_ALLOWED_TOOLS,
+          undefined,
+          undefined,
+          'truncation_continue',
+        );
+        if (contResult.newSessionId) {
+          sessionId = contResult.newSessionId;
+          latestSessionId = sessionId;
+        }
+        if (contResult.lastAssistantUuid) resumeAt = contResult.lastAssistantUuid;
+        if (contResult.closedDuringQuery) {
+          closedDuringTruncationContinue = true;
+          break;
+        }
+        if (contResult.sessionResumeFailed) {
+          // 同压缩 auto-continue 的处理：清 session 暂存历史，停止续写等下一条消息
+          log('WARN: Session resume failed during truncation-continue, clearing session');
+          if (sessionId) {
+            const historyContext = extractSessionHistory(sessionId);
+            if (historyContext) {
+              pendingHistoryContext = historyContext;
+              log('Stashed session history context for next user-initiated query');
+            }
+          }
+          sessionId = undefined;
+          latestSessionId = undefined;
+          resumeAt = undefined;
+          mcpServerConfig = buildMcpServerConfig();
+          break;
+        }
+        if (contResult.unrecoverableTranscriptError) {
+          log('WARN: Unrecoverable transcript error during truncation-continue, signaling reset');
+          writeOutput({
+            status: 'error',
+            result: null,
+            error: 'unrecoverable_transcript: 会话历史中包含无法处理的数据，会话需要重置。',
+            newSessionId: sessionId,
+          });
+          process.exit(1);
+        }
+        if (contResult.interruptedDuringQuery) {
+          log('WARN: Truncation-continue query was interrupted by user');
+          resumeAt = undefined;
+          try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+          break;
+        }
+        // 续写本身又被截断 → 带新结尾再续，直到写完或触顶
+        truncatedTail = contResult.suspectTruncatedTail;
+      }
+      if (closedDuringTruncationContinue) {
+        log('Close sentinel during truncation-continue, exiting');
+        writeOutput({ status: 'closed', result: null });
+        break;
+      }
+      if (truncatedTail) {
+        // 续写触顶仍被断流 / 会话恢复失败等无法继续 → 发出机器状态标记
+        //（字面与主进程 src/index.ts 的 TRUNCATION_EXHAUSTED_STATUS 保持一致），
+        // 主进程据此把挂起中的卡片收口，不再等一个不会来的 healthy result。
+        log('Truncation-continue exhausted, signaling host to finalize held card');
+        writeOutput({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: 'truncation_continue_exhausted',
+          },
+        });
       }
 
       log('Query ended, waiting for next IPC message...');
