@@ -1711,6 +1711,10 @@ export class StreamingCardController {
 
   // Auxiliary display state
     private systemStatus: string | null = null;
+    /** 挂起完成状态：本 turn 回复已送达但后台任务/截断续写未结束，卡片保持
+     * 打开等待追加。pendingTasks=null 表示截断自动续写中。任何新 turn 活动
+     * （append/appendThinking/startTool）自动清除。 */
+    private heldOpen: { pendingTasks: number | null } | null = null;
     private activeHook: { hookName: string; hookEvent: string } | null = null;
     private todos: Array<{ id: string; content: string; status: string }> | null =
       null;
@@ -1776,6 +1780,7 @@ export class StreamingCardController {
    * Signal that a tool has started executing.
    */
   startTool(toolId: string, toolName: string): void {
+    this.heldOpen = null; // 新 turn 活动，退出挂起态
     this.toolCalls.set(toolId, {
       name: toolName,
       status: 'running',
@@ -1841,6 +1846,7 @@ export class StreamingCardController {
    * Append thinking text (accumulated, tail-truncated at MAX_THINKING_CHARS).
    */
   appendThinking(text: string): void {
+    this.heldOpen = null; // 新 turn 活动，退出挂起态
     this.thinkingText += text;
     if (this.thinkingText.length > MAX_THINKING_CHARS) {
       this.thinkingText =
@@ -1871,6 +1877,23 @@ export class StreamingCardController {
    */
   setSystemStatus(status: string | null): void {
     this.systemStatus = status;
+    this.stateVersion++;
+    if (this.state === 'streaming') {
+      this.backendMode === 'streaming'
+        ? this.scheduleAuxFlush()
+        : this.schedulePatch();
+    }
+  }
+
+  /**
+   * 标记卡片进入「挂起完成」态：本 turn 回复已送达，但后台任务（异步 Agent /
+   * backgrounded Bash）或截断自动续写仍在进行，卡片不定稿、状态横幅切到
+   * 「后台任务运行中 ⏳」。pendingTasks 为后台任务数，null 表示截断续写中。
+   * 下一 turn 的任何活动（append/appendThinking/startTool）自动清除该态，
+   * 恢复正常的 phase 推导。
+   */
+  setHeldOpen(pendingTasks: number | null): void {
+    this.heldOpen = { pendingTasks };
     this.stateVersion++;
     if (this.state === 'streaming') {
       this.backendMode === 'streaming'
@@ -1970,6 +1993,7 @@ export class StreamingCardController {
    * Creates the card on first call, then patches on subsequent calls.
    */
     append(text: string): void {
+      this.heldOpen = null; // 新 turn 文本到达，退出挂起态
       this.accumulatedText = text;
       this.thinking = false; // Text arrived, no longer just thinking
 
@@ -2402,6 +2426,11 @@ export class StreamingCardController {
    * Falls back to schedulePatch() if streaming backend is not available.
    */
   private derivePhase(): StreamingPhase {
+    // 挂起完成态优先：本 turn 已答复、等后台任务/续写。放在最前是有意的——
+    // backgrounded Bash 等工具的 tool_use 可能永远等不到 end 事件而滞留
+    // 'running'，若 tooling 优先会把挂起期一直显示成「调用工具」。
+    // 新 turn 的任何活动（append/appendThinking/startTool）会清除 heldOpen。
+    if (this.heldOpen) return 'waiting_bg';
     // Priority: active tool > hook > thinking > streaming text > working > idle
     for (const tc of this.toolCalls.values()) {
       if (tc.status === 'running') return 'tooling';
@@ -2439,6 +2468,11 @@ export class StreamingCardController {
     if (phase === 'streaming') {
       const chars = this.accumulatedText.length;
       return `已输出 ${chars} 字`;
+    }
+    if (phase === 'waiting_bg') {
+      if (this.systemStatus) return this.systemStatus;
+      const n = this.heldOpen?.pendingTasks;
+      return n ? `${n} 个后台任务运行中，完成后将继续汇总` : '自动续写中…';
     }
     if (phase === 'working') {
       return this.systemStatus ?? undefined;

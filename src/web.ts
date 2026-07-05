@@ -862,11 +862,15 @@ async function handleAgentConversationMessage(
 
   // Try to pipe into running agent process
   const agentImages = toAgentImages(normalizedAttachments);
+  const finalizeHeld = deps.finalizeHeldCard;
   const agentSendResult = deps.queue.sendMessage(
     virtualChatJid,
     formatted,
     agentImages,
-    undefined,
+    () => {
+      // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
+      finalizeHeld?.(virtualChatJid);
+    },
     virtualChatJid,
   );
   if (agentSendResult === 'no_active') {

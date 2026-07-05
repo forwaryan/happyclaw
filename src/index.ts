@@ -715,6 +715,58 @@ const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 // outputs to the correct IM channel (the running session holds the truth).
 const activeImReplyRoutes = new Map<string, string | null>();
 
+// ── 卡片挂起完成机制的共享工具 ──
+// 挂起卡内各 turn 文本之间的分隔线（最终定稿卡片正文按时间序拼接各 turn）。
+const HELD_TURN_DIVIDER = '\n\n---\n\n';
+// agent-runner 截断续写触顶放弃时发出的机器状态标记（与
+// container/agent-runner/src/index.ts 的 emit 保持字面一致），主进程据此
+// 把挂起中的卡片收口，不再等一个永远不会来的 healthy result。
+const TRUNCATION_EXHAUSTED_STATUS = 'truncation_continue_exhausted';
+// 挂起期间累计的 usage 增量（与 StreamEvent['usage'] 同形），定稿后与最终
+// turn 的 usage 合并成整个回合的总量补到卡片 usage note。
+type HeldUsageTotals = NonNullable<StreamEvent['usage']>;
+function mergeHeldUsage(
+  base: HeldUsageTotals | null,
+  next: HeldUsageTotals,
+): HeldUsageTotals {
+  if (!base) return { ...next, modelUsage: next.modelUsage ? { ...next.modelUsage } : undefined };
+  const mergedModel: NonNullable<HeldUsageTotals['modelUsage']> = {
+    ...(base.modelUsage || {}),
+  };
+  for (const [model, mu] of Object.entries(next.modelUsage || {})) {
+    const prev = mergedModel[model];
+    mergedModel[model] = prev
+      ? {
+          inputTokens: (prev.inputTokens || 0) + (mu.inputTokens || 0),
+          outputTokens: (prev.outputTokens || 0) + (mu.outputTokens || 0),
+          cacheReadInputTokens:
+            (prev.cacheReadInputTokens || 0) + (mu.cacheReadInputTokens || 0),
+          cacheCreationInputTokens:
+            (prev.cacheCreationInputTokens || 0) +
+            (mu.cacheCreationInputTokens || 0),
+          costUSD: (prev.costUSD || 0) + (mu.costUSD || 0),
+        }
+      : { ...mu };
+  }
+  return {
+    inputTokens: (base.inputTokens || 0) + (next.inputTokens || 0),
+    outputTokens: (base.outputTokens || 0) + (next.outputTokens || 0),
+    cacheReadInputTokens:
+      (base.cacheReadInputTokens || 0) + (next.cacheReadInputTokens || 0),
+    cacheCreationInputTokens:
+      (base.cacheCreationInputTokens || 0) + (next.cacheCreationInputTokens || 0),
+    costUSD: (base.costUSD || 0) + (next.costUSD || 0),
+    durationMs: (base.durationMs || 0) + (next.durationMs || 0),
+    numTurns: (base.numTurns || 0) + (next.numTurns || 0),
+    modelUsage: Object.keys(mergedModel).length > 0 ? mergedModel : undefined,
+  };
+}
+
+// Sub-Agent 路径的挂起卡 finalizer 注册表（key: virtualChatJid）。主路径复用
+// activeRouteUpdaters（用户消息注入时必经），Sub-Agent 注入点不走 route updater，
+// 由 web.ts / 消息循环在注入成功回调里显式触发。
+const activeHeldCardFinalizers = new Map<string, () => void>();
+
 // ── IPC send_message 跨重试去重 ──
 // 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
 // 会被原样再执行一遍，经 IPC watcher 即时送达用户（重复刷消息）。
@@ -3113,6 +3165,50 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // 之后才执行（waitForOutputChain 30s 兜底只放行不取消）；此时绝不能再重建
   // 流式卡片——重建出的卡片永远无人 complete，成为僵尸「生成中」卡。
   let runEnded = false;
+  // ── 卡片挂起完成机制 ──
+  // pendingBgTasks>0 / truncated 的 result 不定稿卡片：本 turn 文本存入
+  // heldCardParts（DB 照常逐 turn 入库），卡片保持 streaming 态并显示
+  // 「后台任务运行中」，后续 turn 的流式增量继续追加到同一张卡；全部后台
+  // 任务 settle 后的 healthy result 才用累积全文定稿「已完成」——对齐
+  // Claude Code "一次委托 = 一个完整回合" 的体验，不再分段发多张卡。
+  let heldCardParts: string[] = [];
+  // 挂起期间各 turn 的 usage 增量累计，定稿后与最终 turn 的 usage 合并
+  // 补到卡片 usage note（否则卡片只显示最后一个 turn 的用量）。
+  let heldCardUsage: HeldUsageTotals | null = null;
+  // 定稿后等待最终 usage 事件合并补丁的卡片控制器。usage 事件在 result 之后
+  // 到达，而主路径定稿即轮换 session——不留引用的话 usage note 永远打在新空卡
+  // 上（no-op）。每条 result 开始时清空，避免打到过期卡。
+  let heldUsagePatchTarget: StreamingSession | null = null;
+  const heldCardBaseText = (): string =>
+    heldCardParts.length > 0
+      ? heldCardParts.join(HELD_TURN_DIVIDER) + HELD_TURN_DIVIDER
+      : '';
+  // 用户在挂起期间发来新消息 → 先把挂起卡定稿并轮换新卡。IM 时间线上挂起卡
+  // 在用户消息之前，新 turn 的回复不能长在旧卡里。
+  const finalizeHeldCardForNewMessage = async (): Promise<void> => {
+    if (heldCardParts.length === 0) return;
+    const txt = heldCardParts.join(HELD_TURN_DIVIDER);
+    heldCardParts = [];
+    heldCardUsage = null;
+    if (!streamingSession?.isActive()) return;
+    try {
+      await streamingSession.complete(txt);
+    } catch {
+      await streamingSession.abort('').catch(() => {});
+    }
+    unregisterStreamingSession(streamingSessionJid);
+    streamingAccumulatedText = '';
+    streamingAccumulatedThinking = '';
+    streamingSession = await imManager
+      .createStreamingSession(
+        streamingSessionJid,
+        makeOnCardCreated(streamingSessionJid),
+      )
+      .catch(() => undefined);
+    if (streamingSession) {
+      registerStreamingSession(streamingSessionJid, streamingSession);
+    }
+  };
   logger.info(
     { chatJid, streamingSessionJid, hasSession: !!streamingSession },
     'Streaming session creation result',
@@ -3129,6 +3225,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   activeRouteUpdaters.set(effectiveGroup.folder, async (newSourceJid) => {
     const newImJid =
       newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
+    // 用户新消息注入：挂起中的卡片先定稿轮换——IM 时间线上旧卡在用户消息
+    // 之前，新 turn 的回复不能长在旧卡里。route updater 在所有用户消息
+    // 注入点（index.ts 消息循环 / web.ts）都会被调用，是天然的挂钩位置。
+    await finalizeHeldCardForNewMessage().catch((err) => {
+      logger.warn(
+        { err, chatJid },
+        'Failed to finalize held streaming card on new message',
+      );
+    });
     // New IPC user message arrived — reset sentReply so the next result
     // can be delivered to IM. This is the correct place to reset, NOT
     // in the streaming session rebuild (which also fires on SDK Task
@@ -3298,6 +3403,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
           if (result.status === 'stream' && result.streamEvent) {
+            // ── 截断续写触顶信号（机器标记，不广播不展示）──
+            // runner 连续续写仍被断流、放弃后发出。挂起中的卡片不能再等一个
+            // 永远不会来的 healthy result，就地收口为「已中断」。
+            if (
+              result.streamEvent.eventType === 'status' &&
+              result.streamEvent.statusText === TRUNCATION_EXHAUSTED_STATUS
+            ) {
+              if (heldCardParts.length > 0) {
+                heldCardParts = [];
+                heldCardUsage = null;
+                if (streamingSession?.isActive()) {
+                  await streamingSession
+                    .abort('自动续写未能完成（上游连续断流），以上为已生成内容')
+                    .catch(() => {});
+                }
+              }
+              return;
+            }
             broadcastStreamEvent(chatJid, result.streamEvent);
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
@@ -3358,12 +3481,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
             }
             if (streamingSession) {
-              feedStreamEventToCard(
+              const se = result.streamEvent;
+              if (se.eventType === 'usage' && se.usage && heldCardParts.length > 0) {
+                // 挂起中：累计本 turn 的 usage 增量，不喂卡
+                //（patchUsageNote 在 streaming 态本就 no-op，累计后定稿时合并补丁）。
+                heldCardUsage = mergeHeldUsage(heldCardUsage, se.usage);
+              } else if (se.eventType === 'usage' && se.usage && heldUsagePatchTarget) {
+                // 挂起回合刚定稿：合并挂起期累计 + 最终 turn 的 usage，
+                // 补到已定稿的旧卡上（session 已轮换，正常喂卡会打到新空卡上 no-op）。
+                const target = heldUsagePatchTarget;
+                heldUsagePatchTarget = null;
+                const merged = heldCardUsage
+                  ? mergeHeldUsage(heldCardUsage, se.usage)
+                  : se.usage;
+                heldCardUsage = null;
+                void target.patchUsageNote(merged);
+              } else {
+                feedStreamEventToCard(
                   streamingSession,
-                  result.streamEvent,
-                  streamingAccumulatedText,
-                  buildWebTraceUrl(effectiveGroup.folder, result.streamEvent.turnId || lastProcessed.id),
+                  se,
+                  heldCardBaseText() + streamingAccumulatedText,
+                  buildWebTraceUrl(effectiveGroup.folder, se.turnId || lastProcessed.id),
                 );
+              }
             }
 
             // ── 中断时立即保存已输出内容 ──
@@ -3374,6 +3514,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               result.streamEvent.statusText === 'interrupted'
             ) {
               streamInterrupted = true;
+              // 挂起中的卡片被用户中断：就地收口（内容已逐 turn 入库，不丢），
+              // abort 后 session 转 inactive，下一 turn 由流事件重建路径开新卡。
+              if (heldCardParts.length > 0) {
+                heldCardParts = [];
+                heldCardUsage = null;
+                if (streamingSession?.isActive()) {
+                  await streamingSession.abort('已中断').catch(() => {});
+                }
+              }
               // Skip if shutdown handler already saved this text (prevents duplicates)
               const inlineWebJid = chatJid.startsWith('web:')
                 ? chatJid
@@ -3699,19 +3848,70 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Stop typing indicator before sending — clears the 4s refresh timer
               // so it doesn't keep firing while the agent stays alive in idle state.
               await setTyping(chatJid, false);
+
+              // ── 卡片挂起判定 ──
+              // 后台任务未 settle / 截断待续写的 result 不定稿卡片：内容进
+              // heldCardParts（DB 照常入库），卡片保持活跃等后续 turn 追加，
+              // 全部结束后的 healthy result 才定稿——一次委托一张卡。
+              const holdReason: 'bg_tasks' | 'truncated' | null =
+                !streamingSession?.isActive() || runEnded
+                  ? null
+                  : result.finalizationReason === 'truncated'
+                    ? 'truncated'
+                    : (result.pendingBgTasks ?? 0) > 0
+                      ? 'bg_tasks'
+                      : null;
+              // 状态提示追加进正文：进入 DB / Web / 卡片转录，非卡渠道（QQ 纯文本
+              // 等无法挂起的通道）也能看到"还没完"。
+              if (result.finalizationReason === 'truncated') {
+                text += '\n\n> ⚠️ 回复在生成中被上游截断，正在自动续写…';
+              } else if ((result.pendingBgTasks ?? 0) > 0) {
+                text += `\n\n> ⏳ ${result.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
+              }
               const localImagePaths = extractLocalImImagePaths(
                 text,
                 effectiveGroup.folder,
               );
+              // 新 result 到达即关闭上一轮的 usage 合并补丁窗口
+              heldUsagePatchTarget = null;
 
-              // ── Complete Feishu streaming card ──
+              // ── Complete or hold Feishu streaming card ──
               // If a streaming card is active, finalize it with the complete text.
               // The card replaces the normal IM sendMessage for the Feishu channel.
               let streamingCardHandledIM = false;
-              if (streamingSession?.isActive()) {
+              let cardHeldThisResult = false;
+              if (holdReason) {
+                heldCardParts.push(text);
+                cardHeldThisResult = true;
+                streamingCardHandledIM = true;
+                imManager.clearAckReaction(replySourceImJid || chatJid);
+                const holdNote =
+                  holdReason === 'truncated'
+                    ? '检测到上游断流，自动续写中…'
+                    : `${result.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
+                streamingSession!.setSystemStatus(holdNote);
+                if (streamingSession instanceof StreamingCardController) {
+                  streamingSession.setHeldOpen(
+                    holdReason === 'bg_tasks' ? (result.pendingBgTasks ?? 0) : null,
+                  );
+                }
+                logger.info(
+                  {
+                    chatJid,
+                    holdReason,
+                    pendingBgTasks: result.pendingBgTasks,
+                    heldParts: heldCardParts.length,
+                  },
+                  'Streaming card held open (background tasks / truncation continue)',
+                );
+              } else if (streamingSession?.isActive()) {
                 try {
-                  await streamingSession.complete(text);
+                  await streamingSession.complete(heldCardBaseText() + text);
                   streamingCardHandledIM = true;
+                  // 定稿后 session 即将轮换；留住引用供随后到达的 usage 事件
+                  // 打合并 usage note（挂起期累计 + 最终 turn）。
+                  heldUsagePatchTarget = streamingSession;
+                  heldCardParts = [];
                   // Streaming card replaced the normal sendMessage path,
                   // so clear the ack reaction that would normally be cleared in sendMessage.
                   imManager.clearAckReaction(replySourceImJid || chatJid);
@@ -3728,6 +3928,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   await streamingSession
                     .abort('回复已通过消息发送')
                     .catch(() => {});
+                  // 卡片已死，挂起累积随之作废（内容早已逐 turn 入库）
+                  heldCardParts = [];
+                  heldCardUsage = null;
                   // Fall through to normal sendMessage
                 }
               }
@@ -3737,6 +3940,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // messages get a fresh streaming card instead of falling back to static.
               // Previously only rebuilt for partial outputs (#223); now rebuild for
               // all completions to fix DingTalk "second message gets no reply" bug.
+              // 挂起中的卡片不轮换：session 保持原状，后续 turn 继续追加。
               if (streamingCardHandledIM) {
                 // Streaming card strips local image references (only img_xxx keys
                 // are valid in Feishu cards).  Send any local images as separate
@@ -3764,22 +3968,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   }
                 }
 
-                unregisterStreamingSession(streamingSessionJid);
-                streamingAccumulatedText = '';
-                streamingAccumulatedThinking = '';
-                streamingSession = await imManager.createStreamingSession(
-                  streamingSessionJid,
-                  makeOnCardCreated(streamingSessionJid),
-                );
-                if (streamingSession) {
-                  registerStreamingSession(
+                if (!cardHeldThisResult) {
+                  unregisterStreamingSession(streamingSessionJid);
+                  streamingAccumulatedText = '';
+                  streamingAccumulatedThinking = '';
+                  streamingSession = await imManager.createStreamingSession(
                     streamingSessionJid,
-                    streamingSession,
+                    makeOnCardCreated(streamingSessionJid),
                   );
-                  logger.debug(
-                    { chatJid, sourceKind: result.sourceKind },
-                    'Rebuilt streaming card after partial output',
-                  );
+                  if (streamingSession) {
+                    registerStreamingSession(
+                      streamingSessionJid,
+                      streamingSession,
+                    );
+                    logger.debug(
+                      { chatJid, sourceKind: result.sourceKind },
+                      'Rebuilt streaming card after partial output',
+                    );
+                  }
                 }
               }
 
@@ -3903,7 +4109,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // isActive() 仍为 true ⟹ 卡片从未被 complete()（result.result 非空路径会
         // 在 3594 complete 后令 isActive 转 false）。这里覆盖所有"卡片建了但没收口"的
         // 收尾场景，避免卡片永久停在「生成中」（僵尸卡片）。
-        if (hadError || !output || output.status === 'error') {
+        if (heldCardParts.length > 0) {
+          // 挂起卡收口：后台任务未等到 settle 进程就结束了（空闲/容器超时、
+          // _close、出错）。就地定稿为「已中断」+ 原因，绝不留僵尸
+          // 「后台任务运行中」卡。内容已逐 turn 入库，无消息损失。
+          const heldNote =
+            hadError || !output || output.status === 'error'
+              ? '处理出错，后台任务可能未完成'
+              : '后台任务未全部完成，会话已结束';
+          heldCardParts = [];
+          heldCardUsage = null;
+          await streamingSession.abort(heldNote).catch(() => {});
+        } else if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
           await streamingSession.abort('已中断').catch(() => {});
@@ -6681,6 +6898,17 @@ async function processAgentConversation(
   // the container drained mid-query so the finally block finalizes the card as
   // "reconnecting" instead of leaving a zombie 生成中 card.
   let agentClosed = false;
+  // ── 卡片挂起完成机制（与主路径 runContainerAgent 对齐）──
+  // Sub-Agent 路径首条回复后本就不再向 IM 发消息（isFirstReply 门控），挂起
+  // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
+  let heldAgentParts: string[] = [];
+  let heldAgentUsage: HeldUsageTotals | null = null;
+  // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
+  let heldAgentUsagePatchPending = false;
+  const heldAgentBaseText = (): string =>
+    heldAgentParts.length > 0
+      ? heldAgentParts.join(HELD_TURN_DIVIDER) + HELD_TURN_DIVIDER
+      : '';
   if (agentStreamingSession && streamingSessionJid) {
     registerStreamingSession(streamingSessionJid, agentStreamingSession);
     logger.debug(
@@ -6688,6 +6916,39 @@ async function processAgentConversation(
       'Streaming card session created for conversation agent',
     );
   }
+  // 用户在挂起期间发来新消息 → 先定稿旧卡、开新卡（注入点在 web.ts /
+  // 消息循环，经 activeHeldCardFinalizers 以 virtualChatJid 为键触达）。
+  activeHeldCardFinalizers.set(virtualChatJid, () => {
+    void (async () => {
+      if (heldAgentParts.length === 0) return;
+      const txt = heldAgentParts.join(HELD_TURN_DIVIDER);
+      heldAgentParts = [];
+      heldAgentUsage = null;
+      if (!agentStreamingSession?.isActive()) return;
+      try {
+        await agentStreamingSession.complete(txt);
+      } catch {
+        await agentStreamingSession.abort('').catch(() => {});
+      }
+      if (streamingSessionJid) unregisterStreamingSession(streamingSessionJid);
+      agentStreamingAccText = '';
+      agentStreamingSession = replySourceImJid
+        ? await imManager
+            .createStreamingSession(replySourceImJid, (messageId) =>
+              registerMessageIdMapping(messageId, streamingSessionJid!),
+            )
+            .catch(() => undefined)
+        : undefined;
+      if (agentStreamingSession && streamingSessionJid) {
+        registerStreamingSession(streamingSessionJid, agentStreamingSession);
+      }
+    })().catch((err) => {
+      logger.warn(
+        { err, chatJid, agentId },
+        'Failed to finalize held agent streaming card on new message',
+      );
+    });
+  });
 
   // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -6761,6 +7022,22 @@ async function processAgentConversation(
 
     // Stream events
     if (output.status === 'stream' && output.streamEvent) {
+      // ── 截断续写触顶信号（机器标记，不广播不展示）──
+      if (
+        output.streamEvent.eventType === 'status' &&
+        output.streamEvent.statusText === TRUNCATION_EXHAUSTED_STATUS
+      ) {
+        if (heldAgentParts.length > 0) {
+          heldAgentParts = [];
+          heldAgentUsage = null;
+          if (agentStreamingSession?.isActive()) {
+            await agentStreamingSession
+              .abort('自动续写未能完成（上游连续断流），以上为已生成内容')
+              .catch(() => {});
+          }
+        }
+        return;
+      }
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
       // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
@@ -6777,12 +7054,30 @@ async function processAgentConversation(
 
       // ── Feed stream events into Feishu streaming card ──
       if (agentStreamingSession) {
-        feedStreamEventToCard(
+        const se = output.streamEvent;
+        if (se.eventType === 'usage' && se.usage && heldAgentParts.length > 0) {
+          // 挂起中：累计 usage 增量，不喂卡（定稿后合并补丁）
+          heldAgentUsage = mergeHeldUsage(heldAgentUsage, se.usage);
+        } else if (
+          se.eventType === 'usage' &&
+          se.usage &&
+          heldAgentUsagePatchPending
+        ) {
+          // 挂起回合刚定稿：合并挂起期累计 + 最终 turn 的 usage 打到卡上
+          heldAgentUsagePatchPending = false;
+          const merged = heldAgentUsage
+            ? mergeHeldUsage(heldAgentUsage, se.usage)
+            : se.usage;
+          heldAgentUsage = null;
+          void agentStreamingSession.patchUsageNote(merged);
+        } else {
+          feedStreamEventToCard(
             agentStreamingSession,
-            output.streamEvent,
-            agentStreamingAccText,
-            buildWebTraceUrl(effectiveGroup.folder, output.streamEvent.turnId || lastProcessed.id),
+            se,
+            heldAgentBaseText() + agentStreamingAccText,
+            buildWebTraceUrl(effectiveGroup.folder, se.turnId || lastProcessed.id),
           );
+        }
       }
 
       // ── 中断时立即保存已输出内容 ──
@@ -6791,6 +7086,14 @@ async function processAgentConversation(
         output.streamEvent.statusText === 'interrupted'
       ) {
         agentStreamInterrupted = true;
+        // 挂起中的卡片被中断：就地收口（内容已逐 turn 入库）
+        if (heldAgentParts.length > 0) {
+          heldAgentParts = [];
+          heldAgentUsage = null;
+          if (agentStreamingSession?.isActive()) {
+            await agentStreamingSession.abort('已中断').catch(() => {});
+          }
+        }
         if (!cursorCommitted) {
           const interruptedText = buildInterruptedReply(agentStreamingAccText);
           try {
@@ -6937,6 +7240,22 @@ async function processAgentConversation(
         return;
       }
       if (text) {
+        // ── 卡片挂起判定（与主路径对齐）──
+        const holdReason: 'bg_tasks' | 'truncated' | null =
+          !agentStreamingSession?.isActive()
+            ? null
+            : output.finalizationReason === 'truncated'
+              ? 'truncated'
+              : (output.pendingBgTasks ?? 0) > 0
+                ? 'bg_tasks'
+                : null;
+        // 状态提示追加进正文（DB / Web / 卡片转录一致可见）
+        if (output.finalizationReason === 'truncated') {
+          text += '\n\n> ⚠️ 回复在生成中被上游截断，正在自动续写…';
+        } else if ((output.pendingBgTasks ?? 0) > 0) {
+          text += `\n\n> ⏳ ${output.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
+        }
+        heldAgentUsagePatchPending = false;
         const isFirstReply = !lastAgentReplyMsgId;
         const msgId = crypto.randomUUID();
         lastAgentReplyMsgId = msgId;
@@ -6993,12 +7312,44 @@ async function processAgentConversation(
           effectiveGroup.folder,
         );
 
-        // ── Complete Feishu streaming card or fall back to static message ──
+        // ── Complete or hold Feishu streaming card, or fall back to static ──
         let streamingCardHandledIM = false;
-        if (agentStreamingSession?.isActive()) {
+        if (holdReason) {
+          // 挂起：不定稿，正文进 heldAgentParts，卡片状态行提示，后续 turn
+          // 的流式增量继续追加到同一张卡（Sub 路径 session 本就不轮换）。
+          heldAgentParts.push(text);
+          agentStreamingAccText = '';
+          streamingCardHandledIM = true;
+          if (replySourceImJid) {
+            imManager.clearAckReaction(replySourceImJid);
+          }
+          const holdNote =
+            holdReason === 'truncated'
+              ? '检测到上游断流，自动续写中…'
+              : `${output.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
+          agentStreamingSession!.setSystemStatus(holdNote);
+          if (agentStreamingSession instanceof StreamingCardController) {
+            agentStreamingSession.setHeldOpen(
+              holdReason === 'bg_tasks' ? (output.pendingBgTasks ?? 0) : null,
+            );
+          }
+          logger.info(
+            {
+              chatJid,
+              agentId,
+              holdReason,
+              pendingBgTasks: output.pendingBgTasks,
+              heldParts: heldAgentParts.length,
+            },
+            'Agent streaming card held open (background tasks / truncation continue)',
+          );
+        } else if (agentStreamingSession?.isActive()) {
           try {
-            await agentStreamingSession.complete(text);
+            await agentStreamingSession.complete(heldAgentBaseText() + text);
             streamingCardHandledIM = true;
+            // 定稿后等最终 usage 事件做合并补丁（挂起期累计 + 最终 turn）
+            heldAgentUsagePatchPending = true;
+            heldAgentParts = [];
             if (replySourceImJid) {
               imManager.clearAckReaction(replySourceImJid);
             }
@@ -7010,6 +7361,8 @@ async function processAgentConversation(
             await agentStreamingSession
               .abort('回复已通过消息发送')
               .catch(() => {});
+            heldAgentParts = [];
+            heldAgentUsage = null;
           }
         }
 
@@ -7115,7 +7468,11 @@ async function processAgentConversation(
           agent.kind === 'spawn' &&
           text &&
           output.sourceKind !== 'overflow_partial' &&
-          output.sourceKind !== 'compact_partial'
+          output.sourceKind !== 'compact_partial' &&
+          // 有未 settle 的后台任务 / 截断待续写时不能关流——关流会连坐杀掉
+          // 还在跑的任务（runner 侧同理保持 query 存活）。等最终 result 再关。
+          (output.pendingBgTasks ?? 0) === 0 &&
+          output.finalizationReason !== 'truncated'
         ) {
           logger.info(
             { agentId, chatJid },
@@ -7265,12 +7622,22 @@ async function processAgentConversation(
     const wasInterrupted = agentStreamInterrupted && !cursorCommitted;
 
     // ── Streaming card cleanup ──
+    activeHeldCardFinalizers.delete(virtualChatJid);
     if (agentStreamingSession) {
       if (agentStreamingSession.isActive()) {
         // Symmetric with the main session's five-way finalize (index.ts ~3804):
         // every "card built but never completed" path must finalize so the card
         // can't get stuck at 生成中 (zombie card).
-        if (hadError) {
+        if (heldAgentParts.length > 0) {
+          // 挂起卡收口：后台任务未等到 settle 进程就结束了。就地定稿为
+          // 「已中断」+ 原因，不留僵尸「后台任务运行中」卡（内容已逐 turn 入库）。
+          const heldNote = hadError
+            ? '处理出错，后台任务可能未完成'
+            : '后台任务未全部完成，会话已结束';
+          heldAgentParts = [];
+          heldAgentUsage = null;
+          await agentStreamingSession.abort(heldNote).catch(() => {});
+        } else if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
           await agentStreamingSession.abort('已中断').catch(() => {});
@@ -8774,7 +9141,10 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             virtualChatJid,
             formatted,
             imagesForAgent,
-            undefined,
+            () => {
+              // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
+              activeHeldCardFinalizers.get(virtualChatJid)?.();
+            },
             lastAgentSourceJid,
           )
         : 'no_active';
@@ -9868,6 +10238,9 @@ async function main(): Promise<void> {
     removeImGroupRecord,
     updateReplyRoute: (folder: string, sourceJid: string | null) => {
       activeRouteUpdaters.get(folder)?.(sourceJid);
+    },
+    finalizeHeldCard: (key: string) => {
+      activeHeldCardFinalizers.get(key)?.();
     },
     handleSpawnCommand,
     applyAutoIsolateContext: (userId: string, enable: boolean) =>

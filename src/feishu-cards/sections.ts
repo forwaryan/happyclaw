@@ -343,6 +343,7 @@ export type StreamingPhase =
   | 'hook'
   | 'streaming'
   | 'waiting'
+  | 'waiting_bg'
   | 'completed'
   | 'aborted'
   | 'error';
@@ -374,6 +375,10 @@ export function buildStatusBannerText(input: {
       return `${tag('生成回复', 'violet')} ✨${detailPart}${elapsed}`;
     case 'waiting':
       return `${tag('等待输入', 'grey')} ⏸${detailPart}`;
+    case 'waiting_bg':
+      // 本 turn 回复已送达，但后台任务（异步 Agent / 截断自动续写）仍在跑，
+      // 卡片保持打开等待追加——不能显示成绿色「已完成」误导用户。
+      return `${tag('后台任务运行中', 'violet')} ⏳${detailPart}${elapsed}`;
     case 'completed':
       return `${tag('已完成', 'green')} ✅${detailPart}${elapsed}`;
     case 'aborted':

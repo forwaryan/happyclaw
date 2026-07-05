@@ -139,6 +139,10 @@ export interface WebDeps {
    */
   removeImGroupRecord?: (jid: string, reason: string) => void;
   updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
+  /** 用户消息注入运行中 Sub-Agent 时，先把该 agent 挂起中的流式卡片定稿轮换。
+   * key 为 virtualChatJid（`web:{folder}#agent:{id}`）。主会话路径无需调用
+   * ——updateReplyRoute 触发的 route updater 已内置同样的收口。 */
+  finalizeHeldCard?: (key: string) => void;
   triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
   handleSpawnCommand?: (
     chatJid: string,
