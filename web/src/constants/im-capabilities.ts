@@ -10,7 +10,19 @@ export interface ImChannelCapabilities {
   supports_file_send: boolean;
 }
 
-export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
+export const IM_CHANNEL_ORDER = [
+  'feishu',
+  'telegram',
+  'qq',
+  'wechat',
+  'dingtalk',
+  'discord',
+  'whatsapp',
+] as const;
+
+export type ImChannelType = (typeof IM_CHANNEL_ORDER)[number];
+
+export const IM_CHANNEL_CAPABILITIES: Record<ImChannelType, ImChannelCapabilities> = {
   feishu: {
     channel_type: 'feishu',
     label: '飞书',
@@ -93,7 +105,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
 export function getImChannelCapabilities(
   channelType: string | null | undefined,
 ): ImChannelCapabilities | undefined {
-  return channelType ? IM_CHANNEL_CAPABILITIES[channelType] : undefined;
+  return channelType ? IM_CHANNEL_CAPABILITIES[channelType as ImChannelType] : undefined;
 }
 
 export function isThreadMapCapableChat(info?: {

@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import type { AvailableImGroup } from '../../types';
 import { ChannelBadge } from './channel-meta';
 import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
+import { getImChannelCapabilities } from '../../constants/im-capabilities';
 
 interface ImBindingRowProps {
   group: AvailableImGroup;
@@ -18,10 +19,11 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onResetAl
   const boundSessionId = group.bound_session_id ?? group.bound_agent_id;
   const boundWorkspaceJid = group.bound_workspace_jid ?? group.bound_main_jid;
   const hasBound = !!boundSessionId || !!boundWorkspaceJid;
+  const supportsActivation = getImChannelCapabilities(group.channel_type)?.supports_activation_modes === true;
   // Empty array = "owner-locked trap": bot was added before Feishu owner DM'd it,
   // so nobody (not even the owner) can trigger the bot until allowlist is reset
   // or owner sends a DM (which auto-backfills via learnFeishuOwner).
-  const isAllowlistLocked = group.sender_allowlist_locked === true;
+  const isAllowlistLocked = group.channel_type === 'feishu' && group.sender_allowlist_locked === true;
 
   const bindingLabel = (): string => {
     if (boundSessionId && group.bound_target_name) {
@@ -101,7 +103,7 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onResetAl
             重置白名单
           </Button>
         )}
-        {hasBound && (
+        {hasBound && supportsActivation && (
           <div className="flex items-center gap-1.5">
             <select
               value={group.activation_mode || 'auto'}

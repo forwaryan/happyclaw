@@ -10,8 +10,13 @@ import { BindingTargetDialog } from './BindingTargetDialog';
 import { api } from '../../api/client';
 import type { AvailableImGroup } from '../../types';
 import type { BindingTarget } from './hooks/useImBindings';
+import {
+  getImChannelCapabilities,
+  IM_CHANNEL_ORDER,
+  type ImChannelType,
+} from '../../constants/im-capabilities';
 
-type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord' | 'whatsapp';
+type ChannelFilter = 'all' | ImChannelType;
 
 export function BindingsSection() {
   const { bindings, loading, targets, targetsLoading, reload, rebind, resetAllowlist, error: hookError, clearError: clearHookError } = useImBindings();
@@ -28,17 +33,19 @@ export function BindingsSection() {
   const [resetAllowlistGroup, setResetAllowlistGroup] = useState<AvailableImGroup | null>(null);
   const [deleteGroup, setDeleteGroup] = useState<AvailableImGroup | null>(null);
 
-  const channels: { key: ChannelFilter; label: string }[] = useMemo(() => {
-    const types = new Set(bindings.map((b) => b.channel_type));
-    const all: { key: ChannelFilter; label: string }[] = [{ key: 'all', label: '全部' }];
-    if (types.has('feishu')) all.push({ key: 'feishu', label: '飞书' });
-    if (types.has('telegram')) all.push({ key: 'telegram', label: 'Telegram' });
-    if (types.has('qq')) all.push({ key: 'qq', label: 'QQ' });
-    if (types.has('wechat')) all.push({ key: 'wechat', label: '微信' });
-    if (types.has('dingtalk')) all.push({ key: 'dingtalk', label: '钉钉' });
-    if (types.has('discord')) all.push({ key: 'discord', label: 'Discord' });
-    if (types.has('whatsapp')) all.push({ key: 'whatsapp', label: 'WhatsApp' });
-    return all;
+  const channels: { key: ChannelFilter; label: string; count: number }[] = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const binding of bindings) {
+      counts.set(binding.channel_type, (counts.get(binding.channel_type) ?? 0) + 1);
+    }
+    return [
+      { key: 'all', label: '全部', count: bindings.length },
+      ...IM_CHANNEL_ORDER.map((type) => ({
+        key: type,
+        label: getImChannelCapabilities(type)?.label ?? type,
+        count: counts.get(type) ?? 0,
+      })),
+    ];
   }, [bindings]);
 
   const filtered = useMemo(() => {
@@ -57,6 +64,10 @@ export function BindingsSection() {
     }
     return list;
   }, [bindings, channelFilter, search]);
+
+  const selectedChannelLabel = channelFilter === 'all'
+    ? null
+    : getImChannelCapabilities(channelFilter)?.label ?? channelFilter;
 
   const selectableTargets = useMemo(() => {
     if (!rebindGroup?.is_thread_capable) return targets;
@@ -207,23 +218,24 @@ export function BindingsSection() {
         {/* Toolbar: channel filter + search */}
         {bindings.length > 0 && (
           <div className="flex items-center gap-3 flex-wrap">
-            {channels.length > 1 && (
-              <div className="flex items-center gap-1">
-                {channels.map((ch) => (
-                  <button
-                    key={ch.key}
-                    onClick={() => setChannelFilter(ch.key)}
-                    className={`px-3 py-1 text-xs font-medium rounded-full transition-colors cursor-pointer ${
-                      channelFilter === ch.key
-                        ? 'bg-primary text-white'
-                        : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-                    }`}
-                  >
-                    {ch.label}
-                  </button>
-                ))}
-              </div>
-            )}
+            <div className="flex items-center gap-1 flex-wrap">
+              {channels.map((ch) => (
+                <button
+                  key={ch.key}
+                  onClick={() => setChannelFilter(ch.key)}
+                  className={`px-3 py-1 text-xs font-medium rounded-full transition-colors cursor-pointer ${
+                    channelFilter === ch.key
+                      ? 'bg-primary text-white'
+                      : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+                  }`}
+                >
+                  {ch.label}
+                  <span className={`ml-1 ${channelFilter === ch.key ? 'text-white/80' : 'text-muted-foreground/70'}`}>
+                    {ch.count}
+                  </span>
+                </button>
+              ))}
+            </div>
             <div className="flex-1 min-w-[200px]">
               <SearchInput
                 value={search}
@@ -252,7 +264,9 @@ export function BindingsSection() {
           </Card>
         ) : filtered.length === 0 ? (
           <div className="text-center py-10 text-muted-foreground text-sm">
-            没有匹配的渠道
+            {selectedChannelLabel && !search.trim()
+              ? `暂无 ${selectedChannelLabel} 渠道。请先完成该渠道配置，并向 Bot 发送一条消息。`
+              : '没有匹配的渠道'}
           </div>
         ) : (
           <div className="space-y-2">

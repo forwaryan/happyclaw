@@ -14,6 +14,11 @@ import { showToast } from '../../utils/toast';
 import type { AgentInfo, AvailableImGroup } from '../../types';
 import { ChannelBadge } from '../settings/channel-meta';
 import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
+import {
+  getImChannelCapabilities,
+  IM_CHANNEL_ORDER,
+  type ImChannelType,
+} from '../../constants/im-capabilities';
 
 interface ImBindingDialogProps {
   open: boolean;
@@ -24,11 +29,18 @@ interface ImBindingDialogProps {
   onClose: () => void;
 }
 
+type ChannelFilter = 'all' | ImChannelType;
+
+function supportsActivationModes(channelType: string | null | undefined): boolean {
+  return getImChannelCapabilities(channelType)?.supports_activation_modes === true;
+}
+
 export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImBindingDialogProps) {
   const [imGroups, setImGroups] = useState<AvailableImGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
+  const [channelFilter, setChannelFilter] = useState<ChannelFilter>('all');
   const [rebindTarget, setRebindTarget] = useState<{ imJid: string; group: AvailableImGroup } | null>(null);
   const [activationModes, setActivationModes] = useState<Record<string, string>>({});
 
@@ -45,6 +57,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       setLoading(false);
       setActionLoading(null);
       setFilter('');
+      setChannelFilter('all');
       setRebindTarget(null);
       setActivationModes({});
       return;
@@ -55,12 +68,13 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
     setActivationModes({});
     setLoading(true);
     setFilter('');
+    setChannelFilter('all');
     loadAvailableImGroups(groupJid).then((groups) => {
       setImGroups(groups);
-      // Initialize activation modes from existing data for feishu groups
+      // Initialize activation modes from existing data for channels that support them.
       const initial: Record<string, string> = {};
       for (const g of groups) {
-        if (g.channel_type === 'feishu' && g.activation_mode && g.activation_mode !== 'auto') {
+        if (supportsActivationModes(g.channel_type) && g.activation_mode && g.activation_mode !== 'auto') {
           initial[g.jid] = g.activation_mode;
         }
       }
@@ -69,13 +83,36 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
     });
   }, [open, groupJid, agentId, loadAvailableImGroups]);
 
+  const channelFilters: { key: ChannelFilter; label: string; count: number }[] = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const group of imGroups) {
+      counts.set(group.channel_type, (counts.get(group.channel_type) ?? 0) + 1);
+    }
+    return [
+      { key: 'all', label: '全部', count: imGroups.length },
+      ...IM_CHANNEL_ORDER.map((type) => ({
+        key: type,
+        label: getImChannelCapabilities(type)?.label ?? type,
+        count: counts.get(type) ?? 0,
+      })),
+    ];
+  }, [imGroups]);
+
+  const selectedChannelLabel = channelFilter === 'all'
+    ? null
+    : getImChannelCapabilities(channelFilter)?.label ?? channelFilter;
+
   const filteredGroups = useMemo(() => {
-    if (!filter.trim()) return imGroups;
+    let groups = imGroups;
+    if (channelFilter !== 'all') {
+      groups = groups.filter((g) => g.channel_type === channelFilter);
+    }
+    if (!filter.trim()) return groups;
     const q = filter.trim().toLowerCase();
-    return imGroups.filter(
+    return groups.filter(
       (g) => g.name.toLowerCase().includes(q) || g.jid.toLowerCase().includes(q),
     );
-  }, [imGroups, filter]);
+  }, [imGroups, channelFilter, filter]);
 
   const isBoundToThis = (group: AvailableImGroup): boolean => {
     if (isMainMode) {
@@ -104,7 +141,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       let ok: boolean;
       if (isMainMode) {
         const target = imGroups.find((g) => g.jid === imJid);
-        const mode = target?.channel_type === 'feishu' ? (activationModes[imJid] || 'auto') : undefined;
+        const mode = supportsActivationModes(target?.channel_type) ? (activationModes[imJid] || 'auto') : undefined;
         ok = await bindMainImGroup(groupJid, imJid, false, mode);
       } else {
         ok = await bindImGroup(groupJid, agentId, imJid);
@@ -171,7 +208,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
     try {
       let ok: boolean;
       if (isMainMode) {
-        const mode = rebindGroup.channel_type === 'feishu' ? (activationModes[imJid] || 'auto') : undefined;
+        const mode = supportsActivationModes(rebindGroup.channel_type) ? (activationModes[imJid] || 'auto') : undefined;
         ok = await bindMainImGroup(groupJid, imJid, true, mode);
       } else {
         ok = await bindImGroup(groupJid, agentId!, imJid, true);
@@ -202,7 +239,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
 
   return (<>
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <MessageSquare className="w-4 h-4" />
@@ -212,18 +249,39 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
 
         {isMainMode && (
           <div className="rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            绑定飞书话题群后，工作区会切换为竖向话题列表，每个飞书话题都会自动映射成一个独立会话。
+            支持绑定飞书、Telegram、QQ、微信、钉钉、Discord、WhatsApp。具备话题能力的渠道绑定到工作区后，会按话题自动映射独立会话。
           </div>
         )}
 
-        {/* Filter input — only show when there are groups */}
-        {!loading && imGroups.length > 0 && (
-          <SearchInput
-            value={filter}
-            onChange={setFilter}
-            placeholder="搜索群组..."
-            debounce={150}
-          />
+        {!loading && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-1 flex-wrap">
+              {channelFilters.map((ch) => (
+                <button
+                  key={ch.key}
+                  onClick={() => setChannelFilter(ch.key)}
+                  className={`px-2.5 py-1 text-xs font-medium rounded-full transition-colors cursor-pointer ${
+                    channelFilter === ch.key
+                      ? 'bg-primary text-white'
+                      : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
+                  }`}
+                >
+                  {ch.label}
+                  <span className={`ml-1 ${channelFilter === ch.key ? 'text-white/80' : 'text-muted-foreground/70'}`}>
+                    {ch.count}
+                  </span>
+                </button>
+              ))}
+            </div>
+            {imGroups.length > 0 && (
+              <SearchInput
+                value={filter}
+                onChange={setFilter}
+                placeholder="搜索群组..."
+                debounce={150}
+              />
+            )}
+          </div>
         )}
 
         <div className="space-y-2 max-h-72 overflow-y-auto">
@@ -236,15 +294,17 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
 
           {!loading && imGroups.length === 0 && (
             <div className="text-center py-8 text-muted-foreground text-sm">
-              暂无可绑定的消息通道。请先在飞书、Telegram、Discord、QQ、微信、钉钉或 WhatsApp 中向 Bot 发送消息，通道会自动出现在此列表中。
+              暂无可绑定的消息通道。请先完成对应渠道配置，并在飞书、Telegram、QQ、微信、钉钉、Discord 或 WhatsApp 中向 Bot 发送消息。
               <br />
-              <span className="text-xs opacity-70">普通群和私聊可绑定到会话；飞书话题群绑定到工作区后按话题自动分会话。</span>
+              <span className="text-xs opacity-70">普通群和私聊可绑定到会话；具备话题能力的渠道绑定到工作区后按话题自动分会话。</span>
             </div>
           )}
 
           {!loading && imGroups.length > 0 && filteredGroups.length === 0 && (
             <div className="text-center py-6 text-muted-foreground text-sm">
-              没有匹配的群组
+              {selectedChannelLabel && !filter.trim()
+                ? `暂无 ${selectedChannelLabel} 可绑定渠道。请先完成该渠道配置，并向 Bot 发送一条消息。`
+                : '没有匹配的群组'}
             </div>
           )}
 
@@ -254,7 +314,7 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
               const boundToOther = isBoundToOther(group);
               const isActioning = actionLoading === group.jid;
               const cannotBindToSession = !isMainMode && !!group.is_thread_capable;
-              const supportsActivation = isMainMode && (group.channel_type === 'feishu' || group.channel_type === 'dingtalk');
+              const supportsActivation = isMainMode && supportsActivationModes(group.channel_type);
               const effectiveMode = (activationModes[group.jid] || group.activation_mode || 'auto') as string;
 
               return (
@@ -308,12 +368,12 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
                     </div>
                     {cannotBindToSession && (
                       <div className="mt-1 text-[11px] text-muted-foreground">
-                        该群会按飞书话题自动映射，只能绑定到工作区。
+                        该渠道会按话题自动映射会话，只能绑定到工作区。
                       </div>
                     )}
                   </div>
 
-                  {/* Activation mode selector — only for main mode + unbound feishu/dingtalk group chats */}
+                  {/* Activation mode selector — only for main-mode channels that support trigger modes. */}
                   {supportsActivation && !boundToThis && !boundToOther && (
                     <div className="flex-shrink-0 flex flex-col items-end gap-1">
                       <select
