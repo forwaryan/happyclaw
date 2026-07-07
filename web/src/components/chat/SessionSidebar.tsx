@@ -64,6 +64,25 @@ export function SessionSidebar({
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 py-2">
+        {canModify && onBindMain && (
+          <button
+            onClick={onBindMain}
+            className="mb-2 flex w-full items-center gap-2 rounded-lg border border-brand-200 bg-brand-50/80 px-3 py-2 text-left text-brand-700 transition-colors hover:bg-brand-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:border-brand-700/50 dark:bg-brand-700/10 dark:text-brand-300 dark:hover:bg-brand-700/20 cursor-pointer"
+            title="绑定消息渠道到这个工作区"
+            aria-label="绑定消息渠道到这个工作区"
+          >
+            <Link className="h-4 w-4 shrink-0" />
+            <span className="min-w-0">
+              <span className="block text-[12px] font-semibold leading-4">
+                工作区消息渠道
+              </span>
+              <span className="block truncate text-[11px] leading-4 text-brand-600/80 dark:text-brand-300/80">
+                绑定飞书、Telegram 等群聊
+              </span>
+            </span>
+          </button>
+        )}
+
         <SessionRow
           name="主会话"
           active={activeSessionId === null}
@@ -166,8 +185,8 @@ function SessionRow({
                 onBind();
               }}
               className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
-              title="绑定 IM 群组"
-              aria-label="绑定 IM 群组"
+              title="绑定消息渠道"
+              aria-label="绑定消息渠道"
             >
               <Link className="h-3.5 w-3.5" />
             </button>

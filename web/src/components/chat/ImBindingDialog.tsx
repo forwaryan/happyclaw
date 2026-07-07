@@ -225,8 +225,8 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
   };
 
   const title = isMainMode
-    ? '绑定 IM 渠道 — 主会话'
-    : `绑定 IM 渠道${agent ? ` — ${agent.name}` : ' — 当前会话'}`;
+    ? '绑定消息渠道 — 工作区'
+    : `绑定消息渠道${agent ? ` — ${agent.name}` : ' — 当前会话'}`;
 
   const renderThreadCapability = (group: AvailableImGroup) => {
     if (!group.is_thread_capable) return null;

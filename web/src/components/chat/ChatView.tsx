@@ -567,6 +567,17 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
           </div>
         </div>
+        {canModifyWorkspaceConfig && (
+          <button
+            onClick={() => setBindingAgentId(MAIN_BINDING)}
+            className="hidden lg:inline-flex h-9 items-center gap-2 rounded-lg border border-brand-200 bg-brand-50 px-3 text-sm font-medium text-brand-700 transition-colors hover:bg-brand-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:border-brand-700/50 dark:bg-brand-700/10 dark:text-brand-300 dark:hover:bg-brand-700/20 cursor-pointer"
+            title="绑定消息渠道到这个工作区"
+            aria-label="绑定消息渠道到这个工作区"
+          >
+            <Link className="w-4 h-4" />
+            <span>消息渠道</span>
+          </button>
+        )}
         {/* Desktop: toggle theme (light → dark → system) */}
         <button
           onClick={toggleTheme}
@@ -607,11 +618,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         </div>
       </div>
 
-      {/* IM channel setup banner for home container without IM */}
+      {/* Message channel setup banner for home container without channel config */}
       {isOwnHome && imStatus && !Object.values(imStatus).some(Boolean) && !imBannerDismissed && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm">
           <Link className="w-4 h-4 flex-shrink-0" />
-          <span className="flex-1 min-w-0">未配置 IM 渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉 / WhatsApp），消息无法与默认 Agent 的主会话互通</span>
+          <span className="flex-1 min-w-0">未配置消息渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉 / WhatsApp），消息无法与默认 Agent 的主会话互通</span>
           <button
             onClick={() => navigate('/setup/channels')}
             className="flex-shrink-0 px-3 py-1 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 transition-colors cursor-pointer"
@@ -652,7 +663,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               const agent = agents.find((a) => a.id === id);
               if (agent?.linked_im_groups && agent.linked_im_groups.length > 0) {
                 const names = agent.linked_im_groups.map((g) => g.name).join('、');
-                alert(`该会话已绑定 IM 渠道（${names}），请先解绑后再删除。`);
+                alert(`该会话已绑定消息渠道（${names}），请先解绑后再删除。`);
                 setBindingAgentId(id);
                 return;
               }
@@ -906,6 +917,20 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             <SheetTitle>工作区操作</SheetTitle>
           </SheetHeader>
           <div className="space-y-2 pt-2">
+            {canModifyWorkspaceConfig && (
+              <button
+                onClick={() => {
+                  setMobileActionsOpen(false);
+                  setBindingAgentId(MAIN_BINDING);
+                }}
+                className="w-full text-left px-4 py-3 rounded-lg border border-brand-200 bg-brand-50 text-brand-700 hover:bg-brand-100 transition-colors cursor-pointer text-sm font-medium dark:border-brand-700/50 dark:bg-brand-700/10 dark:text-brand-300 dark:hover:bg-brand-700/20"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Link className="w-4 h-4" />
+                  绑定消息渠道
+                </span>
+              </button>
+            )}
             <button
               onClick={openMobileFiles}
               className="w-full text-left px-4 py-3 rounded-lg border border-border hover:bg-accent transition-colors cursor-pointer text-foreground text-sm"
