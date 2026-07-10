@@ -19,7 +19,18 @@ import {
 type ChannelFilter = 'all' | ImChannelType;
 
 export function BindingsSection() {
-  const { bindings, loading, targets, targetsLoading, reload, rebind, resetAllowlist, error: hookError, clearError: clearHookError } = useImBindings();
+  const {
+    bindings,
+    loading,
+    bindingsLoadError,
+    targets,
+    targetsLoading,
+    reload,
+    rebind,
+    resetAllowlist,
+    error: hookError,
+    clearError: clearHookError,
+  } = useImBindings();
   const [localError, setLocalError] = useState<string | null>(null);
   const errorMsg = localError || hookError;
   const [search, setSearch] = useState('');
@@ -30,23 +41,28 @@ export function BindingsSection() {
   // Dialog state
   const [rebindGroup, setRebindGroup] = useState<AvailableImGroup | null>(null);
   const [unbindGroup, setUnbindGroup] = useState<AvailableImGroup | null>(null);
-  const [resetAllowlistGroup, setResetAllowlistGroup] = useState<AvailableImGroup | null>(null);
+  const [resetAllowlistGroup, setResetAllowlistGroup] =
+    useState<AvailableImGroup | null>(null);
   const [deleteGroup, setDeleteGroup] = useState<AvailableImGroup | null>(null);
 
-  const channels: { key: ChannelFilter; label: string; count: number }[] = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const binding of bindings) {
-      counts.set(binding.channel_type, (counts.get(binding.channel_type) ?? 0) + 1);
-    }
-    return [
-      { key: 'all', label: '全部', count: bindings.length },
-      ...IM_CHANNEL_ORDER.map((type) => ({
-        key: type,
-        label: getImChannelCapabilities(type)?.label ?? type,
-        count: counts.get(type) ?? 0,
-      })),
-    ];
-  }, [bindings]);
+  const channels: { key: ChannelFilter; label: string; count: number }[] =
+    useMemo(() => {
+      const counts = new Map<string, number>();
+      for (const binding of bindings) {
+        counts.set(
+          binding.channel_type,
+          (counts.get(binding.channel_type) ?? 0) + 1,
+        );
+      }
+      return [
+        { key: 'all', label: '全部', count: bindings.length },
+        ...IM_CHANNEL_ORDER.map((type) => ({
+          key: type,
+          label: getImChannelCapabilities(type)?.label ?? type,
+          count: counts.get(type) ?? 0,
+        })),
+      ];
+    }, [bindings]);
 
   const filtered = useMemo(() => {
     let list = bindings;
@@ -59,15 +75,17 @@ export function BindingsSection() {
         (b) =>
           b.name.toLowerCase().includes(q) ||
           b.jid.toLowerCase().includes(q) ||
-          (b.bound_target_name && b.bound_target_name.toLowerCase().includes(q)),
+          (b.bound_target_name &&
+            b.bound_target_name.toLowerCase().includes(q)),
       );
     }
     return list;
   }, [bindings, channelFilter, search]);
 
-  const selectedChannelLabel = channelFilter === 'all'
-    ? null
-    : getImChannelCapabilities(channelFilter)?.label ?? channelFilter;
+  const selectedChannelLabel =
+    channelFilter === 'all'
+      ? null
+      : (getImChannelCapabilities(channelFilter)?.label ?? channelFilter);
 
   const selectableTargets = useMemo(() => {
     if (!rebindGroup?.is_thread_capable) return targets;
@@ -117,13 +135,23 @@ export function BindingsSection() {
     if (err) setLocalError(err);
   }, [resetAllowlistGroup, resetAllowlist]);
 
-  const handleActivationModeChange = useCallback(async (jid: string, mode: string) => {
-    setActioningJid(jid);
-    setLocalError(null);
-    const err = await rebind(jid, { activation_mode: mode as 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled' });
-    setActioningJid(null);
-    if (err) setLocalError(err);
-  }, [rebind]);
+  const handleActivationModeChange = useCallback(
+    async (jid: string, mode: string) => {
+      setActioningJid(jid);
+      setLocalError(null);
+      const err = await rebind(jid, {
+        activation_mode: mode as
+          | 'auto'
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled',
+      });
+      setActioningJid(null);
+      if (err) setLocalError(err);
+    },
+    [rebind],
+  );
 
   const confirmUnbind = useCallback(async () => {
     if (!unbindGroup) return;
@@ -136,34 +164,40 @@ export function BindingsSection() {
     if (err) setLocalError(err);
   }, [unbindGroup, rebind]);
 
-  const handleSelectTarget = useCallback(async (target: BindingTarget) => {
-    if (!rebindGroup) return;
-    const imJid = rebindGroup.jid;
-    const key = target.sessionId || `main:${target.groupJid}`;
-    setSelectingKey(key);
-    setLocalError(null);
+  const handleSelectTarget = useCallback(
+    async (target: BindingTarget) => {
+      if (!rebindGroup) return;
+      const imJid = rebindGroup.jid;
+      const key = target.sessionId || `main:${target.groupJid}`;
+      setSelectingKey(key);
+      setLocalError(null);
 
-    const hasBound = !!(rebindGroup.bound_session_id ?? rebindGroup.bound_agent_id) || !!rebindGroup.bound_main_jid;
-    const payload: {
-      target_session_id?: string;
-      target_main_jid?: string;
-      force?: boolean;
-    } = {};
+      const hasBound =
+        !!(rebindGroup.bound_session_id ?? rebindGroup.bound_agent_id) ||
+        !!rebindGroup.bound_main_jid;
+      const payload: {
+        target_session_id?: string;
+        target_main_jid?: string;
+        force?: boolean;
+      } = {};
 
-    if (target.type === 'session' && target.sessionId) {
-      payload.target_session_id = target.sessionId;
-    } else {
-      payload.target_main_jid = target.groupJid;
-    }
-    if (hasBound) payload.force = true;
+      if (target.type === 'session' && target.sessionId) {
+        payload.target_session_id = target.sessionId;
+      } else {
+        payload.target_main_jid = target.groupJid;
+      }
+      if (hasBound) payload.force = true;
 
-    const err = await rebind(imJid, payload);
-    setSelectingKey(null);
-    if (!err) setRebindGroup(null);
-    else setLocalError(err);
-  }, [rebindGroup, rebind]);
+      const err = await rebind(imJid, payload);
+      setSelectingKey(null);
+      if (!err) setRebindGroup(null);
+      else setLocalError(err);
+    },
+    [rebindGroup, rebind],
+  );
 
-  const [restoreConfirmGroup, setRestoreConfirmGroup] = useState<AvailableImGroup | null>(null);
+  const [restoreConfirmGroup, setRestoreConfirmGroup] =
+    useState<AvailableImGroup | null>(null);
 
   const handleRestoreDefault = useCallback(() => {
     if (!rebindGroup) return;
@@ -193,7 +227,8 @@ export function BindingsSection() {
               消息挂载管理
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              查看和管理 IM 渠道到工作区/会话的路由。未绑定的渠道默认发送到默认 Agent 的主会话。
+              查看和管理 IM 渠道到工作区/会话的路由。未绑定的渠道默认发送到默认
+              Agent 的主会话。
             </p>
           </div>
           <Button
@@ -202,7 +237,9 @@ export function BindingsSection() {
             onClick={reload}
             disabled={loading}
           >
-            <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />
+            <RefreshCw
+              className={`w-3.5 h-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`}
+            />
             刷新
           </Button>
         </div>
@@ -211,7 +248,15 @@ export function BindingsSection() {
         {errorMsg && (
           <div className="bg-error-bg border border-error/20 text-error text-sm rounded-lg px-4 py-2.5 flex items-center justify-between">
             <span>{errorMsg}</span>
-            <button onClick={() => { setLocalError(null); clearHookError(); }} className="text-error hover:text-error ml-2 text-xs">✕</button>
+            <button
+              onClick={() => {
+                setLocalError(null);
+                clearHookError();
+              }}
+              className="text-error hover:text-error ml-2 text-xs"
+            >
+              ✕
+            </button>
           </div>
         )}
 
@@ -230,7 +275,9 @@ export function BindingsSection() {
                   }`}
                 >
                   {ch.label}
-                  <span className={`ml-1 ${channelFilter === ch.key ? 'text-white/80' : 'text-muted-foreground/70'}`}>
+                  <span
+                    className={`ml-1 ${channelFilter === ch.key ? 'text-white/80' : 'text-muted-foreground/70'}`}
+                  >
                     {ch.count}
                   </span>
                 </button>
@@ -253,13 +300,27 @@ export function BindingsSection() {
             <Loader2 className="w-5 h-5 animate-spin mr-2" />
             加载中...
           </div>
+        ) : bindingsLoadError ? (
+          <Card>
+            <CardContent className="space-y-3 text-center">
+              <MessageSquare className="w-10 h-10 mx-auto text-error" />
+              <p className="text-sm text-error">
+                消息渠道加载失败：{bindingsLoadError}
+              </p>
+              <Button variant="outline" size="sm" onClick={reload}>
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                重试
+              </Button>
+            </CardContent>
+          </Card>
         ) : bindings.length === 0 ? (
           <Card>
             <CardContent className="text-center">
-            <MessageSquare className="w-10 h-10 mx-auto text-muted-foreground mb-3" />
-            <p className="text-sm text-muted-foreground">
-              暂无 IM 渠道。在飞书、Telegram、QQ、微信、钉钉、Discord 或 WhatsApp 中向 Bot 发送消息后，渠道会自动出现在这里。
-            </p>
+              <MessageSquare className="w-10 h-10 mx-auto text-muted-foreground mb-3" />
+              <p className="text-sm text-muted-foreground">
+                暂无 IM 渠道。在飞书、Telegram、QQ、微信、钉钉、Discord 或
+                WhatsApp 中向 Bot 发送消息后，渠道会自动出现在这里。
+              </p>
             </CardContent>
           </Card>
         ) : filtered.length === 0 ? (
@@ -304,7 +365,11 @@ export function BindingsSection() {
         onClose={() => setUnbindGroup(null)}
         onConfirm={confirmUnbind}
         title="确认解绑"
-        message={unbindGroup ? `解绑后，「${unbindGroup.name}」的消息将恢复默认路由到默认 Agent 的主会话。确认解绑？` : ''}
+        message={
+          unbindGroup
+            ? `解绑后，「${unbindGroup.name}」的消息将恢复默认路由到默认 Agent 的主会话。确认解绑？`
+            : ''
+        }
         confirmText="解绑"
       />
 
@@ -314,7 +379,11 @@ export function BindingsSection() {
         onClose={() => setRestoreConfirmGroup(null)}
         onConfirm={confirmRestoreDefault}
         title="恢复默认路由"
-        message={restoreConfirmGroup ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到默认 Agent 的主会话）？` : ''}
+        message={
+          restoreConfirmGroup
+            ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到默认 Agent 的主会话）？`
+            : ''
+        }
         confirmText="恢复默认"
       />
 

@@ -10,22 +10,41 @@ import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/common';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { BugReportDialog } from '../common/BugReportDialog';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
 import { ChatGroupItem } from '../chat/ChatGroupItem';
 import { CreateContainerDialog } from '../chat/CreateContainerDialog';
 import { RenameDialog } from '../chat/RenameDialog';
 import { SkeletonCardList } from '@/components/common/Skeletons';
 import { cn } from '@/lib/utils';
 import { filterNavItems } from './nav-items';
-import { type GroupEntry, type DateSection, groupByDate, compareByLastActivity } from '../../utils/group-utils';
+import {
+  type GroupEntry,
+  compareByLastActivity,
+} from '../../utils/group-utils';
+import {
+  groupWorkspacesByAgent,
+  type AgentWorkspaceSection,
+} from '../../utils/agent-product';
 
 interface UnifiedSidebarProps {
   collapsed: boolean;
   onToggleCollapse: () => void;
 }
 
-export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarProps) {
+export function UnifiedSidebar({
+  collapsed,
+  onToggleCollapse,
+}: UnifiedSidebarProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const isChatRoute = location.pathname.startsWith('/chat');
@@ -35,7 +54,9 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
   const appearance = useAuthStore((s) => s.appearance);
   const billingEnabled = useBillingStore((s) => s.billingEnabled);
   const [showBugReport, setShowBugReport] = useState(false);
-  const userInitial = (user?.display_name || user?.username || '?')[0].toUpperCase();
+  const userInitial = (user?.display_name ||
+    user?.username ||
+    '?')[0].toUpperCase();
 
   const navItems = useMemo(
     () => filterNavItems(billingEnabled),
@@ -43,14 +64,33 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
   );
 
   const [createOpen, setCreateOpen] = useState(false);
-  const [renameState, setRenameState] = useState({ open: false, jid: '', name: '' });
-  const [deleteState, setDeleteState] = useState({ open: false, jid: '', name: '' });
+  const [renameState, setRenameState] = useState({
+    open: false,
+    jid: '',
+    name: '',
+  });
+  const [deleteState, setDeleteState] = useState({
+    open: false,
+    jid: '',
+    name: '',
+  });
   const [deleteLoading, setDeleteLoading] = useState(false);
-  const { clearState, clearLoading, openClear, closeClear, handleClearConfirm } = useClearWorkspace();
+  const {
+    clearState,
+    clearLoading,
+    openClear,
+    closeClear,
+    handleClearConfirm,
+  } = useClearWorkspace();
 
   const {
-    groups, currentGroup, selectGroup, loadGroups, loading,
-    deleteFlow, togglePin,
+    groups,
+    currentGroup,
+    selectGroup,
+    loadGroups,
+    loading,
+    deleteFlow,
+    togglePin,
   } = useChatStore();
   const runnerStates = useGroupsStore((s) => s.runnerStates);
 
@@ -70,47 +110,34 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
     return { mainGroup: main, otherGroups: others };
   }, [groups]);
 
-  const { pinnedGroups, myAgentSections, collabSections } = useMemo(() => {
-    const pinned: GroupEntry[] = [];
-    const my: GroupEntry[] = [];
-    const collab: GroupEntry[] = [];
-    otherGroups.forEach((g) => {
-      if (g.pinned_at) pinned.push(g);
-      else if (g.is_shared && (g.member_count ?? 0) >= 2) collab.push(g);
-      else my.push(g);
-    });
-    pinned.sort((a, b) => (a.pinned_at || '').localeCompare(b.pinned_at || ''));
-    const byAgent = new Map<
-      string,
-      { id: string; name: string; version?: number; items: GroupEntry[] }
-    >();
-    for (const group of my) {
-      const id = group.agent_profile_id || '__default__';
-      const existing =
-        byAgent.get(id) ||
-        {
-          id,
-          name: group.agent_profile_name || 'Default Agent',
-          version: group.agent_profile_version,
-          items: [],
-        };
-      existing.items.push(group);
-      if (!existing.version && group.agent_profile_version) {
-        existing.version = group.agent_profile_version;
-      }
-      byAgent.set(id, existing);
-    }
-    const myAgentSections = Array.from(byAgent.values())
-      .map((section) => ({
-        ...section,
-        items: section.items.sort(compareByLastActivity),
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
-    return { pinnedGroups: pinned, myAgentSections, collabSections: groupByDate(collab) };
-  }, [otherGroups]);
+  const { pinnedAgentSections, myAgentSections, collabAgentSections } =
+    useMemo(() => {
+      const pinned: GroupEntry[] = [];
+      const my: GroupEntry[] = [];
+      const collab: GroupEntry[] = [];
+      otherGroups.forEach((g) => {
+        if (g.pinned_at) pinned.push(g);
+        else if (g.is_shared && (g.member_count ?? 0) >= 2) collab.push(g);
+        else my.push(g);
+      });
+      pinned.sort((a, b) =>
+        (a.pinned_at || '').localeCompare(b.pinned_at || ''),
+      );
+      return {
+        pinnedAgentSections: groupWorkspacesByAgent(pinned),
+        myAgentSections: groupWorkspacesByAgent(my),
+        collabAgentSections: groupWorkspacesByAgent(collab),
+      };
+    }, [otherGroups]);
 
-  const handleGroupSelect = (jid: string, folder: string) => { selectGroup(jid); navigate(`/chat/${folder}`); };
-  const handleCreated = (jid: string, folder: string) => { selectGroup(jid); navigate(`/chat/${folder}`); };
+  const handleGroupSelect = (jid: string, folder: string) => {
+    selectGroup(jid);
+    navigate(`/chat/${folder}`);
+  };
+  const handleCreated = (jid: string, folder: string) => {
+    selectGroup(jid);
+    navigate(`/chat/${folder}`);
+  };
 
   const handleDeleteConfirm = async () => {
     setDeleteLoading(true);
@@ -118,12 +145,20 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
       await deleteFlow(deleteState.jid);
       setDeleteState({ open: false, jid: '', name: '' });
       const nextJid = useChatStore.getState().currentGroup;
-      const nextFolder = nextJid ? useChatStore.getState().groups[nextJid]?.folder : null;
+      const nextFolder = nextJid
+        ? useChatStore.getState().groups[nextJid]?.folder
+        : null;
       navigate(nextFolder ? `/chat/${nextFolder}` : '/chat');
     } catch (err: unknown) {
       const typed = err as {
-        boundSessions?: Array<{ sessionName: string; imGroups: Array<{ name: string }> }>;
-        boundAgents?: Array<{ agentName: string; imGroups: Array<{ name: string }> }>;
+        boundSessions?: Array<{
+          sessionName: string;
+          imGroups: Array<{ name: string }>;
+        }>;
+        boundAgents?: Array<{
+          agentName: string;
+          imGroups: Array<{ name: string }>;
+        }>;
         boundMainImGroups?: Array<{ name: string }>;
       };
       const details: string[] = [];
@@ -135,35 +170,62 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
         })) ??
         [];
       if (typed.boundMainImGroups?.length) {
-        details.push(`主会话 -> ${typed.boundMainImGroups.map((g) => g.name).join('、')}`);
+        details.push(
+          `主会话 -> ${typed.boundMainImGroups.map((g) => g.name).join('、')}`,
+        );
       }
       if (sessions.length) {
         details.push(
-          ...sessions.map((s) => `会话「${s.sessionName}」 -> ${s.imGroups.map((g) => g.name).join('、')}`),
+          ...sessions.map(
+            (s) =>
+              `会话「${s.sessionName}」 -> ${s.imGroups.map((g) => g.name).join('、')}`,
+          ),
         );
       }
       if (details.length > 0) {
-        alert(`该工作区仍有消息通道挂载，请先解绑后再删除：\n${details.join('\n')}`);
+        alert(
+          `该工作区仍有消息通道挂载，请先解绑后再删除：\n${details.join('\n')}`,
+        );
       } else {
-        alert(`删除工作区失败：${err instanceof Error ? err.message : '未知错误'}`);
+        alert(
+          `删除工作区失败：${err instanceof Error ? err.message : '未知错误'}`,
+        );
       }
       setDeleteState({ open: false, jid: '', name: '' });
-    } finally { setDeleteLoading(false); }
+    } finally {
+      setDeleteLoading(false);
+    }
   };
 
-  const renderSections = (sections: DateSection[], showCollabBadge: boolean) =>
+  const renderAgentSections = (
+    sections: AgentWorkspaceSection[],
+    options: { showCollabBadge?: boolean; showPinned?: boolean } = {},
+  ) =>
     sections.map((section) => (
-      <div key={section.label} className="mb-1">
-        <div className="px-2 pt-2 pb-1">
-          <span className="text-[10px] text-muted-foreground/70 tracking-wide">{section.label}</span>
+      <div key={section.id} className="mb-1">
+        <div className="flex items-center gap-1.5 px-2 pb-1 pt-2">
+          <span className="truncate text-[10px] text-muted-foreground/80">
+            {section.name}
+          </span>
+          {section.version && (
+            <span className="text-[10px] text-muted-foreground/60">
+              v{section.version}
+            </span>
+          )}
         </div>
         {section.items.map((g) => (
           <ChatGroupItem
-            key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
-            lastMessage={g.lastMessage}            isShared={showCollabBadge ? g.is_shared : undefined}
-            memberRole={showCollabBadge ? g.member_role : undefined}
-            memberCount={showCollabBadge ? g.member_count : undefined}
-            isActive={currentGroup === g.jid} isHome={false}
+            key={g.jid}
+            jid={g.jid}
+            name={g.name}
+            folder={g.folder}
+            lastMessage={g.lastMessage}
+            isShared={options.showCollabBadge ? g.is_shared : undefined}
+            memberRole={options.showCollabBadge ? g.member_role : undefined}
+            memberCount={options.showCollabBadge ? g.member_count : undefined}
+            isActive={currentGroup === g.jid}
+            isHome={false}
+            isPinned={options.showPinned}
             isRunning={runnerStates[g.jid] === 'running'}
             canModify={g.can_modify}
             onSelect={handleGroupSelect}
@@ -180,205 +242,272 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
 
   return (
     <TooltipProvider delayDuration={200}>
-    <div className="h-full flex flex-shrink-0">
-      <nav className="w-[4.5rem] h-full bg-muted/30 flex flex-col items-center py-3 gap-1 flex-shrink-0">
-        <div className="w-11 h-11 rounded-xl overflow-hidden mb-3 flex-shrink-0">
-          <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />
-        </div>
-
-        {navItems.map(({ path, icon: Icon, label }) => {
-          const isChatItem = path === '/chat';
-          const isActive = location.pathname.startsWith(path);
-          const baseClass = 'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
-          const activeClass = isActive ? 'bg-brand-50 text-primary' : 'text-muted-foreground hover:bg-accent';
-
-          return (
-            <Tooltip key={path}>
-              <TooltipTrigger asChild>
-                {isChatItem && isChatRoute ? (
-                  <button onClick={onToggleCollapse} className={cn(baseClass, activeClass)}>
-                    <Icon className="w-[20px] h-[20px]" strokeWidth={isActive ? 2 : 1.75} />
-                    <span className="text-[10px] leading-tight">{label}</span>
-                  </button>
-                ) : (
-                  <NavLink to={path} className={cn(baseClass, activeClass)}>
-                    <Icon className="w-[20px] h-[20px]" strokeWidth={isActive ? 2 : 1.75} />
-                    <span className="text-[10px] leading-tight">{label}</span>
-                  </NavLink>
-                )}
-              </TooltipTrigger>
-              <TooltipContent side="right">{isChatItem && isChatRoute ? (collapsed ? '展开 Agent 工作台' : '收起 Agent 工作台') : label}</TooltipContent>
-            </Tooltip>
-          );
-        })}
-
-        {/* Spacer */}
-        <div className="flex-1" />
-
-        {/* Bug report */}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button onClick={() => setShowBugReport(true)} className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 transition-colors">
-              <Bug className="w-4 h-4" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="right">报告问题</TooltipContent>
-        </Tooltip>
-
-        {/* User avatar popover */}
-        <Popover>
-          <PopoverTrigger asChild>
-            <button className="rounded-full hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer mb-2">
-              <EmojiAvatar emoji={user?.avatar_emoji} color={user?.avatar_color} fallbackChar={userInitial} size="md" className="w-8 h-8" />
-            </button>
-          </PopoverTrigger>
-          <PopoverContent side="right" align="end" className="w-44 p-1">
-            <div className="px-3 py-2 text-xs font-medium text-muted-foreground truncate border-b border-border mb-1">{user?.display_name || user?.username}</div>
-            <button onClick={() => navigate('/settings?tab=profile')} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-accent text-foreground cursor-pointer">
-              <UserCog className="w-4 h-4" /> 个人设置
-            </button>
-            <button onClick={async () => { await useAuthStore.getState().logout(); navigate('/login'); }} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-destructive/10 text-destructive cursor-pointer">
-              <LogOut className="w-4 h-4" /> 退出登录
-            </button>
-          </PopoverContent>
-        </Popover>
-      </nav>
-
-      <div
-        className="h-full overflow-hidden transition-[width] duration-200 ease-linear"
-        style={{ width: panelWidth }}
-      >
-        <div className="w-[16.5rem] h-full flex flex-col bg-muted/30">
-          <div className="flex items-center gap-2 px-4 pt-6 pb-3 mb-3 flex-shrink-0">
-            <img src={`${import.meta.env.BASE_URL}icons/logo-text.svg`} alt={appearance?.appName || 'HappyClaw'} className="h-10" />
-            <div className="flex-1" />
-            <button onClick={onToggleCollapse} className="w-7 h-7 rounded-lg flex items-center justify-center hover:bg-accent text-muted-foreground hover:text-foreground transition-colors cursor-pointer">
-              <PanelLeftClose className="w-4 h-4" />
-            </button>
-          </div>
-          {/* New workspace button */}
-          <div className="px-3 pb-2 flex-shrink-0">
-            <Button
-              variant="outline"
-              size="sm"
-              className="w-full justify-start gap-2 text-xs"
-              onClick={() => setCreateOpen(true)}
-            >
-              <Plus className="w-3.5 h-3.5" />
-              新工作区
-            </Button>
+      <div className="h-full flex flex-shrink-0">
+        <nav className="w-[4.5rem] h-full bg-muted/30 flex flex-col items-center py-3 gap-1 flex-shrink-0">
+          <div className="w-11 h-11 rounded-xl overflow-hidden mb-3 flex-shrink-0">
+            <img
+              src={`${import.meta.env.BASE_URL}icons/icon-192.png`}
+              alt="HappyClaw"
+              className="w-full h-full object-cover"
+            />
           </div>
 
-              {/* Workspace list */}
-              <div className="flex-1 overflow-y-auto px-1.5">
-                {loading && !mainGroup && otherGroups.length === 0 ? (
-                  <SkeletonCardList count={6} compact />
-                ) : (
-                  <>
-                    {mainGroup && (
-                      <div className="mb-1">
-                        <div className="px-2 pt-1 pb-1">
-                          <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">默认 Agent</span>
-                        </div>
-                        <ChatGroupItem
-                          jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
-                          lastMessage={mainGroup.lastMessage}                          isActive={currentGroup === mainGroup.jid} isHome
-                          isRunning={runnerStates[mainGroup.jid] === 'running'} canModify={mainGroup.can_modify}
-                          onSelect={handleGroupSelect}
-                          onRename={(jid, name) => setRenameState({ open: true, jid, name })}
-                          onClearHistory={openClear}
-                        />
-                      </div>
-                    )}
+          {navItems.map(({ path, icon: Icon, label }) => {
+            const isChatItem = path === '/chat';
+            const isActive = location.pathname.startsWith(path);
+            const baseClass =
+              'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
+            const activeClass = isActive
+              ? 'bg-brand-50 text-primary'
+              : 'text-muted-foreground hover:bg-accent';
 
-                    {pinnedGroups.length > 0 && (
-                      <div className="mb-1">
-                        <div className="mt-1" />
-                        <div className="px-2 pt-2 pb-1">
-                          <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">已固定</span>
-                        </div>
-                        {pinnedGroups.map((g) => (
-                          <ChatGroupItem
-                            key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
-                            lastMessage={g.lastMessage}                            isShared={g.is_shared} memberRole={g.member_role} memberCount={g.member_count}
-                            isActive={currentGroup === g.jid} isHome={false} isPinned
-                            isRunning={runnerStates[g.jid] === 'running'}
-                            canModify={g.can_modify}
-                            onSelect={handleGroupSelect}
-                            onRename={(jid, name) => setRenameState({ open: true, jid, name })}
-                            onClearHistory={openClear}
-                            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
-                            onTogglePin={(jid) => togglePin(jid)}
-                          />
-                        ))}
-                      </div>
-                    )}
+            return (
+              <Tooltip key={path}>
+                <TooltipTrigger asChild>
+                  {isChatItem && isChatRoute ? (
+                    <button
+                      onClick={onToggleCollapse}
+                      className={cn(baseClass, activeClass)}
+                    >
+                      <Icon
+                        className="w-[20px] h-[20px]"
+                        strokeWidth={isActive ? 2 : 1.75}
+                      />
+                      <span className="text-[10px] leading-tight">{label}</span>
+                    </button>
+                  ) : (
+                    <NavLink to={path} className={cn(baseClass, activeClass)}>
+                      <Icon
+                        className="w-[20px] h-[20px]"
+                        strokeWidth={isActive ? 2 : 1.75}
+                      />
+                      <span className="text-[10px] leading-tight">{label}</span>
+                    </NavLink>
+                  )}
+                </TooltipTrigger>
+                <TooltipContent side="right">
+                  {isChatItem && isChatRoute
+                    ? collapsed
+                      ? '展开 Agent 工作台'
+                      : '收起 Agent 工作台'
+                    : label}
+                </TooltipContent>
+              </Tooltip>
+            );
+          })}
 
-                    {myAgentSections.length === 0 && collabSections.length === 0 && pinnedGroups.length === 0 && !mainGroup ? (
-                      <div className="flex flex-col items-center justify-center h-32 px-4">
-                        <p className="text-xs text-muted-foreground text-center">暂无 Agent 工作区</p>
+          {/* Spacer */}
+          <div className="flex-1" />
+
+          {/* Bug report */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => setShowBugReport(true)}
+                className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 transition-colors"
+              >
+                <Bug className="w-4 h-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right">报告问题</TooltipContent>
+          </Tooltip>
+
+          {/* User avatar popover */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button className="rounded-full hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer mb-2">
+                <EmojiAvatar
+                  emoji={user?.avatar_emoji}
+                  color={user?.avatar_color}
+                  fallbackChar={userInitial}
+                  size="md"
+                  className="w-8 h-8"
+                />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent side="right" align="end" className="w-44 p-1">
+              <div className="px-3 py-2 text-xs font-medium text-muted-foreground truncate border-b border-border mb-1">
+                {user?.display_name || user?.username}
+              </div>
+              <button
+                onClick={() => navigate('/settings?tab=profile')}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-accent text-foreground cursor-pointer"
+              >
+                <UserCog className="w-4 h-4" /> 个人设置
+              </button>
+              <button
+                onClick={async () => {
+                  await useAuthStore.getState().logout();
+                  navigate('/login');
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-destructive/10 text-destructive cursor-pointer"
+              >
+                <LogOut className="w-4 h-4" /> 退出登录
+              </button>
+            </PopoverContent>
+          </Popover>
+        </nav>
+
+        <div
+          className="h-full overflow-hidden transition-[width] duration-200 ease-linear"
+          style={{ width: panelWidth }}
+        >
+          <div className="w-[16.5rem] h-full flex flex-col bg-muted/30">
+            <div className="flex items-center gap-2 px-4 pt-6 pb-3 mb-3 flex-shrink-0">
+              <img
+                src={`${import.meta.env.BASE_URL}icons/logo-text.svg`}
+                alt={appearance?.appName || 'HappyClaw'}
+                className="h-10"
+              />
+              <div className="flex-1" />
+              <button
+                onClick={onToggleCollapse}
+                className="w-7 h-7 rounded-lg flex items-center justify-center hover:bg-accent text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              >
+                <PanelLeftClose className="w-4 h-4" />
+              </button>
+            </div>
+            {/* New workspace button */}
+            <div className="px-3 pb-2 flex-shrink-0">
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full justify-start gap-2 text-xs"
+                onClick={() => setCreateOpen(true)}
+              >
+                <Plus className="w-3.5 h-3.5" />
+                新工作区
+              </Button>
+            </div>
+
+            {/* Workspace list */}
+            <div className="flex-1 overflow-y-auto px-1.5">
+              {loading && !mainGroup && otherGroups.length === 0 ? (
+                <SkeletonCardList count={6} compact />
+              ) : (
+                <>
+                  {mainGroup && (
+                    <div className="mb-1">
+                      <div className="px-2 pt-1 pb-1">
+                        <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+                          {mainGroup.agent_profile_name || 'Default Agent'}
+                          {mainGroup.agent_profile_version
+                            ? ` · v${mainGroup.agent_profile_version}`
+                            : ''}
+                        </span>
                       </div>
-                    ) : (
-                      <>
-                        {myAgentSections.length > 0 && (
-                          <div>
-                            <div className="mt-1" />
-                            <div className="px-2 pt-2 pb-1">
-                              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">我的 Agent</span>
-                            </div>
-                            {myAgentSections.map((section) => (
-                              <div key={section.id} className="mb-1">
-                                <div className="px-2 pt-2 pb-1 flex items-center gap-1.5">
-                                  <span className="text-[10px] text-muted-foreground/80 truncate">
-                                    {section.name}
-                                  </span>
-                                  {section.version && (
-                                    <span className="text-[10px] text-muted-foreground/60">
-                                      v{section.version}
-                                    </span>
-                                  )}
-                                </div>
-                                {section.items.map((g) => (
-                                  <ChatGroupItem
-                                    key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
-                                    lastMessage={g.lastMessage}
-                                    isActive={currentGroup === g.jid} isHome={false}
-                                    isRunning={runnerStates[g.jid] === 'running'}
-                                    canModify={g.can_modify}
-                                    onSelect={handleGroupSelect}
-                                    onRename={(jid, name) => setRenameState({ open: true, jid, name })}
-                                    onClearHistory={openClear}
-                                    onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
-                                    onTogglePin={(jid) => togglePin(jid)}
-                                  />
-                                ))}
-                              </div>
-                            ))}
+                      <ChatGroupItem
+                        jid={mainGroup.jid}
+                        name={mainGroup.name}
+                        folder={mainGroup.folder}
+                        lastMessage={mainGroup.lastMessage}
+                        isActive={currentGroup === mainGroup.jid}
+                        isHome
+                        isRunning={runnerStates[mainGroup.jid] === 'running'}
+                        canModify={mainGroup.can_modify}
+                        onSelect={handleGroupSelect}
+                        onRename={(jid, name) =>
+                          setRenameState({ open: true, jid, name })
+                        }
+                        onClearHistory={openClear}
+                      />
+                    </div>
+                  )}
+
+                  {pinnedAgentSections.length > 0 && (
+                    <div className="mb-1">
+                      <div className="mt-1" />
+                      <div className="px-2 pt-2 pb-1">
+                        <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+                          已固定
+                        </span>
+                      </div>
+                      {renderAgentSections(pinnedAgentSections, {
+                        showCollabBadge: true,
+                        showPinned: true,
+                      })}
+                    </div>
+                  )}
+
+                  {myAgentSections.length === 0 &&
+                  collabAgentSections.length === 0 &&
+                  pinnedAgentSections.length === 0 &&
+                  !mainGroup ? (
+                    <div className="flex flex-col items-center justify-center h-32 px-4">
+                      <p className="text-xs text-muted-foreground text-center">
+                        暂无 Agent 工作区
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      {myAgentSections.length > 0 && (
+                        <div>
+                          <div className="mt-1" />
+                          <div className="px-2 pt-2 pb-1">
+                            <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+                              我的 Agent
+                            </span>
                           </div>
-                        )}
-                        {collabSections.length > 0 && (
-                          <div>
-                            <div className="mt-1" />
-                            <div className="px-2 pt-2 pb-1">
-                              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">协作 Agent 工作区</span>
-                            </div>
-                            {renderSections(collabSections, true)}
+                          {renderAgentSections(myAgentSections)}
+                        </div>
+                      )}
+                      {collabAgentSections.length > 0 && (
+                        <div>
+                          <div className="mt-1" />
+                          <div className="px-2 pt-2 pb-1">
+                            <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+                              协作 Agent 工作区
+                            </span>
                           </div>
-                        )}
-                      </>
-                    )}
-                  </>
-                )}
+                          {renderAgentSections(collabAgentSections, {
+                            showCollabBadge: true,
+                          })}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
+            </div>
           </div>
         </div>
       </div>
-    </div>
 
-        <BugReportDialog open={showBugReport} onClose={() => setShowBugReport(false)} />
-        <CreateContainerDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} />
-        <RenameDialog open={renameState.open} jid={renameState.jid} currentName={renameState.name} onClose={() => setRenameState({ open: false, jid: '', name: '' })} />
-        <ConfirmDialog open={clearState.open} onClose={closeClear} onConfirm={handleClearConfirm} title="重建工作区" message={`确认重建「${clearState.name}」？会清除全部聊天记录、上下文、所有子对话及其消息，并删除工作目录文件。持久化目录 (data/extra/) 与定时任务本身保留。不可撤销。`} confirmText="确认重建" confirmVariant="danger" loading={clearLoading} />
-        <ConfirmDialog open={deleteState.open} onClose={() => setDeleteState({ open: false, jid: '', name: '' })} onConfirm={handleDeleteConfirm} title="删除工作区" message={`确认删除「${deleteState.name}」？不可撤销。`} confirmText="删除" confirmVariant="danger" loading={deleteLoading} />
+      <BugReportDialog
+        open={showBugReport}
+        onClose={() => setShowBugReport(false)}
+      />
+      <CreateContainerDialog
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={handleCreated}
+      />
+      <RenameDialog
+        open={renameState.open}
+        jid={renameState.jid}
+        currentName={renameState.name}
+        onClose={() => setRenameState({ open: false, jid: '', name: '' })}
+      />
+      <ConfirmDialog
+        open={clearState.open}
+        onClose={closeClear}
+        onConfirm={handleClearConfirm}
+        title="重建工作区"
+        message={`确认重建「${clearState.name}」？会清除全部聊天记录、上下文、所有子对话及其消息，并删除工作目录文件。持久化目录 (data/extra/) 与定时任务本身保留。不可撤销。`}
+        confirmText="确认重建"
+        confirmVariant="danger"
+        loading={clearLoading}
+      />
+      <ConfirmDialog
+        open={deleteState.open}
+        onClose={() => setDeleteState({ open: false, jid: '', name: '' })}
+        onConfirm={handleDeleteConfirm}
+        title="删除工作区"
+        message={`确认删除「${deleteState.name}」？不可撤销。`}
+        confirmText="删除"
+        confirmVariant="danger"
+        loading={deleteLoading}
+      />
     </TooltipProvider>
   );
 }

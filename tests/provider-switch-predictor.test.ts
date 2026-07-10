@@ -49,7 +49,7 @@ vi.mock('../src/db.js', async () => {
   };
 });
 
-const { willClearSessionOnProviderSwitch } =
+const { trySelectPoolProvider, willClearSessionOnProviderSwitch } =
   await import('../src/container-runner.ts');
 const { providerPool } = await import('../src/provider-pool.ts');
 
@@ -61,6 +61,23 @@ function setProviders(...ids: string[]) {
     recoveryIntervalMs: 300_000,
   });
   for (const id of ids) providerPool.resetHealth(id);
+}
+
+function agentProfileWithProvider(providerId: string) {
+  return {
+    id: 'agent-profile-policy',
+    name: 'Policy Agent',
+    version: 1,
+    identityHash: 'hash',
+    identityPrompt: '',
+    includeClaudePreset: true,
+    runtimePolicy: {
+      provider_id: providerId,
+      skills: { mode: 'inherit' as const, ids: [] },
+      mcp: { mode: 'inherit' as const, ids: [] },
+      tools: { mode: 'inherit' as const },
+    },
+  };
 }
 
 beforeEach(() => {
@@ -119,6 +136,57 @@ describe('willClearSessionOnProviderSwitch', () => {
     setProviders('B');
     mocks.boundId = 'A';
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
+  });
+
+  test('true when AgentProfile pins a different enabled provider', () => {
+    setProviders('A', 'B');
+    mocks.boundId = 'A';
+    expect(
+      willClearSessionOnProviderSwitch(
+        'grp',
+        null,
+        agentProfileWithProvider('B'),
+      ),
+    ).toBe(true);
+  });
+
+  test('AgentProfile pin takes precedence over a group env override', () => {
+    setProviders('A', 'B');
+    mocks.boundId = 'A';
+    mocks.envOverride = { anthropicApiKey: 'must-not-bypass-policy' };
+    expect(
+      willClearSessionOnProviderSwitch(
+        'grp',
+        null,
+        agentProfileWithProvider('B'),
+      ),
+    ).toBe(true);
+  });
+
+  test('runtime fails closed when the pinned provider is unavailable', () => {
+    setProviders('A');
+    mocks.boundId = 'A';
+    expect(() =>
+      trySelectPoolProvider(
+        'grp',
+        null,
+        agentProfileWithProvider('disabled-provider'),
+      ),
+    ).toThrow(
+      'AgentProfile agent-profile-policy pins unavailable provider disabled-provider',
+    );
+  });
+
+  test('false when AgentProfile pins the already-bound provider', () => {
+    setProviders('A', 'B');
+    mocks.boundId = 'B';
+    expect(
+      willClearSessionOnProviderSwitch(
+        'grp',
+        null,
+        agentProfileWithProvider('B'),
+      ),
+    ).toBe(false);
   });
 
   test('false when no providers are enabled', () => {

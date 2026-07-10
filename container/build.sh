@@ -12,7 +12,8 @@ TAG="${1:-latest}"
 echo "Building HappyClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 
-# Build with Docker (CACHEBUST ensures claude-code is always latest)
+# Build with Docker. SDK/claude-code come from the committed lockfile;
+# CACHEBUST refreshes the other intentionally-latest image tools only.
 # --network=host: the build container otherwise gets Docker's default bridge DNS
 # (8.8.8.8), which is unreliable inside VPN/tunnel environments and breaks the
 # GitHub fetch in the feishu-cli step. Host networking reuses the host's working

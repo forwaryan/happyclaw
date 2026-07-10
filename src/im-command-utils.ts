@@ -168,30 +168,36 @@ export function resolveBoundChatTarget(
   getRegisteredGroup: (jid: string) => RegisteredGroupLike | undefined,
   getAgent: (id: string) => AgentLike | undefined,
   findGroupNameByFolder: (folder: string) => string,
-): BoundChatTarget {
+  resolveWorkspaceJid?: (jid: string) => string | null,
+): BoundChatTarget | null {
   if (group.target_agent_id) {
     const agent = getAgent(group.target_agent_id);
-    const parent = agent ? getRegisteredGroup(agent.chat_jid) : undefined;
+    if (!agent?.chat_jid) return null;
+    const parent = getRegisteredGroup(agent.chat_jid);
+    if (!parent) return null;
     const workspaceName =
-      parent?.name || findGroupNameByFolder(parent?.folder || group.folder);
-    const baseChatJid = agent?.chat_jid || sourceChatJid;
+      parent.name || findGroupNameByFolder(parent.folder || group.folder);
+    const baseChatJid = agent.chat_jid;
     return {
       baseChatJid,
       targetChatJid: `${baseChatJid}#agent:${group.target_agent_id}`,
-      folder: parent?.folder || group.folder,
+      folder: parent.folder,
       agentId: group.target_agent_id,
-      locationLine: `${workspaceName} / ${agent?.name || group.target_agent_id}`,
+      locationLine: `${workspaceName} / ${agent.name || group.target_agent_id}`,
     };
   }
 
   if (group.target_main_jid) {
-    const target = getRegisteredGroup(group.target_main_jid);
+    const baseChatJid =
+      resolveWorkspaceJid?.(group.target_main_jid) ?? group.target_main_jid;
+    const target = getRegisteredGroup(baseChatJid);
+    if (!target) return null;
     return {
-      baseChatJid: group.target_main_jid,
-      targetChatJid: group.target_main_jid,
-      folder: target?.folder || group.folder,
+      baseChatJid,
+      targetChatJid: baseChatJid,
+      folder: target.folder,
       agentId: null,
-      locationLine: `${target?.name || group.target_main_jid} / 主会话`,
+      locationLine: `${target.name || baseChatJid} / 主会话`,
     };
   }
 

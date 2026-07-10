@@ -58,6 +58,7 @@ import pluginsRoutes from './routes/plugins.js';
 import workspaceConfigRoutes from './routes/workspace-config.js';
 import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import agentProfileRoutes from './routes/agent-profiles.js';
+import workspaceRoutes from './routes/workspaces.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
@@ -91,6 +92,7 @@ import type {
   AuthUser,
   StreamEvent,
   UserRole,
+  MessageCursor,
 } from './types.js';
 import {
   WEB_PORT,
@@ -207,6 +209,23 @@ function releaseTerminalOwnership(ws: WebSocket, groupJid: string): void {
 const CORS_ALLOWED_ORIGINS = process.env.CORS_ALLOWED_ORIGINS || '';
 const CORS_ALLOW_LOCALHOST = process.env.CORS_ALLOW_LOCALHOST !== 'false'; // default: true
 
+function completeWebOutOfBandMessage(
+  webDeps: WebDeps,
+  jid: string,
+  cursor: MessageCursor,
+): void {
+  if (webDeps.completeOutOfBandMessage) {
+    webDeps.completeOutOfBandMessage(jid, cursor);
+    return;
+  }
+  // Compatibility for focused tests that predate the production chokepoint.
+  if (webDeps.hasEarlierPendingMessages(jid, cursor)) {
+    webDeps.advanceNextPullCursorOnly(jid, cursor);
+  } else {
+    webDeps.advanceCursors(jid, cursor);
+  }
+}
+
 function isAllowedOrigin(origin: string | undefined): string | null {
   if (!origin) return null; // same-origin requests
   // 环境变量设为 '*' 时允许所有来源
@@ -256,6 +275,7 @@ app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/plugins', pluginsRoutes);
 app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/agent-profiles', agentProfileRoutes);
+app.route('/api/workspaces', workspaceRoutes);
 app.route('/api/groups', agentRoutes); // Workspace session routes; /agents paths remain compatibility aliases
 app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
 app.route('/api', monitorRoutes);
@@ -451,7 +471,10 @@ async function handleWebUserMessage(
           timestamp: sysTimestamp,
           is_from_me: true,
         });
-        deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+        completeWebOutOfBandMessage(deps, chatJid, {
+          timestamp,
+          id: messageId,
+        });
         deps.advanceGlobalCursor({ timestamp, id: messageId });
         return { ok: true, messageId, timestamp };
       }
@@ -528,11 +551,7 @@ async function handleWebUserMessage(
         //     committed → already-processed messages re-polled and the
         //     reply re-fired.
         const replyCursor = { timestamp, id: messageId };
-        if (deps.hasEarlierPendingMessages(chatJid, replyCursor)) {
-          deps.advanceNextPullCursorOnly(chatJid, replyCursor);
-        } else {
-          deps.advanceCursors(chatJid, replyCursor);
-        }
+        completeWebOutOfBandMessage(deps, chatJid, replyCursor);
         deps.advanceGlobalCursor(replyCursor);
         return { ok: true, messageId, timestamp };
       }
@@ -602,6 +621,12 @@ async function handleWebUserMessage(
       updateRoute?.(group.folder, null);
     },
     chatJid,
+    undefined,
+    {
+      chatJid,
+      coveredCursors: [{ timestamp, id: messageId }],
+      cursor: { timestamp, id: messageId },
+    },
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
@@ -633,8 +658,7 @@ async function handleWebUserMessage(
   // messages. If the agent crashes without processing them, the close handler
   // resets pendingMessages so drainGroup re-reads from DB.
   if (pipedToActive) {
-    deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
-    deps.queue.markIpcInjectedMessage(chatJid);
+    deps.advanceNextPullCursorOnly(chatJid, { timestamp, id: messageId });
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
   return { ok: true, messageId, timestamp };
@@ -808,11 +832,11 @@ async function handleAgentConversationMessage(
           // (#27 round-17 P2-2) — direct overwrite would regress cursor on
           // same-millisecond batches and re-fire the reply.
           const replyCursor = { timestamp, id: messageId };
-          if (deps.hasEarlierPendingMessages(virtualChatJid, replyCursor)) {
-            deps.advanceNextPullCursorOnly(virtualChatJid, replyCursor);
-          } else {
-            deps.advanceCursors(virtualChatJid, replyCursor);
-          }
+          completeWebOutOfBandMessage(
+            deps,
+            virtualChatJid,
+            replyCursor,
+          );
           return;
         }
         if (expansion.kind === 'expanded') {
@@ -874,7 +898,19 @@ async function handleAgentConversationMessage(
       finalizeHeld?.(virtualChatJid);
     },
     virtualChatJid,
+    undefined,
+    {
+      chatJid: virtualChatJid,
+      coveredCursors: [{ timestamp, id: messageId }],
+      cursor: { timestamp, id: messageId },
+    },
   );
+  if (agentSendResult === 'sent') {
+    deps.advanceNextPullCursorOnly(virtualChatJid, {
+      timestamp,
+      id: messageId,
+    });
+  }
   if (agentSendResult === 'no_active') {
     if (eagerExpandAgentActive && agentSendContent !== content) {
       // Race: peek said active, but the runner exited before sendMessage.

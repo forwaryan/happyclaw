@@ -7,6 +7,7 @@ import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { logger } from './logger.js';
 import {
   AgentProfile,
+  AgentProfileRuntimePolicy,
   AgentKind,
   AgentStatus,
   AuthAuditLog,
@@ -454,6 +455,54 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_channel_mounts_workspace ON channel_mounts(workspace_jid);
     CREATE INDEX IF NOT EXISTS idx_channel_mounts_session ON channel_mounts(session_id);
     CREATE INDEX IF NOT EXISTS idx_channel_mounts_type ON channel_mounts(channel_type);
+    CREATE TABLE IF NOT EXISTS workspaces (
+      jid TEXT PRIMARY KEY,
+      folder TEXT NOT NULL,
+      owner_user_id TEXT,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      is_home INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspaces_folder ON workspaces(folder);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id, status);
+    -- Runtime resume state projected from the legacy sessions table. This is
+    -- deliberately not named sessions: product conversation Sessions live in
+    -- agents, while these rows only track SDK/provider resume metadata.
+    CREATE TABLE IF NOT EXISTS workspace_runtime_sessions (
+      group_folder TEXT NOT NULL,
+      runtime_agent_id TEXT NOT NULL DEFAULT '',
+      workspace_jid TEXT NOT NULL,
+      sdk_session_id TEXT NOT NULL DEFAULT '',
+      provider_id TEXT,
+      agent_profile_id TEXT,
+      agent_profile_version INTEGER,
+      identity_hash TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (group_folder, runtime_agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_workspace ON workspace_runtime_sessions(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_profile ON workspace_runtime_sessions(agent_profile_id);
+    CREATE TABLE IF NOT EXISTS agent_channel_mounts (
+      channel_jid TEXT PRIMARY KEY,
+      agent_profile_id TEXT,
+      owner_user_id TEXT,
+      channel_type TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      workspace_folder TEXT,
+      session_id TEXT,
+      routing_mode TEXT NOT NULL DEFAULT 'single_session',
+      reply_policy TEXT NOT NULL DEFAULT 'source_only',
+      activation_mode TEXT NOT NULL DEFAULT 'auto',
+      owner_im_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_profile ON agent_channel_mounts(agent_profile_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_workspace ON agent_channel_mounts(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_session ON agent_channel_mounts(session_id);
   `);
 
   // Auth tables
@@ -583,6 +632,7 @@ export function initDatabase(): void {
       name TEXT NOT NULL,
       identity_prompt TEXT NOT NULL DEFAULT '',
       include_claude_preset INTEGER NOT NULL DEFAULT 1,
+      runtime_policy TEXT NOT NULL DEFAULT '{}',
       identity_hash TEXT NOT NULL DEFAULT '',
       version INTEGER NOT NULL DEFAULT 1,
       is_default INTEGER NOT NULL DEFAULT 0,
@@ -1417,6 +1467,7 @@ export function initDatabase(): void {
   // and start a fresh SDK session without losing HappyClaw message history.
   ensureColumn('sessions', 'agent_profile_id', 'TEXT');
   ensureColumn('sessions', 'identity_hash', 'TEXT');
+  ensureColumn('sessions', 'agent_profile_version', 'INTEGER');
 
   // v40 → v41: Allow each AgentProfile to opt out of the Claude Code
   // built-in system prompt preset and use only HappyClaw/Agent prompts.
@@ -1425,6 +1476,40 @@ export function initDatabase(): void {
     'include_claude_preset',
     'INTEGER NOT NULL DEFAULT 1',
   );
+
+  // v43 → v44: AgentProfile runtime policy moves provider/tool/skill/MCP
+  // intent from workspace-level compatibility fields into the top-level Agent.
+  ensureColumn(
+    'agent_profiles',
+    'runtime_policy',
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+
+  // v44 → v45: make the SDK resume-state projection explicit. The former
+  // `workspace_sessions` name looked like a product conversation model even
+  // though it only mirrored `sessions` provider/SDK metadata.
+  if (tableExists('workspace_sessions')) {
+    db.transaction(() => {
+      db.exec(`
+        INSERT OR REPLACE INTO workspace_runtime_sessions (
+          group_folder, runtime_agent_id, workspace_jid, sdk_session_id,
+          provider_id, agent_profile_id, agent_profile_version, identity_hash,
+          created_at, updated_at
+        )
+        SELECT group_folder, session_agent_id, workspace_jid, claude_session_id,
+          provider_id, agent_profile_id, agent_profile_version, identity_hash,
+          created_at, updated_at
+        FROM workspace_sessions
+      `);
+      db.exec('DROP TABLE workspace_sessions');
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_workspace
+          ON workspace_runtime_sessions(workspace_jid);
+        CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_profile
+          ON workspace_runtime_sessions(agent_profile_id);
+      `);
+    })();
+  }
 
   // v37 → v38: Added users.default_require_mention column (per-user default
   // for require_mention on auto-registered IM group chats). The actual
@@ -1487,10 +1572,13 @@ export function initDatabase(): void {
     }
   }
 
+  // v42 → v43: top-level Agent ownership and canonical workspace/channel
+  // projections. Tables are created with CREATE IF NOT EXISTS above; this
+  // pass backfills sources and removes any projection-only ghosts.
   backfillAgentProfileDefaultsAndWorkspaceMappings();
-  syncAllChannelMountsFromRegisteredGroups();
+  reconcileCanonicalRuntimeProjections();
 
-  const SCHEMA_VERSION = '42';
+  const SCHEMA_VERSION = '45';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2647,26 +2735,31 @@ export function setSession(
   agentId?: string | null,
   agentIdentity?: {
     agentProfileId?: string | null;
+    agentProfileVersion?: number | null;
     identityHash?: string | null;
   },
 ): void {
   const effectiveAgentId = agentId || '';
-  db.prepare(
-    `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
-     ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
-  ).run(groupFolder, sessionId, effectiveAgentId);
-  if (agentIdentity) {
+  db.transaction(() => {
     db.prepare(
-      `UPDATE sessions
-       SET agent_profile_id = ?, identity_hash = ?
-       WHERE group_folder = ? AND agent_id = ?`,
-    ).run(
-      agentIdentity.agentProfileId ?? null,
-      agentIdentity.identityHash ?? null,
-      groupFolder,
-      effectiveAgentId,
-    );
-  }
+      `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
+       ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
+    ).run(groupFolder, sessionId, effectiveAgentId);
+    if (agentIdentity) {
+      db.prepare(
+        `UPDATE sessions
+         SET agent_profile_id = ?, agent_profile_version = ?, identity_hash = ?
+         WHERE group_folder = ? AND agent_id = ?`,
+      ).run(
+        agentIdentity.agentProfileId ?? null,
+        agentIdentity.agentProfileVersion ?? null,
+        agentIdentity.identityHash ?? null,
+        groupFolder,
+        effectiveAgentId,
+      );
+    }
+    syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
+  })();
 }
 
 export function deleteSession(
@@ -2674,9 +2767,14 @@ export function deleteSession(
   agentId?: string | null,
 ): void {
   const effectiveAgentId = agentId || '';
-  db.prepare(
-    'DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?',
-  ).run(groupFolder, effectiveAgentId);
+  db.transaction(() => {
+    db.prepare(
+      'DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+  })();
 }
 
 /**
@@ -2712,19 +2810,28 @@ export function setSessionProviderId(
   providerId: string | null,
 ): void {
   const effectiveAgentId = agentId || '';
-  db.prepare(
-    `INSERT INTO sessions (group_folder, session_id, agent_id, provider_id)
-     VALUES (?, '', ?, ?)
-     ON CONFLICT(group_folder, agent_id) DO UPDATE SET provider_id = excluded.provider_id`,
-  ).run(groupFolder, effectiveAgentId, providerId);
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO sessions (group_folder, session_id, agent_id, provider_id)
+       VALUES (?, '', ?, ?)
+       ON CONFLICT(group_folder, agent_id) DO UPDATE SET provider_id = excluded.provider_id`,
+    ).run(groupFolder, effectiveAgentId, providerId);
+    syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
+  })();
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
-  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+    ).run(groupFolder);
+  })();
 }
 
 export interface SessionAgentIdentity {
   agent_profile_id: string | null;
+  agent_profile_version: number | null;
   identity_hash: string | null;
 }
 
@@ -2735,7 +2842,7 @@ export function getSessionAgentIdentity(
   const effectiveAgentId = agentId || '';
   const row = db
     .prepare(
-      `SELECT agent_profile_id, identity_hash
+      `SELECT agent_profile_id, agent_profile_version, identity_hash
        FROM sessions
        WHERE group_folder = ? AND agent_id = ?`,
     )
@@ -2743,28 +2850,186 @@ export function getSessionAgentIdentity(
   return row;
 }
 
+const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
+  provider_id: null,
+  skills: { mode: 'inherit', ids: [] },
+  mcp: { mode: 'inherit', ids: [] },
+  tools: { mode: 'inherit' },
+};
+
+type RuntimePolicyInput = Partial<{
+  provider_id: string | null;
+  skills: Partial<AgentProfileRuntimePolicy['skills']> | null;
+  mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
+  tools: Partial<AgentProfileRuntimePolicy['tools']> | null;
+}>;
+
+function normalizeOptionalText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function normalizeMode<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+export function normalizeAgentProfileRuntimePolicy(
+  input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+): AgentProfileRuntimePolicy {
+  const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
+  return {
+    provider_id: normalizeOptionalText(raw.provider_id),
+    skills: {
+      mode: normalizeMode(
+        raw.skills?.mode,
+        ['inherit', 'custom', 'disabled'] as const,
+        'inherit',
+      ),
+      ids: normalizeIdList(raw.skills?.ids),
+    },
+    mcp: {
+      mode: normalizeMode(
+        raw.mcp?.mode,
+        ['inherit', 'custom', 'disabled'] as const,
+        'inherit',
+      ),
+      ids: normalizeIdList(raw.mcp?.ids),
+    },
+    tools: {
+      mode: normalizeMode(
+        raw.tools?.mode,
+        ['inherit', 'readonly', 'restricted'] as const,
+        'inherit',
+      ),
+    },
+  };
+}
+
+/** Merge a PATCH-shaped policy without resetting omitted sibling fields. */
+export function mergeAgentProfileRuntimePolicy(
+  current: AgentProfileRuntimePolicy,
+  patch: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+): AgentProfileRuntimePolicy {
+  if (patch === null) return normalizeAgentProfileRuntimePolicy();
+  const has = (key: keyof RuntimePolicyInput) =>
+    Object.prototype.hasOwnProperty.call(patch, key);
+  const mergeCapability = <T extends 'skills' | 'mcp'>(key: T) => {
+    const value = patch[key];
+    if (value === null) return DEFAULT_AGENT_PROFILE_RUNTIME_POLICY[key];
+    return {
+      mode: value?.mode ?? current[key].mode,
+      ids: value?.ids ?? current[key].ids,
+    };
+  };
+
+  return normalizeAgentProfileRuntimePolicy({
+    provider_id: has('provider_id') ? patch.provider_id : current.provider_id,
+    skills: has('skills') ? mergeCapability('skills') : current.skills,
+    mcp: has('mcp') ? mergeCapability('mcp') : current.mcp,
+    tools: has('tools')
+      ? patch.tools === null
+        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.tools
+        : {
+            mode: patch.tools?.mode ?? current.tools.mode,
+          }
+      : current.tools,
+  });
+}
+
+export function serializeAgentProfileRuntimePolicy(
+  input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+): string {
+  return JSON.stringify(normalizeAgentProfileRuntimePolicy(input));
+}
+
+function parseAgentProfileRuntimePolicy(
+  raw: unknown,
+): AgentProfileRuntimePolicy {
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as RuntimePolicyInput;
+      return normalizeAgentProfileRuntimePolicy(parsed);
+    } catch {
+      return normalizeAgentProfileRuntimePolicy();
+    }
+  }
+  if (raw && typeof raw === 'object') {
+    return normalizeAgentProfileRuntimePolicy(raw as RuntimePolicyInput);
+  }
+  return normalizeAgentProfileRuntimePolicy();
+}
+
+function isDefaultAgentProfileRuntimePolicy(
+  policy: AgentProfileRuntimePolicy,
+): boolean {
+  return (
+    serializeAgentProfileRuntimePolicy(policy) ===
+    serializeAgentProfileRuntimePolicy(DEFAULT_AGENT_PROFILE_RUNTIME_POLICY)
+  );
+}
+
 export function computeAgentProfileIdentityHash(
   identityPrompt: string,
   includeClaudePreset = true,
+  runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+  name = '',
 ): string {
+  const normalizedPolicy = normalizeAgentProfileRuntimePolicy(runtimePolicy);
+  const payload: {
+    identityPrompt: string;
+    includeClaudePreset: boolean;
+    runtimePolicy?: AgentProfileRuntimePolicy;
+    name?: string;
+  } = { identityPrompt, includeClaudePreset };
+  if (name) payload.name = name;
+  if (!isDefaultAgentProfileRuntimePolicy(normalizedPolicy)) {
+    payload.runtimePolicy = normalizedPolicy;
+  }
   return crypto
     .createHash('sha256')
-    .update(JSON.stringify({ identityPrompt, includeClaudePreset }))
+    .update(JSON.stringify(payload))
     .digest('hex');
 }
 
 function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
+  const name = String(row.name);
   const prompt = String(row.identity_prompt ?? '');
   const includeClaudePreset = Number(row.include_claude_preset ?? 1) === 1;
+  const runtimePolicy = parseAgentProfileRuntimePolicy(row.runtime_policy);
   return {
     id: String(row.id),
     owner_user_id: String(row.owner_user_id),
-    name: String(row.name),
+    name,
     identity_prompt: prompt,
     include_claude_preset: includeClaudePreset,
+    runtime_policy: runtimePolicy,
     identity_hash: String(
       row.identity_hash ??
-        computeAgentProfileIdentityHash(prompt, includeClaudePreset),
+        computeAgentProfileIdentityHash(
+          prompt,
+          includeClaudePreset,
+          runtimePolicy,
+          name,
+        ),
     ),
     version: Number(row.version ?? 1),
     is_default: Number(row.is_default ?? 0) === 1,
@@ -2803,23 +3068,28 @@ export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
 
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
+  const name = 'Default Agent';
   const identityPrompt = '';
   const includeClaudePreset = true;
   const identityHash = computeAgentProfileIdentityHash(
     identityPrompt,
     includeClaudePreset,
+    undefined,
+    name,
   );
+  const runtimePolicyJson = serializeAgentProfileRuntimePolicy();
   db.prepare(
     `INSERT INTO agent_profiles (
-      id, owner_user_id, name, identity_prompt, include_claude_preset, identity_hash, version,
+      id, owner_user_id, name, identity_prompt, include_claude_preset, runtime_policy, identity_hash, version,
       is_default, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`,
   ).run(
     id,
     userId,
-    'Default Agent',
+    name,
     identityPrompt,
     includeClaudePreset ? 1 : 0,
+    runtimePolicyJson,
     identityHash,
     now,
     now,
@@ -2844,26 +3114,32 @@ export function createAgentProfile(input: {
   name: string;
   identityPrompt?: string;
   includeClaudePreset?: boolean;
+  runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
 }): AgentProfile {
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
   const identityPrompt = input.identityPrompt ?? '';
   const includeClaudePreset = input.includeClaudePreset ?? true;
+  const runtimePolicy = normalizeAgentProfileRuntimePolicy(input.runtimePolicy);
+  const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
   const identityHash = computeAgentProfileIdentityHash(
     identityPrompt,
     includeClaudePreset,
+    runtimePolicy,
+    input.name,
   );
   db.prepare(
     `INSERT INTO agent_profiles (
-      id, owner_user_id, name, identity_prompt, include_claude_preset, identity_hash, version,
+      id, owner_user_id, name, identity_prompt, include_claude_preset, runtime_policy, identity_hash, version,
       is_default, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
   ).run(
     id,
     input.ownerUserId,
     input.name,
     identityPrompt,
     includeClaudePreset ? 1 : 0,
+    runtimePolicyJson,
     identityHash,
     now,
     now,
@@ -2878,11 +3154,13 @@ export function updateAgentProfile(
     name?: string;
     identityPrompt?: string;
     includeClaudePreset?: boolean;
+    runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
   },
 ): AgentProfile | undefined {
   const existing = getAgentProfileForUser(profileId, ownerUserId);
   if (!existing) return undefined;
   const nextName = updates.name ?? existing.name;
+  const nameChanged = updates.name !== undefined && nextName !== existing.name;
   const promptChanged =
     updates.identityPrompt !== undefined &&
     updates.identityPrompt !== existing.identity_prompt;
@@ -2892,20 +3170,38 @@ export function updateAgentProfile(
     updates.includeClaudePreset !== existing.include_claude_preset;
   const nextIncludeClaudePreset =
     updates.includeClaudePreset ?? existing.include_claude_preset;
-  const identityChanged = promptChanged || includeChanged;
+  const nextRuntimePolicy =
+    updates.runtimePolicy !== undefined
+      ? mergeAgentProfileRuntimePolicy(
+          existing.runtime_policy,
+          updates.runtimePolicy,
+        )
+      : existing.runtime_policy;
+  const runtimePolicyChanged =
+    updates.runtimePolicy !== undefined &&
+    serializeAgentProfileRuntimePolicy(nextRuntimePolicy) !==
+      serializeAgentProfileRuntimePolicy(existing.runtime_policy);
+  const identityChanged =
+    nameChanged || promptChanged || includeChanged || runtimePolicyChanged;
   const nextHash = identityChanged
-    ? computeAgentProfileIdentityHash(nextPrompt, nextIncludeClaudePreset)
+    ? computeAgentProfileIdentityHash(
+        nextPrompt,
+        nextIncludeClaudePreset,
+        nextRuntimePolicy,
+        nextName,
+      )
     : existing.identity_hash;
   const nextVersion = identityChanged ? existing.version + 1 : existing.version;
   const now = new Date().toISOString();
   db.prepare(
     `UPDATE agent_profiles
-     SET name = ?, identity_prompt = ?, include_claude_preset = ?, identity_hash = ?, version = ?, updated_at = ?
+     SET name = ?, identity_prompt = ?, include_claude_preset = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
      WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
   ).run(
     nextName,
     nextPrompt,
     nextIncludeClaudePreset ? 1 : 0,
+    serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
     nextHash,
     nextVersion,
     now,
@@ -2918,12 +3214,13 @@ export function updateAgentProfile(
 export function archiveAgentProfile(
   profileId: string,
   ownerUserId: string,
-): 'ok' | 'not_found' | 'is_default' | 'has_workspaces' {
+): 'ok' | 'not_found' | 'is_default' | 'has_workspaces' | 'has_mounts' {
   const existing = getAgentProfileForUser(profileId, ownerUserId);
   if (!existing) return 'not_found';
   if (existing.is_default) return 'is_default';
   const count = countWorkspaceAgentProfileMappings(profileId);
   if (count > 0) return 'has_workspaces';
+  if (countAgentChannelMountsForProfile(profileId) > 0) return 'has_mounts';
   db.prepare(
     "UPDATE agent_profiles SET status = 'archived', updated_at = ? WHERE id = ? AND owner_user_id = ?",
   ).run(new Date().toISOString(), profileId, ownerUserId);
@@ -2935,14 +3232,17 @@ export function assignWorkspaceAgentProfile(
   profileId: string,
 ): void {
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO workspace_agent_profiles (
-      group_folder, agent_profile_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?)
-    ON CONFLICT(group_folder) DO UPDATE SET
-      agent_profile_id = excluded.agent_profile_id,
-      updated_at = excluded.updated_at`,
-  ).run(groupFolder, profileId, now, now);
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO workspace_agent_profiles (
+        group_folder, agent_profile_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(group_folder) DO UPDATE SET
+        agent_profile_id = excluded.agent_profile_id,
+        updated_at = excluded.updated_at`,
+    ).run(groupFolder, profileId, now, now);
+    syncAgentChannelMountsForWorkspaceFolder(groupFolder);
+  })();
 }
 
 export function getWorkspaceAgentProfileId(
@@ -2957,9 +3257,12 @@ export function getWorkspaceAgentProfileId(
 }
 
 export function deleteWorkspaceAgentProfile(groupFolder: string): void {
-  db.prepare('DELETE FROM workspace_agent_profiles WHERE group_folder = ?').run(
-    groupFolder,
-  );
+  db.transaction(() => {
+    db.prepare(
+      'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+    ).run(groupFolder);
+    syncAgentChannelMountsForWorkspaceFolder(groupFolder);
+  })();
 }
 
 export function countWorkspaceAgentProfileMappings(profileId: string): number {
@@ -2982,11 +3285,17 @@ export function getAgentProfileForWorkspace(
   }
   if (!ownerUserId) return undefined;
   const fallback = getOrCreateDefaultAgentProfile(ownerUserId);
+  // Runtime fallback may materialize a previously-unmapped default ownership,
+  // but Agent PATCH snapshots use the same default fallback before this write.
+  // Therefore the workspace is already included in the default profile lock's
+  // quiesce set; it cannot appear as a new membership outside that snapshot.
   assignWorkspaceAgentProfile(groupFolder, fallback.id);
   return fallback;
 }
 
 export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
+  // initDatabase invokes this before the web server publishes routes or starts
+  // runners, so no process-local profile membership lock is necessary here.
   const tx = db.transaction(() => {
     const users = db
       .prepare("SELECT id FROM users WHERE status != 'deleted'")
@@ -3048,6 +3357,9 @@ export function deleteSessionsByProviderId(providerId: string): {
       )
       .all(id) as Array<{ group_folder: string }>;
     const affectedFolders = rows.map((r) => r.group_folder);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE provider_id = ?',
+    ).run(id);
     const result = db
       .prepare('DELETE FROM sessions WHERE provider_id = ?')
       .run(id);
@@ -3213,6 +3525,428 @@ function parseActivationMode(
   return 'auto';
 }
 
+export interface WorkspaceRecord {
+  jid: string;
+  folder: string;
+  owner_user_id: string | null;
+  name: string;
+  status: 'active' | 'archived';
+  is_home: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** SDK/provider resume state. This is not a user-visible product Session. */
+export interface WorkspaceRuntimeSessionRecord {
+  group_folder: string;
+  runtime_agent_id: string;
+  workspace_jid: string;
+  sdk_session_id: string;
+  provider_id: string | null;
+  agent_profile_id: string | null;
+  agent_profile_version: number | null;
+  identity_hash: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentChannelMountRecord extends ChannelMount {
+  agent_profile_id: string | null;
+  owner_user_id: string | null;
+  workspace_folder: string | null;
+}
+
+function parseWorkspaceRecord(row: Record<string, unknown>): WorkspaceRecord {
+  return {
+    jid: String(row.jid),
+    folder: String(row.folder),
+    owner_user_id:
+      typeof row.owner_user_id === 'string' ? row.owner_user_id : null,
+    name: String(row.name),
+    status: row.status === 'archived' ? 'archived' : 'active',
+    is_home: Number(row.is_home ?? 0) === 1,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function parseWorkspaceRuntimeSessionRecord(
+  row: Record<string, unknown>,
+): WorkspaceRuntimeSessionRecord {
+  return {
+    group_folder: String(row.group_folder),
+    runtime_agent_id: String(row.runtime_agent_id ?? ''),
+    workspace_jid: String(row.workspace_jid),
+    sdk_session_id: String(row.sdk_session_id ?? ''),
+    provider_id: typeof row.provider_id === 'string' ? row.provider_id : null,
+    agent_profile_id:
+      typeof row.agent_profile_id === 'string' ? row.agent_profile_id : null,
+    agent_profile_version:
+      typeof row.agent_profile_version === 'number'
+        ? row.agent_profile_version
+        : row.agent_profile_version == null
+          ? null
+          : Number(row.agent_profile_version),
+    identity_hash:
+      typeof row.identity_hash === 'string' ? row.identity_hash : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function parseAgentChannelMountRecord(
+  row: ChannelMountRow & Record<string, unknown>,
+): AgentChannelMountRecord {
+  return {
+    ...parseChannelMountRow(row),
+    agent_profile_id:
+      typeof row.agent_profile_id === 'string' ? row.agent_profile_id : null,
+    owner_user_id:
+      typeof row.owner_user_id === 'string' ? row.owner_user_id : null,
+    workspace_folder:
+      typeof row.workspace_folder === 'string' ? row.workspace_folder : null,
+  };
+}
+
+function getWorkspaceJidForFolder(groupFolder: string): string | null {
+  const row = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%' ORDER BY is_home DESC, added_at ASC LIMIT 1",
+    )
+    .get(groupFolder) as { jid: string } | undefined;
+  return row?.jid ?? null;
+}
+
+function syncWorkspaceFromRegisteredGroup(
+  jid: string,
+  group: RegisteredGroup,
+): void {
+  if (!jid.startsWith('web:')) return;
+  const now = new Date().toISOString();
+  const existing = getWorkspaceRecord(jid);
+  db.prepare(
+    `INSERT INTO workspaces (
+      jid, folder, owner_user_id, name, status, is_home, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+    ON CONFLICT(jid) DO UPDATE SET
+      folder = excluded.folder,
+      owner_user_id = excluded.owner_user_id,
+      name = excluded.name,
+      status = 'active',
+      is_home = excluded.is_home,
+      updated_at = excluded.updated_at`,
+  ).run(
+    jid,
+    group.folder,
+    group.created_by ?? null,
+    group.name,
+    group.is_home ? 1 : 0,
+    existing?.created_at ?? group.added_at ?? now,
+    now,
+  );
+}
+
+function deleteWorkspaceMirror(jid: string, folder?: string): void {
+  db.prepare('DELETE FROM workspaces WHERE jid = ?').run(jid);
+  db.prepare(
+    'DELETE FROM workspace_runtime_sessions WHERE workspace_jid = ?',
+  ).run(jid);
+  db.prepare('DELETE FROM agent_channel_mounts WHERE workspace_jid = ?').run(
+    jid,
+  );
+  db.prepare('DELETE FROM channel_mounts WHERE workspace_jid = ?').run(jid);
+  if (folder) {
+    const replacementJid = getWorkspaceJidForFolder(folder);
+    if (replacementJid) {
+      const rows = db
+        .prepare('SELECT agent_id FROM sessions WHERE group_folder = ?')
+        .all(folder) as Array<{ agent_id: string | null }>;
+      for (const row of rows) {
+        syncWorkspaceRuntimeSessionProjection(folder, row.agent_id ?? '');
+      }
+    } else {
+      db.prepare(
+        'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+      ).run(folder);
+    }
+  }
+}
+
+function syncWorkspaceRuntimeSessionProjection(
+  groupFolder: string,
+  agentId?: string | null,
+): void {
+  const effectiveAgentId = agentId || '';
+  const row = db
+    .prepare(
+      `SELECT session_id, provider_id, agent_profile_id, agent_profile_version, identity_hash
+       FROM sessions
+       WHERE group_folder = ? AND agent_id = ?`,
+    )
+    .get(groupFolder, effectiveAgentId) as
+    | {
+        session_id: string;
+        provider_id: string | null;
+        agent_profile_id: string | null;
+        agent_profile_version: number | null;
+        identity_hash: string | null;
+      }
+    | undefined;
+  if (!row) {
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+    return;
+  }
+  const workspaceJid = getWorkspaceJidForFolder(groupFolder);
+  if (!workspaceJid) {
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+    return;
+  }
+  const now = new Date().toISOString();
+  const existing = getWorkspaceRuntimeSession(groupFolder, effectiveAgentId);
+  db.prepare(
+    `INSERT INTO workspace_runtime_sessions (
+      group_folder, runtime_agent_id, workspace_jid, sdk_session_id,
+      provider_id, agent_profile_id, agent_profile_version, identity_hash,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(group_folder, runtime_agent_id) DO UPDATE SET
+      workspace_jid = excluded.workspace_jid,
+      sdk_session_id = excluded.sdk_session_id,
+      provider_id = excluded.provider_id,
+      agent_profile_id = excluded.agent_profile_id,
+      agent_profile_version = excluded.agent_profile_version,
+      identity_hash = excluded.identity_hash,
+      updated_at = excluded.updated_at`,
+  ).run(
+    groupFolder,
+    effectiveAgentId,
+    workspaceJid,
+    row.session_id,
+    row.provider_id ?? null,
+    row.agent_profile_id ?? null,
+    row.agent_profile_version ?? null,
+    row.identity_hash ?? null,
+    existing?.created_at ?? now,
+    now,
+  );
+}
+
+function syncWorkspaceRuntimeSessionsForFolder(groupFolder: string): void {
+  const rows = db
+    .prepare('SELECT agent_id FROM sessions WHERE group_folder = ?')
+    .all(groupFolder) as Array<{ agent_id: string | null }>;
+  for (const row of rows) {
+    syncWorkspaceRuntimeSessionProjection(groupFolder, row.agent_id ?? '');
+  }
+}
+
+function syncAgentChannelMountFromMount(mount: ChannelMount): void {
+  const workspace = getRegisteredGroup(mount.workspace_jid);
+  const agentProfileId = workspace
+    ? (getWorkspaceAgentProfileId(workspace.folder) ?? null)
+    : null;
+  db.prepare(
+    `INSERT INTO agent_channel_mounts (
+      channel_jid, agent_profile_id, owner_user_id, channel_type,
+      workspace_jid, workspace_folder, session_id, routing_mode, reply_policy,
+      activation_mode, owner_im_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(channel_jid) DO UPDATE SET
+      agent_profile_id = excluded.agent_profile_id,
+      owner_user_id = excluded.owner_user_id,
+      channel_type = excluded.channel_type,
+      workspace_jid = excluded.workspace_jid,
+      workspace_folder = excluded.workspace_folder,
+      session_id = excluded.session_id,
+      routing_mode = excluded.routing_mode,
+      reply_policy = excluded.reply_policy,
+      activation_mode = excluded.activation_mode,
+      owner_im_id = excluded.owner_im_id,
+      updated_at = excluded.updated_at`,
+  ).run(
+    mount.channel_jid,
+    agentProfileId,
+    workspace?.created_by ?? null,
+    mount.channel_type,
+    mount.workspace_jid,
+    workspace?.folder ?? null,
+    mount.session_id ?? null,
+    mount.routing_mode,
+    mount.reply_policy,
+    mount.activation_mode,
+    mount.owner_im_id ?? null,
+    mount.created_at,
+    mount.updated_at,
+  );
+}
+
+function syncAgentChannelMountsForWorkspaceFolder(groupFolder: string): void {
+  const rows = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%'",
+    )
+    .all(groupFolder) as Array<{ jid: string }>;
+  for (const row of rows) {
+    const mounts = listChannelMountsByWorkspace(row.jid);
+    for (const mount of mounts) {
+      syncAgentChannelMountFromMount(mount);
+    }
+  }
+}
+
+function syncAgentChannelMountsForWorkspaceJid(workspaceJid: string): void {
+  for (const mount of listChannelMountsByWorkspace(workspaceJid)) {
+    syncAgentChannelMountFromMount(mount);
+  }
+}
+
+export function getWorkspaceRecord(jid: string): WorkspaceRecord | undefined {
+  const row = db.prepare('SELECT * FROM workspaces WHERE jid = ?').get(jid) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? parseWorkspaceRecord(row) : undefined;
+}
+
+export function listWorkspaceRecords(): WorkspaceRecord[] {
+  const rows = db
+    .prepare('SELECT * FROM workspaces ORDER BY updated_at DESC')
+    .all() as Array<Record<string, unknown>>;
+  return rows.map(parseWorkspaceRecord);
+}
+
+export function getWorkspaceRuntimeSession(
+  groupFolder: string,
+  agentId?: string | null,
+): WorkspaceRuntimeSessionRecord | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    )
+    .get(groupFolder, agentId || '') as Record<string, unknown> | undefined;
+  return row ? parseWorkspaceRuntimeSessionRecord(row) : undefined;
+}
+
+export function listWorkspaceRuntimeSessionsByWorkspace(
+  workspaceJid: string,
+): WorkspaceRuntimeSessionRecord[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM workspace_runtime_sessions WHERE workspace_jid = ? ORDER BY updated_at DESC',
+    )
+    .all(workspaceJid) as Array<Record<string, unknown>>;
+  return rows.map(parseWorkspaceRuntimeSessionRecord);
+}
+
+export function getAgentChannelMount(
+  channelJid: string,
+): AgentChannelMountRecord | undefined {
+  const row = db
+    .prepare('SELECT * FROM agent_channel_mounts WHERE channel_jid = ?')
+    .get(channelJid) as (ChannelMountRow & Record<string, unknown>) | undefined;
+  return row ? parseAgentChannelMountRecord(row) : undefined;
+}
+
+export function listAgentChannelMountsForProfile(
+  agentProfileId: string,
+): AgentChannelMountRecord[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM agent_channel_mounts WHERE agent_profile_id = ? ORDER BY updated_at DESC',
+    )
+    .all(agentProfileId) as Array<ChannelMountRow & Record<string, unknown>>;
+  return rows.map(parseAgentChannelMountRecord);
+}
+
+export function listAgentChannelMountsByWorkspace(
+  workspaceJid: string,
+): AgentChannelMountRecord[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM agent_channel_mounts WHERE workspace_jid = ? ORDER BY updated_at DESC',
+    )
+    .all(workspaceJid) as Array<ChannelMountRow & Record<string, unknown>>;
+  return rows.map(parseAgentChannelMountRecord);
+}
+
+export function countAgentChannelMountsForProfile(
+  agentProfileId: string,
+): number {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as count FROM agent_channel_mounts WHERE agent_profile_id = ?',
+    )
+    .get(agentProfileId) as { count: number };
+  return row.count;
+}
+
+export function syncAllWorkspacesFromRegisteredGroups(): void {
+  const rows = db
+    .prepare("SELECT * FROM registered_groups WHERE jid LIKE 'web:%'")
+    .all() as RegisteredGroupRow[];
+  for (const row of rows) {
+    syncWorkspaceFromRegisteredGroup(row.jid, parseGroupRow(row));
+  }
+}
+
+export function syncAllWorkspaceRuntimeSessionsFromSessions(): void {
+  const rows = db
+    .prepare('SELECT group_folder, agent_id FROM sessions')
+    .all() as Array<{ group_folder: string; agent_id: string | null }>;
+  for (const row of rows) {
+    syncWorkspaceRuntimeSessionProjection(row.group_folder, row.agent_id ?? '');
+  }
+}
+
+/**
+ * Rebuild compatibility projections from their authoritative source tables.
+ * The whole pass is atomic and removes projection-only ghosts left by crashes
+ * or historical non-transactional dual writes.
+ */
+export function reconcileCanonicalRuntimeProjections(): void {
+  db.transaction(() => {
+    db.exec(`
+      DELETE FROM workspaces
+      WHERE NOT EXISTS (
+        SELECT 1 FROM registered_groups rg
+        WHERE rg.jid = workspaces.jid AND rg.jid LIKE 'web:%'
+      )
+    `);
+    syncAllWorkspacesFromRegisteredGroups();
+    db.exec(`
+      DELETE FROM workspace_agent_profiles
+      WHERE NOT EXISTS (
+        SELECT 1 FROM workspaces w
+        WHERE w.folder = workspace_agent_profiles.group_folder
+      )
+    `);
+
+    db.exec(`
+      DELETE FROM workspace_runtime_sessions
+      WHERE NOT EXISTS (
+        SELECT 1 FROM sessions s
+        WHERE s.group_folder = workspace_runtime_sessions.group_folder
+          AND s.agent_id = workspace_runtime_sessions.runtime_agent_id
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM registered_groups rg
+        WHERE rg.jid = workspace_runtime_sessions.workspace_jid
+          AND rg.jid LIKE 'web:%'
+          AND rg.folder = workspace_runtime_sessions.group_folder
+      )
+    `);
+    syncAllWorkspaceRuntimeSessionsFromSessions();
+
+    // Channel projections are cheap to rebuild and their source can change
+    // shape (workspace vs product Session target), so a full replace is safer
+    // than trying to infer every stale-target case.
+    syncAllChannelMountsFromRegisteredGroups();
+  })();
+}
+
 export function getRegisteredGroup(
   jid: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
@@ -3224,45 +3958,72 @@ export function getRegisteredGroup(
 }
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    jid,
-    group.name,
-    group.folder,
-    group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.executionMode ?? 'container',
-    group.customCwd ?? null,
-    group.initSourcePath ?? null,
-    group.initGitUrl ?? null,
-    group.created_by ?? null,
-    group.is_home ? 1 : 0,
-    null, // selected_skills: deprecated, always null (user-level skills apply globally)
-    group.target_agent_id ?? null,
-    group.target_main_jid ?? null,
-    group.reply_policy ?? 'source_only',
-    group.require_mention === true ? 1 : 0,
-    group.activation_mode ?? 'auto',
-    group.owner_im_id ?? null,
-    'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
-    null, // selected_mcps: deprecated, always null
-    group.conversation_source ?? 'manual',
-    group.conversation_nav_mode ?? 'horizontal',
-    group.binding_mode ?? 'single_context',
-    group.feishu_chat_mode ?? null,
-    group.feishu_group_message_type ?? null,
-    group.sender_allowlist != null
-      ? JSON.stringify(group.sender_allowlist)
-      : null,
-  );
-  syncChannelMountFromRegisteredGroup(jid, group);
+  db.transaction(() => {
+    const existing = getRegisteredGroup(jid);
+    db.prepare(
+      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      jid,
+      group.name,
+      group.folder,
+      group.added_at,
+      group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+      group.executionMode ?? 'container',
+      group.customCwd ?? null,
+      group.initSourcePath ?? null,
+      group.initGitUrl ?? null,
+      group.created_by ?? null,
+      group.is_home ? 1 : 0,
+      null, // selected_skills: deprecated, always null (user-level skills apply globally)
+      group.target_agent_id ?? null,
+      group.target_main_jid ?? null,
+      group.reply_policy ?? 'source_only',
+      group.require_mention === true ? 1 : 0,
+      group.activation_mode ?? 'auto',
+      group.owner_im_id ?? null,
+      'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
+      null, // selected_mcps: deprecated, always null
+      group.conversation_source ?? 'manual',
+      group.conversation_nav_mode ?? 'horizontal',
+      group.binding_mode ?? 'single_context',
+      group.feishu_chat_mode ?? null,
+      group.feishu_group_message_type ?? null,
+      group.sender_allowlist != null
+        ? JSON.stringify(group.sender_allowlist)
+        : null,
+    );
+    syncWorkspaceFromRegisteredGroup(jid, group);
+    syncChannelMountFromRegisteredGroup(jid, group);
+    if (jid.startsWith('web:')) {
+      if (existing?.folder && existing.folder !== group.folder) {
+        syncWorkspaceRuntimeSessionsForFolder(existing.folder);
+      }
+      syncWorkspaceRuntimeSessionsForFolder(group.folder);
+      syncAgentChannelMountsForWorkspaceJid(jid);
+    }
+  })();
 }
 
 export function deleteRegisteredGroup(jid: string): void {
-  deleteChannelMount(jid);
-  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+  db.transaction(() => {
+    const existing = getRegisteredGroup(jid);
+    deleteChannelMount(jid);
+    db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+    if (jid.startsWith('web:')) {
+      db.prepare(
+        `UPDATE registered_groups
+         SET target_main_jid = NULL, binding_mode = 'single_context'
+         WHERE target_main_jid = ? OR target_main_jid = ?`,
+      ).run(jid, existing?.folder ? `web:${existing.folder}` : jid);
+      deleteWorkspaceMirror(jid, existing?.folder);
+      if (existing?.folder && !getWorkspaceJidForFolder(existing.folder)) {
+        db.prepare(
+          'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+        ).run(existing.folder);
+      }
+    }
+  })();
 }
 
 /**
@@ -3459,45 +4220,54 @@ export function upsertChannelMount(
   mount: Omit<ChannelMount, 'created_at' | 'updated_at'> &
     Partial<Pick<ChannelMount, 'created_at' | 'updated_at'>>,
 ): ChannelMount {
-  const now = new Date().toISOString();
-  const existing = getChannelMount(mount.channel_jid);
-  const createdAt = mount.created_at ?? existing?.created_at ?? now;
-  const updatedAt = mount.updated_at ?? now;
-  db.prepare(
-    `INSERT INTO channel_mounts (
-      channel_jid, channel_type, workspace_jid, session_id, routing_mode,
-      reply_policy, activation_mode, owner_im_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(channel_jid) DO UPDATE SET
-      channel_type = excluded.channel_type,
-      workspace_jid = excluded.workspace_jid,
-      session_id = excluded.session_id,
-      routing_mode = excluded.routing_mode,
-      reply_policy = excluded.reply_policy,
-      activation_mode = excluded.activation_mode,
-      owner_im_id = excluded.owner_im_id,
-      updated_at = excluded.updated_at`,
-  ).run(
-    mount.channel_jid,
-    mount.channel_type,
-    mount.workspace_jid,
-    mount.session_id ?? null,
-    mount.routing_mode,
-    mount.reply_policy,
-    mount.activation_mode,
-    mount.owner_im_id ?? null,
-    createdAt,
-    updatedAt,
-  );
-  return getChannelMount(mount.channel_jid)!;
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    const existing = getChannelMount(mount.channel_jid);
+    const createdAt = mount.created_at ?? existing?.created_at ?? now;
+    const updatedAt = mount.updated_at ?? now;
+    db.prepare(
+      `INSERT INTO channel_mounts (
+        channel_jid, channel_type, workspace_jid, session_id, routing_mode,
+        reply_policy, activation_mode, owner_im_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(channel_jid) DO UPDATE SET
+        channel_type = excluded.channel_type,
+        workspace_jid = excluded.workspace_jid,
+        session_id = excluded.session_id,
+        routing_mode = excluded.routing_mode,
+        reply_policy = excluded.reply_policy,
+        activation_mode = excluded.activation_mode,
+        owner_im_id = excluded.owner_im_id,
+        updated_at = excluded.updated_at`,
+    ).run(
+      mount.channel_jid,
+      mount.channel_type,
+      mount.workspace_jid,
+      mount.session_id ?? null,
+      mount.routing_mode,
+      mount.reply_policy,
+      mount.activation_mode,
+      mount.owner_im_id ?? null,
+      createdAt,
+      updatedAt,
+    );
+    const saved = getChannelMount(mount.channel_jid)!;
+    syncAgentChannelMountFromMount(saved);
+    return saved;
+  })();
 }
 
 export function deleteChannelMount(channelJid: string): void {
   if (!db) return;
   try {
-    db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(
-      channelJid,
-    );
+    db.transaction(() => {
+      db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(
+        channelJid,
+      );
+      db.prepare('DELETE FROM agent_channel_mounts WHERE channel_jid = ?').run(
+        channelJid,
+      );
+    })();
   } catch {
     // Startup can call legacy group deletion paths before a pre-v42 DB has
     // created channel_mounts. The next init pass will create and backfill it.
@@ -3556,6 +4326,7 @@ export function syncChannelMountFromRegisteredGroup(
 
 export function syncAllChannelMountsFromRegisteredGroups(): void {
   db.prepare('DELETE FROM channel_mounts').run();
+  db.prepare('DELETE FROM agent_channel_mounts').run();
   const rows = db
     .prepare('SELECT * FROM registered_groups')
     .all() as RegisteredGroupRow[];
@@ -3823,6 +4594,9 @@ export function deleteChatHistory(chatJid: string): void {
 export function deleteImGroupRecord(jid: string): void {
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(jid);
+    db.prepare('DELETE FROM agent_channel_mounts WHERE channel_jid = ?').run(
+      jid,
+    );
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
@@ -3831,6 +4605,14 @@ export function deleteImGroupRecord(jid: string): void {
     // Feishu thread agents (source_kind='feishu_thread') and other chat-scoped
     // agents reference this jid via agents.chat_jid — without this, deleting
     // an IM group leaves orphan agent rows visible in the agents list.
+    db.prepare(
+      `DELETE FROM workspace_runtime_sessions
+       WHERE runtime_agent_id IN (SELECT id FROM agents WHERE chat_jid = ?)`,
+    ).run(jid);
+    db.prepare(
+      `DELETE FROM sessions
+       WHERE agent_id IN (SELECT id FROM agents WHERE chat_jid = ?)`,
+    ).run(jid);
     db.prepare('DELETE FROM agents WHERE chat_jid = ?').run(jid);
     db.prepare(
       'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
@@ -3855,6 +4637,9 @@ export function deleteGroupData(jid: string, folder: string): void {
        )`,
     ).run(folder, jid);
     db.prepare('DELETE FROM channel_mounts WHERE workspace_jid = ?').run(jid);
+    db.prepare('DELETE FROM agent_channel_mounts WHERE workspace_jid = ?').run(
+      jid,
+    );
     db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
       jid,
     );
@@ -3870,6 +4655,11 @@ export function deleteGroupData(jid: string, folder: string): void {
     // 3. 删除 workspace -> AgentProfile 归属映射
     db.prepare(
       'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+    ).run(folder);
+    // 3b. 删除 canonical workspace/session 镜像
+    db.prepare('DELETE FROM workspaces WHERE jid = ?').run(jid);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
     ).run(folder);
     // 4. 删除注册信息
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
@@ -5370,10 +6160,24 @@ export function listActiveConversationAgents(): SubAgent[] {
 }
 
 export function deleteAgent(id: string): void {
-  // Delete associated session
-  db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
-  deleteImContextBindingsByAgent(id);
-  db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+  db.transaction(() => {
+    // A product Session can own an SDK runtime resume row and channel mounts;
+    // clear all three projections together so direct DB callers cannot leave
+    // routable ghosts behind.
+    db.prepare(
+      `UPDATE registered_groups
+       SET target_agent_id = NULL, binding_mode = 'single_context'
+       WHERE target_agent_id = ?`,
+    ).run(id);
+    db.prepare('DELETE FROM channel_mounts WHERE session_id = ?').run(id);
+    db.prepare('DELETE FROM agent_channel_mounts WHERE session_id = ?').run(id);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE runtime_agent_id = ?',
+    ).run(id);
+    db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
+    deleteImContextBindingsByAgent(id);
+    db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+  })();
 }
 
 function mapAgentRow(row: Record<string, unknown>): SubAgent {

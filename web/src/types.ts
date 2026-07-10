@@ -18,7 +18,12 @@ export interface GroupInfo {
   custom_cwd?: string;
   created_by?: string;
   pinned_at?: string;
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
   conversation_source?: 'manual' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
   agent_profile_id?: string;
@@ -32,12 +37,72 @@ export interface AgentProfile {
   name: string;
   identity_prompt: string;
   include_claude_preset: boolean;
+  runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
   is_default: boolean;
   status: 'active' | 'archived';
   created_at: string;
   updated_at: string;
+}
+
+export interface AgentProfileRuntimePolicy {
+  provider_id: string | null;
+  skills: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+  mcp: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+  tools: {
+    mode: 'inherit' | 'readonly' | 'restricted';
+  };
+}
+
+export interface AgentProfileWorkspaceRuntimeSession {
+  runtime_agent_id: string;
+  sdk_session_id: string;
+  provider_id: string | null;
+  agent_profile_id: string | null;
+  agent_profile_version: number | null;
+  identity_hash: string | null;
+  updated_at: string;
+}
+
+export interface AgentProfileWorkspace {
+  jid: string;
+  name: string;
+  folder: string;
+  is_home: boolean;
+  execution_mode: 'container' | 'host';
+  added_at: string;
+  runtime_sessions: AgentProfileWorkspaceRuntimeSession[];
+}
+
+export interface AgentProfileChannelMount {
+  channel_jid: string;
+  channel_type: string;
+  workspace_jid: string;
+  workspace_folder: string | null;
+  session_id: string | null;
+  routing_mode: 'single_session' | 'thread_map';
+  reply_policy: 'source_only' | 'mirror';
+  activation_mode:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
+  owner_im_id: string | null;
+  updated_at: string;
+}
+
+export interface AgentProfileGovernance {
+  profile: AgentProfile;
+  workspaces: AgentProfileWorkspace[];
+  channel_mounts: AgentProfileChannelMount[];
 }
 
 export interface AgentInfo {
@@ -72,7 +137,12 @@ export interface AvailableImGroup {
   avatar?: string;
   member_count?: number;
   channel_type: string;
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
   owner_im_id?: string | null;
   binding_mode?: 'single_context' | 'thread_map';
   routing_mode?: 'single_session' | 'thread_map';

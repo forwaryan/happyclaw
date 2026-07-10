@@ -31,6 +31,7 @@ import { DirectoryBrowser } from '../shared/DirectoryBrowser';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useAgentProfilesStore } from '../../stores/agent-profiles';
+import { workspaceCreationBlockReason } from '../../utils/agent-product';
 
 interface CreateContainerDialogProps {
   open: boolean;
@@ -46,7 +47,9 @@ export function CreateContainerDialog({
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [executionMode, setExecutionMode] = useState<'container' | 'host'>('container');
+  const [executionMode, setExecutionMode] = useState<'container' | 'host'>(
+    'container',
+  );
   const [customCwd, setCustomCwd] = useState('');
   const [initMode, setInitMode] = useState<'empty' | 'local' | 'git'>('empty');
   const [initSourcePath, setInitSourcePath] = useState('');
@@ -57,6 +60,7 @@ export function CreateContainerDialog({
   const canHostExec = useAuthStore((s) => s.user?.role === 'admin');
   const profiles = useAgentProfilesStore((s) => s.profiles);
   const profilesLoading = useAgentProfilesStore((s) => s.loading);
+  const profilesError = useAgentProfilesStore((s) => s.profilesError);
   const loadProfiles = useAgentProfilesStore((s) => s.loadProfiles);
 
   useEffect(() => {
@@ -65,7 +69,8 @@ export function CreateContainerDialog({
 
   useEffect(() => {
     if (!open || selectedAgentProfileId || profiles.length === 0) return;
-    const defaultProfile = profiles.find((profile) => profile.is_default) ?? profiles[0];
+    const defaultProfile =
+      profiles.find((profile) => profile.is_default) ?? profiles[0];
     setSelectedAgentProfileId(defaultProfile.id);
   }, [open, profiles, selectedAgentProfileId]);
 
@@ -87,7 +92,14 @@ export function CreateContainerDialog({
 
   const handleConfirm = async () => {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    const blocked = workspaceCreationBlockReason({
+      name: trimmed,
+      submitting: loading,
+      profilesLoading,
+      profilesError,
+      selectedAgentProfileId,
+    });
+    if (blocked) return;
 
     setLoading(true);
     try {
@@ -102,8 +114,12 @@ export function CreateContainerDialog({
           options.init_git_url = initGitUrl.trim();
         }
       }
-      if (selectedAgentProfileId) options.agent_profile_id = selectedAgentProfileId;
-      const created = await createFlow(trimmed, Object.keys(options).length ? options : undefined);
+      if (selectedAgentProfileId)
+        options.agent_profile_id = selectedAgentProfileId;
+      const created = await createFlow(
+        trimmed,
+        Object.keys(options).length ? options : undefined,
+      );
       if (created) {
         onCreated(created.jid, created.folder);
         handleClose();
@@ -133,7 +149,11 @@ export function CreateContainerDialog({
               disabled={profilesLoading || profiles.length === 0}
             >
               <SelectTrigger className="w-full">
-                <SelectValue placeholder={profilesLoading ? '正在加载 Agent...' : '选择 Agent'} />
+                <SelectValue
+                  placeholder={
+                    profilesLoading ? '正在加载 Agent...' : '选择 Agent'
+                  }
+                />
               </SelectTrigger>
               <SelectContent>
                 {profiles.map((profile) => (
@@ -142,17 +162,45 @@ export function CreateContainerDialog({
                       <Bot className="w-3.5 h-3.5 text-muted-foreground" />
                       <span className="truncate">{profile.name}</span>
                       {profile.is_default && (
-                        <span className="text-[10px] text-muted-foreground">默认</span>
+                        <span className="text-[10px] text-muted-foreground">
+                          默认
+                        </span>
                       )}
-                      <span className="text-[10px] text-muted-foreground">v{profile.version}</span>
+                      <span className="text-[10px] text-muted-foreground">
+                        v{profile.version}
+                      </span>
                     </span>
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {profilesError && (
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-error/20 bg-error-bg px-2.5 py-2 text-xs text-error">
+                <span className="min-w-0">
+                  Agent 列表加载失败：{profilesError}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 flex-shrink-0"
+                  onClick={() => void loadProfiles()}
+                  disabled={profilesLoading}
+                >
+                  重试
+                </Button>
+              </div>
+            )}
+            {!profilesLoading && !profilesError && profiles.length === 0 && (
+              <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                暂无可用 Agent，请先到 Agent 页面创建。
+              </p>
+            )}
             {profiles.length > 0 && (
               <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
-                {profiles.find((profile) => profile.id === selectedAgentProfileId)?.identity_prompt ||
+                {profiles.find(
+                  (profile) => profile.id === selectedAgentProfileId,
+                )?.identity_prompt ||
                   '使用默认 Agent 行为，不追加额外身份提示词。'}
               </p>
             )}
@@ -164,7 +212,9 @@ export function CreateContainerDialog({
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleConfirm(); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleConfirm();
+              }}
               placeholder="输入这个 Agent 工作区的名称"
               autoFocus
             />
@@ -177,14 +227,20 @@ export function CreateContainerDialog({
               onClick={() => setAdvancedOpen(!advancedOpen)}
               className="w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
             >
-              {advancedOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+              {advancedOpen ? (
+                <ChevronDown className="w-4 h-4" />
+              ) : (
+                <ChevronRight className="w-4 h-4" />
+              )}
               高级选项
             </button>
             {advancedOpen && (
               <div className="px-3 pb-3 space-y-3 border-t">
                 {/* Execution mode */}
                 <div className="pt-3">
-                  <label className="block text-sm font-medium mb-2">执行模式</label>
+                  <label className="block text-sm font-medium mb-2">
+                    执行模式
+                  </label>
                   <div className="space-y-2">
                     <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
                       <input
@@ -192,35 +248,57 @@ export function CreateContainerDialog({
                         name="execution_mode"
                         value="container"
                         checked={executionMode === 'container'}
-                        onChange={() => { setExecutionMode('container'); setCustomCwd(''); }}
+                        onChange={() => {
+                          setExecutionMode('container');
+                          setCustomCwd('');
+                        }}
                         className="mt-0.5 accent-primary"
                       />
                       <div>
                         <div className="flex items-center gap-1.5">
                           <Box className="w-4 h-4 text-muted-foreground" />
-                          <span className="text-sm font-medium">Docker 模式</span>
-                          <span className="text-xs text-primary font-medium">推荐</span>
+                          <span className="text-sm font-medium">
+                            Docker 模式
+                          </span>
+                          <span className="text-xs text-primary font-medium">
+                            推荐
+                          </span>
                         </div>
-                        <p className="text-xs text-muted-foreground mt-0.5">在隔离的 Docker 环境中执行</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          在隔离的 Docker 环境中执行
+                        </p>
                       </div>
                     </label>
-                    <label className={`flex items-start gap-3 p-2 rounded-lg border transition-colors ${canHostExec ? 'cursor-pointer hover:bg-accent/50' : 'opacity-50 cursor-not-allowed'}`}>
+                    <label
+                      className={`flex items-start gap-3 p-2 rounded-lg border transition-colors ${canHostExec ? 'cursor-pointer hover:bg-accent/50' : 'opacity-50 cursor-not-allowed'}`}
+                    >
                       <input
                         type="radio"
                         name="execution_mode"
                         value="host"
                         checked={executionMode === 'host'}
-                        onChange={() => { if (canHostExec) { setExecutionMode('host'); setInitMode('empty'); setInitSourcePath(''); setInitGitUrl(''); } }}
+                        onChange={() => {
+                          if (canHostExec) {
+                            setExecutionMode('host');
+                            setInitMode('empty');
+                            setInitSourcePath('');
+                            setInitGitUrl('');
+                          }
+                        }}
                         disabled={!canHostExec}
                         className="mt-0.5 accent-primary"
                       />
                       <div>
                         <div className="flex items-center gap-1.5">
                           <Monitor className="w-4 h-4 text-muted-foreground" />
-                          <span className="text-sm font-medium">宿主机模式</span>
+                          <span className="text-sm font-medium">
+                            宿主机模式
+                          </span>
                         </div>
                         <p className="text-xs text-muted-foreground mt-0.5">
-                          {canHostExec ? '直接在服务器上执行' : '需要管理员权限'}
+                          {canHostExec
+                            ? '直接在服务器上执行'
+                            : '需要管理员权限'}
                         </p>
                       </div>
                     </label>
@@ -230,40 +308,79 @@ export function CreateContainerDialog({
                 {/* Container mode: workspace source */}
                 {executionMode === 'container' && (
                   <div className="pt-1">
-                    <label className="block text-sm font-medium mb-2">工作区来源</label>
+                    <label className="block text-sm font-medium mb-2">
+                      工作区来源
+                    </label>
                     <div className="space-y-2">
                       <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
-                        <input type="radio" name="init_mode" value="empty" checked={initMode === 'empty'} onChange={() => setInitMode('empty')} className="mt-0.5 accent-primary" />
+                        <input
+                          type="radio"
+                          name="init_mode"
+                          value="empty"
+                          checked={initMode === 'empty'}
+                          onChange={() => setInitMode('empty')}
+                          className="mt-0.5 accent-primary"
+                        />
                         <div>
-                          <span className="text-sm font-medium">空白工作区</span>
-                          <p className="text-xs text-muted-foreground mt-0.5">从空目录开始</p>
+                          <span className="text-sm font-medium">
+                            空白工作区
+                          </span>
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            从空目录开始
+                          </p>
                         </div>
                       </label>
                       {canHostExec && (
                         <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
-                          <input type="radio" name="init_mode" value="local" checked={initMode === 'local'} onChange={() => setInitMode('local')} className="mt-0.5 accent-primary" />
+                          <input
+                            type="radio"
+                            name="init_mode"
+                            value="local"
+                            checked={initMode === 'local'}
+                            onChange={() => setInitMode('local')}
+                            className="mt-0.5 accent-primary"
+                          />
                           <div className="flex-1">
                             <div className="flex items-center gap-1.5">
                               <FolderInput className="w-4 h-4 text-muted-foreground" />
-                              <span className="text-sm font-medium">复制本地目录</span>
+                              <span className="text-sm font-medium">
+                                复制本地目录
+                              </span>
                             </div>
-                            <p className="text-xs text-muted-foreground mt-0.5">将宿主机目录复制到工作区（隔离副本）</p>
+                            <p className="text-xs text-muted-foreground mt-0.5">
+                              将宿主机目录复制到工作区（隔离副本）
+                            </p>
                           </div>
                         </label>
                       )}
                       {initMode === 'local' && canHostExec && (
                         <div className="ml-6">
-                          <DirectoryBrowser value={initSourcePath} onChange={setInitSourcePath} placeholder="选择要复制的目录" />
+                          <DirectoryBrowser
+                            value={initSourcePath}
+                            onChange={setInitSourcePath}
+                            placeholder="选择要复制的目录"
+                          />
                         </div>
                       )}
                       <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
-                        <input type="radio" name="init_mode" value="git" checked={initMode === 'git'} onChange={() => setInitMode('git')} className="mt-0.5 accent-primary" />
+                        <input
+                          type="radio"
+                          name="init_mode"
+                          value="git"
+                          checked={initMode === 'git'}
+                          onChange={() => setInitMode('git')}
+                          className="mt-0.5 accent-primary"
+                        />
                         <div className="flex-1">
                           <div className="flex items-center gap-1.5">
                             <GitBranch className="w-4 h-4 text-muted-foreground" />
-                            <span className="text-sm font-medium">克隆 Git 仓库</span>
+                            <span className="text-sm font-medium">
+                              克隆 Git 仓库
+                            </span>
                           </div>
-                          <p className="text-xs text-muted-foreground mt-0.5">从 GitHub 等平台克隆仓库到工作区</p>
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            从 GitHub 等平台克隆仓库到工作区
+                          </p>
                         </div>
                       </label>
                       {initMode === 'git' && (
@@ -282,11 +399,16 @@ export function CreateContainerDialog({
                 {/* Host mode: custom cwd */}
                 {executionMode === 'host' && (
                   <>
-                    <DirectoryBrowser value={customCwd} onChange={setCustomCwd} placeholder="默认: data/groups/{folder}/" />
+                    <DirectoryBrowser
+                      value={customCwd}
+                      onChange={setCustomCwd}
+                      placeholder="默认: data/groups/{folder}/"
+                    />
                     <div className="flex items-start gap-2 p-2 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
                       <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
                       <p className="text-xs text-amber-700 dark:text-amber-300">
-                        宿主机模式下 Agent 可访问完整文件系统和工具链，请谨慎使用。
+                        宿主机模式下 Agent
+                        可访问完整文件系统和工具链，请谨慎使用。
                       </p>
                     </div>
                   </>
@@ -294,16 +416,28 @@ export function CreateContainerDialog({
               </div>
             )}
           </div>
-
         </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={handleClose} disabled={loading}>
             取消
           </Button>
-          <Button onClick={handleConfirm} disabled={loading || !name.trim()}>
+          <Button
+            onClick={handleConfirm}
+            disabled={
+              workspaceCreationBlockReason({
+                name,
+                submitting: loading,
+                profilesLoading,
+                profilesError,
+                selectedAgentProfileId,
+              }) !== null
+            }
+          >
             {loading && <Loader2 className="w-4 h-4 animate-spin" />}
-            {loading && (initMode === 'local' || initMode === 'git') ? '正在初始化工作区...' : '创建'}
+            {loading && (initMode === 'local' || initMode === 'git')
+              ? '正在初始化工作区...'
+              : '创建'}
           </Button>
         </DialogFooter>
       </DialogContent>

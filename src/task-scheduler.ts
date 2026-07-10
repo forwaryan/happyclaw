@@ -37,6 +37,7 @@ import {
   pauseTaskAfterRun,
   setSession,
   deleteSession,
+  deleteMessagesForChatJid,
   updateTaskAfterRun,
   updateTask,
 } from './db.js';
@@ -106,6 +107,7 @@ function toRunnerAgentProfile(profile: AgentProfile | undefined) {
     identityHash: profile.identity_hash,
     identityPrompt: profile.identity_prompt,
     includeClaudePreset: profile.include_claude_preset,
+    runtimePolicy: profile.runtime_policy,
   };
 }
 
@@ -126,6 +128,12 @@ function taskSessionNeedsAgentProfileReset(
     return false;
   }
   if (current.identity_hash !== profile.identity_hash) return true;
+  if (
+    current.agent_profile_version != null &&
+    current.agent_profile_version !== profile.version
+  ) {
+    return true;
+  }
   return !!current.agent_profile_id && current.agent_profile_id !== profile.id;
 }
 
@@ -148,6 +156,33 @@ function resolveTaskWorkspace(
   return { jid, folder: group.folder, group };
 }
 
+function resolveTaskRunWorkspace(
+  task: ScheduledTask,
+  deps: SchedulerDependencies,
+  options?: RunTaskOptions,
+): { jid: string; folder: string; group: RegisteredGroup } | null {
+  if (options?.sourceWorkspaceJid && options.sourceWorkspaceFolder) {
+    const group = deps.registeredGroups()[options.sourceWorkspaceJid];
+    if (!group || group.folder !== options.sourceWorkspaceFolder) {
+      logger.error(
+        {
+          taskId: task.id,
+          workspaceJid: options.sourceWorkspaceJid,
+          workspaceFolder: options.sourceWorkspaceFolder,
+        },
+        'Pinned task workspace disappeared before queued run started',
+      );
+      return null;
+    }
+    return {
+      jid: options.sourceWorkspaceJid,
+      folder: options.sourceWorkspaceFolder,
+      group,
+    };
+  }
+  return resolveTaskWorkspace(task, deps);
+}
+
 /**
  * Compute the queue JID for an isolated (non-group, non-script) task run.
  * The queue key is a virtual task chat under the source workspace. That keeps
@@ -157,10 +192,11 @@ function resolveTaskWorkspace(
  * Returns null when the source workspace cannot be resolved. The caller skips
  * the run and retries later instead of falling back to another workspace.
  */
-function computeIsolatedTaskQueueJid(
+function prepareIsolatedTaskRun(
   task: ScheduledTask,
   deps: SchedulerDependencies,
-): string | null {
+  manualRun = false,
+): { queueJid: string; options: RunTaskOptions } | null {
   const workspace = resolveTaskWorkspace(task, deps);
   if (!workspace) {
     logger.error(
@@ -173,7 +209,104 @@ function computeIsolatedTaskQueueJid(
     );
     return null;
   }
-  return `${workspace.jid}#task:${task.id}`;
+  const taskRunId = createIsolatedTaskRunId(task.id);
+  return {
+    queueJid: `${workspace.jid}#task:${taskRunId}`,
+    options: {
+      taskRunId,
+      manualRun,
+      sourceWorkspaceJid: workspace.jid,
+      sourceWorkspaceFolder: workspace.folder,
+    },
+  };
+}
+
+function createIsolatedTaskRunId(taskId: string): string {
+  const safeTaskId = taskId
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  return `task-${safeTaskId || 'run'}-${randomUUID()}`;
+}
+
+function createTaskSessionAgentId(taskRunId: string): string {
+  return `task-${taskRunId}`;
+}
+
+function cleanupIsolatedTaskRun(
+  task: ScheduledTask,
+  deps: SchedulerDependencies,
+  options?: RunTaskOptions,
+): void {
+  const taskRunId = options?.taskRunId;
+  if (!taskRunId) return;
+
+  // Only generated, Docker-safe identifiers may reach filesystem cleanup.
+  // This guard prevents a future caller from turning RunTaskOptions into a
+  // path traversal primitive.
+  if (!/^[a-zA-Z0-9_-]+$/.test(taskRunId)) {
+    logger.error(
+      { taskId: task.id, taskRunId },
+      'Refusing to clean unsafe isolated task run id',
+    );
+    return;
+  }
+
+  const resolvedWorkspace = resolveTaskRunWorkspace(task, deps, options);
+  const workspace = resolvedWorkspace ??
+    (options.sourceWorkspaceJid && options.sourceWorkspaceFolder
+      ? {
+          jid: options.sourceWorkspaceJid,
+          folder: options.sourceWorkspaceFolder,
+        }
+      : null);
+  if (!workspace) return;
+  const sessionAgentId = createTaskSessionAgentId(taskRunId);
+  const virtualChatJid = `${workspace.jid}#task:${taskRunId}`;
+
+  try {
+    deleteSession(workspace.folder, sessionAgentId);
+  } catch (err) {
+    logger.warn(
+      { taskId: task.id, taskRunId, err },
+      'Failed to delete isolated task session rows',
+    );
+  }
+  try {
+    deleteMessagesForChatJid(virtualChatJid);
+  } catch (err) {
+    logger.warn(
+      { taskId: task.id, taskRunId, err },
+      'Failed to delete isolated task virtual chat',
+    );
+  }
+
+  const paths = [
+    path.join(
+      DATA_DIR,
+      'sessions',
+      workspace.folder,
+      'agents',
+      sessionAgentId,
+    ),
+    path.join(
+      DATA_DIR,
+      'ipc',
+      workspace.folder,
+      'tasks-run',
+      taskRunId,
+    ),
+  ];
+  for (const runPath of paths) {
+    try {
+      fs.rmSync(runPath, { recursive: true, force: true });
+    } catch (err) {
+      logger.warn(
+        { taskId: task.id, taskRunId, runPath, err },
+        'Failed to delete isolated task run directory',
+      );
+    }
+  }
 }
 
 export interface SchedulerDependencies {
@@ -229,12 +362,31 @@ export interface RunTaskOptions {
   taskRunId?: string;
   /** Manual trigger — don't update next_run, skip isTaskStillActive check */
   manualRun?: boolean;
+  /** Workspace pinned when this run entered GroupQueue. */
+  sourceWorkspaceJid?: string;
+  sourceWorkspaceFolder?: string;
 }
 
 const runningTaskIds = new Set<string>();
+const pendingManualTaskIds = new Set<string>();
+const pendingScheduledTaskIds = new Set<string>();
+
+function isTaskReserved(taskId: string): boolean {
+  return (
+    runningTaskIds.has(taskId) ||
+    pendingManualTaskIds.has(taskId) ||
+    pendingScheduledTaskIds.has(taskId)
+  );
+}
 
 export function getRunningTaskIds(): string[] {
-  return [...runningTaskIds];
+  return [
+    ...new Set([
+      ...runningTaskIds,
+      ...pendingManualTaskIds,
+      ...pendingScheduledTaskIds,
+    ]),
+  ];
 }
 
 /**
@@ -452,7 +604,46 @@ async function runTask(
   try {
     await runTaskInner(task, deps, options);
   } finally {
+    cleanupIsolatedTaskRun(task, deps, options);
     runningTaskIds.delete(task.id);
+  }
+}
+
+export function enqueueIsolatedScheduledTask(
+  task: ScheduledTask,
+  deps: SchedulerDependencies,
+): boolean {
+  if (isTaskReserved(task.id)) return false;
+
+  const prepared = prepareIsolatedTaskRun(task, deps);
+  if (!prepared) return false;
+
+  pendingScheduledTaskIds.add(task.id);
+  const releaseReservation = () => {
+    pendingScheduledTaskIds.delete(task.id);
+  };
+
+  try {
+    const accepted = deps.queue.enqueueTask(
+      prepared.queueJid,
+      task.id,
+      async () => {
+        try {
+          await runTask(task, deps, prepared.options);
+        } finally {
+          releaseReservation();
+        }
+      },
+      { onDropped: releaseReservation },
+    );
+    if (accepted === false) {
+      releaseReservation();
+      return false;
+    }
+    return true;
+  } catch (err) {
+    releaseReservation();
+    throw err;
   }
 }
 
@@ -466,7 +657,7 @@ async function runTaskInner(
 
   // Agent tasks run in the source workspace directory, but use a task-scoped
   // virtual chat/session so scheduled automation does not pollute the main chat.
-  const workspace = resolveTaskWorkspace(task, deps);
+  const workspace = resolveTaskRunWorkspace(task, deps, options);
   const workspaceGroup = workspace?.group;
 
   if (!workspace || !workspaceGroup) {
@@ -645,8 +836,12 @@ async function runTaskInner(
     deps.queue.closeStdin(effectiveJid);
   };
 
-  // Use a task-scoped Claude session in the same workspace folder.
-  const taskSessionAgentId = `task:${task.id}`;
+  // Use a run-scoped Claude session in the same workspace folder. Reusing
+  // `task:${task.id}` would let isolated scheduled tasks accumulate context
+  // across runs, which contradicts the default isolated semantics.
+  const taskSessionAgentId = options?.taskRunId
+    ? createTaskSessionAgentId(options.taskRunId)
+    : `task-${task.id.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
   const agentProfile = getAgentProfileForWorkspace(
     workspace.folder,
     taskOwnerId,
@@ -746,6 +941,7 @@ async function runTaskInner(
             taskSessionAgentId,
             {
               agentProfileId: agentProfile?.id,
+              agentProfileVersion: agentProfile?.version,
               identityHash: agentProfile?.identity_hash,
             },
           );
@@ -776,6 +972,7 @@ async function runTaskInner(
     ) {
       setSession(workspace.folder, output.newSessionId, taskSessionAgentId, {
         agentProfileId: agentProfile?.id,
+        agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
     }
@@ -793,22 +990,6 @@ async function runTaskInner(
     lastOutputTime = Date.now();
     logger.error({ taskId: task.id, error }, 'Task failed');
   } finally {
-    // Clean up isolated task IPC directory
-    if (options?.taskRunId) {
-      const taskRunDir = path.join(
-        DATA_DIR,
-        'ipc',
-        workspace.folder,
-        'tasks-run',
-        options.taskRunId,
-      );
-      try {
-        fs.rmSync(taskRunDir, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
-
     // Safety net: finalize run log if not already done by onOutput callback
     finalizeRunLog();
   }
@@ -846,7 +1027,7 @@ async function runTaskInner(
           sourceKind: 'sdk_final',
           // Use source workspace folder for IM routing; task sessions are virtual
           // chats under that workspace and should inherit its channel bindings.
-          workspaceFolder: task.group_folder || undefined,
+          workspaceFolder: workspace.folder || undefined,
         });
       } catch (err) {
         logger.error(
@@ -1233,6 +1414,8 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 
   // Clean up stale state from previous process crash
   runningTaskIds.clear();
+  pendingManualTaskIds.clear();
+  pendingScheduledTaskIds.clear();
   try {
     const cleaned = cleanupStaleRunningLogs();
     if (cleaned > 0) {
@@ -1319,7 +1502,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        if (runningTaskIds.has(currentTask.id)) {
+        if (isTaskReserved(currentTask.id)) {
           continue;
         }
 
@@ -1442,17 +1625,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
             );
           });
         } else {
-          // Isolated mode (default): task-scoped session in the source workspace.
-          const taskQueueJid = computeIsolatedTaskQueueJid(currentTask, deps);
-          if (!taskQueueJid) {
-            // Workspace not ready (transient error); skip and retry next tick.
-            continue;
-          }
-          deps.queue.enqueueTask(taskQueueJid, currentTask.id, () =>
-            runTask(currentTask, deps, {
-              taskRunId: currentTask.id,
-            }),
-          );
+          // Isolated mode (default): reserve before enqueue so route mutation,
+          // duplicate scheduler ticks, and manual triggers all see this queued
+          // run as active even while GroupQueue is capacity-blocked.
+          enqueueIsolatedScheduledTask(currentTask, deps);
         }
       }
     } catch (err) {
@@ -1479,7 +1655,7 @@ export function triggerTaskNow(
     return { success: false, error: 'Task already completed' };
   if (task.status === 'parsing')
     return { success: false, error: '任务仍在解析中，请稍后再运行' };
-  if (runningTaskIds.has(taskId))
+  if (isTaskReserved(taskId))
     return { success: false, error: 'Task is already running' };
 
   const groups = deps.registeredGroups();
@@ -1487,28 +1663,58 @@ export function triggerTaskNow(
   if (!targetGroupJid)
     return { success: false, error: 'Target group not registered' };
 
+  pendingManualTaskIds.add(taskId);
+  const releaseManualReservation = () => {
+    pendingManualTaskIds.delete(taskId);
+  };
+
   if (task.execution_type === 'script') {
-    if (!hasScriptCapacity())
+    if (!hasScriptCapacity()) {
+      releaseManualReservation();
       return { success: false, error: 'Script concurrency limit reached' };
-    runScriptTask(task, deps, targetGroupJid, true).catch((err) =>
-      logger.error({ taskId, err }, 'Manual script task failed'),
-    );
+    }
+    runScriptTask(task, deps, targetGroupJid, true)
+      .catch((err) =>
+        logger.error({ taskId, err }, 'Manual script task failed'),
+      )
+      .finally(releaseManualReservation);
   } else if (task.context_mode === 'group') {
-    runGroupModeTask(task, deps, targetGroupJid, true).catch((err) =>
-      logger.error({ taskId, err }, 'Manual group-mode task failed'),
-    );
+    runGroupModeTask(task, deps, targetGroupJid, true)
+      .catch((err) =>
+        logger.error({ taskId, err }, 'Manual group-mode task failed'),
+      )
+      .finally(releaseManualReservation);
   } else {
-    const opts: RunTaskOptions = { manualRun: true, taskRunId: task.id };
-    const taskQueueJid = computeIsolatedTaskQueueJid(task, deps);
-    if (!taskQueueJid) {
+    const prepared = prepareIsolatedTaskRun(task, deps, true);
+    if (!prepared) {
+      releaseManualReservation();
       return { success: false, error: 'Failed to prepare task workspace' };
     }
-    deps.queue.enqueueTask(
-      taskQueueJid,
-      task.id,
-      () => runTask(task, deps, opts),
-      { allowInactive: true },
-    );
+    try {
+      const accepted = deps.queue.enqueueTask(
+        prepared.queueJid,
+        task.id,
+        async () => {
+          try {
+            await runTask(task, deps, prepared.options);
+          } finally {
+            releaseManualReservation();
+          }
+        },
+        {
+          allowInactive: true,
+          onDropped: releaseManualReservation,
+        },
+      );
+      if (accepted === false) {
+        releaseManualReservation();
+        return { success: false, error: 'Task queue is shutting down' };
+      }
+    } catch (err) {
+      releaseManualReservation();
+      logger.error({ taskId, err }, 'Failed to enqueue manual task');
+      return { success: false, error: 'Failed to enqueue task' };
+    }
   }
 
   return { success: true };

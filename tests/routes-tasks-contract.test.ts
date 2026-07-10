@@ -55,6 +55,8 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
 
 const tasksRoutesModule = await import('../src/routes/tasks.js');
 const db = await import('../src/db.js');
+const { enqueueIsolatedScheduledTask, getRunningTaskIds } =
+  await import('../src/task-scheduler.js');
 
 const tasksRoutes = tasksRoutesModule.default;
 
@@ -119,6 +121,15 @@ async function deleteTask(id: string) {
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
+async function patchTask(id: string, body: Record<string, unknown>) {
+  const res = await tasksRoutes.request(`/${id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
 beforeAll(() => {
   db.initDatabase();
 });
@@ -129,6 +140,7 @@ beforeEach(() => {
     'bob-task',
     'legacy-task',
     'dirty-source-task',
+    'queued-route-task',
   ]) {
     try {
       db.deleteTask(id);
@@ -191,5 +203,75 @@ describe('tasks route ownership and cleanup contract', () => {
     expect(db.getTaskById('dirty-source-task')).toBeUndefined();
     expect(db.getRegisteredGroup(GROUP_JID)).toBeTruthy();
     expect(fs.readFileSync(marker, 'utf8')).toBe('workspace data');
+  });
+
+  test('capacity-queued scheduled run blocks route mutation and drop releases it', async () => {
+    const targetJid = 'web:tasks-contract-target';
+    const targetFolder = 'tasks-contract-target';
+    db.setRegisteredGroup(targetJid, {
+      name: 'Target Workspace',
+      folder: targetFolder,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    db.addGroupMember(targetFolder, OWNER_ID, 'owner');
+    createTask('queued-route-task', OWNER_ID);
+
+    const droppedCallbacks: Array<() => void> = [];
+    const queue = {
+      enqueueTask: vi.fn(
+        (
+          _jid: string,
+          _taskId: string,
+          _fn: () => Promise<void>,
+          options?: { onDropped?: () => void },
+        ) => {
+          if (options?.onDropped) droppedCallbacks.push(options.onDropped);
+          return true;
+        },
+      ),
+    };
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+      [targetJid]: db.getRegisteredGroup(targetJid)!,
+    };
+    const deps = {
+      registeredGroups: () => groups,
+      queue,
+    } as any;
+
+    expect(
+      enqueueIsolatedScheduledTask(
+        db.getTaskById('queued-route-task')!,
+        deps,
+      ),
+    ).toBe(true);
+    expect(getRunningTaskIds()).toContain('queued-route-task');
+
+    asUser(OWNER_ID);
+    const blocked = await patchTask('queued-route-task', {
+      chat_jid: targetJid,
+    });
+    expect(blocked.status).toBe(409);
+    expect(db.getTaskById('queued-route-task')?.chat_jid).toBe(GROUP_JID);
+
+    droppedCallbacks.shift()?.();
+    expect(getRunningTaskIds()).not.toContain('queued-route-task');
+    const patched = await patchTask('queued-route-task', {
+      chat_jid: targetJid,
+    });
+    expect(patched.status).toBe(200);
+    expect(db.getTaskById('queued-route-task')?.chat_jid).toBe(targetJid);
+
+    expect(
+      enqueueIsolatedScheduledTask(
+        db.getTaskById('queued-route-task')!,
+        deps,
+      ),
+    ).toBe(true);
+    expect(queue.enqueueTask).toHaveBeenCalledTimes(2);
+    droppedCallbacks.shift()?.();
   });
 });

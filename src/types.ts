@@ -104,12 +104,28 @@ export interface AgentProfile {
   name: string;
   identity_prompt: string;
   include_claude_preset: boolean;
+  runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
   is_default: boolean;
   status: 'active' | 'archived';
   created_at: string;
   updated_at: string;
+}
+
+export interface AgentProfileRuntimePolicy {
+  provider_id: string | null;
+  skills: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+  mcp: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+  tools: {
+    mode: 'inherit' | 'readonly' | 'restricted';
+  };
 }
 
 export interface GroupMember {

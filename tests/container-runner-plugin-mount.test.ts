@@ -57,7 +57,11 @@ const catalog = await import('../src/plugin-catalog.js');
 const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
 
-const { buildVolumeMounts, prepareHostPlugins } = containerRunner;
+const {
+  buildVolumeMounts,
+  prepareHostPlugins,
+  replaceHostMcpServersEnv,
+} = containerRunner;
 const { writeCatalogIndex, getCatalogSnapshotDir } = catalog;
 const { CONTAINER_PLUGINS_PATH } = utils;
 const { getUserRuntimeRoot, getUserPluginRuntimeDir } = materializer;
@@ -255,6 +259,322 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
     expect(mounts.some((m) => m.containerPath === '/workspace/CLAUDE.md')).toBe(false);
     expect(mounts.some((m) => m.containerPath === '/workspace/.claude/rules')).toBe(false);
     expect(mounts.some((m) => m.containerPath === '/workspace/external-skills')).toBe(false);
+  });
+});
+
+describe('buildVolumeMounts — AgentProfile runtime policy', () => {
+  test('writes AgentProfile tools policy into the container env file', () => {
+    buildVolumeMounts(
+      fakeGroup('grp-policy-tools', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        id: 'agent-profile-policy',
+        name: 'Policy Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          provider_id: null,
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'inherit', ids: [] },
+          tools: { mode: 'readonly' },
+        },
+      },
+    );
+
+    const envFile = path.join(tmpDataDir, 'env', 'grp-policy-tools', 'env');
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    expect(envContent).toContain('HAPPYCLAW_AGENT_DISALLOWED_TOOLS=');
+    expect(envContent).toContain("HAPPYCLAW_AGENT_TOOL_POLICY='readonly'");
+    expect(envContent).toContain('Write');
+    expect(envContent).toContain('Bash');
+  });
+
+  test('custom skills policy exposes only selected user skills', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    fs.mkdirSync(path.join(sourceRoot, 'review'), { recursive: true });
+    fs.mkdirSync(path.join(sourceRoot, 'research'), { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'review', 'SKILL.md'), '# review');
+    fs.writeFileSync(
+      path.join(sourceRoot, 'research', 'SKILL.md'),
+      '# research',
+    );
+
+    const mounts = buildVolumeMounts(
+      fakeGroup('grp-policy-skills', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        id: 'agent-profile-skills',
+        name: 'Skills Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          provider_id: null,
+          skills: { mode: 'custom', ids: ['review'] },
+          mcp: { mode: 'inherit', ids: [] },
+          tools: { mode: 'inherit' },
+        },
+      },
+    );
+
+    const userSkillsMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/user-skills',
+    );
+    expect(userSkillsMount).toBeTruthy();
+    expect(fs.existsSync(path.join(userSkillsMount!.hostPath, 'review'))).toBe(true);
+    expect(fs.existsSync(path.join(userSkillsMount!.hostPath, 'research'))).toBe(false);
+  });
+
+  test('custom skill runtimes are immutable and isolated by profile version', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    fs.mkdirSync(path.join(sourceRoot, 'review'), { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'review', 'SKILL.md'), '# review');
+
+    const profile = (version: number) => ({
+      id: 'agent-profile-skills-versioned',
+      name: 'Skills Agent',
+      version,
+      identityHash: `hash-${version}`,
+      identityPrompt: '',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        provider_id: null,
+        skills: { mode: 'custom' as const, ids: ['review'] },
+        mcp: { mode: 'inherit' as const, ids: [] },
+        tools: { mode: 'inherit' as const },
+      },
+    });
+
+    const v1Mounts = buildVolumeMounts(
+      fakeGroup('grp-policy-skills-v1', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      profile(1),
+    );
+    const v2Mounts = buildVolumeMounts(
+      fakeGroup('grp-policy-skills-v2', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      profile(2),
+    );
+    const v1 = v1Mounts.find(
+      (mount) => mount.containerPath === '/workspace/user-skills',
+    )!;
+    const v2 = v2Mounts.find(
+      (mount) => mount.containerPath === '/workspace/user-skills',
+    )!;
+
+    expect(v1.hostPath).not.toBe(v2.hostPath);
+    expect(v1.hostPath).toContain(`${path.sep}v1${path.sep}`);
+    expect(v2.hostPath).toContain(`${path.sep}v2${path.sep}`);
+    expect(fs.existsSync(path.join(v1.hostPath, 'review'))).toBe(true);
+    expect(fs.existsSync(path.join(v2.hostPath, 'review'))).toBe(true);
+  });
+
+  test('custom skill policy fails closed when a selected skill is deleted', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    const skillDir = path.join(sourceRoot, 'review');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '# review');
+    const profile = {
+      id: 'agent-profile-deleted-skill',
+      name: 'Skills Agent',
+      version: 1,
+      identityHash: 'hash',
+      identityPrompt: '',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        provider_id: null,
+        skills: { mode: 'custom' as const, ids: ['review'] },
+        mcp: { mode: 'inherit' as const, ids: [] },
+        tools: { mode: 'inherit' as const },
+      },
+    };
+
+    buildVolumeMounts(
+      fakeGroup('grp-policy-skill-before-delete', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      profile,
+    );
+    fs.unlinkSync(path.join(skillDir, 'SKILL.md'));
+
+    expect(() =>
+      buildVolumeMounts(
+        fakeGroup('grp-policy-skill-after-delete', USER) as any,
+        false,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        profile,
+      ),
+    ).toThrow(
+      'AgentProfile agent-profile-deleted-skill requires unavailable skill definition review/SKILL.md',
+    );
+  });
+
+  test('custom MCP policy replaces settings with only selected servers', () => {
+    const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
+    fs.mkdirSync(mcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          github: { enabled: true, command: 'github-mcp' },
+          slack: { enabled: true, command: 'slack-mcp' },
+        },
+      }),
+    );
+
+    buildVolumeMounts(
+      fakeGroup('grp-policy-mcp', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        id: 'agent-profile-mcp',
+        name: 'MCP Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          provider_id: null,
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'custom', ids: ['github'] },
+          tools: { mode: 'inherit' },
+        },
+      },
+    );
+
+    const settingsFile = path.join(
+      tmpDataDir,
+      'sessions',
+      'grp-policy-mcp',
+      '.claude',
+      'settings.json',
+    );
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    expect(Object.keys(settings.mcpServers ?? {})).toEqual(['github']);
+  });
+
+  test('host MCP env replaces inherited servers and clears disabled policy', () => {
+    const env = {
+      HAPPYCLAW_USER_MCP_SERVERS_JSON: JSON.stringify({ stale: {} }),
+      KEEP_ME: 'yes',
+    };
+
+    replaceHostMcpServersEnv(env, { github: { command: 'github-mcp' } });
+    expect(JSON.parse(env.HAPPYCLAW_USER_MCP_SERVERS_JSON)).toEqual({
+      github: { command: 'github-mcp' },
+    });
+    expect(env.KEEP_ME).toBe('yes');
+
+    replaceHostMcpServersEnv(env, {});
+    expect(env.HAPPYCLAW_USER_MCP_SERVERS_JSON).toBeUndefined();
+    expect(env.KEEP_ME).toBe('yes');
+  });
+
+  test('custom MCP policy fails closed when a selected server is disabled', () => {
+    const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
+    fs.mkdirSync(mcpDir, { recursive: true });
+    const serversFile = path.join(mcpDir, 'servers.json');
+    fs.writeFileSync(
+      serversFile,
+      JSON.stringify({
+        servers: {
+          github: { enabled: true, command: 'github-mcp' },
+        },
+      }),
+    );
+    const profile = {
+      id: 'agent-profile-disabled-mcp',
+      name: 'MCP Agent',
+      version: 1,
+      identityHash: 'hash',
+      identityPrompt: '',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        provider_id: null,
+        skills: { mode: 'inherit' as const, ids: [] },
+        mcp: { mode: 'custom' as const, ids: ['github'] },
+        tools: { mode: 'inherit' as const },
+      },
+    };
+    buildVolumeMounts(
+      fakeGroup('grp-policy-mcp-before-disable', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      profile,
+    );
+    fs.writeFileSync(
+      serversFile,
+      JSON.stringify({
+        servers: {
+          github: { enabled: false, command: 'github-mcp' },
+        },
+      }),
+    );
+
+    expect(() =>
+      buildVolumeMounts(
+        fakeGroup('grp-policy-mcp-after-disable', USER) as any,
+        false,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        profile,
+      ),
+    ).toThrow(
+      'AgentProfile agent-profile-disabled-mcp requires unavailable MCP server(s): github',
+    );
   });
 });
 

@@ -12,6 +12,7 @@ import {
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
@@ -59,6 +60,8 @@ import {
   syncHostClaudeContext,
 } from './claude-context-resolver.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
+import type { AgentProfileRuntimePolicy } from './types.js';
+import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import {
   attachStderrHandler,
@@ -179,6 +182,7 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
 function ensureSettingsJson(
   settingsFile: string,
   mcpServers?: Record<string, Record<string, unknown>>,
+  options?: { replaceMcpServers?: boolean },
 ): void {
   let existing: Record<string, unknown> = {};
   try {
@@ -193,8 +197,12 @@ function ensureSettingsJson(
   const mergedEnv = { ...existingEnv, ...REQUIRED_SETTINGS_ENV };
   const merged: Record<string, unknown> = { ...existing, env: mergedEnv };
 
-  // Merge user-configured MCP servers into settings
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
+  // Merge user-configured MCP servers into settings by default. AgentProfile
+  // policy uses replace mode so disabled/custom MCP does not leave stale
+  // servers from an earlier run in the session settings.
+  if (options?.replaceMcpServers) {
+    merged.mcpServers = mcpServers ?? {};
+  } else if (mcpServers && Object.keys(mcpServers).length > 0) {
     const existingMcp = (existing.mcpServers as Record<string, unknown>) || {};
     merged.mcpServers = { ...existingMcp, ...mcpServers };
   }
@@ -245,6 +253,7 @@ export interface ContainerInput {
     identityHash: string;
     identityPrompt: string;
     includeClaudePreset: boolean;
+    runtimePolicy?: AgentProfileRuntimePolicy;
   };
   agentId?: string;
   agentName?: string;
@@ -274,6 +283,13 @@ export interface ContainerOutput {
   /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
    * >0 时主进程把流式卡片保持在「后台任务运行中」而非定稿。 */
   pendingBgTasks?: number;
+  inputTurnCompleted?: boolean;
+  ipcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{ timestamp: string; id: string }>;
+    cursor: { timestamp: string; id: string };
+  }>;
 }
 
 interface VolumeMount {
@@ -296,9 +312,171 @@ function mkdirForContainer(dirPath: string): void {
   }
 }
 
+export function replaceHostMcpServersEnv(
+  env: Record<string, string>,
+  servers: Record<string, Record<string, unknown>>,
+): void {
+  delete env['HAPPYCLAW_USER_MCP_SERVERS_JSON'];
+  if (Object.keys(servers).length > 0) {
+    env['HAPPYCLAW_USER_MCP_SERVERS_JSON'] = JSON.stringify(servers);
+  }
+}
+
 interface ResolvedProvider {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+}
+
+type RunnerAgentProfile = NonNullable<ContainerInput['agentProfile']>;
+
+function getAgentProfileProviderPolicy(
+  agentProfile?: RunnerAgentProfile,
+): string | null {
+  return agentProfile?.runtimePolicy?.provider_id?.trim() || null;
+}
+
+function sanitizeRuntimePolicyPathSegment(value: string): string {
+  return (
+    value
+      .replace(/[^a-zA-Z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 96) || 'default'
+  );
+}
+
+function resolveAgentProfileUserSkillsPolicy(
+  ownerId: string | undefined,
+  agentProfile?: RunnerAgentProfile,
+): { mountUserSkills: boolean; userSkillsDirOverride?: string } {
+  const policy = agentProfile?.runtimePolicy?.skills;
+  if (!ownerId || !policy || policy.mode === 'inherit') {
+    return { mountUserSkills: !!ownerId };
+  }
+  if (policy.mode === 'disabled') {
+    return { mountUserSkills: false };
+  }
+
+  const sourceRoot = path.join(DATA_DIR, 'skills', ownerId);
+  const selectedSkills = policy.ids.map((id) => {
+    const source = path.join(sourceRoot, id);
+    if (!validateSkillId(id) || !validateSkillPath(sourceRoot, source)) {
+      throw new Error(
+        `AgentProfile ${agentProfile.id} selects unsafe skill id ${id}`,
+      );
+    }
+    let isDirectory = false;
+    try {
+      isDirectory = fs.statSync(source).isDirectory();
+    } catch {
+      // Report the same policy failure for deleted and never-installed skills.
+    }
+    if (!isDirectory) {
+      throw new Error(
+        `AgentProfile ${agentProfile.id} requires unavailable skill ${id}`,
+      );
+    }
+    let hasSkillDefinition = false;
+    try {
+      hasSkillDefinition = fs
+        .statSync(path.join(source, 'SKILL.md'))
+        .isFile();
+    } catch {
+      // Disabled/deleted definitions must invalidate the exact-set policy.
+    }
+    if (!hasSkillDefinition) {
+      throw new Error(
+        `AgentProfile ${agentProfile.id} requires unavailable skill definition ${id}/SKILL.md`,
+      );
+    }
+    return { id, source };
+  });
+  const runtimeRoot = path.join(
+    DATA_DIR,
+    'agent-profile-runtime',
+    ownerId,
+    sanitizeRuntimePolicyPathSegment(agentProfile.id),
+    `v${agentProfile.version}`,
+    'skills',
+  );
+  if (!fs.existsSync(runtimeRoot)) {
+    const stagingRoot = `${runtimeRoot}.tmp-${randomUUID()}`;
+    fs.mkdirSync(stagingRoot, { recursive: true });
+    try {
+      for (const { id, source } of selectedSkills) {
+        fs.symlinkSync(source, path.join(stagingRoot, id));
+      }
+      fs.mkdirSync(path.dirname(runtimeRoot), { recursive: true });
+      try {
+        fs.renameSync(stagingRoot, runtimeRoot);
+      } catch (err) {
+        // A concurrent runner may have published the same immutable version.
+        if (!fs.existsSync(runtimeRoot)) throw err;
+      }
+    } finally {
+      fs.rmSync(stagingRoot, { recursive: true, force: true });
+    }
+  }
+
+  return { mountUserSkills: true, userSkillsDirOverride: runtimeRoot };
+}
+
+function resolveAgentProfileMcpPolicy(
+  allServers: Record<string, Record<string, unknown>>,
+  agentProfile?: RunnerAgentProfile,
+): {
+  servers: Record<string, Record<string, unknown>>;
+  replaceMcpServers: boolean;
+} {
+  const policy = agentProfile?.runtimePolicy?.mcp;
+  if (!policy || policy.mode === 'inherit') {
+    return { servers: allServers, replaceMcpServers: false };
+  }
+  if (policy.mode === 'disabled') {
+    return { servers: {}, replaceMcpServers: true };
+  }
+
+  const missingIds = policy.ids.filter(
+    (id) => !Object.prototype.hasOwnProperty.call(allServers, id),
+  );
+  if (missingIds.length > 0) {
+    throw new Error(
+      `AgentProfile ${agentProfile?.id ?? 'unknown'} requires unavailable MCP server(s): ${missingIds.join(', ')}`,
+    );
+  }
+  const allowed = new Set(policy.ids);
+  return {
+    servers: Object.fromEntries(
+      Object.entries(allServers).filter(([name]) => allowed.has(name)),
+    ),
+    replaceMcpServers: true,
+  };
+}
+
+function resolveAgentProfileDisallowedTools(
+  agentProfile?: RunnerAgentProfile,
+): string[] {
+  switch (agentProfile?.runtimePolicy?.tools.mode) {
+    case 'readonly':
+      return ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash'];
+    case 'restricted':
+      return [
+        'Write',
+        'Edit',
+        'MultiEdit',
+        'NotebookEdit',
+        'Bash',
+        'WebSearch',
+        'WebFetch',
+      ];
+    default:
+      return [];
+  }
+}
+
+function getAgentProfileToolPolicyMode(
+  agentProfile?: RunnerAgentProfile,
+): 'inherit' | 'readonly' | 'restricted' {
+  return agentProfile?.runtimePolicy?.tools.mode ?? 'inherit';
 }
 
 /**
@@ -332,7 +510,19 @@ export function setProviderOverride(
 export function willClearSessionOnProviderSwitch(
   groupFolder: string,
   agentId?: string | null,
+  agentProfile?: RunnerAgentProfile,
 ): boolean {
+  const policyProviderId = getAgentProfileProviderPolicy(agentProfile);
+  if (policyProviderId) {
+    const boundId = getSessionProviderId(groupFolder, agentId);
+    if (!boundId) return false;
+    const enabledProviders = getEnabledProviders();
+    const policyProviderEnabled = enabledProviders.some(
+      (provider) => provider.id === policyProviderId,
+    );
+    return policyProviderEnabled && boundId !== policyProviderId;
+  }
+
   // Env-level provider override means the pool is bypassed entirely — no
   // pool-driven switch, so the session is never cleared on this account.
   const override = getContainerEnvConfig(groupFolder);
@@ -388,9 +578,10 @@ export function willClearSessionOnProviderSwitch(
  * (different OAuth account / API key). Each successful selection updates the
  * binding via setSessionProviderId().
  */
-function trySelectPoolProvider(
+export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
+  agentProfile?: RunnerAgentProfile,
 ): {
   profileId: string;
   resolved: ResolvedProvider;
@@ -403,9 +594,50 @@ function trySelectPoolProvider(
     override.anthropicAuthToken ||
     override.anthropicBaseUrl
   );
-  if (hasOverride) return null;
-
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
+  const policyProviderId = getAgentProfileProviderPolicy(agentProfile);
+  if (policyProviderId) {
+    const ignoredOverrideProviderId = providerOverrides.get(groupFolder);
+    if (ignoredOverrideProviderId) {
+      providerOverrides.delete(groupFolder);
+      logger.info(
+        {
+          groupFolder,
+          ignoredProviderId: ignoredOverrideProviderId,
+          policyProviderId,
+          agentProfileId: agentProfile?.id,
+        },
+        'Ignoring one-time provider override because AgentProfile pins a provider',
+      );
+    }
+
+    const enabledProviders = getEnabledProviders();
+    if (!enabledProviders.some((provider) => provider.id === policyProviderId)) {
+      throw new Error(
+        `AgentProfile ${agentProfile?.id ?? 'unknown'} pins unavailable provider ${policyProviderId}`,
+      );
+    }
+    try {
+      const balancing = getBalancingConfig();
+      providerPool.refreshFromConfig(enabledProviders, balancing);
+      const resolved = resolveProviderById(policyProviderId);
+      providerPool.acquireSession(policyProviderId);
+      setSessionProviderId(groupFolder, agentId, policyProviderId);
+      return {
+        profileId: policyProviderId,
+        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        previousProviderId: existingBoundId,
+        resetSession: !!existingBoundId && existingBoundId !== policyProviderId,
+      };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `AgentProfile ${agentProfile?.id ?? 'unknown'} failed to use pinned provider ${policyProviderId}: ${reason}`,
+      );
+    }
+  }
+
+  if (hasOverride) return null;
 
   // Check one-time override (consumed on use)
   const overrideProviderId = providerOverrides.get(groupFolder);
@@ -463,10 +695,7 @@ function trySelectPoolProvider(
           );
           return {
             profileId: boundId,
-            resolved: {
-              config: resolved.config,
-              customEnv: resolved.customEnv,
-            },
+            resolved: { config: resolved.config, customEnv: resolved.customEnv },
           };
         } catch (err) {
           logger.warn(
@@ -559,6 +788,7 @@ export function buildVolumeMounts(
   taskRunId?: string,
   resolvedProvider?: ResolvedProvider,
   ipcAgentId?: string,
+  agentProfile?: RunnerAgentProfile,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -633,6 +863,10 @@ export function buildVolumeMounts(
       )
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   mkdirForContainer(groupSessionsDir);
+  const userSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
+    ownerId,
+    agentProfile,
+  );
   const claudeContextPlan = buildClaudeContextPlan({
     executionMode: 'container',
     group,
@@ -641,11 +875,15 @@ export function buildVolumeMounts(
     projectRoot,
     dataDir: DATA_DIR,
     groupSessionsDir,
-    mountUserSkills,
+    mountUserSkills: mountUserSkills && userSkillsPolicy.mountUserSkills,
+    userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
   });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
-  ensureSettingsJson(settingsFile, mcpServers);
+  const mcpPolicy = resolveAgentProfileMcpPolicy(mcpServers, agentProfile);
+  ensureSettingsJson(settingsFile, mcpPolicy.servers, {
+    replaceMcpServers: mcpPolicy.replaceMcpServers,
+  });
 
   mounts.push({
     hostPath: groupSessionsDir,
@@ -804,6 +1042,16 @@ export function buildVolumeMounts(
   // 此时不注入，避免覆盖用户可能在 provider customEnv 里设的 SUBAGENT_MODEL（与 autoCompact 对称）。
   if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
     envLines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
+  }
+  const disallowedTools = resolveAgentProfileDisallowedTools(agentProfile);
+  const toolPolicyMode = getAgentProfileToolPolicyMode(agentProfile);
+  if (toolPolicyMode !== 'inherit') {
+    envLines.push(`HAPPYCLAW_AGENT_TOOL_POLICY=${toolPolicyMode}`);
+  }
+  if (disallowedTools.length > 0) {
+    envLines.push(
+      `HAPPYCLAW_AGENT_DISALLOWED_TOOLS=${JSON.stringify(disallowedTools)}`,
+    );
   }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
@@ -966,7 +1214,11 @@ export async function runContainerAgent(
   mkdirForContainer(groupDir);
 
   // ─── Provider Pool selection ───
-  const poolResult = trySelectPoolProvider(group.folder, sessionAgentId);
+  const poolResult = trySelectPoolProvider(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile,
+  );
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
   let providerFailureReported = false;
@@ -1005,6 +1257,7 @@ export async function runContainerAgent(
       input.taskRunId,
       resolvedProvider,
       input.agentId,
+      input.agentProfile,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -1512,14 +1765,22 @@ export async function runHostAgent(
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = group.created_by
-    ? loadUserMcpServers(group.created_by)
-    : {};
-  ensureSettingsJson(settingsFile, hostMcpServers);
+  const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
+  const hostMcpPolicy = resolveAgentProfileMcpPolicy(
+    hostMcpServers,
+    input.agentProfile,
+  );
+  ensureSettingsJson(settingsFile, hostMcpPolicy.servers, {
+    replaceMcpServers: hostMcpPolicy.replaceMcpServers,
+  });
 
   // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
   // happyclawMemoryActive：记忆层未禁用 + admin 原生 ~/.claude/CLAUDE.md 并存时触发 audit 告警。
   // 与下方 disableMemoryLayer 同源（共用 isAdminHomeMemoryDisabled），口径保持一致。
+  const hostUserSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
+    group.created_by,
+    input.agentProfile,
+  );
   const hostClaudeContextPlan = buildClaudeContextPlan({
     executionMode: 'host',
     group,
@@ -1528,6 +1789,8 @@ export async function runHostAgent(
     projectRoot: process.cwd(),
     dataDir: DATA_DIR,
     groupSessionsDir,
+    mountUserSkills: hostUserSkillsPolicy.mountUserSkills,
+    userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
     happyclawMemoryActive: !isAdminHomeMemoryDisabled(ownerHomeFolder, group),
   });
   const hostClaudeContextSync = syncHostClaudeContext(
@@ -1542,6 +1805,10 @@ export async function runHostAgent(
   const hostEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
   };
+  // Per-run policy must replace, never merge with, a parent process value.
+  // Otherwise disabled/custom MCP can inherit servers from an earlier wrapper
+  // environment even when this run intentionally resolves to an empty set.
+  delete hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'];
 
   // Strip macOS launch-context vars that must not be inherited by child
   // processes. When happyclaw is started by a background process manager
@@ -1557,7 +1824,11 @@ export async function runHostAgent(
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
-  const hostPoolResult = trySelectPoolProvider(group.folder, sessionAgentId);
+  const hostPoolResult = trySelectPoolProvider(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile,
+  );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const globalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
@@ -1680,6 +1951,19 @@ export async function runHostAgent(
     ) {
       hostEnv['SUBAGENT_MODEL'] = hostSysSettings.subagentModel;
     }
+    const hostDisallowedTools = resolveAgentProfileDisallowedTools(
+      input.agentProfile,
+    );
+    const hostToolPolicyMode = getAgentProfileToolPolicyMode(
+      input.agentProfile,
+    );
+    if (hostToolPolicyMode !== 'inherit') {
+      hostEnv['HAPPYCLAW_AGENT_TOOL_POLICY'] = hostToolPolicyMode;
+    }
+    if (hostDisallowedTools.length > 0) {
+      hostEnv['HAPPYCLAW_AGENT_DISALLOWED_TOOLS'] =
+        JSON.stringify(hostDisallowedTools);
+    }
 
     // 禁用 HappyClaw 记忆层：不注入 memory MCP 工具 / WORKSPACE_GLOBAL/MEMORY env / 记忆提示，
     // 三件套仍通过同步后的 session .claude 生效，避免 externalClaudeDir 漂移。
@@ -1733,10 +2017,7 @@ export async function runHostAgent(
         hostEnv[key] = value;
       }
       // 同样，per-user MCP servers 通过 env 透传，agent-runner 合并进 SDK mcpServers 参数。
-      if (hostMcpServers && Object.keys(hostMcpServers).length > 0) {
-        hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'] =
-          JSON.stringify(hostMcpServers);
-      }
+      replaceHostMcpServersEnv(hostEnv, hostMcpPolicy.servers);
     }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';

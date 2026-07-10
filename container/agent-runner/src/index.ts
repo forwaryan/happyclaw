@@ -52,6 +52,19 @@ import {
 import { StreamEventProcessor } from './stream-processor.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
+import {
+  filterHappyclawToolsForPolicy,
+  getAgentToolPolicyFlagSettings,
+  parseAgentToolPolicyMode,
+  resolveAgentToolPolicy,
+} from './runtime-tool-policy.js';
+import {
+  IpcTurnDeliveryTracker,
+  isHealthyInputTurnCompletion,
+  parseIpcReceipt,
+  requeueIpcInputMessages,
+  type IpcInputMessage,
+} from './ipc-delivery.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP = process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
@@ -117,6 +130,35 @@ const MEMORY_FLUSH_KEEP_MCP = new Set([
   'mcp__happyclaw__memory_get',
   'mcp__happyclaw__memory_search',
 ]);
+
+function parseDisallowedToolsEnv(): string[] {
+  const raw = process.env.HAPPYCLAW_AGENT_DISALLOWED_TOOLS;
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((tool): tool is string => typeof tool === 'string')
+      .map((tool) => tool.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+const AGENT_PROFILE_DISALLOWED_TOOLS = parseDisallowedToolsEnv();
+let activeAgentToolPolicy = resolveAgentToolPolicy('inherit', []);
+
+function mergeDisallowedTools(disallowedTools?: string[]): string[] | undefined {
+  const merged = Array.from(
+    new Set([
+      ...(disallowedTools ?? []),
+      ...AGENT_PROFILE_DISALLOWED_TOOLS,
+      ...activeAgentToolPolicy.disallowedTools,
+    ]),
+  );
+  return merged.length > 0 ? merged : undefined;
+}
 
 const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
 
@@ -1047,12 +1089,7 @@ function shouldDrain(): boolean {
  * Returns messages found (with optional images), or empty array.
  */
 interface IpcDrainResult {
-  messages: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }>;
+  messages: IpcInputMessage[];
 }
 
 function drainIpcInput(): IpcDrainResult {
@@ -1073,6 +1110,7 @@ function drainIpcInput(): IpcDrainResult {
             images: data.images,
             taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
             sourceJid: typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
+            receipt: parseIpcReceipt(data.receipt),
           });
         }
       } catch (err) {
@@ -1144,7 +1182,7 @@ function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages (with optional images), or null if _close.
  */
-function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string } | null> {
+function waitForIpcMessage(): Promise<(IpcInputMessage & { messages: IpcInputMessage[] }) | null> {
   return new Promise((resolve) => {
     let resolved = false;
     const tryDrain = () => {
@@ -1194,6 +1232,7 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
           images: allImages.length > 0 ? allImages : undefined,
           taskId: combinedTaskId,
           sourceJid: combinedSourceJid,
+          messages,
         });
         return;
       }
@@ -1272,13 +1311,19 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }>; suspectTruncatedTail?: string }> {
+  initialIpcMessages: IpcInputMessage[] = [],
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: IpcInputMessage[]; suspectTruncatedTail?: string }> {
   const stream = new MessageStream();
   // Track messages piped into this query.  When the query is interrupted,
   // these messages would otherwise be lost (consumed by the aborted query).
   // The main loop uses them as the next prompt so the user's queued intent
   // continues after the cancelled turn (#421, Claude Code-style queuing).
-  const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> = [];
+  // Unacknowledged IPC inputs owned by this query. Despite the legacy field
+  // name in the return type, this includes the initial startup/idle-drain batch
+  // as well as messages piped while the query is active.
+  const ipcDeliveryTracker = new IpcTurnDeliveryTracker(initialIpcMessages);
+  const pipedMessagesDuringQuery =
+    ipcDeliveryTracker.unacknowledgedMessages;
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   const assistantTextTracker = new AssistantTextTracker();
@@ -1451,7 +1496,10 @@ async function runQuery(
     const { messages } = drainIpcInput();
     for (const msg of messages) {
       log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
-      pipedMessagesDuringQuery.push(msg);
+      ipcDeliveryTracker.acceptTurn([msg]);
+      // A new user turn arrived after a prior result. Cancel that result's
+      // post-timeout so the stream cannot close before this turn completes.
+      resultReceivedAt = null;
       const rejected = stream.push(msg.text, msg.images);
       for (const reason of rejected) {
         emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
@@ -1544,6 +1592,10 @@ async function runQuery(
   if (Number.isFinite(autoCompactWindow) && autoCompactWindow > 0) {
     flagSettings.autoCompactWindow = autoCompactWindow;
   }
+  Object.assign(
+    flagSettings,
+    getAgentToolPolicyFlagSettings(activeAgentToolPolicy),
+  );
 
   // Resolve the actual claude CLI path for the SDK.
   // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-{platform} 等）不保证被安装，
@@ -1588,12 +1640,18 @@ async function runQuery(
   // Paths are already runtime-translated upstream (container-internal for
   // Docker, host absolute for host mode).
   const userPlugins =
-    containerInput.plugins && containerInput.plugins.length > 0
+    activeAgentToolPolicy.loadUserPlugins &&
+    containerInput.plugins &&
+    containerInput.plugins.length > 0
       ? containerInput.plugins
       : undefined;
   if (userPlugins) {
     log(`Loading ${userPlugins.length} plugin(s): ${userPlugins.map((p) => p.path).join(', ')}`);
   }
+  const effectiveDisallowedTools = mergeDisallowedTools(disallowedTools);
+  const userMcpServers = activeAgentToolPolicy.includeUserMcpServers
+    ? loadUserMcpServers()
+    : {};
 
   try {
     const q = query({
@@ -1606,13 +1664,21 @@ async function runQuery(
         resume: sessionId,
         ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
         systemPrompt,
+        ...(activeAgentToolPolicy.builtinTools
+          ? { tools: activeAgentToolPolicy.builtinTools }
+          : {}),
         allowedTools,
-        ...(disallowedTools && { disallowedTools }),
+        ...(effectiveDisallowedTools && {
+          disallowedTools: effectiveDisallowedTools,
+        }),
         thinking: { type: 'adaptive' as const, display: 'summarized' as const },
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         agentProgressSummaries: true,
-        settingSources: ['project', 'user'],
+        settingSources: activeAgentToolPolicy.settingSources,
+        ...(activeAgentToolPolicy.managedSettings
+          ? { managedSettings: activeAgentToolPolicy.managedSettings }
+          : {}),
         // 启用全部已发现的技能到主会话。SDK 0.3.x 起 skills 是"打开技能的唯一正确位置"
         // （用了它就无需再往 allowedTools 塞已废弃的 'Skill'）。'all' = 启用所有发现的技能，
         // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
@@ -1626,8 +1692,11 @@ async function runQuery(
         forwardSubagentText: true,
         ...(Object.keys(flagSettings).length > 0 ? { settings: flagSettings as any } : {}),
         ...(userPlugins && { plugins: userPlugins }),
+        ...(activeAgentToolPolicy.strictMcpConfig
+          ? { strictMcpConfig: true }
+          : {}),
         mcpServers: {
-          ...loadUserMcpServers(),     // 用户配置的 MCP（stdio/http/sse），SDK 原生支持
+          ...userMcpServers,           // 用户配置的 MCP（stdio/http/sse），SDK 原生支持
           happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
         },
         hooks: {
@@ -1956,6 +2025,13 @@ async function runQuery(
       } else {
         suspectTruncatedTail = undefined;
       }
+      const inputTurnCompleted = isHealthyInputTurnCompletion(
+        pendingBgTasks,
+        suspectTruncated,
+      );
+      const ipcReceipts = inputTurnCompleted
+        ? ipcDeliveryTracker.completeNextTurn()
+        : undefined;
       emit({
         status: 'success',
         result: finalText,
@@ -1964,6 +2040,8 @@ async function runQuery(
         sourceKind: sourceKindOverride ?? 'sdk_final',
         finalizationReason: suspectTruncated ? 'truncated' : 'completed',
         pendingBgTasks,
+        inputTurnCompleted,
+        ...(ipcReceipts && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
       });
       // After emitting an sdk_final result, rotate turnId so that if
       // another result is emitted within the same query (e.g. user sent
@@ -2249,10 +2327,20 @@ async function main(): Promise<void> {
     workspaceMemory: WORKSPACE_MEMORY,
     disableMemoryLayer,
   };
+  const happyclawToolNames = createMcpTools(mcpToolsConfig).map(
+    (tool) => tool.name,
+  );
+  activeAgentToolPolicy = resolveAgentToolPolicy(
+    parseAgentToolPolicyMode(process.env.HAPPYCLAW_AGENT_TOOL_POLICY),
+    happyclawToolNames,
+  );
   const buildMcpServerConfig = () => createSdkMcpServer({
     name: 'happyclaw',
     version: '1.0.0',
-    tools: createMcpTools(mcpToolsConfig),
+    tools: filterHappyclawToolsForPolicy(
+      activeAgentToolPolicy,
+      createMcpTools(mcpToolsConfig),
+    ),
   });
   let mcpServerConfig = buildMcpServerConfig();
 
@@ -2295,6 +2383,7 @@ async function main(): Promise<void> {
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
   }
   const pendingDrain = drainIpcInput();
+  let currentIpcMessages: IpcInputMessage[] = pendingDrain.messages;
   if (pendingDrain.messages.length > 0) {
     log(`Draining ${pendingDrain.messages.length} pending IPC messages into initial prompt`);
     prompt += '\n' + pendingDrain.messages.map((m) => m.text).join('\n');
@@ -2364,7 +2453,10 @@ async function main(): Promise<void> {
         DEFAULT_ALLOWED_TOOLS,
         undefined,
         promptImages,
+        undefined,
+        currentIpcMessages,
       );
+      currentIpcMessages = queryResult.pipedMessagesDuringQuery;
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
         latestSessionId = sessionId;
@@ -2472,17 +2564,7 @@ async function main(): Promise<void> {
         if (queryResult.pipedMessagesDuringQuery.length > 0) {
           const piped = queryResult.pipedMessagesDuringQuery;
           log(`Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`);
-          for (const msg of piped) {
-            const filename = `${Date.now()}-requeue-${Math.random().toString(36).slice(2, 8)}.json`;
-            const filepath = path.join(IPC_INPUT_DIR, filename);
-            const tempPath = `${filepath}.tmp`;
-            try {
-              fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: msg.text, images: msg.images, taskId: msg.taskId, sourceJid: msg.sourceJid }));
-              fs.renameSync(tempPath, filepath);
-            } catch (err) {
-              log(`Failed to re-enqueue piped message: ${err}`);
-            }
-          }
+          requeueIpcInputMessages(IPC_INPUT_DIR, piped);
         }
 
         // 等待下一条消息（包括刚重新入队的 piped 消息）
@@ -2496,6 +2578,7 @@ async function main(): Promise<void> {
         }
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
+        currentIpcMessages = nextMessage.messages;
         containerInput.turnId = generateTurnId();
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
@@ -2636,6 +2719,15 @@ async function main(): Promise<void> {
             resumeAt = undefined;
             try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
           }
+          // Auto-continue can consume user IPC while it is running. A query
+          // that ends without a healthy result leaves those messages in the
+          // delivery tracker; requeue them now so they become the next turn
+          // instead of remaining invisible until host-side exit recovery.
+          if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+            const pending = autoContResult.pipedMessagesDuringQuery;
+            log(`Auto-continue ended with ${pending.length} unacknowledged IPC message(s); re-enqueueing`);
+            requeueIpcInputMessages(IPC_INPUT_DIR, pending);
+          }
           // After auto-continue, fall through to wait for next IPC message.
         } else {
           log(`Compaction loop detected (${consecutiveCompactions} consecutive), stopping auto-continue and waiting for user input`);
@@ -2653,6 +2745,7 @@ async function main(): Promise<void> {
       // 上限 2 次防止网关持续断流时无限烧 token；压缩 auto-continue 本轮已跑过
       // 新 query 时跳过（模型已经继续过了）。
       let truncatedTail = ranCompactionContinue ? undefined : queryResult.suspectTruncatedTail;
+      let truncationIpcMessages = queryResult.pipedMessagesDuringQuery;
       let truncationContinues = 0;
       const MAX_TRUNCATION_CONTINUES = 2;
       let closedDuringTruncationContinue = false;
@@ -2679,7 +2772,10 @@ async function main(): Promise<void> {
           undefined,
           undefined,
           'truncation_continue',
+          truncationIpcMessages,
         );
+        truncationIpcMessages = contResult.pipedMessagesDuringQuery;
+        currentIpcMessages = truncationIpcMessages;
         if (contResult.newSessionId) {
           sessionId = contResult.newSessionId;
           latestSessionId = sessionId;
@@ -2757,6 +2853,7 @@ async function main(): Promise<void> {
       log(`Got new message (${nextMessage.text.length} chars, ${nextMessage.images?.length || 0} images), starting new query`);
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
+      currentIpcMessages = nextMessage.messages;
       containerInput.turnId = generateTurnId();
       // Clear per-turn task attribution: the previous query may have been a
       // scheduled-task turn, but this new IPC message is a regular follow-up

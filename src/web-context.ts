@@ -55,6 +55,10 @@ export interface WebDeps {
    * yet, so the recovery cursor must not advance past it.
    */
   advanceNextPullCursorOnly: (jid: string, cursor: MessageCursor) => void;
+  /** Production single chokepoint for direct replies/drops. It advances only
+   * next-pull when an earlier unreceipted message exists. Optional solely for
+   * compatibility with focused route-test fixtures. */
+  completeOutOfBandMessage?: (jid: string, cursor: MessageCursor) => void;
   advanceGlobalCursor: (cursor: MessageCursor) => void;
   /**
    * Returns true iff there exists at least one unprocessed (`is_from_me=0`)

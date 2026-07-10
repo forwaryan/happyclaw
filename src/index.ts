@@ -22,6 +22,13 @@ import {
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
+import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
+import {
+  DeferredOutOfBandCursorLedger,
+  hasEarlierCursorMessage,
+  hasUncoveredCursorMessageThrough,
+  shouldRecoverPendingHistory,
+} from './delivery-cursor.js';
 import {
   AvailableGroup,
   ContainerInput,
@@ -104,6 +111,7 @@ import {
   buildSessionMountUpdate,
   buildUnmountUpdate,
   buildWorkspaceMountUpdate,
+  resolveChannelMountTarget,
 } from './channel-mount-service.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
@@ -172,7 +180,10 @@ import type {
   DiscordConnectConfig,
   WhatsAppConnectConfig,
 } from './im-manager.js';
-import { GroupQueue } from './group-queue.js';
+import {
+  GroupQueue,
+  type IpcDeliveryReceipt,
+} from './group-queue.js';
 import {
   startSchedulerLoop,
   triggerTaskNow,
@@ -517,6 +528,8 @@ let lastAgentTimestamp: Record<string, MessageCursor> = {};
 // Recovery-safe cursor: only advances when an agent actually finishes processing.
 // recoverPendingMessages() uses this to detect IPC-injected but unprocessed messages.
 let lastCommittedCursor: Record<string, MessageCursor> = {};
+const deferredOutOfBandCursors = new DeferredOutOfBandCursorLedger();
+const startupRecoveredDeliveryJids = new Set<string>();
 
 /** Set both cursors directly (no max-merge) and persist. */
 function setCursors(jid: string, cursor: MessageCursor): void {
@@ -564,12 +577,165 @@ function advanceNextPullCursorOnly(
  * → cursor regressed to m1 → next poll re-read m2 and reply re-fired.
  */
 function advanceCursors(jid: string, candidate: MessageCursor): void {
-  const current = lastAgentTimestamp[jid];
-  const target =
-    current && isCursorAfter(current, candidate) ? current : candidate;
-  lastAgentTimestamp[jid] = target;
-  lastCommittedCursor[jid] = target;
+  const currentPull = lastAgentTimestamp[jid];
+  lastAgentTimestamp[jid] =
+    currentPull && isCursorAfter(currentPull, candidate)
+      ? currentPull
+      : candidate;
+  const currentCommitted = lastCommittedCursor[jid];
+  lastCommittedCursor[jid] =
+    currentCommitted && isCursorAfter(currentCommitted, candidate)
+      ? currentCommitted
+      : candidate;
   saveState();
+}
+
+function rewindNextPullCursorToCommitted(jid: string): void {
+  lastAgentTimestamp[jid] = lastCommittedCursor[jid] || EMPTY_CURSOR;
+  saveState();
+}
+
+function commitIpcDeliveryReceipts(receipts: IpcDeliveryReceipt[]): void {
+  const touchedJids = new Set<string>();
+  for (const receipt of receipts) {
+    advanceCursors(receipt.chatJid, receipt.cursor);
+    touchedJids.add(receipt.chatJid);
+  }
+  for (const jid of touchedJids) {
+    flushDeferredOutOfBandMessages(jid);
+  }
+}
+
+function hasEarlierPendingMessage(
+  jid: string,
+  candidate: MessageCursor,
+): boolean {
+  const sinceCursor = lastCommittedCursor[jid] || EMPTY_CURSOR;
+  return hasEarlierCursorMessage(getMessagesSince(jid, sinceCursor), candidate);
+}
+
+function createIpcDeliveryTarget(
+  chatJid: string,
+  messages: Array<{ timestamp: string; id: string }>,
+): {
+  chatJid: string;
+  coveredCursors: MessageCursor[];
+  cursor: MessageCursor;
+} | undefined {
+  if (messages.length === 0) return undefined;
+  const unique = new Map<string, MessageCursor>();
+  for (const message of messages) {
+    const cursor = { timestamp: message.timestamp, id: message.id };
+    unique.set(`${cursor.timestamp}\u0000${cursor.id}`, cursor);
+  }
+  const coveredCursors = [...unique.values()].sort((a, b) => {
+    if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  });
+  return {
+    chatJid,
+    coveredCursors,
+    cursor: coveredCursors[coveredCursors.length - 1],
+  };
+}
+
+function hasUncoveredPendingMessage(receipt: IpcDeliveryReceipt): boolean {
+  const sinceCursor = lastCommittedCursor[receipt.chatJid] || EMPTY_CURSOR;
+  const covered =
+    receipt.coveredCursors && receipt.coveredCursors.length > 0
+      ? receipt.coveredCursors
+      : [receipt.cursor];
+  return hasUncoveredCursorMessageThrough(
+    getMessagesSince(receipt.chatJid, sinceCursor),
+    receipt.cursor,
+    covered,
+  );
+}
+
+/** Complete an out-of-band reply/drop without crossing earlier work that an
+ * active runner accepted but has not receipted yet. */
+function completeOutOfBandMessage(
+  jid: string,
+  candidate: MessageCursor,
+): void {
+  if (hasEarlierPendingMessage(jid, candidate)) {
+    advanceNextPullCursorOnly(jid, candidate);
+    deferredOutOfBandCursors.defer(jid, candidate);
+  } else {
+    advanceCursors(jid, candidate);
+    flushDeferredOutOfBandMessages(jid);
+    flushAcknowledgedIpcForJid(jid);
+  }
+}
+
+function completeOutOfBandMessages(
+  jid: string,
+  messages: Array<{ timestamp: string; id: string }>,
+): void {
+  const ordered = [...messages].sort((a, b) =>
+    a.timestamp === b.timestamp
+      ? a.id.localeCompare(b.id)
+      : a.timestamp.localeCompare(b.timestamp),
+  );
+  for (const message of ordered) {
+    completeOutOfBandMessage(jid, {
+      timestamp: message.timestamp,
+      id: message.id,
+    });
+  }
+}
+
+function flushDeferredOutOfBandMessages(jid: string): void {
+  deferredOutOfBandCursors.flush(
+    jid,
+    (cursor) => hasEarlierPendingMessage(jid, cursor),
+    (cursor) => advanceCursors(jid, cursor),
+  );
+}
+
+function flushAcknowledgedIpcForJid(jid: string): void {
+  queue.flushAcknowledgedIpcDeliveries(jid, commitIpcDeliveryReceipts);
+}
+
+function clearPersistedIpcDeliveriesForChats(chatJids: Set<string>): number {
+  if (chatJids.size === 0) return 0;
+  const ipcRoot = path.join(DATA_DIR, 'ipc');
+  let removed = 0;
+  const visit = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const filepath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'tasks-run') continue;
+        visit(filepath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const payload = JSON.parse(fs.readFileSync(filepath, 'utf8')) as {
+          receipt?: { chatJid?: unknown };
+        };
+        const chatJid = payload.receipt?.chatJid;
+        if (typeof chatJid === 'string' && chatJids.has(chatJid)) {
+          fs.unlinkSync(filepath);
+          removed++;
+        }
+      } catch (err) {
+        logger.warn(
+          { filepath, err },
+          'Failed to inspect persisted IPC delivery during recovery',
+        );
+      }
+    }
+  };
+  visit(ipcRoot);
+  return removed;
 }
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
@@ -1070,6 +1236,7 @@ function toContainerAgentProfile(
     identityHash: profile.identity_hash,
     identityPrompt: profile.identity_prompt,
     includeClaudePreset: profile.include_claude_preset,
+    runtimePolicy: profile.runtime_policy,
   };
 }
 
@@ -1093,6 +1260,12 @@ function hasSessionAgentProfileMismatch(
   }
 
   if (current.identity_hash !== profile.identity_hash) return true;
+  if (
+    current.agent_profile_version != null &&
+    current.agent_profile_version !== profile.version
+  ) {
+    return true;
+  }
   return !!current.agent_profile_id && current.agent_profile_id !== profile.id;
 }
 
@@ -1649,7 +1822,9 @@ async function handleClearCommand(chatJid: string): Promise<string> {
     (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
     getAgent,
     findGroupNameByFolder,
+    resolveWorkspaceJid,
   );
+  if (!target) return '当前绑定目标不存在，请先重新绑定工作区或会话。';
 
   try {
     await executeSessionReset(
@@ -2443,7 +2618,13 @@ function resolveSpawnWorkspace(
       (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
       getAgent,
       findGroupNameByFolder,
+      resolveWorkspaceJid,
     );
+    if (!target) {
+      return group.target_agent_id
+        ? '绑定会话所属的工作区不存在'
+        : '绑定的工作区不存在';
+    }
     const targetGroup =
       registeredGroups[target.baseChatJid] ??
       getRegisteredGroup(target.baseChatJid);
@@ -2748,24 +2929,12 @@ function loadState(): void {
   lastAgentTimestamp = loadCursorMap('last_agent_timestamp');
   lastCommittedCursor = loadCursorMap('last_committed_cursor');
 
-  // Migration: fill in missing lastCommittedCursor entries from lastAgentTimestamp.
-  // The original migration only triggered when lastCommittedCursor was completely empty,
-  // missing the case where some keys exist but others don't (e.g. new IM groups).
-  {
-    let migrated = false;
-    for (const [jid, cursor] of Object.entries(lastAgentTimestamp)) {
-      if (!lastCommittedCursor[jid]) {
-        lastCommittedCursor[jid] = cursor;
-        migrated = true;
-      }
-    }
-    if (migrated) {
-      logger.info(
-        'Migrated missing lastCommittedCursor entries from lastAgentTimestamp',
-      );
-      saveState();
-    }
-  }
+  // Do not synthesize a missing committed cursor from the next-pull cursor.
+  // A crash can persist next-pull immediately after IPC acceptance while the
+  // corresponding receipt is still uncommitted. Treating that position as
+  // committed would turn an upgrade/startup heuristic into silent data loss.
+  // Legacy installs may replay once from EMPTY_CURSOR; at-least-once is the
+  // intentional safety trade-off.
 
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
@@ -3206,7 +3375,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // could lose earlier toSend messages on crash before the agent runs
       // (#18 P2-bug-2). When toSend is empty we fully commit.
       const advanceReplyCursor =
-        toSend.length === 0 ? setCursors : advanceNextPullCursorOnly;
+        toSend.length === 0
+          ? completeOutOfBandMessage
+          : advanceNextPullCursorOnly;
       for (const r of replies) {
         // Per-reply IM target: prefer the originating message's source_jid
         // (so individual replies route back to whoever sent the slash command,
@@ -3292,7 +3463,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'AgentProfile identity change: injected recent conversation history into prompt',
       );
     }
-  } else if (willClearSessionOnProviderSwitch(effectiveGroup.folder)) {
+  } else if (
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      undefined,
+      toContainerAgentProfile(agentProfile),
+    )
+  ) {
     // Proactive provider switch (sticky binding unhealthy/disabled) will clear
     // the SDK session inside the runner. Inject history so the new provider's
     // first turn keeps context, matching the recovery + reactive-failure paths.
@@ -3355,6 +3532,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let sentReply = false;
   let lastError = '';
   let cursorCommitted = false;
+  let healthyInputTurnCompleted = false;
   let lastReplyMsgId: string | undefined;
   let lastSavedTurnId: string | undefined; // tracks last turnId saved to DB, prevents UPSERT overwrite
   const queryTaskIds = new Set<string>();
@@ -3581,6 +3759,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       timestamp: lastProcessed.timestamp,
       id: lastProcessed.id,
     });
+    flushAcknowledgedIpcForJid(chatJid);
     cursorCommitted = true;
   };
 
@@ -3590,7 +3769,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // (disabled or deleted). See `src/owner-gate.ts` for rationale.
     const ownerGate = checkOwnerActive(owner);
     if (!ownerGate.allowed) {
-      commitCursor();
+      completeOutOfBandMessages(chatJid, missedMessages);
+      cursorCommitted = true;
       await setTyping(chatJid, false);
       logger.info(
         {
@@ -3610,7 +3790,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (!accessResult.allowed) {
         const sysMsg = formatBillingAccessDeniedMessage(accessResult);
         sendBillingDeniedMessage(chatJid, sysMsg);
-        commitCursor();
+        completeOutOfBandMessages(chatJid, missedMessages);
+        cursorCommitted = true;
         await setTyping(chatJid, false);
         logger.info(
           {
@@ -3644,6 +3825,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       lastProcessed.id,
       async (result) => {
         try {
+          if (result.inputTurnCompleted) {
+            healthyInputTurnCompleted = true;
+          }
           if (result.newSessionId && result.status !== 'error') {
             activeSessionId = result.newSessionId;
           }
@@ -4354,7 +4538,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Persist cursor as soon as a visible reply is emitted.
               // Long-lived runners may stay alive for idleTimeout, and waiting
               // until process exit would cause duplicate replay after restart.
-              commitCursor();
+              if (result.inputTurnCompleted) commitCursor();
             }
             // Only reset idle timer on actual results, not session-update markers (result: null)
             resetIdleTimer();
@@ -4483,7 +4667,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           },
         });
         sentReply = true;
-        commitCursor();
       } catch (err) {
         logger.warn({ err, chatJid }, 'Failed to save interrupted text');
       }
@@ -4512,7 +4695,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           },
         });
         sentReply = true;
-        commitCursor();
       } catch (err) {
         logger.warn({ err, chatJid }, 'Failed to save overflow partial text');
       }
@@ -4523,11 +4705,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // If a reply was already sent, commit the cursor so we don't re-process.
   // Otherwise return false to allow retry (H-1 audit fix).
   if (!output) {
-    if (sentReply) {
-      commitCursor();
-      return true;
-    }
-    return false;
+    return cursorCommitted;
   }
 
   // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）：无论是否已有回复，都必须重置会话
@@ -4647,7 +4825,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  if (isErrorExit && !sentReply) {
+  if (isErrorExit && !healthyInputTurnCompleted) {
+    // Partial/interrupted text is useful to persist, but it is not a delivery
+    // acknowledgement. Keep the recovery cursor behind so the user input is
+    // replayed at least once after the failed runner exits.
+    if (sentReply) return false;
     // Only roll back cursor if no reply was sent — if the agent already
     // replied successfully, a subsequent timeout is not a real error and
     // rolling back would cause the same messages to be re-processed,
@@ -4786,9 +4968,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       sessionId: activeSessionId,
     });
   }
-  commitCursor();
-
-  return true;
+  if (healthyInputTurnCompleted) {
+    commitCursor();
+    return true;
+  }
+  logger.warn(
+    { chatJid, status: output.status },
+    'Runner exited without a healthy input-turn completion; keeping cursor for replay',
+  );
+  return false;
 }
 
 async function runTerminalWarmup(chatJid: string): Promise<void> {
@@ -4946,6 +5134,13 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         queue.markRunnerActivity(chatJid);
+        if (output.ipcReceipts?.length) {
+          queue.acknowledgeIpcDeliveries(
+            chatJid,
+            output.ipcReceipts,
+            commitIpcDeliveryReceipts,
+          );
+        }
         if (
           (output.status === 'success' && output.result !== null) ||
           (output.status === 'stream' &&
@@ -4964,6 +5159,7 @@ async function runAgent(
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId, undefined, {
             agentProfileId: resolvedAgentProfile?.id,
+            agentProfileVersion: resolvedAgentProfile?.version,
             identityHash: resolvedAgentProfile?.identity_hash,
           });
         }
@@ -5048,6 +5244,7 @@ async function runAgent(
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId, undefined, {
         agentProfileId: resolvedAgentProfile?.id,
+        agentProfileVersion: resolvedAgentProfile?.version,
         identityHash: resolvedAgentProfile?.identity_hash,
       });
     }
@@ -7086,13 +7283,7 @@ async function processAgentConversation(
   if (effectiveGroup.created_by) {
     const ownerGate = checkOwnerActive(getUserById(effectiveGroup.created_by));
     if (!ownerGate.allowed) {
-      const lastMsg = missedMessages[missedMessages.length - 1];
-      if (lastMsg) {
-        setCursors(virtualChatJid, {
-          timestamp: lastMsg.timestamp,
-          id: lastMsg.id,
-        });
-      }
+      completeOutOfBandMessages(virtualChatJid, missedMessages);
       logger.info(
         {
           chatJid,
@@ -7164,7 +7355,9 @@ async function processAgentConversation(
       // Same crash-safe split as processGroupMessages (#18 P2-bug-2):
       // hold the recovery cursor when toSend still has work pending.
       const advanceReplyCursor =
-        toSend.length === 0 ? setCursors : advanceNextPullCursorOnly;
+        toSend.length === 0
+          ? completeOutOfBandMessage
+          : advanceNextPullCursorOnly;
       // Resolve IM target so plugin replies fan out to the originating IM
       // channel (#20 P1-1). Per-reply: prefer that message's source_jid;
       // otherwise fall back to the agent's last_im_jid, but only if its
@@ -7238,7 +7431,11 @@ async function processAgentConversation(
   if (
     !sessionId ||
     resetForAgentProfile ||
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      agentId,
+      toContainerAgentProfile(agentProfile),
+    )
   ) {
     const historyContext = buildRecentConversationHistoryContext(
       virtualChatJid,
@@ -7458,6 +7655,7 @@ async function processAgentConversation(
   };
 
   let cursorCommitted = false;
+  let healthyAgentInputTurnCompleted = false;
   let hadError = false;
   let lastError = '';
   let lastAgentReplyMsgId: string | undefined;
@@ -7469,6 +7667,7 @@ async function processAgentConversation(
       timestamp: lastProcessed.timestamp,
       id: lastProcessed.id,
     });
+    flushAcknowledgedIpcForJid(virtualChatJid);
     cursorCommitted = true;
   };
 
@@ -7476,6 +7675,16 @@ async function processAgentConversation(
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    if (output.ipcReceipts?.length) {
+      queue.acknowledgeIpcDeliveries(
+        virtualJid,
+        output.ipcReceipts,
+        commitIpcDeliveryReceipts,
+      );
+    }
+    if (output.inputTurnCompleted) {
+      healthyAgentInputTurnCompleted = true;
+    }
     if (
       (output.status === 'success' && output.result !== null) ||
       (output.status === 'stream' &&
@@ -7512,6 +7721,7 @@ async function processAgentConversation(
     ) {
       setSession(effectiveGroup.folder, output.newSessionId, agentId, {
         agentProfileId: agentProfile?.id,
+        agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
       currentAgentSessionId = output.newSessionId;
@@ -7645,7 +7855,6 @@ async function processAgentConversation(
               },
               agentId,
             );
-            commitCursor();
             clearStreamingSnapshot(virtualChatJid);
           } catch (err) {
             logger.warn(
@@ -7964,7 +8173,7 @@ async function processAgentConversation(
             sendImWithFailTracking(imJid, text, localImagePaths);
         }
 
-        commitCursor();
+        if (output.inputTurnCompleted) commitCursor();
         resetIdleTimer();
 
         // Per-turn snapshot cleanup — mirror of the main path (clearStreamingSnapshot
@@ -8097,6 +8306,7 @@ async function processAgentConversation(
     ) {
       setSession(effectiveGroup.folder, output.newSessionId, agentId, {
         agentProfileId: agentProfile?.id,
+        agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
     }
@@ -8137,7 +8347,7 @@ async function processAgentConversation(
     // Only commit cursor if a reply was actually sent.  Without a reply the
     // messages haven't been "processed" — leaving the cursor behind lets the
     // recovery logic pick them up after a restart.
-    if (lastAgentReplyMsgId) {
+    if (lastAgentReplyMsgId && healthyAgentInputTurnCompleted) {
       commitCursor();
     }
   } catch (err) {
@@ -8253,7 +8463,6 @@ async function processAgentConversation(
           },
           agentId,
         );
-        commitCursor();
       } catch (err) {
         logger.warn(
           { err, chatJid, agentId },
@@ -8337,7 +8546,6 @@ async function processAgentConversation(
             'Partial reply: no replySourceImJid found, skipping IM send',
           );
         }
-        commitCursor();
       } catch (err) {
         logger.warn(
           { err, chatJid, agentId },
@@ -8467,11 +8675,7 @@ async function startMessageLoop(): Promise<void> {
             const owner = getUserById(group.created_by);
             const ownerGate = checkOwnerActive(owner);
             if (!ownerGate.allowed) {
-              const lastMsg = groupMessages[groupMessages.length - 1];
-              setCursors(chatJid, {
-                timestamp: lastMsg.timestamp,
-                id: lastMsg.id,
-              });
+              completeOutOfBandMessages(chatJid, groupMessages);
               logger.info(
                 {
                   chatJid,
@@ -8519,11 +8723,7 @@ async function startMessageLoop(): Promise<void> {
                 }
 
                 // Advance cursor past these messages so they aren't re-processed
-                const lastMsg = groupMessages[groupMessages.length - 1];
-                setCursors(chatJid, {
-                  timestamp: lastMsg.timestamp,
-                  id: lastMsg.id,
-                });
+                completeOutOfBandMessages(chatJid, groupMessages);
                 continue;
               }
             }
@@ -8536,6 +8736,14 @@ async function startMessageLoop(): Promise<void> {
           );
           let messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+          // The receipt covers the exact pre-expansion DB batch. Plugin replies
+          // removed from `messagesToSend` below are already handled out-of-band,
+          // so a healthy agent result for the remainder may safely commit the
+          // full batch, but never an unrelated cursor inserted inside its range.
+          const deliveryTarget = createIpcDeliveryTarget(
+            chatJid,
+            messagesToSend,
+          );
 
           // Plugin command expander (DMI commands) — same as cold-start path.
           // Active-runner IPC injection: replies advance the cursor without
@@ -8580,7 +8788,9 @@ async function startMessageLoop(): Promise<void> {
               // Hold the recovery cursor while toSend still has work pending
               // (#18 P2-bug-2 also applies on the active path).
               const advanceReplyCursor =
-                toSend.length === 0 ? setCursors : advanceNextPullCursorOnly;
+                toSend.length === 0
+                  ? completeOutOfBandMessage
+                  : advanceNextPullCursorOnly;
               // IM fan-out (#20 P1-1): if chatJid itself is an IM channel
               // we route to itself; otherwise prefer the originating message's
               // source_jid (mixed batches retain individual user routing).
@@ -8641,8 +8851,9 @@ async function startMessageLoop(): Promise<void> {
             },
             lastSourceJidForRoute,
             injectionTaskId,
+            deliveryTarget,
           );
-          if (sendResult === 'sent') {
+          if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(
               {
                 chatJid,
@@ -8651,15 +8862,11 @@ async function startMessageLoop(): Promise<void> {
               },
               'Piped messages to active container',
             );
-            const lastProcessed = messagesToSend[messagesToSend.length - 1];
             // advanceNextPullCursorOnly (not direct assignment) so an earlier
-            // reply already pushed past lastProcessed isn't regressed back
-            // to a plain-text timestamp, which would cause the reply to be
-            // re-pulled and replayed on the next poll (#18 P1-bug-1).
-            advanceNextPullCursorOnly(chatJid, {
-              timestamp: lastProcessed.timestamp,
-              id: lastProcessed.id,
-            });
+            // reply already pushed past this batch terminal is not regressed,
+            // which would cause it to be re-pulled and replayed on the next
+            // poll (#18 P1-bug-1).
+            advanceNextPullCursorOnly(chatJid, deliveryTarget.cursor);
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -8766,12 +8973,29 @@ async function recoverStuckPendingGroups(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    // No committed cursor → this group was never successfully processed.
-    // Skip recovery — the normal 2s message loop will pick up any pending messages.
-    // Using EMPTY_CURSOR here would match ALL historical messages and falsely
-    // trigger session clearing (the bug that caused context reset on restart).
-    const sinceCursor = lastCommittedCursor[chatJid];
-    if (!sinceCursor) continue;
+    const committedCursor = lastCommittedCursor[chatJid];
+    const pullCursor = lastAgentTimestamp[chatJid];
+    const pullWasAhead =
+      !!pullCursor &&
+      (!committedCursor || isCursorAfter(pullCursor, committedCursor));
+    if (pullWasAhead) {
+      clearPersistedIpcDeliveriesForChats(new Set([chatJid]));
+      rewindNextPullCursorToCommitted(chatJid);
+      logger.warn(
+        { chatJid, pullCursor, committedCursor: committedCursor || EMPTY_CURSOR },
+        'Startup recovery rewound next-pull cursor past uncommitted IPC delivery',
+      );
+    }
+    // With no committed cursor and no evidence of an IPC-ahead state, leave a
+    // fresh/legacy group to the normal poller rather than replaying all history.
+    if (
+      !shouldRecoverPendingHistory(
+        !!committedCursor,
+        pullWasAhead,
+        startupRecoveredDeliveryJids.has(chatJid),
+      )
+    ) continue;
+    const sinceCursor = committedCursor || EMPTY_CURSOR;
 
     const pending = getMessagesSince(chatJid, sinceCursor);
     if (pending.length > 0) {
@@ -8831,7 +9055,24 @@ function recoverConversationAgents(): void {
 
       // Check for pending messages on the virtual JID
       const virtualChatJid = `${chatJid}#agent:${agentId}`;
-      const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+      const committedCursor = lastCommittedCursor[virtualChatJid];
+      const pullCursor = lastAgentTimestamp[virtualChatJid];
+      const pullWasAhead =
+        !!pullCursor &&
+        (!committedCursor || isCursorAfter(pullCursor, committedCursor));
+      if (pullWasAhead) {
+        clearPersistedIpcDeliveriesForChats(new Set([virtualChatJid]));
+        rewindNextPullCursorToCommitted(virtualChatJid);
+        logger.warn(
+          {
+            virtualChatJid,
+            pullCursor,
+            committedCursor: committedCursor || EMPTY_CURSOR,
+          },
+          'Startup recovery rewound conversation-agent IPC delivery',
+        );
+      }
+      const sinceCursor = committedCursor || EMPTY_CURSOR;
       const pending = getMessagesSince(virtualChatJid, sinceCursor);
 
       if (pending.length > 0) {
@@ -8875,6 +9116,26 @@ function recoverConversationAgents(): void {
         'Recovery: failed to recover conversation agent, skipping',
       );
     }
+  }
+}
+
+function recoverStartupTypedIpcDeliveries(): void {
+  let chatJids = new Set<string>();
+  const receipts = discardStartupTypedIpcDeliveries(
+    path.join(DATA_DIR, 'ipc'),
+    (claims) => {
+      chatJids = new Set(claims.map((receipt) => receipt.chatJid));
+      for (const chatJid of chatJids) {
+        startupRecoveredDeliveryJids.add(chatJid);
+        rewindNextPullCursorToCommitted(chatJid);
+      }
+    },
+  );
+  if (receipts.length > 0) {
+    logger.warn(
+      { deliveryCount: receipts.length, chatJids: [...chatJids] },
+      'Startup removed typed IPC deliveries and rewound them for DB replay',
+    );
   }
 }
 
@@ -9565,61 +9826,56 @@ function buildResolveEffectiveChatJid(): (
     }
 
     const mount = getChannelMount(chatJid);
-    if (mount?.session_id) {
-      const agent = getAgent(mount.session_id);
-      if (!agent) {
+    if (mount) {
+      const mountedTarget = resolveChannelMountTarget(mount, {
+        getAgent,
+        getRegisteredGroup: (jid) =>
+          registeredGroups[jid] ?? getRegisteredGroup(jid),
+      });
+      if (mountedTarget.status === 'stale') {
         logger.warn(
-          { chatJid, sessionId: mount.session_id },
-          'resolveEffectiveChatJid: session not found for channel_mounts row',
+          {
+            chatJid,
+            reason: mountedTarget.reason,
+            sessionId: mountedTarget.sessionId,
+            workspaceJid: mountedTarget.workspaceJid,
+          },
+          'resolveEffectiveChatJid: stale channel_mounts row, message will not route',
         );
-      } else {
+        return null;
+      }
+      if (mountedTarget.workspaceMismatch) {
+        logger.warn(
+          { chatJid, ...mountedTarget.workspaceMismatch },
+          'resolveEffectiveChatJid: channel_mounts workspace differs from session owner, using session owner workspace',
+        );
+      }
+      if (mountedTarget.agentId) {
         return {
-          effectiveJid: `${mount.workspace_jid}#agent:${mount.session_id}`,
-          agentId: mount.session_id,
+          effectiveJid: mountedTarget.effectiveJid,
+          agentId: mountedTarget.agentId,
         };
       }
-    }
 
-    if (
-      mount?.routing_mode === 'thread_map' &&
-      getChannelType(chatJid) === 'feishu' &&
-      messageMeta &&
-      (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
-    ) {
-      const threadContextId =
-        messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
-      if (!threadContextId) return null;
-      const workspace =
-        registeredGroups[mount.workspace_jid] ??
-        getRegisteredGroup(mount.workspace_jid);
-      if (!workspace) {
-        logger.warn(
-          { chatJid, workspaceJid: mount.workspace_jid },
-          'resolveEffectiveChatJid: workspace not found for thread_map channel_mounts row',
-        );
-      } else {
+      if (
+        mount.routing_mode === 'thread_map' &&
+        getChannelType(chatJid) === 'feishu' &&
+        messageMeta &&
+        (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
+      ) {
+        const threadContextId =
+          messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
+        if (!threadContextId) return null;
         return resolveOrCreateThreadAgent(
           chatJid,
-          mount.workspace_jid,
-          workspace,
+          mountedTarget.workspaceJid,
+          mountedTarget.workspace,
           group,
           { ...messageMeta, threadId: threadContextId },
         );
       }
-    }
 
-    if (mount?.workspace_jid) {
-      const workspace =
-        registeredGroups[mount.workspace_jid] ??
-        getRegisteredGroup(mount.workspace_jid);
-      if (!workspace) {
-        logger.warn(
-          { chatJid, workspaceJid: mount.workspace_jid },
-          'resolveEffectiveChatJid: workspace not found for channel_mounts row',
-        );
-      } else {
-        return { effectiveJid: mount.workspace_jid, agentId: null };
-      }
+      return { effectiveJid: mountedTarget.effectiveJid, agentId: null };
     }
 
     // Agent binding takes priority
@@ -9771,6 +10027,10 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
 
       const lastAgentSourceJid =
         missedMessages[missedMessages.length - 1]?.source_jid || virtualChatJid;
+      const deliveryTarget = createIpcDeliveryTarget(
+        virtualChatJid,
+        missedMessages,
+      );
       const sendResult = formatted
         ? queue.sendMessage(
             virtualChatJid,
@@ -9781,8 +10041,13 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
               activeHeldCardFinalizers.get(virtualChatJid)?.();
             },
             lastAgentSourceJid,
+            undefined,
+            deliveryTarget,
           )
         : 'no_active';
+      if (sendResult === 'sent' && deliveryTarget) {
+        advanceNextPullCursorOnly(virtualChatJid, deliveryTarget.cursor);
+      }
       if (sendResult === 'no_active') {
         const taskId = `agent-conv:${agentId}:${Date.now()}`;
         queue.enqueueTask(virtualChatJid, taskId, async () => {
@@ -10858,27 +11123,14 @@ async function main(): Promise<void> {
     setLastAgentTimestamp: setCursors,
     advanceCursors,
     advanceNextPullCursorOnly,
+    completeOutOfBandMessage,
     advanceGlobalCursor: (cursor: MessageCursor) => {
       if (isCursorAfter(cursor, globalMessageCursor)) {
         globalMessageCursor = cursor;
         saveState();
       }
     },
-    hasEarlierPendingMessages: (jid, candidate) => {
-      // Compare against lastCommittedCursor (recovery anchor) so the
-      // semantic is "would a recovery pass surface anything earlier than
-      // this candidate?". Lexicographic (timestamp, id) — same ordering
-      // used by getMessagesSince's ORDER BY.
-      const sinceCursor = lastCommittedCursor[jid] || EMPTY_CURSOR;
-      const pending = getMessagesSince(jid, sinceCursor);
-      for (const m of pending) {
-        if (m.timestamp < candidate.timestamp) return true;
-        if (m.timestamp === candidate.timestamp && m.id < candidate.id) {
-          return true;
-        }
-      }
-      return false;
-    },
+    hasEarlierPendingMessages: hasEarlierPendingMessage,
     reloadFeishuConnection,
     reloadTelegramConnection,
     reloadUserIMConfig,
@@ -11101,6 +11353,53 @@ async function main(): Promise<void> {
       await processAgentConversation(homeChatJid, agentId);
     });
   });
+  queue.setOnUnacknowledgedIpcDeliveries(
+    (runnerJid: string, receipts: IpcDeliveryReceipt[]) => {
+      const chatJids = new Set(receipts.map((receipt) => receipt.chatJid));
+      clearPersistedIpcDeliveriesForChats(chatJids);
+      for (const deliveryJid of chatJids) {
+        rewindNextPullCursorToCommitted(deliveryJid);
+        const agentSep = deliveryJid.indexOf('#agent:');
+        if (agentSep < 0) {
+          recoveryGroups.add(deliveryJid);
+          queue.enqueueMessageCheck(deliveryJid);
+          continue;
+        }
+        const baseChatJid = deliveryJid.slice(0, agentSep);
+        const agentId = deliveryJid.slice(agentSep + '#agent:'.length);
+        const agent = getAgent(agentId);
+        const homeChatJid = agent?.chat_jid || baseChatJid;
+        const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
+        queue.enqueueTask(
+          virtualChatJid,
+          `agent-delivery-recovery:${agentId}`,
+          async () => {
+            await processAgentConversation(homeChatJid, agentId);
+          },
+        );
+      }
+      logger.warn(
+        { runnerJid, deliveryCount: receipts.length, chatJids: [...chatJids] },
+        'Rewound unacknowledged IPC deliveries for DB replay',
+      );
+    },
+  );
+  queue.setIpcDeliveryCommitEligibilityChecker(
+    (receipt: IpcDeliveryReceipt) =>
+      !hasUncoveredPendingMessage(receipt),
+  );
+  queue.setOnAbandonedIpcDeliveries(
+    (runnerJid: string, receipts: IpcDeliveryReceipt[]) => {
+      // Explicit Stop/delete is a user-requested terminal action. Advance the
+      // durable cursors for every accepted delivery so exit recovery cannot
+      // resurrect cancelled work.
+      commitIpcDeliveryReceipts(receipts);
+      logger.info(
+        { runnerJid, deliveryCount: receipts.length },
+        'Abandoned IPC deliveries after explicit runner stop',
+      );
+    },
+  );
   const schedulerDeps: import('./task-scheduler.js').SchedulerDependencies = {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
@@ -11198,6 +11497,7 @@ async function main(): Promise<void> {
 
   startIpcWatcher();
   recoverStreamingBuffer();
+  recoverStartupTypedIpcDeliveries();
   recoverPendingMessages();
   recoverConversationAgents();
   startStreamingBuffer();

@@ -13,6 +13,89 @@ export interface AgentProfileWorkspace {
   group: RegisteredGroup;
 }
 
+export interface WorkspaceRuntimeQuiesceTarget {
+  folder: string;
+  primaryJid?: string;
+}
+
+export class WorkspaceRuntimeQuiesceError<T = unknown> extends Error {
+  constructor(
+    public readonly phase: 'pre_commit' | 'post_commit',
+    public readonly failures: Array<{ jid: string; err: unknown }>,
+    public readonly committedValue?: T,
+  ) {
+    super(
+      phase === 'pre_commit'
+        ? 'Failed to quiesce workspace runtimes before commit'
+        : 'Commit succeeded but failed to quiesce workspace runtimes afterward',
+    );
+    this.name = 'WorkspaceRuntimeQuiesceError';
+  }
+
+  get persisted(): boolean {
+    return this.phase === 'post_commit';
+  }
+}
+
+type AgentProfileLockState = {
+  tail: Promise<void>;
+  references: number;
+};
+
+const agentProfileLocks = new Map<string, AgentProfileLockState>();
+
+async function acquireAgentProfileLock(profileId: string): Promise<() => void> {
+  let state = agentProfileLocks.get(profileId);
+  if (!state) {
+    state = { tail: Promise.resolve(), references: 0 };
+    agentProfileLocks.set(profileId, state);
+  }
+  state.references += 1;
+
+  const previous = state.tail;
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  state.tail = previous.then(() => gate);
+  await previous;
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+    state!.references -= 1;
+    if (state!.references === 0 && agentProfileLocks.get(profileId) === state) {
+      agentProfileLocks.delete(profileId);
+    }
+  };
+}
+
+/**
+ * Serialize membership/config mutations by top-level AgentProfile. Multiple
+ * keys are always acquired in lexical order, so opposite A→B/B→A migrations
+ * cannot deadlock. References include queued holders and are removed in the
+ * exceptional path as well as success.
+ */
+export async function withAgentProfileLocks<T>(
+  profileIds: string[],
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  const orderedIds = Array.from(new Set(profileIds)).sort();
+  const releases: Array<() => void> = [];
+  try {
+    for (const profileId of orderedIds) {
+      releases.push(await acquireAgentProfileLock(profileId));
+    }
+    return await operation();
+  } finally {
+    for (let index = releases.length - 1; index >= 0; index -= 1) {
+      releases[index]();
+    }
+  }
+}
+
 export function listWorkspaceGroupsForAgentProfile(
   ownerUserId: string,
   profileId: string,
@@ -45,6 +128,126 @@ export function getWorkspaceRuntimeJids(
   return Array.from(new Set([...siblingJids, ...descendantJids]));
 }
 
+function collectWorkspaceRuntimeJids(
+  deps: WebDeps,
+  targets: WorkspaceRuntimeQuiesceTarget[],
+): string[] {
+  return Array.from(
+    new Set(
+      targets.flatMap((target) =>
+        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+      ),
+    ),
+  );
+}
+
+async function forceStopRuntimeJids(
+  deps: WebDeps,
+  stopJids: string[],
+  options?: { preserveQueuedWork?: boolean },
+): Promise<Array<{ jid: string; err: unknown }>> {
+  const failures: Array<{ jid: string; err: unknown }> = [];
+  for (const jid of stopJids) {
+    try {
+      await deps.queue.stopGroup(
+        jid,
+        options?.preserveQueuedWork
+          ? { force: true, preserveQueuedWork: true }
+          : { force: true },
+      );
+    } catch (err) {
+      failures.push({ jid, err });
+    }
+  }
+  return failures;
+}
+
+/**
+ * Stop every affected runtime, synchronously commit the identity/ownership
+ * change, then stop the same (plus newly discovered) runtime JIDs again.
+ *
+ * The second pass closes the stop-before-persist TOCTOU window. In the JS
+ * event loop, `commit` contains no await. Immediately afterward stopGroup
+ * synchronously observes/marks an active GroupState before its first await;
+ * inactive runtimes return without awaiting. Therefore a runner created after
+ * pass one either exists when pass two starts and is awaited to inactive, or
+ * starts only after the commit and can observe only the new DB state. This is
+ * the required commit -> post-stop happens-before relationship. A scoped,
+ * ref-counted mutation pause parks accepted work across both passes and the
+ * finally block resumes it, so the quiesce cannot drop messages/tasks.
+ */
+export async function quiesceWorkspaceRunnersAroundCommit<T>(
+  deps: WebDeps,
+  targets: WorkspaceRuntimeQuiesceTarget[],
+  options: { reason: string },
+  commit: () => T,
+): Promise<{ value: T; runtimeJids: string[] }> {
+  const preCommitJids = collectWorkspaceRuntimeJids(deps, targets);
+  // Lock all serialization/folder keys synchronously before the first await.
+  // Work arriving for these keys is parked, including work for a descendant
+  // JID discovered only by the post-commit pass.
+  const pauseToken = deps.queue.pauseGroupsForMutation(preCommitJids);
+  try {
+    const preCommitFailures = await forceStopRuntimeJids(deps, preCommitJids, {
+      preserveQueuedWork: true,
+    });
+    if (preCommitFailures.length > 0) {
+      logger.error(
+        {
+          phase: 'pre_commit',
+          stopJids: preCommitJids,
+          failures: preCommitFailures,
+          reason: options.reason,
+        },
+        'Failed to quiesce workspace runtimes before commit',
+      );
+      throw new WorkspaceRuntimeQuiesceError('pre_commit', preCommitFailures);
+    }
+
+    const value = commit();
+
+    const postCommitJids = Array.from(
+      new Set([
+        ...preCommitJids,
+        ...collectWorkspaceRuntimeJids(deps, targets),
+      ]),
+    );
+    const postCommitFailures = await forceStopRuntimeJids(
+      deps,
+      postCommitJids,
+      { preserveQueuedWork: true },
+    );
+    if (postCommitFailures.length > 0) {
+      logger.error(
+        {
+          phase: 'post_commit',
+          stopJids: postCommitJids,
+          failures: postCommitFailures,
+          reason: options.reason,
+        },
+        'Commit persisted but post-commit workspace runtime cleanup failed',
+      );
+      throw new WorkspaceRuntimeQuiesceError(
+        'post_commit',
+        postCommitFailures,
+        value,
+      );
+    }
+
+    if (postCommitJids.length > 0) {
+      logger.info(
+        { stopJids: postCommitJids, reason: options.reason },
+        'Quiesced workspace runtimes around commit',
+      );
+    }
+    return { value, runtimeJids: postCommitJids };
+  } finally {
+    // Success and both failure phases release exactly once. Resume drains all
+    // accepted messages/manual/scheduled tasks parked during the mutation.
+    deps.queue.resumeGroupsAfterMutation(pauseToken);
+  }
+}
+
 export async function stopWorkspaceRunnersForAgentIdentityChange(
   deps: WebDeps,
   folder: string,
@@ -54,15 +257,7 @@ export async function stopWorkspaceRunnersForAgentIdentityChange(
   },
 ): Promise<string[]> {
   const stopJids = getWorkspaceRuntimeJids(deps, folder, options.primaryJid);
-  const errors: Array<{ jid: string; err: unknown }> = [];
-
-  for (const jid of stopJids) {
-    try {
-      await deps.queue.stopGroup(jid, { force: true });
-    } catch (err) {
-      errors.push({ jid, err });
-    }
-  }
+  const errors = await forceStopRuntimeJids(deps, stopJids);
 
   if (errors.length > 0) {
     logger.error(
@@ -81,4 +276,3 @@ export async function stopWorkspaceRunnersForAgentIdentityChange(
 
   return stopJids;
 }
-

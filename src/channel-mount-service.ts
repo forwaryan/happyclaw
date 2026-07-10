@@ -10,7 +10,7 @@ export interface ChannelMountResolutionDeps {
   getAgent: (sessionId: string) => Pick<SubAgent, 'id' | 'chat_jid'> | undefined;
   getRegisteredGroup: (
     jid: string,
-  ) => (RegisteredGroup & { jid: string }) | undefined;
+  ) => RegisteredGroup | undefined;
   getJidsByFolder?: (folder: string) => string[];
 }
 
@@ -19,6 +19,25 @@ export interface ChannelMountUpdateOptions {
   activationMode?: ChannelMount['activation_mode'];
   ownerImId?: string | null;
 }
+
+export type ChannelMountTargetResolution =
+  | {
+      status: 'resolved';
+      effectiveJid: string;
+      workspaceJid: string;
+      workspace: RegisteredGroup;
+      agentId: string | null;
+      workspaceMismatch?: {
+        storedWorkspaceJid: string;
+        actualWorkspaceJid: string;
+      };
+    }
+  | {
+      status: 'stale';
+      reason: 'missing_session' | 'missing_workspace';
+      sessionId?: string;
+      workspaceJid: string;
+    };
 
 export function isImChannelJid(jid: string): boolean {
   return jid !== '' && !jid.startsWith('web:') && getChannelType(jid) !== null;
@@ -89,6 +108,63 @@ export function normalizeChannelMountFromGroup(
 
   void now;
   return null;
+}
+
+export function resolveChannelMountTarget(
+  mount: Pick<ChannelMount, 'session_id' | 'workspace_jid'>,
+  deps: Pick<ChannelMountResolutionDeps, 'getAgent' | 'getRegisteredGroup'>,
+): ChannelMountTargetResolution {
+  if (mount.session_id) {
+    const session = deps.getAgent(mount.session_id);
+    if (!session?.chat_jid) {
+      return {
+        status: 'stale',
+        reason: 'missing_session',
+        sessionId: mount.session_id,
+        workspaceJid: mount.workspace_jid,
+      };
+    }
+    const workspace = deps.getRegisteredGroup(session.chat_jid);
+    if (!workspace) {
+      return {
+        status: 'stale',
+        reason: 'missing_workspace',
+        sessionId: mount.session_id,
+        workspaceJid: session.chat_jid,
+      };
+    }
+    return {
+      status: 'resolved',
+      effectiveJid: `${session.chat_jid}#agent:${mount.session_id}`,
+      workspaceJid: session.chat_jid,
+      workspace,
+      agentId: mount.session_id,
+      ...(mount.workspace_jid !== session.chat_jid
+        ? {
+            workspaceMismatch: {
+              storedWorkspaceJid: mount.workspace_jid,
+              actualWorkspaceJid: session.chat_jid,
+            },
+          }
+        : {}),
+    };
+  }
+
+  const workspace = deps.getRegisteredGroup(mount.workspace_jid);
+  if (!workspace) {
+    return {
+      status: 'stale',
+      reason: 'missing_workspace',
+      workspaceJid: mount.workspace_jid,
+    };
+  }
+  return {
+    status: 'resolved',
+    effectiveJid: mount.workspace_jid,
+    workspaceJid: mount.workspace_jid,
+    workspace,
+    agentId: null,
+  };
 }
 
 export function buildSessionMountUpdate(

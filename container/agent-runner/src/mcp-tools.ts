@@ -448,11 +448,11 @@ EXECUTION TYPE:
 EXECUTION MODE:
 \u2022 "host": Task runs directly on the host machine. Admin only.
 \u2022 "container" (default for non-admin): Task runs in a Docker container.
-Each agent task automatically gets its own dedicated workspace.
+Each agent task runs in its source workspace (same files, mounts, skills, and Agent profile).
 
 CONTEXT MODE (agent mode only) - Choose based on task type:
 \u2022 "group": Task runs in the group's conversation context, with access to chat history.
-\u2022 "isolated": Task runs in a fresh session with no conversation history.
+\u2022 "isolated": Each trigger gets a fresh, independent session inside the source workspace. The session and virtual task chat are removed after that run.
 
 MESSAGING BEHAVIOR - The task output is sent to the user or group.
 \u2022 Agent mode: output is sent via MCP tool or stdout. Use <internal> tags to suppress.

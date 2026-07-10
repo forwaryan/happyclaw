@@ -1,8 +1,14 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
-import type { AgentProfile, GroupInfo } from '../types';
+import type {
+  AgentProfile,
+  AgentProfileGovernance,
+  AgentProfileRuntimePolicy,
+  GroupInfo,
+} from '../types';
 import { useChatStore } from './chat';
 import { useGroupsStore } from './groups';
+import { buildWorkspaceAgentProfilePatch } from '../utils/agent-product';
 
 interface AgentProfileDraft {
   name: string;
@@ -11,18 +17,29 @@ interface AgentProfileDraft {
 
 interface AgentProfilesState {
   profiles: AgentProfile[];
+  governanceByProfile: Record<string, AgentProfileGovernance | undefined>;
+  governanceLoading: Record<string, boolean | undefined>;
+  governanceErrors: Record<string, string | undefined>;
   loading: boolean;
+  profilesError: string | null;
   error: string | null;
   loadProfiles: () => Promise<void>;
+  loadProfileGovernance: (id: string) => Promise<AgentProfileGovernance>;
   generateProfileDraft: (description: string) => Promise<AgentProfileDraft>;
   createProfile: (data: {
     name: string;
     identity_prompt?: string;
     include_claude_preset?: boolean;
+    runtime_policy?: AgentProfileRuntimePolicy;
   }) => Promise<AgentProfile>;
   updateProfile: (
     id: string,
-    data: { name?: string; identity_prompt?: string; include_claude_preset?: boolean },
+    data: {
+      name?: string;
+      identity_prompt?: string;
+      include_claude_preset?: boolean;
+      runtime_policy?: AgentProfileRuntimePolicy;
+    },
   ) => Promise<AgentProfile>;
   deleteProfile: (id: string) => Promise<void>;
   setWorkspaceAgentProfile: (jid: string, profileId: string) => Promise<void>;
@@ -30,19 +47,57 @@ interface AgentProfilesState {
 
 export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
   profiles: [],
+  governanceByProfile: {},
+  governanceLoading: {},
+  governanceErrors: {},
   loading: false,
+  profilesError: null,
   error: null,
 
   loadProfiles: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ profiles: AgentProfile[] }>('/api/agent-profiles');
-      set({ profiles: data.profiles, loading: false, error: null });
+      const data = await api.get<{ profiles: AgentProfile[] }>(
+        '/api/agent-profiles',
+      );
+      set({
+        profiles: data.profiles,
+        loading: false,
+        profilesError: null,
+        error: null,
+      });
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        profilesError: message,
+        error: message,
       });
+    }
+  },
+
+  loadProfileGovernance: async (id) => {
+    set((state) => ({
+      governanceLoading: { ...state.governanceLoading, [id]: true },
+      governanceErrors: { ...state.governanceErrors, [id]: undefined },
+    }));
+    try {
+      const data = await api.get<AgentProfileGovernance>(
+        `/api/agent-profiles/${encodeURIComponent(id)}/workspaces`,
+      );
+      set((state) => ({
+        governanceByProfile: { ...state.governanceByProfile, [id]: data },
+        governanceLoading: { ...state.governanceLoading, [id]: false },
+        governanceErrors: { ...state.governanceErrors, [id]: undefined },
+      }));
+      return data;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        governanceLoading: { ...state.governanceLoading, [id]: false },
+        governanceErrors: { ...state.governanceErrors, [id]: message },
+      }));
+      throw err;
     }
   },
 
@@ -63,11 +118,15 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
 
   createProfile: async (data) => {
     try {
-      const res = await api.post<{ profile: AgentProfile }>('/api/agent-profiles', data);
+      const res = await api.post<{ profile: AgentProfile }>(
+        '/api/agent-profiles',
+        data,
+      );
       set((state) => ({
-        profiles: [res.profile, ...state.profiles.filter((p) => p.id !== res.profile.id)].sort(
-          (a, b) => Number(b.is_default) - Number(a.is_default),
-        ),
+        profiles: [
+          res.profile,
+          ...state.profiles.filter((p) => p.id !== res.profile.id),
+        ].sort((a, b) => Number(b.is_default) - Number(a.is_default)),
         error: null,
       }));
       await get().loadProfiles();
@@ -86,6 +145,12 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
       );
       set((state) => ({
         profiles: state.profiles.map((p) => (p.id === id ? res.profile : p)),
+        governanceByProfile: {
+          ...state.governanceByProfile,
+          [id]: state.governanceByProfile[id]
+            ? { ...state.governanceByProfile[id], profile: res.profile }
+            : undefined,
+        },
         error: null,
       }));
       await Promise.all([
@@ -104,6 +169,14 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
       await api.delete(`/api/agent-profiles/${encodeURIComponent(id)}`);
       set((state) => ({
         profiles: state.profiles.filter((p) => p.id !== id),
+        governanceByProfile: Object.fromEntries(
+          Object.entries(state.governanceByProfile).filter(
+            ([key]) => key !== id,
+          ),
+        ),
+        governanceErrors: Object.fromEntries(
+          Object.entries(state.governanceErrors).filter(([key]) => key !== id),
+        ),
         error: null,
       }));
     } catch (err) {
@@ -120,7 +193,7 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
         agent_profile_name: string;
         agent_profile_version: number;
       }>(`/api/groups/${encodeURIComponent(jid)}/agent-profile`, {
-        agent_profile_id: profileId,
+        ...buildWorkspaceAgentProfilePatch(profileId),
       });
       const patchGroup = (group?: GroupInfo): GroupInfo | undefined =>
         group

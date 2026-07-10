@@ -11,6 +11,14 @@ import {
   toggleNotifyChannel,
 } from '../../utils/task-utils';
 import { useConnectedChannels } from '../../hooks/useConnectedChannels';
+import { useGroupsStore } from '../../stores/groups';
+import { useAuthStore } from '../../stores/auth';
+import { getWorkspaceExecutionMode } from '../../utils/agent-product';
+import {
+  buildTaskWorkspacePatch,
+  canSelectTaskExecutionMode,
+  type TaskExecutionMode,
+} from '../../utils/task-edit';
 import {
   ChannelBadge,
   CHANNEL_LABEL,
@@ -71,12 +79,24 @@ export function TaskDetail({ task }: TaskDetailProps) {
 
   const connectedChannels = useConnectedChannels();
   const groupNames = useTasksStore((s) => s.groupNames);
+  const executionRole = useAuthStore((state) =>
+    state.user?.role === 'admin' ? 'admin' : 'member',
+  );
+  const isAdmin = executionRole === 'admin';
+  const groups = useGroupsStore((state) => state.groups);
+  const groupsLoading = useGroupsStore((state) => state.loading);
+  const groupsError = useGroupsStore((state) => state.error);
+  const loadGroups = useGroupsStore((state) => state.loadGroups);
   const taskLogs = logs[task.id] || [];
   const [logsLoading, setLogsLoading] = useState(false);
 
   useEffect(() => {
     loadLogs(task.id);
   }, [task.id, loadLogs]);
+
+  useEffect(() => {
+    void loadGroups();
+  }, [loadGroups]);
 
   const handleRefreshLogs = async () => {
     setLogsLoading(true);
@@ -96,6 +116,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
     schedule_value: task.schedule_value,
     notify_channels: task.notify_channels ?? null,
     chat_jid: task.chat_jid,
+    execution_mode: (task.execution_mode ?? 'container') as TaskExecutionMode,
     context_mode: task.context_mode,
   });
 
@@ -117,6 +138,8 @@ export function TaskDetail({ task }: TaskDetailProps) {
         schedule_value: task.schedule_value,
         notify_channels: task.notify_channels ?? null,
         chat_jid: task.chat_jid,
+        execution_mode: (task.execution_mode ??
+          'container') as TaskExecutionMode,
         context_mode: task.context_mode,
       });
       const decomposed = decomposeInterval(task.schedule_value);
@@ -146,8 +169,15 @@ export function TaskDetail({ task }: TaskDetailProps) {
       const newChannels = JSON.stringify(editForm.notify_channels);
       if (oldChannels !== newChannels)
         fields.notify_channels = editForm.notify_channels;
-      if (editForm.chat_jid !== task.chat_jid)
-        fields.chat_jid = editForm.chat_jid;
+      Object.assign(
+        fields,
+        buildTaskWorkspacePatch({
+          currentChatJid: task.chat_jid,
+          currentExecutionMode: task.execution_mode,
+          targetChatJid: editForm.chat_jid,
+          targetExecutionMode: editForm.execution_mode,
+        }),
+      );
       if (editForm.context_mode !== task.context_mode)
         fields.context_mode = editForm.context_mode;
 
@@ -171,6 +201,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
       schedule_value: task.schedule_value,
       notify_channels: task.notify_channels ?? null,
       chat_jid: task.chat_jid,
+      execution_mode: (task.execution_mode ?? 'container') as TaskExecutionMode,
       context_mode: task.context_mode,
     });
     const decomposed = decomposeInterval(task.schedule_value);
@@ -391,7 +422,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
           <div className="text-xs text-muted-foreground mb-1">
             {scheduleLabel()}
           </div>
-          {editing ? (
+          {editing && isAdmin ? (
             <>
               {editForm.schedule_type === 'interval' ? (
                 <div className="flex gap-2">
@@ -460,14 +491,45 @@ export function TaskDetail({ task }: TaskDetailProps) {
           </div>
         )}
 
-        {task.execution_mode && (
-          <div>
-            <div className="text-xs text-muted-foreground mb-1">执行模式</div>
-            <div className="text-sm text-foreground">
-              {task.execution_mode === 'host' ? '宿主机' : 'Docker 容器'}
-            </div>
-          </div>
-        )}
+        <div>
+          <div className="text-xs text-muted-foreground mb-1">执行模式</div>
+          {editing ? (
+            <>
+              <select
+                value={editForm.execution_mode}
+                onChange={(event) =>
+                  setEditForm({
+                    ...editForm,
+                    execution_mode: event.target.value as TaskExecutionMode,
+                  })
+                }
+                className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
+              >
+                <option value="host">宿主机</option>
+                <option value="container">Docker 容器</option>
+              </select>
+              <p className="mt-1 text-xs text-muted-foreground">
+                切换工作区时会自动继承目标工作区模式，也可在保存前手动调整。
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="text-sm text-foreground">
+                {(editing ? editForm.execution_mode : task.execution_mode) ===
+                'host'
+                  ? '宿主机'
+                  : 'Docker 容器'}
+              </div>
+              {editing && !isAdmin && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {editForm.execution_mode === 'host'
+                    ? '这是旧版宿主机任务；成员只能查看，执行模式仅管理员可修改。'
+                    : '成员任务固定使用 Docker 容器；宿主机模式仅管理员可用。'}
+                </p>
+              )}
+            </>
+          )}
+        </div>
 
         <div>
           <div className="text-xs text-muted-foreground mb-1">会话模式</div>
@@ -495,19 +557,57 @@ export function TaskDetail({ task }: TaskDetailProps) {
         <div>
           <div className="text-xs text-muted-foreground mb-1">所属工作区</div>
           {editing ? (
-            <select
-              value={editForm.chat_jid}
-              onChange={(e) =>
-                setEditForm({ ...editForm, chat_jid: e.target.value })
-              }
-              className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
-            >
-              {Object.entries(groupNames).map(([jid, name]) => (
-                <option key={jid} value={jid}>
-                  {formatGroupLabel(jid, name)}
-                </option>
-              ))}
-            </select>
+            <>
+              <select
+                value={editForm.chat_jid}
+                onChange={(event) => {
+                  const chatJid = event.target.value;
+                  const targetExecutionMode = getWorkspaceExecutionMode(
+                    groups,
+                    chatJid,
+                  );
+                  if (!targetExecutionMode) {
+                    showToast('无法切换工作区', '尚未取得目标工作区的执行模式');
+                    return;
+                  }
+                  if (
+                    !canSelectTaskExecutionMode(
+                      executionRole,
+                      targetExecutionMode,
+                    )
+                  ) {
+                    showToast(
+                      '无法切换工作区',
+                      '成员任务不能迁移到宿主机执行工作区',
+                    );
+                    return;
+                  }
+                  setEditForm({
+                    ...editForm,
+                    chat_jid: chatJid,
+                    execution_mode: targetExecutionMode,
+                  });
+                }}
+                disabled={groupsLoading || !!groupsError}
+                className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
+              >
+                {Object.entries(groupNames).map(([jid, name]) => (
+                  <option key={jid} value={jid}>
+                    {formatGroupLabel(jid, name)}
+                  </option>
+                ))}
+              </select>
+              {groupsLoading && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  正在加载工作区执行模式…
+                </p>
+              )}
+              {groupsError && (
+                <p className="mt-1 text-xs text-error">
+                  工作区信息加载失败，请关闭编辑后重试。
+                </p>
+              )}
+            </>
           ) : (
             <div className="text-sm text-foreground inline-flex items-center gap-1.5">
               <ChannelBadge channelType={task.chat_jid.split(':')[0]} />

@@ -28,12 +28,13 @@ dist/
 *.db-shm
 *.sqlite
 
-# Lockfiles（子项目的 package-lock 由构建生成，不需要跟踪）
+# Lockfiles（agent-runner 是可复现容器构建的例外，必须跟踪）
 package-lock.json
 container/agent-runner/package-lock.json
 web/package-lock.json
 bun.lock
 bun.lockb
+!container/agent-runner/package-lock.json
 
 # Build cache
 .build-sentinel

@@ -23,6 +23,9 @@ export function useImBindings() {
   const [loading, setLoading] = useState(true);
   const [targets, setTargets] = useState<BindingTarget[]>([]);
   const [targetsLoading, setTargetsLoading] = useState(true);
+  const [bindingsLoadError, setBindingsLoadError] = useState<string | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const groups = useChatStore((s) => s.groups);
@@ -51,9 +54,14 @@ export function useImBindings() {
       return;
     }
     setLoading(true);
+    setBindingsLoadError(null);
     try {
       const result = await loadAvailableImGroups(hJid);
       setBindings(result);
+    } catch (err) {
+      setBindingsLoadError(
+        err instanceof Error ? err.message : '消息渠道加载失败，请稍后重试',
+      );
     } finally {
       setLoading(false);
     }
@@ -63,8 +71,8 @@ export function useImBindings() {
     setTargetsLoading(true);
     try {
       const currentGroups = groupsRef.current;
-      const webGroups = Object.entries(currentGroups).filter(
-        ([jid]) => jid.startsWith('web:'),
+      const webGroups = Object.entries(currentGroups).filter(([jid]) =>
+        jid.startsWith('web:'),
       );
 
       const allTargets: BindingTarget[] = [];
@@ -138,7 +146,12 @@ export function useImBindings() {
         unbind?: boolean;
         force?: boolean;
         reply_policy?: 'source_only' | 'mirror';
-        activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+        activation_mode?:
+          | 'auto'
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled';
         owner_im_id?: string;
       },
     ): Promise<string | null> => {
@@ -151,8 +164,7 @@ export function useImBindings() {
         await loadBindings();
         return null;
       } catch (err) {
-        const msg =
-          err instanceof Error ? err.message : '操作失败，请重试';
+        const msg = err instanceof Error ? err.message : '操作失败，请重试';
         setError(msg);
         return msg;
       }
@@ -185,5 +197,16 @@ export function useImBindings() {
 
   const clearError = useCallback(() => setError(null), []);
 
-  return { bindings, loading, targets, targetsLoading, reload, rebind, resetAllowlist, error, clearError };
+  return {
+    bindings,
+    loading,
+    bindingsLoadError,
+    targets,
+    targetsLoading,
+    reload,
+    rebind,
+    resetAllowlist,
+    error,
+    clearError,
+  };
 }

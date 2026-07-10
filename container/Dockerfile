@@ -106,14 +106,15 @@ ENV PATH="/home/node/.local/bin:${PATH}"
 # Create app directory
 WORKDIR /app
 
-# Copy package.json only — no lock file so "*" always resolves to latest SDK
-COPY agent-runner/package.json ./
+# Reproducible agent runtime: the verified SDK/CLI graph is locked and npm ci
+# refuses to build if package.json and package-lock.json ever drift.
+COPY agent-runner/package.json agent-runner/package-lock.json ./
 
-# CACHEBUST after COPY ensures both global and local npm install are cache-busted
-# (COPY caches on file content hash, which blocks ARG invalidation propagation)
+# CACHEBUST refreshes intentionally-latest global tooling. The local npm ci
+# remains deterministic from package-lock.json even when this layer reruns.
 ARG CACHEBUST=1
 RUN npm install -g agent-browser
-RUN npm install
+RUN npm ci
 
 # Headroom (https://github.com/chopratejas/headroom) - 工具输出/RAG/日志压缩.
 # 装上 binary 但默认不启用——用户在 /mcp-servers 自行添加才生效, 配置:

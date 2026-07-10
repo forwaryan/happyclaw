@@ -30,6 +30,50 @@ afterAll(() => {
 });
 
 describe('AgentProfile runtime invalidation', () => {
+  test('opposite multi-profile lock order is serialized without deadlock', async () => {
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstEntered!: () => void;
+    const firstEnteredPromise = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+
+    const first = runtime.withAgentProfileLocks(
+      ['profile-b', 'profile-a'],
+      async () => {
+        events.push('first-enter');
+        firstEntered();
+        await firstGate;
+        events.push('first-exit');
+      },
+    );
+    await firstEnteredPromise;
+
+    const second = runtime.withAgentProfileLocks(
+      ['profile-a', 'profile-b'],
+      () => events.push('second-enter'),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(events).toEqual(['first-enter']);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(events).toEqual(['first-enter', 'first-exit', 'second-enter']);
+
+    // An exception must also release/refcount-clean both keys.
+    await expect(
+      runtime.withAgentProfileLocks(['profile-a', 'profile-b'], () => {
+        throw new Error('lock callback failed');
+      }),
+    ).rejects.toThrow('lock callback failed');
+    await expect(
+      runtime.withAgentProfileLocks(['profile-b', 'profile-a'], () => 'ok'),
+    ).resolves.toBe('ok');
+  });
+
   test('stops all workspace sibling and descendant runners', async () => {
     const folder = 'agent-profile-runtime-workspace';
     const now = new Date().toISOString();
@@ -94,5 +138,143 @@ describe('AgentProfile runtime invalidation', () => {
       force: true,
     });
   });
-});
 
+  test('post-commit pass stops a runner that appeared after pass one', async () => {
+    const folder = 'agent-profile-runtime-two-phase';
+    const primaryJid = 'web:agent-profile-runtime-two-phase';
+    db.setRegisteredGroup(primaryJid, {
+      name: 'Two Phase Workspace',
+      folder,
+      added_at: new Date().toISOString(),
+      created_by: 'agent-profile-runtime-user',
+    });
+
+    const events: string[] = [];
+    let exposeRunnerStartedBetweenStopAndCommit = false;
+    const stopGroup = vi.fn(async (jid: string) => {
+      events.push(`stop:${jid}`);
+      if (stopGroup.mock.calls.length === 1) {
+        // Simulate a runner starting after pass one and reading the old DB
+        // state. The post-commit collection must discover and stop it.
+        exposeRunnerStartedBetweenStopAndCommit = true;
+        events.push('runner-started-with-old-state');
+      }
+    });
+    const deps = {
+      queue: {
+        pauseGroupsForMutation: (jids: string[]) => {
+          events.push(`pause:${jids.join(',')}`);
+          return { keys: ['two-phase'] };
+        },
+        resumeGroupsAfterMutation: () => events.push('resume'),
+        listDescendantJids: () =>
+          exposeRunnerStartedBetweenStopAndCommit
+            ? [`${primaryJid}#agent:between-phases`]
+            : [],
+        stopGroup,
+      },
+    } as unknown as Parameters<
+      typeof runtime.quiesceWorkspaceRunnersAroundCommit
+    >[0];
+
+    const result = await runtime.quiesceWorkspaceRunnersAroundCommit(
+      deps,
+      [{ folder, primaryJid }],
+      { reason: 'test two-phase happens-before' },
+      () => {
+        events.push('commit-new-state');
+        return 'committed';
+      },
+    );
+
+    expect(result.value).toBe('committed');
+    expect(result.runtimeJids.sort()).toEqual(
+      [primaryJid, `${primaryJid}#agent:between-phases`].sort(),
+    );
+    expect(events).toEqual([
+      `pause:${primaryJid}`,
+      `stop:${primaryJid}`,
+      'runner-started-with-old-state',
+      'commit-new-state',
+      `stop:${primaryJid}`,
+      `stop:${primaryJid}#agent:between-phases`,
+      'resume',
+    ]);
+    expect(stopGroup).toHaveBeenCalledWith(primaryJid, {
+      force: true,
+      preserveQueuedWork: true,
+    });
+  });
+
+  test('pre-commit stop failure does not call commit', async () => {
+    const commit = vi.fn(() => 'must-not-persist');
+    const resumeGroupsAfterMutation = vi.fn();
+    const deps = {
+      queue: {
+        pauseGroupsForMutation: () => ({ keys: ['pre-failure'] }),
+        resumeGroupsAfterMutation,
+        listDescendantJids: () => [],
+        stopGroup: vi.fn(async () => {
+          throw new Error('injected pre-commit failure');
+        }),
+      },
+    } as unknown as Parameters<
+      typeof runtime.quiesceWorkspaceRunnersAroundCommit
+    >[0];
+
+    await expect(
+      runtime.quiesceWorkspaceRunnersAroundCommit(
+        deps,
+        [
+          {
+            folder: 'pre-commit-failure',
+            primaryJid: 'web:pre-commit-failure',
+          },
+        ],
+        { reason: 'test pre failure' },
+        commit,
+      ),
+    ).rejects.toMatchObject({ phase: 'pre_commit', persisted: false });
+    expect(commit).not.toHaveBeenCalled();
+    expect(resumeGroupsAfterMutation).toHaveBeenCalledTimes(1);
+  });
+
+  test('post-commit stop failure exposes the committed value', async () => {
+    let stopCalls = 0;
+    const resumeGroupsAfterMutation = vi.fn();
+    const deps = {
+      queue: {
+        pauseGroupsForMutation: () => ({ keys: ['post-failure'] }),
+        resumeGroupsAfterMutation,
+        listDescendantJids: () => [],
+        stopGroup: vi.fn(async () => {
+          stopCalls += 1;
+          if (stopCalls === 2) {
+            throw new Error('injected post-commit failure');
+          }
+        }),
+      },
+    } as unknown as Parameters<
+      typeof runtime.quiesceWorkspaceRunnersAroundCommit
+    >[0];
+
+    await expect(
+      runtime.quiesceWorkspaceRunnersAroundCommit(
+        deps,
+        [
+          {
+            folder: 'post-commit-failure',
+            primaryJid: 'web:post-commit-failure',
+          },
+        ],
+        { reason: 'test post failure' },
+        () => ({ version: 2 }),
+      ),
+    ).rejects.toMatchObject({
+      phase: 'post_commit',
+      persisted: true,
+      committedValue: { version: 2 },
+    });
+    expect(resumeGroupsAfterMutation).toHaveBeenCalledTimes(1);
+  });
+});

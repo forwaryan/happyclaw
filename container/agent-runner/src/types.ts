@@ -77,6 +77,15 @@ export interface ContainerOutput {
    * >0 时主进程应把流式卡片保持在「后台任务运行中」而非定稿，后续 turn 的
    * 内容会继续追加到同一张卡。仅 sdk_final 类 result 携带。 */
   pendingBgTasks?: number;
+  /** This SDK result durably completed the user-input turn associated with it.
+   * False/absent for truncated, background-pending, interrupted, and error paths. */
+  inputTurnCompleted?: boolean;
+  ipcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{ timestamp: string; id: string }>;
+    cursor: { timestamp: string; id: string };
+  }>;
 }
 
 export interface SessionEntry {

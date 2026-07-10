@@ -13,6 +13,7 @@ export interface ClaudeContextPlanArgs {
   dataDir: string;
   groupSessionsDir?: string;
   mountUserSkills?: boolean;
+  userSkillsDirOverride?: string;
   // host 模式下 HappyClaw 记忆层是否启用（即 !disableMemoryLayerForAdminHost）。
   // true 且 admin 原生 ~/.claude/CLAUDE.md 存在时，两套全局记忆并存，触发 audit 告警。
   happyclawMemoryActive?: boolean;
@@ -128,7 +129,7 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
   const projectSkillsDir = path.join(args.projectRoot, 'container', 'skills');
   const userSkillsDir =
     args.mountUserSkills !== false && ownerId
-      ? path.join(args.dataDir, 'skills', ownerId)
+      ? (args.userSkillsDirOverride ?? path.join(args.dataDir, 'skills', ownerId))
       : undefined;
 
   const hostClaudeRuntime = args.groupSessionsDir

@@ -201,6 +201,43 @@ export const GroupAgentProfilePatchSchema = z.object({
   agent_profile_id: z.string().trim().min(1),
 });
 
+const AgentProfileRuntimePolicyModeSchema = z.enum([
+  'inherit',
+  'custom',
+  'disabled',
+]);
+
+export const AgentProfileRuntimePolicySchema = z
+  .object({
+    provider_id: z
+      .string()
+      .trim()
+      .max(128)
+      .nullable()
+      .optional()
+      .transform((val) =>
+        val === undefined ? undefined : val && val.trim() ? val.trim() : null,
+      ),
+    skills: z
+      .object({
+        mode: AgentProfileRuntimePolicyModeSchema.optional(),
+        ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+      })
+      .optional(),
+    mcp: z
+      .object({
+        mode: AgentProfileRuntimePolicyModeSchema.optional(),
+        ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+      })
+      .optional(),
+    tools: z
+      .object({
+        mode: z.enum(['inherit', 'readonly', 'restricted']).optional(),
+      })
+      .optional(),
+  })
+  .strict();
+
 export const AgentProfileCreateSchema = z.object({
   name: z.string().trim().min(1).max(80),
   identity_prompt: z
@@ -209,6 +246,7 @@ export const AgentProfileCreateSchema = z.object({
     .optional()
     .transform((val) => (val == null ? undefined : val.trim())),
   include_claude_preset: z.boolean().optional(),
+  runtime_policy: AgentProfileRuntimePolicySchema.optional(),
 });
 
 export const AgentProfilePatchSchema = z.object({
@@ -219,6 +257,7 @@ export const AgentProfilePatchSchema = z.object({
     .optional()
     .transform((val) => (val == null ? undefined : val.trim())),
   include_claude_preset: z.boolean().optional(),
+  runtime_policy: AgentProfileRuntimePolicySchema.optional(),
 });
 
 export const AgentProfileGenerateSchema = z.object({

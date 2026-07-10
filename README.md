@@ -58,6 +58,7 @@ HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claud
 ### 关键特性
 
 - **原生 Claude Code 驱动** — 基于 Claude Agent SDK，底层为完整的 Claude Code CLI 运行时，继承其全部能力
+- **Agent-first 工作台** — Agent 是顶层身份与运行策略，工作区是其下的文件/执行隔离边界；固定、个人与协作列表都保留 Agent → Workspace 层级
 - **多用户隔离** — Per-user 工作区、Per-user IM 通道、RBAC 权限体系、邀请码注册、审计日志，每个用户拥有独立的执行环境
 - **六端消息统一路由** — 飞书 WebSocket 长连接（流式卡片 + Reaction）、Telegram Bot API、QQ Bot API v2、钉钉 Stream 协议、微信 iLink Bot API、Web 界面，六端消息统一路由
 - **多提供商负载均衡** — 支持多个 Claude API 提供商，三种负载均衡策略（round-robin / weighted / failover），自动健康检测与恢复
@@ -82,13 +83,26 @@ HappyClaw 是一个基于 [Claude Agent SDK](https://github.com/anthropics/claud
 每个用户可独立配置自己的 IM 通道（飞书应用凭据、Telegram Bot Token、QQ Bot 凭据、钉钉 Client ID/Secret、微信 iLink Token），互不干扰。消息统一路由：各渠道来源回各自渠道，Web 来源回 Web。
 
 
+### Agent-first 工作区模型
+
+产品层级为 `Agent → Workspace → Runtime Session`：
+
+- **Agent** — 保存身份提示词、Claude 原生 preset 开关，以及 Provider、用户 Skills、用户 MCP 和工具能力策略
+- **Workspace** — 归属于一个 Agent，提供宿主机/容器执行模式、文件目录、成员与消息挂载等隔离边界；创建时必须显式选择 Agent
+- **Runtime Session** — 工作区内实际运行的主会话、对话或任务会话，是运行态记录，不是另一个顶层 Agent
+- **归属迁移** — 可在 Agent 治理页迁移工作区；迁移会同步消息挂载的 Agent 归属并刷新旧运行态。删除非默认 Agent 前必须先迁移其全部工作区
+- **策略安全边界** — `readonly` / `restricted` 会关闭用户 MCP 与用户插件、启用严格 MCP、禁用写入/Bash/子 Agent，并默认拒绝未分类的 HappyClaw 工具；仅保留已分类的查询、记忆读取和消息回复等能力
+
+Agent、工作区和 IM 列表加载失败会显示可重试错误态，不会静默回退到默认 Agent 创建工作区。
+
+
 ### 多提供商与负载均衡
 
 支持配置多个 Claude API 提供商（Anthropic 官方、各类中转服务、Coding Plan），实现高可用部署：
 
 - **三种负载均衡策略** — Round-Robin（轮询）、Weighted（加权）、Failover（主备切换）
 - **自动健康检测** — 连续错误追踪（默认 3 次标记不健康），5 分钟自动恢复探测
-- **Per-group 提供商切换** — 在监控页面可为每个工作区指定使用哪个提供商
+- **Agent 级 Provider 策略** — 每个 Agent 可固定使用一个已启用 Provider，或继承全局负载均衡池
 - **OAuth 凭据支持** — 支持 Claude Code OAuth Token，兼容各类认证方式
 - **活跃会话计数** — 实时显示每个提供商的并发使用量
 
@@ -180,7 +194,8 @@ Agent 在运行时可通过内置 MCP Server 与主进程通信：
 
 - **三种调度模式** — Cron 表达式 / 固定间隔 / 一次性执行
 - **两种执行类型** — Agent（启动完整 Claude Agent）/ Script（直接执行 shell 命令）
-- **两种上下文模式** — `group`（在指定会话中执行）/ `isolated`（独立隔离环境）
+- **两种上下文模式** — `group` 把任务作为普通消息注入来源工作区主会话；默认的 `isolated` 仍使用来源工作区的目录、环境、Agent 身份与执行模式，但每次运行创建独立队列、Claude session 和 IPC 命名空间，结束后清理，既不污染主会话，也不跨运行累积上下文
+- **迁移保持执行语义** — 编辑任务所属工作区时，同时保存目标工作区的 `execution_mode`，避免从宿主机工作区迁到容器工作区后仍按旧模式运行
 - **通知渠道** — 任务完成后可通知到指定 IM 渠道（飞书/Telegram/QQ/钉钉/微信）
 - **完整的执行日志** — 耗时、状态、结果，Web 界面管理
 

@@ -59,13 +59,19 @@ import {
   deleteAgent,
   deleteImContextBindingsByWorkspace,
   assignWorkspaceAgentProfile,
+  deleteWorkspaceAgentProfile,
   getAgentProfileForUser,
   getAgentProfileForWorkspace,
   getOrCreateDefaultAgentProfile,
+  getWorkspaceAgentProfileId,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
-import { stopWorkspaceRunnersForAgentIdentityChange } from '../agent-profile-runtime.js';
+import {
+  quiesceWorkspaceRunnersAroundCommit,
+  withAgentProfileLocks,
+  WorkspaceRuntimeQuiesceError,
+} from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
   saveContainerEnvConfig,
@@ -128,7 +134,12 @@ interface GroupPayloadItem {
   can_modify?: boolean;
   can_manage_members?: boolean;
   pinned_at?: string;
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
   conversation_source?: 'manual' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
   agent_profile_id?: string;
@@ -265,6 +276,13 @@ import { removeFlowArtifacts } from '../file-manager.js';
 import { clearSessionFiles } from '../session-files.js';
 export { removeFlowArtifacts };
 
+class WorkspaceMissingDuringMigrationError extends Error {
+  constructor() {
+    super('Workspace no longer exists or changed during migration');
+    this.name = 'WorkspaceMissingDuringMigrationError';
+  }
+}
+
 function resetWorkspaceForGroup(folder: string): void {
   // 1. 清除工作目录（Agent 文件、CLAUDE.md、logs/ 等），然后重建空目录
   const groupDir = path.join(GROUPS_DIR, folder);
@@ -335,7 +353,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   // If user didn't specify execution mode, pick based on Docker availability
-  const executionMode = validation.data.execution_mode || (await isDockerAvailable() ? 'container' : 'host');
+  const executionMode =
+    validation.data.execution_mode ||
+    ((await isDockerAvailable()) ? 'container' : 'host');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
@@ -556,16 +576,11 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     created_by: authUser.id,
   };
 
-  setRegisteredGroup(jid, group);
-  updateChatName(jid, name);
-  deps.getRegisteredGroups()[jid] = group;
-
-  // Register creator as owner in group_members
-  addGroupMember(folder, authUser.id, 'owner', authUser.id);
-
-  // 工作区初始化
+  // Initialize private filesystem state before publishing either the
+  // registered workspace or its Agent membership. This removes the rollback
+  // race entirely: while clone/copy awaits, migration/delete routes cannot see
+  // the workspace, and a failure has no DB membership to undo.
   const groupDir = path.join(GROUPS_DIR, folder);
-
   try {
     if (initSourcePath) {
       await fsp.mkdir(groupDir, { recursive: true });
@@ -590,21 +605,64 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       );
     }
   } catch (err) {
-    // 初始化失败时清理
-    logger.error(
-      { folder, err },
-      'Workspace initialization failed, cleaning up',
-    );
+    logger.error({ folder, err }, 'Workspace initialization failed');
     fs.rmSync(groupDir, { recursive: true, force: true });
-    deleteRegisteredGroup(jid);
-    deleteChatHistory(jid);
-    delete deps.getRegisteredGroups()[jid];
-
     const errMsg = err instanceof Error ? err.message : String(err);
     return c.json({ error: `Workspace initialization failed: ${errMsg}` }, 500);
   }
 
-  assignWorkspaceAgentProfile(folder, agentProfile.id);
+  let publishedAgentProfile;
+  try {
+    publishedAgentProfile = await withAgentProfileLocks(
+      [agentProfile.id],
+      () => {
+        // The target may have been archived while the request performed its
+        // filesystem/network validation. Recheck under the same lock used by
+        // Agent DELETE/PATCH and workspace migration.
+        const lockedProfile = getAgentProfileForUser(
+          agentProfile.id,
+          authUser.id,
+        );
+        if (!lockedProfile) return undefined;
+
+        try {
+          // Mapping first and registered-group publication immediately after
+          // it occur in one synchronous critical section. Agent PATCH cannot
+          // snapshot between them: it holds this same profile lock.
+          assignWorkspaceAgentProfile(folder, lockedProfile.id);
+          setRegisteredGroup(jid, group);
+          updateChatName(jid, name);
+          deps.getRegisteredGroups()[jid] = group;
+          addGroupMember(folder, authUser.id, 'owner', authUser.id);
+          return lockedProfile;
+        } catch (err) {
+          // setRegisteredGroup may fail after the mapping write. Clear both
+          // sides before releasing the profile lock so no partial membership
+          // can become visible to the next mutation.
+          try {
+            deleteRegisteredGroup(jid);
+          } catch {
+            /* best-effort cleanup continues below */
+          }
+          deleteWorkspaceAgentProfile(folder);
+          deleteChatHistory(jid);
+          delete deps.getRegisteredGroups()[jid];
+          throw err;
+        }
+      },
+    );
+  } catch (err) {
+    logger.error({ err, jid, folder }, 'Workspace publication failed');
+    fs.rmSync(groupDir, { recursive: true, force: true });
+    return c.json({ error: 'Workspace publication failed' }, 500);
+  }
+  if (!publishedAgentProfile) {
+    fs.rmSync(groupDir, { recursive: true, force: true });
+    return c.json(
+      { error: 'Agent profile is no longer active; choose another Agent' },
+      409,
+    );
+  }
 
   // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
   if (executionMode === 'container') {
@@ -638,9 +696,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     activation_mode: group.activation_mode ?? 'auto',
     conversation_source: group.conversation_source ?? 'manual',
     conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
-    agent_profile_id: agentProfile.id,
-    agent_profile_name: agentProfile.name,
-    agent_profile_version: agentProfile.version,
+    agent_profile_id: publishedAgentProfile.id,
+    agent_profile_name: publishedAgentProfile.name,
+    agent_profile_version: publishedAgentProfile.version,
   };
 
   return c.json({
@@ -798,7 +856,10 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (!jid.startsWith('web:')) {
-    return c.json({ error: 'Only web workspaces can switch AgentProfile' }, 403);
+    return c.json(
+      { error: 'Only web workspaces can switch AgentProfile' },
+      403,
+    );
   }
 
   const body = await c.req.json().catch(() => ({}));
@@ -813,38 +874,133 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
   );
   if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
 
-  assignWorkspaceAgentProfile(existing.folder, profile.id);
-
   let invalidatedRuntimeJids = 0;
-  try {
-    const stopped = await stopWorkspaceRunnersForAgentIdentityChange(
-      deps,
-      existing.folder,
-      {
-        primaryJid: jid,
-        reason: `Workspace ${jid} switched to Agent profile ${profile.id}`,
-      },
-    );
-    invalidatedRuntimeJids = stopped.length;
-  } catch (err) {
-    logger.error(
-      { err, jid, folder: existing.folder, agentProfileId: profile.id },
-      'Workspace Agent profile switched but active runner invalidation failed',
-    );
-    return c.json(
-      {
-        error:
-          'Workspace Agent profile updated, but failed to refresh active runtime',
-      },
-      500,
-    );
+  let committedProfile = profile;
+  for (;;) {
+    const observedOldProfileId =
+      getWorkspaceAgentProfileId(existing.folder) ??
+      getOrCreateDefaultAgentProfile(authUser.id).id;
+    try {
+      const outcome = await withAgentProfileLocks(
+        [observedOldProfileId, profile.id],
+        async () => {
+          // DELETE may have archived the target while this request waited for
+          // the locks. Never publish a mapping to a no-longer-active Agent.
+          const lockedTarget = getAgentProfileForUser(profile.id, authUser.id);
+          if (!lockedTarget) return { kind: 'target_missing' as const };
+
+          // This route does not share a lock with workspace DELETE. Re-read the
+          // workspace after acquiring the profile locks so a request that was
+          // deleted or reassigned while we waited cannot be migrated from a
+          // stale entry snapshot.
+          const lockedWorkspace = getRegisteredGroup(jid);
+          if (
+            !lockedWorkspace ||
+            lockedWorkspace.folder !== existing.folder ||
+            !canModifyGroup(
+              { id: authUser.id, role: authUser.role },
+              { ...lockedWorkspace, jid },
+            )
+          ) {
+            return { kind: 'workspace_missing' as const };
+          }
+
+          const lockedOldProfileId =
+            getWorkspaceAgentProfileId(lockedWorkspace.folder) ??
+            getOrCreateDefaultAgentProfile(authUser.id).id;
+          if (lockedOldProfileId !== observedOldProfileId) {
+            return { kind: 'retry' as const };
+          }
+
+          const result = await quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            [{ folder: lockedWorkspace.folder, primaryJid: jid }],
+            {
+              reason: `Workspace ${jid} switched to Agent profile ${lockedTarget.id}`,
+            },
+            () => {
+              // DELETE can finish while the pre-commit stop awaits. Keep this
+              // final check and assignment synchronous so either migration
+              // publishes first or deletion wins without an orphan mapping.
+              const commitWorkspace = getRegisteredGroup(jid);
+              if (
+                !commitWorkspace ||
+                commitWorkspace.folder !== existing.folder ||
+                !canModifyGroup(
+                  { id: authUser.id, role: authUser.role },
+                  { ...commitWorkspace, jid },
+                )
+              ) {
+                // Throw before any assignment. A false return would be
+                // indistinguishable from a successful commit to the generic
+                // quiesce helper, causing it to run post-stop and potentially
+                // report persisted:true even though nothing was written.
+                throw new WorkspaceMissingDuringMigrationError();
+              }
+              assignWorkspaceAgentProfile(
+                commitWorkspace.folder,
+                lockedTarget.id,
+              );
+            },
+          );
+          return { kind: 'success' as const, result, profile: lockedTarget };
+        },
+      );
+      if (outcome.kind === 'retry') continue;
+      if (outcome.kind === 'target_missing') {
+        return c.json({ error: 'Agent profile is no longer active' }, 409);
+      }
+      if (outcome.kind === 'workspace_missing') {
+        return c.json(
+          { error: 'Workspace no longer exists or changed during migration' },
+          409,
+        );
+      }
+      invalidatedRuntimeJids = outcome.result.runtimeJids.length;
+      committedProfile = outcome.profile;
+      break;
+    } catch (err) {
+      if (err instanceof WorkspaceMissingDuringMigrationError) {
+        return c.json(
+          {
+            error: err.message,
+            persisted: false,
+          },
+          409,
+        );
+      }
+      if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+      logger.error(
+        {
+          err,
+          jid,
+          folder: existing.folder,
+          agentProfileId: profile.id,
+          persisted: err.persisted,
+        },
+        err.persisted
+          ? 'Workspace Agent profile persisted but post-commit runtime cleanup failed'
+          : 'Workspace Agent profile switch aborted before persistence',
+      );
+      return c.json(
+        {
+          error: err.persisted
+            ? 'Workspace Agent profile was updated, but runtime cleanup failed; retry the same request'
+            : 'Failed to quiesce active runtime; Workspace Agent profile was not updated',
+          persisted: err.persisted,
+          retryable: true,
+          agent_profile_id: err.persisted ? profile.id : undefined,
+        },
+        503,
+      );
+    }
   }
 
   return c.json({
     success: true,
-    agent_profile_id: profile.id,
-    agent_profile_name: profile.name,
-    agent_profile_version: profile.version,
+    agent_profile_id: committedProfile.id,
+    agent_profile_name: committedProfile.name,
+    agent_profile_version: committedProfile.version,
     invalidated_runtime_jids: invalidatedRuntimeJids,
   });
 });
@@ -861,7 +1017,10 @@ groupRoutes.post('/:jid/reset-owner', authMiddleware, async (c) => {
 
   const authUser = c.get('user') as AuthUser;
   if (authUser.role !== 'admin') {
-    return c.json({ error: 'Only an admin can reset the workspace owner' }, 403);
+    return c.json(
+      { error: 'Only an admin can reset the workspace owner' },
+      403,
+    );
   }
 
   const jid = c.req.param('jid');
@@ -936,7 +1095,10 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     sessionName: string;
     imGroups: Array<{ jid: string; name: string }>;
   }> = [];
-  const sessionBindings = new Map<string, Array<{ jid: string; name: string }>>();
+  const sessionBindings = new Map<
+    string,
+    Array<{ jid: string; name: string }>
+  >();
   const mainBindings = new Map<string, { jid: string; name: string }>();
 
   for (const mount of listChannelMountsByWorkspace(jid)) {
@@ -1029,35 +1191,57 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   // cwd/session dirs deleted out from under them (container/process leak + ENOENT).
   const deleteSiblingJids = getJidsByFolder(existing.folder);
   const deleteDescendantJids = Array.from(
-    new Set(
-      deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
-    ),
+    new Set(deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j))),
   );
   const deleteStopJids = Array.from(
     new Set([jid, ...deleteSiblingJids, ...deleteDescendantJids]),
   );
+  // Unlike an Agent identity mutation, deletion is destructive: work accepted
+  // after this point must be parked across the entire serialization family and
+  // then discarded after the DB/filesystem commit, never resumed against the
+  // deleted workspace. The batch pause is intentionally acquired before the
+  // first await so new sibling and virtual-descendant work cannot slip between
+  // individual stopGroup calls.
+  const deletePauseToken = deps.queue.pauseGroupsForMutation(deleteStopJids);
+  let deleteCommitted = false;
   try {
-    await Promise.all(
-      deleteStopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
-    );
-  } catch (err) {
-    logger.error(
-      { jid, stopJids: deleteStopJids, err },
-      'Failed to stop container before deleting group',
-    );
-    return c.json(
-      { error: 'Failed to stop container, group not deleted' },
-      500,
-    );
+    try {
+      // Do not preserve queued work for permanent deletion. stopGroup clears
+      // work that was already known; discardGroupsAfterMutation below clears
+      // anything newly parked while these asynchronous stops were in flight.
+      await Promise.all(
+        deleteStopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+      );
+    } catch (err) {
+      logger.error(
+        { jid, stopJids: deleteStopJids, err },
+        'Failed to stop container before deleting group',
+      );
+      return c.json(
+        { error: 'Failed to stop container, group not deleted' },
+        500,
+      );
+    }
+
+    deleteGroupData(jid, existing.folder);
+    deleteCommitted = true;
+
+    delete deps.getRegisteredGroups()[jid];
+    delete deps.getSessions()[existing.folder];
+    deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
+
+    removeFlowArtifacts(existing.folder);
+
+    return c.json({ success: true });
+  } finally {
+    if (deleteCommitted) {
+      deps.queue.discardGroupsAfterMutation(deletePauseToken);
+    } else {
+      // Stop/DB failure leaves the workspace valid, so accepted work remains
+      // legitimate and must drain once the failed delete releases its gate.
+      deps.queue.resumeGroupsAfterMutation(deletePauseToken);
+    }
   }
-  deleteGroupData(jid, existing.folder);
-  removeFlowArtifacts(existing.folder);
-
-  delete deps.getRegisteredGroups()[jid];
-  delete deps.getSessions()[existing.folder];
-  deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
-
-  return c.json({ success: true });
 });
 
 // POST /api/groups/:jid/stop - 停止当前运行的容器/进程
@@ -1076,7 +1260,10 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   // member may stop only a run they started themselves (the queue's current-run
   // initiator), not the owner's. Mirrors the delete-message owner-or-sender model.
   if (
-    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid }) &&
+    !canModifyGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid },
+    ) &&
     deps.queue.getActiveRunInitiator(jid) !== authUser.id
   ) {
     return c.json(
@@ -1124,7 +1311,9 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
     deps.queue.getActiveRunInitiator(jid) !== authUser.id
   ) {
     return c.json(
-      { error: 'Only the workspace owner or the run initiator can interrupt it' },
+      {
+        error: 'Only the workspace owner or the run initiator can interrupt it',
+      },
       403,
     );
   }
@@ -1353,9 +1542,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   //    with their cwd/session dirs pulled out from under them (ENOENT / undefined
   //    behavior in container mode).
   const descendantJids = Array.from(
-    new Set(
-      siblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
-    ),
+    new Set(siblingJids.flatMap((j) => deps.queue.listDescendantJids(j))),
   );
   const stopJids = [...siblingJids, ...descendantJids];
   try {
@@ -1611,7 +1798,10 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
     user.role !== 'admin' &&
     !canModifyGroup({ id: user.id, role: user.role }, { ...group, jid })
   ) {
-    return c.json({ error: 'Forbidden: only the workspace owner can read env' }, 403);
+    return c.json(
+      { error: 'Forbidden: only the workspace owner can read env' },
+      403,
+    );
   }
   if (
     user.role !== 'admin' &&
@@ -1648,7 +1838,10 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     envUser.role !== 'admin' &&
     !canModifyGroup({ id: envUser.id, role: envUser.role }, { ...group, jid })
   ) {
-    return c.json({ error: 'Forbidden: only the workspace owner can modify env' }, 403);
+    return c.json(
+      { error: 'Forbidden: only the workspace owner can modify env' },
+      403,
+    );
   }
   if (
     envUser.role !== 'admin' &&
@@ -1904,7 +2097,11 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   const selected_mcps = body.selected_mcps;
 
   // Validate mcp_mode
-  if (mcp_mode !== undefined && mcp_mode !== 'inherit' && mcp_mode !== 'custom') {
+  if (
+    mcp_mode !== undefined &&
+    mcp_mode !== 'inherit' &&
+    mcp_mode !== 'custom'
+  ) {
     return c.json({ error: 'Invalid mcp_mode' }, 400);
   }
 
@@ -1924,7 +2121,8 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   const updatedGroup: RegisteredGroup = {
     ...group,
     mcp_mode: mcp_mode ?? group.mcp_mode ?? 'inherit',
-    selected_mcps: selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
+    selected_mcps:
+      selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
   };
 
   setRegisteredGroup(jid, updatedGroup);

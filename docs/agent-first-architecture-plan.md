@@ -2,10 +2,13 @@
 
 ## Executive Summary
 
-HappyClaw is currently halfway between two models:
+This branch establishes an Agent-first product surface while retaining compatibility with the
+existing group/session runtime. The product model and the persisted runtime model must remain
+explicitly distinct:
 
-- Current persisted workspace model: workspace/group is the top-level runtime container.
-- New target model: Agent is the top-level product entity, and each Agent owns multiple workspaces.
+- Agent is the top-level product identity and policy owner.
+- Workspace is the filesystem, membership, routing, and host/container isolation boundary.
+- Runtime session is an execution record inside a workspace; it is not another product-level Agent.
 
 The correct target hierarchy is:
 
@@ -13,12 +16,12 @@ The correct target hierarchy is:
 Agent
   - identity prompt
   - Claude preset inclusion policy
-  - skill policy
+  - provider / user Skill / user MCP / tool policy
   - channel mounts
   - workspaces
       - runtime isolation boundary
       - main session
-      - optional sub-agent/task sessions
+      - optional conversation/task runtime sessions
 ```
 
 The highest-risk migration point is runtime identity consistency. A warm runner captures
@@ -35,20 +38,27 @@ by the old in-memory runner. This must be fixed before deeper schema migration.
 - The container runner already receives Agent identity metadata and injects it into the
   system prompt.
 - Session identity metadata is already stored and checked through profile id/hash/version.
-- `registered_groups` still mixes workspace state, IM channel state, and routing state.
-- `sessions` are still keyed by workspace folder plus old sub-agent id.
+- `workspaces`, `workspace_runtime_sessions`, and `agent_channel_mounts` are the canonical
+  compatibility mirrors exposed by `/api/workspaces`.
+- `registered_groups` and legacy session/channel fields remain write-through compatibility state;
+  parity tests are required until every reader has migrated.
 - The old `agents` table is still the conversation/task/spawn-agent model, not the new
   top-level Agent concept.
-- Skills are still workspace/user/project scoped, not Agent-owned.
+- Agent runtime policy currently filters enabled user Skills and user MCP servers. Project,
+  external, and plugin Skills are not selected by that policy, but their actions remain subject
+  to the Agent tool boundary.
 
 ### Frontend
 
-- The sidebar has started grouping workspaces by Agent.
-- Agent settings exist as an independent area.
-- Workspace creation can select an Agent.
-- Some copy and mental model still remain workspace-first.
-- Channel binding screens still route around workspace/session concepts rather than an
-  Agent-owned mount model.
+- Desktop and mobile navigation preserve `Agent -> Workspace` grouping for personal, pinned,
+  and collaborative workspaces; the home workspace displays its actual Agent.
+- Workspace creation requires an explicitly loaded and selected Agent. A failed Agent request
+  is an error state, never an implicit default selection.
+- Agent governance shows workspaces, runtime sessions, and channel mounts. A workspace can be
+  migrated explicitly, and deleting a non-default Agent requires pre-migration.
+- Runtime-policy editors use the live Provider, user Skill, and user MCP catalogs rather than
+  free-form identifiers.
+- Agent and IM load failures are distinct from valid empty states and expose retry actions.
 
 ## Target Domain Model
 
@@ -63,6 +73,7 @@ Fields:
 - `name`
 - `identity_prompt`
 - `include_claude_preset`
+- `runtime_policy` (`provider_id`, user Skill policy, user MCP policy, tool boundary)
 - `identity_hash`
 - `version`
 - `status`
@@ -70,9 +81,6 @@ Fields:
 
 Future fields:
 
-- skill policy
-- MCP policy
-- model/provider policy
 - channel mount policy
 - default workspace template
 
@@ -92,18 +100,20 @@ Compatibility mapping:
 
 - existing `registered_groups.folder` is the workspace id/folder key for now.
 - existing `workspace_agent_profiles` is the bridge from workspace to Agent.
+- canonical `workspaces` records mirror the compatibility row and expose Agent/runtime/mount
+  summaries through `/api/workspaces`.
 
-### Session
+### Runtime Session
 
 Each workspace has one main session by default.
 
-Additional sessions can exist for:
+Additional runtime sessions can exist for:
 
 - spawned sub-agents
 - scheduled tasks
 - channel-specific conversations, when needed
 
-Session identity must include:
+Runtime-session identity must include:
 
 - AgentProfile id
 - identity hash
@@ -114,26 +124,28 @@ Session identity must include:
 A channel is an external message entry point. In the target model it is mounted under an Agent,
 then routed to a workspace/session.
 
-Target table:
+Canonical compatibility table:
 
 ```text
 agent_channel_mounts
-  - id
+  - channel_jid
   - owner_user_id
   - agent_profile_id
   - channel_type
-  - source_jid / source_channel_id
-  - workspace_id
-  - session_selector
+  - workspace_jid / workspace_folder
+  - session_id
+  - routing_mode
   - reply_policy
-  - activation_policy
-  - status
+  - activation_mode / owner_im_id
 ```
 
 Compatibility:
 
-- keep existing `registered_groups.target_agent_id`, `target_main_jid`, and `reply_policy`
-  until the mount table is fully read/write enabled.
+- Existing `registered_groups.target_agent_id`, `target_main_jid`, and `reply_policy` remain the
+  routing source of truth during migration.
+- `agent_channel_mounts` is synchronized on bind/unbind, workspace migration, workspace deletion,
+  and startup repair. Workspace-to-Agent reassignment updates the profile mapping and mount mirror
+  in one database transaction.
 
 ## Prompt Composition Semantics
 
@@ -164,6 +176,8 @@ This switch is user-controlled when creating or editing an Agent.
 
 Goal: any Agent identity change must not leak into a warm runner with stale prompt state.
 
+Status: implemented in this branch; update failures must still remain observable and retryable.
+
 Implementation:
 
 - When an Agent identity prompt or Claude preset switch changes, stop all warm runners for
@@ -177,48 +191,77 @@ Implementation:
 
 Goal: make Agent the first-level user mental model.
 
+Status: implemented for navigation, creation, assignment governance, and deletion migration.
+
 Implementation:
 
 - Sidebar exposes Agent management as a primary item.
-- Workspaces are displayed under their owning Agent.
-- Workspace creation starts from an Agent selection.
-- Remove workspace lists from Agent settings details unless the screen is explicitly about
-  workspace assignment.
+- Workspaces are displayed under their owning Agent in personal, pinned, and collaborative lists.
+- Workspace creation requires an explicit Agent selection after the catalog loads successfully.
+- Agent governance is the explicit assignment surface: it lists workspace/runtime/mount ownership,
+  supports migration, and requires migration before deleting a non-default Agent.
 
 ### Phase 2: Workspace Compatibility Schema
 
 Goal: introduce explicit workspace tables without breaking existing data.
 
+Status: canonical read mirrors and compatibility backfill are implemented; legacy write-through
+remains until all runtime readers migrate.
+
 Implementation:
 
-- Add `workspaces` as the canonical workspace metadata table.
+- Use `workspaces` as the canonical workspace metadata table.
 - Backfill from web `registered_groups`.
 - Keep writing `registered_groups` for compatibility until all readers move.
-- Add `workspace_sessions` as the canonical main-session and child-session metadata table.
+- Use `workspace_runtime_sessions` for runtime identity snapshots. API names are
+  `runtime_sessions`, `runtime_session_count`, and `/api/workspaces/:jid/runtime-sessions` so these
+  records are not confused with product-level conversations.
 
 ### Phase 3: Agent-owned Channel Mounts
 
 Goal: move IM/web channel routing from project/workspace-level state to Agent-level mounts.
 
+Status: the canonical mount mirror, APIs, and governance UI are implemented; legacy routing fields
+remain the compatibility source during the migration window.
+
 Implementation:
 
-- Add `agent_channel_mounts`.
+- Maintain `agent_channel_mounts`.
 - Backfill from current binding fields.
 - Write both old fields and new mount records.
-- Migrate route resolution to mount-first, old-field fallback.
-- Update settings UI to show channels under Agent, then target workspace/session.
+- Keep route resolution on validated legacy state until mount-first cutover is separately shipped.
+- Expose mounts under Agent and workspace governance while keeping binding actions targeted at a
+  workspace or runtime session.
 
-### Phase 4: Agent-owned Skills
+### Phase 4: Agent Runtime Policy
 
-Goal: each Agent can control its own skills.
+Goal: each Agent controls the runtime resources that are safe to scope today.
+
+Status: implemented as a versioned JSON runtime policy, deliberately narrower than full ownership.
 
 Implementation:
 
-- Add Agent skill assignment table.
-- Define inheritance order:
-  `system defaults -> user defaults -> Agent policy -> workspace override`.
-- Expose skill enable/disable controls on Agent settings.
-- Inject enabled skill policy into runner input.
+- Provider policy either fixes an enabled Provider or inherits the global balancing pool.
+- User Skill policy inherits, selects, or disables enabled user Skills. Project, external, and
+  plugin Skills are outside the selector.
+- User MCP policy inherits, selects, or disables enabled user MCP servers.
+- `readonly` and `restricted` are security boundaries: both enable strict MCP config, disable user
+  MCP and user plugins, block write/Bash/sub-Agent tools, and default-deny unclassified HappyClaw
+  tools. Only explicitly classified query, memory-read, and reply capabilities remain;
+  `restricted` additionally blocks WebSearch and WebFetch.
+- Any Skill that is still discoverable remains constrained by the selected tool boundary.
+
+### Phase 5: Scheduled Task Context Semantics
+
+Goal: task placement and execution isolation remain explicit when a workspace changes.
+
+Status: implemented.
+
+- `group` mode injects a regular message into the source workspace main session.
+- Default `isolated` mode reuses the source workspace directory, environment, Agent identity, and
+  execution mode, but creates a run-scoped queue JID, Claude session, and IPC namespace. Cleanup
+  after the run prevents main-session pollution and cross-run context accumulation.
+- Moving a task to another workspace saves both `chat_jid` and the target `execution_mode`.
 
 ## Immediate Acceptance Criteria
 
@@ -226,6 +269,10 @@ Implementation:
 - Switching a workspace to another Agent invalidates warm runners for that workspace.
 - Next message after identity change uses the updated prompt policy.
 - Existing session mismatch reset behavior remains responsible for session row cleanup.
-- Agent settings remains independent from workspace listing.
+- Workspace creation cannot silently fall back when Agent loading fails.
+- Agent deletion refreshes governance and requires all attached workspaces to migrate first;
+  channel-mount Agent ownership changes with the workspace mapping.
+- Navigation preserves Agent hierarchy for home, pinned, personal, and collaborative workspaces.
+- Editing a task from a host workspace to a container workspace submits `execution_mode=container`.
+- Agent/IM request failure, valid empty state, and loading state are visually distinct.
 - Build and tests pass.
-
