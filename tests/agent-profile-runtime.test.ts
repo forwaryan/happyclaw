@@ -302,6 +302,7 @@ describe('AgentProfile runtime invalidation', () => {
   test('post-commit stop failure exposes the committed value', async () => {
     let stopCalls = 0;
     const resumeGroupsAfterMutation = vi.fn();
+    const onPostCommitFailure = vi.fn();
     const deps = {
       queue: {
         pauseGroupsForMutation: () => ({ keys: ['post-failure'] }),
@@ -327,7 +328,7 @@ describe('AgentProfile runtime invalidation', () => {
             primaryJid: 'web:post-commit-failure',
           },
         ],
-        { reason: 'test post failure' },
+        { reason: 'test post failure', onPostCommitFailure },
         () => ({ version: 2 }),
       ),
     ).rejects.toMatchObject({
@@ -335,6 +336,9 @@ describe('AgentProfile runtime invalidation', () => {
       persisted: true,
       committedValue: { version: 2 },
     });
+    expect(onPostCommitFailure).toHaveBeenCalledWith([
+      'web:post-commit-failure',
+    ]);
     expect(resumeGroupsAfterMutation).toHaveBeenCalledTimes(1);
   });
 });

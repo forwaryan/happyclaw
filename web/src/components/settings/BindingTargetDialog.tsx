@@ -170,7 +170,9 @@ export function BindingTargetDialog({
                             <span className="flex-1 text-sm truncate">
                               {target.type === 'session'
                                 ? target.sessionName || '会话'
-                                : '绑定到此工作区'}
+                                : targetType === 'session'
+                                  ? '主会话'
+                                  : '绑定到此工作区'}
                             </span>
                             {isSelecting && (
                               <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />

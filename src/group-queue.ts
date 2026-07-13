@@ -110,6 +110,9 @@ export class GroupQueue {
   private activeHostProcessCount = 0;
   private waitingGroups = new Set<string>();
   private mutationPauseCounts = new Map<string, number>();
+  /** Persistent fail-closed gates used when a security-sensitive mutation was
+   * committed but the old runtime could not be confirmed stopped. */
+  private runtimeSafetyBlocks = new Map<string, string>();
   private mutationPauseTokens = new Map<number, string[]>();
   private terminalDiscardMutationKeys = new Set<string>();
   private mutationBaseKeyAliases = new Map<string, string>();
@@ -208,12 +211,45 @@ export class GroupQueue {
 
   private isMutationPaused(groupJid: string): boolean {
     const key = this.getMutationPauseKey(groupJid);
-    const paused = (this.mutationPauseCounts.get(key) ?? 0) > 0;
+    const paused =
+      (this.mutationPauseCounts.get(key) ?? 0) > 0 ||
+      this.runtimeSafetyBlocks.has(key);
     if (paused) {
       const state = this.groups.get(groupJid);
       if (state) state.mutationKey = key;
     }
     return paused;
+  }
+
+  blockGroupsForRuntimeSafety(groupJids: string[], reason: string): void {
+    for (const jid of groupJids) {
+      const key = this.getMutationPauseKey(jid);
+      this.getGroup(jid).mutationKey = key;
+      this.mutationBaseKeyAliases.set(this.getMutationBaseJid(jid), key);
+      this.runtimeSafetyBlocks.set(key, reason);
+    }
+  }
+
+  unblockGroupsForRuntimeSafety(groupJids: string[]): void {
+    const released = new Set<string>();
+    for (const jid of groupJids) {
+      const key = this.getMutationPauseKey(jid);
+      if (this.runtimeSafetyBlocks.delete(key)) released.add(key);
+    }
+    if (released.size === 0) return;
+    for (const [jid, state] of this.groups) {
+      if (!released.has(this.getMutationPauseKey(jid))) continue;
+      if (state.pendingMessages || state.pendingTasks.length > 0) {
+        this.waitingGroups.add(jid);
+      }
+      state.mutationKey = null;
+    }
+    this.clearMutationAliasesForKeys(released);
+    this.drainWaiting();
+  }
+
+  isGroupRuntimeSafetyBlocked(groupJid: string): boolean {
+    return this.runtimeSafetyBlocks.has(this.getMutationPauseKey(groupJid));
   }
 
   private isTerminalMutationDiscarded(groupJid: string): boolean {

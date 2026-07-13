@@ -22,10 +22,15 @@ export const useGroupsStore = create<GroupsState>((set) => ({
   loadGroups: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ groups: Record<string, GroupInfo> }>('/api/groups');
+      const data = await api.get<{ groups: Record<string, GroupInfo> }>(
+        '/api/groups',
+      );
       set({ groups: data.groups, loading: false, error: null });
     } catch (err) {
-      set({ loading: false, error: err instanceof Error ? err.message : String(err) });
+      set({
+        loading: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   },
 

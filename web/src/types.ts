@@ -41,6 +41,8 @@ export interface AgentProfile {
   avatar_color: string | null;
   avatar_url: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
+  /** Policy after applying system defaults and current authorization. */
+  effective_runtime_policy?: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
   is_default: boolean;
@@ -50,7 +52,6 @@ export interface AgentProfile {
 }
 
 export interface AgentProfileRuntimePolicy {
-  provider_id: string | null;
   context?: {
     source: 'managed' | 'host_claude';
     auto_compact_window?: number;
@@ -131,6 +132,45 @@ export interface AgentProfileGovernance {
   profile: AgentProfile;
   workspaces: AgentProfileWorkspace[];
   channel_mounts: AgentProfileChannelMount[];
+}
+
+export type CapabilityLayerSource =
+  | 'builtin'
+  | 'host'
+  | 'project'
+  | 'workspace'
+  | 'managed';
+
+export interface EffectiveCapabilityEntry {
+  id: string;
+  source: CapabilityLayerSource;
+  overrides: CapabilityLayerSource[];
+  available: boolean;
+}
+
+export interface AgentCapabilityPreview {
+  workspace: { jid: string; name: string; folder: string } | null;
+  context: {
+    source: 'managed' | 'host_claude';
+    claudeMd: boolean;
+    rules: number;
+  };
+  skills: {
+    mode: AgentProfileRuntimePolicy['skills']['mode'];
+    entries: EffectiveCapabilityEntry[];
+    conflicts: string[];
+  };
+  mcp: {
+    mode: AgentProfileRuntimePolicy['mcp']['mode'];
+    entries: EffectiveCapabilityEntry[];
+    conflicts: string[];
+    disabledByToolBoundary: boolean;
+  };
+  tools: {
+    mode: AgentProfileRuntimePolicy['tools']['mode'];
+    summary: string;
+  };
+  notes: string[];
 }
 
 export interface AgentInfo {

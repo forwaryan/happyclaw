@@ -72,10 +72,7 @@ export interface WebDeps {
    * which means a clean restart after a no-earlier-pending reply would
    * replay the reply on recovery (the same DB row is still <= the cursor).
    */
-  hasEarlierPendingMessages: (
-    jid: string,
-    candidate: MessageCursor,
-  ) => boolean;
+  hasEarlierPendingMessages: (jid: string, candidate: MessageCursor) => boolean;
   reloadFeishuConnection?: (config: {
     appId: string;
     appSecret: string;
@@ -278,8 +275,8 @@ export function hasHostExecutionPermission(user: AuthUser): boolean {
  * Check if a user can access (view messages, send messages to) a group.
  * All users (including admin) follow the same visibility rules:
  * - is_home groups → only the owner (created_by) can access
- * - IM groups (jid does not start with 'web:') → only the owner
- * - Web groups → created_by matches user.id
+ * - IM groups → only the owner
+ * - Web groups → only the creator
  */
 export function canAccessGroup(
   user: { id: string; role: UserRole },

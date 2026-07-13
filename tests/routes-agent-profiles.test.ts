@@ -53,12 +53,10 @@ vi.mock('../src/middleware/auth.ts', () => ({
 }));
 
 const db = await import('../src/db.js');
-const runtimeConfig = await import('../src/runtime-config.js');
 const webContext = await import('../src/web-context.js');
 const agentProfileRuntime = await import('../src/agent-profile-runtime.js');
 const routeModule = await import('../src/routes/agent-profiles.js');
 const routes = routeModule.default;
-let testProviderId = '';
 
 beforeAll(() => {
   db.initDatabase();
@@ -74,14 +72,6 @@ beforeAll(() => {
     updated_at: now,
     must_change_password: false,
   });
-  testProviderId = runtimeConfig.createProvider({
-    name: 'Routes Test Provider',
-    type: 'third_party',
-    enabled: true,
-    anthropicBaseUrl: 'https://provider.example.test',
-    anthropicAuthToken: 'routes-test-token',
-    anthropicModel: 'claude-test',
-  }).id;
   const skillDir = path.join(
     tmpDataDir,
     'skills',
@@ -126,6 +116,9 @@ describe('/api/agent-profiles routes', () => {
       auto_compact_window: 0,
       auto_compact_percentage: 0,
     });
+    expect(body.profiles[0].effective_runtime_policy).toEqual(
+      body.profiles[0].runtime_policy,
+    );
   });
 
   test('POST creates and PATCH updates an AgentProfile', async () => {
@@ -137,7 +130,6 @@ describe('/api/agent-profiles routes', () => {
         identity_prompt: '用研究员方式回答。',
         include_claude_preset: false,
         runtime_policy: {
-          provider_id: testProviderId,
           skills: { mode: 'custom', ids: ['research'] },
           mcp: { mode: 'inherit', ids: [] },
           tools: { mode: 'readonly' },
@@ -150,7 +142,6 @@ describe('/api/agent-profiles routes', () => {
     expect(created.name).toBe('Research');
     expect(created.include_claude_preset).toBe(false);
     expect(created.runtime_policy).toMatchObject({
-      provider_id: null,
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -169,7 +160,6 @@ describe('/api/agent-profiles routes', () => {
         identity_prompt: '先列证据，再给结论。',
         include_claude_preset: true,
         runtime_policy: {
-          provider_id: null,
           skills: { mode: 'disabled', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
           tools: { mode: 'restricted' },
@@ -181,7 +171,6 @@ describe('/api/agent-profiles routes', () => {
     expect(patchedBody.profile.name).toBe('Research Lead');
     expect(patchedBody.profile.include_claude_preset).toBe(true);
     expect(patchedBody.profile.runtime_policy).toMatchObject({
-      provider_id: null,
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -202,7 +191,6 @@ describe('/api/agent-profiles routes', () => {
         name: 'No Model Policy',
         identity_prompt: '不要在 Agent 层设置模型。',
         runtime_policy: {
-          provider_id: null,
           model: 'claude-opus-4-1',
         },
       }),
@@ -211,14 +199,26 @@ describe('/api/agent-profiles routes', () => {
     expect(res.status).toBe(400);
   });
 
-  test('ignores Agent Provider and rejects unavailable Skill and MCP references', async () => {
+  test('rejects Agent Provider because Provider selection is session-owned', async () => {
+    const res = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'No Provider Policy',
+        runtime_policy: { provider_id: 'missing-provider' },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  test('rejects unavailable Skill and MCP references', async () => {
     const res = await routes.request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         name: 'Invalid References',
         runtime_policy: {
-          provider_id: 'missing-provider',
           skills: { mode: 'custom', ids: ['missing-skill'] },
           mcp: { mode: 'custom', ids: ['missing-mcp'] },
         },
@@ -239,7 +239,6 @@ describe('/api/agent-profiles routes', () => {
       ownerUserId: 'routes-agent-user',
       name: 'Merge Policy',
       runtimePolicy: {
-        provider_id: testProviderId,
         skills: { mode: 'custom', ids: ['research'] },
         mcp: { mode: 'custom', ids: ['github'] },
         tools: { mode: 'restricted' },
@@ -257,7 +256,6 @@ describe('/api/agent-profiles routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.profile.runtime_policy).toEqual({
-      provider_id: null,
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -266,6 +264,41 @@ describe('/api/agent-profiles routes', () => {
       skills: { mode: 'custom', ids: ['research'] },
       mcp: { mode: 'custom', ids: ['github'] },
       tools: { mode: 'readonly' },
+    });
+  });
+
+  test('previews the effective additive capabilities without exposing Provider selection', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Capability Preview',
+      runtimePolicy: {
+        skills: { mode: 'custom', ids: ['research'] },
+        mcp: { mode: 'custom', ids: ['github'] },
+        tools: { mode: 'readonly' },
+      },
+    });
+
+    const res = await routes.request(`/${profile.id}/effective-capabilities`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runtime_policy: profile.runtime_policy }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      preview: {
+        workspace: null,
+        skills: {
+          entries: expect.arrayContaining([
+            expect.objectContaining({ id: 'research', source: 'managed' }),
+          ]),
+        },
+        mcp: {
+          disabledByToolBoundary: true,
+          entries: expect.arrayContaining([
+            expect.objectContaining({ id: 'github', available: false }),
+          ]),
+        },
+      },
     });
   });
 
@@ -659,7 +692,71 @@ describe('/api/agent-profiles routes', () => {
       identity_prompt: 'new post-commit identity',
       version: profile.version + 1,
     });
-    expect(stopGroup).toHaveBeenCalledTimes(4);
+    // Retrying the already-persisted payload is an effective no-op and must
+    // not quiesce the workspace again.
+    expect(stopGroup).toHaveBeenCalledTimes(2);
+  });
+
+  test('emoji-only and normalized no-op PATCHes do not quiesce Agent workspaces', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Stable Runtime Agent',
+      identityPrompt: 'Keep this runtime identity stable.',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        skills: { mode: 'inherit', ids: [] },
+        mcp: { mode: 'inherit', ids: [] },
+        tools: { mode: 'inherit' },
+      },
+    });
+    const folder = 'stable-runtime-workspace';
+    db.setRegisteredGroup('web:stable-runtime-workspace', {
+      name: 'Stable Runtime Workspace',
+      folder,
+      added_at: '2026-07-10T00:00:00.000Z',
+      created_by: 'routes-agent-user',
+    });
+    db.assignWorkspaceAgentProfile(folder, profile.id);
+
+    const stopGroup = vi.fn(async () => {});
+    webContext.setWebDeps({
+      queue: {
+        pauseGroupsForMutation: () => ({ id: 1 }),
+        resumeGroupsAfterMutation: () => {},
+        listDescendantJids: () => [],
+        stopGroup,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const emojiResponse = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: profile.name,
+        identity_prompt: profile.identity_prompt,
+        include_claude_preset: profile.include_claude_preset,
+        avatar_emoji: '🧭',
+        runtime_policy: {
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'inherit', ids: [] },
+          tools: { mode: 'inherit' },
+        },
+      }),
+    });
+    expect(emojiResponse.status).toBe(200);
+    expect((await emojiResponse.json()).profile).toMatchObject({
+      avatar_emoji: '🧭',
+      version: profile.version,
+    });
+
+    const noOpResponse = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: profile.name }),
+    });
+    expect(noOpResponse.status).toBe(200);
+    expect((await noOpResponse.json()).profile.version).toBe(profile.version);
+    expect(stopGroup).not.toHaveBeenCalled();
   });
 
   test('name-only PATCH bumps identity version/hash, quiesces twice, and leaves the old session hash mismatched', async () => {

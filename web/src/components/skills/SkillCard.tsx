@@ -1,4 +1,6 @@
 import { Lock } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Switch } from '@/components/ui/switch';
 import type { Skill } from '../../stores/skills';
 import { useSkillsStore } from '../../stores/skills';
 
@@ -16,11 +18,10 @@ const SOURCE_LABELS: Record<Skill['source'], string> = {
 
 export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
   const toggleSkill = useSkillsStore((s) => s.toggleSkill);
-  const isReadonly = skill.source === 'project';
+  const isReadonly = skill.source !== 'user';
 
   return (
-    <button
-      onClick={onSelect}
+    <div
       className={`w-full text-left rounded-lg border p-4 transition-all ${
         selected
           ? 'ring-2 ring-ring bg-brand-50 border-primary'
@@ -28,9 +29,15 @@ export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
       }`}
     >
       <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
+        <button
+          type="button"
+          onClick={onSelect}
+          className="min-w-0 flex-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+        >
           <div className="flex items-center gap-2 mb-1">
-            <h3 className="font-medium text-foreground truncate">{skill.name}</h3>
+            <h3 className="font-medium text-foreground truncate">
+              {skill.name}
+            </h3>
             <span
               className={`px-2 py-0.5 rounded text-xs font-medium ${
                 skill.source === 'user'
@@ -46,51 +53,40 @@ export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
               </span>
             )}
           </div>
-          <p className="text-sm text-muted-foreground line-clamp-2">{skill.description}</p>
+          <p className="text-sm text-muted-foreground line-clamp-2">
+            {skill.description}
+          </p>
           {skill.packageName && (
-            <p className="text-xs text-muted-foreground mt-1 font-mono truncate">{skill.packageName}</p>
+            <p className="text-xs text-muted-foreground mt-1 font-mono truncate">
+              {skill.packageName}
+            </p>
           )}
-        </div>
+        </button>
 
         {isReadonly && (
-          <div className="flex items-center gap-2">
+          <div
+            className="flex items-center gap-1.5 text-xs text-muted-foreground"
+            title="此来源由系统或宿主机管理"
+          >
             <Lock size={16} className="text-muted-foreground" />
-            <div
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                skill.enabled ? 'bg-primary' : 'bg-muted-foreground/40'
-              } opacity-50`}
-            >
-              <span
-                className={`inline-block h-4 w-4 rounded-full bg-white dark:bg-foreground transition-transform ${
-                  skill.enabled ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
-            </div>
+            <Badge variant="outline">
+              {skill.enabled ? '已启用' : '已停用'}
+            </Badge>
           </div>
         )}
 
         {skill.source === 'user' && (
-          <div
-            className="flex items-center"
-            onClick={(e) => {
-              e.stopPropagation();
-              toggleSkill(skill.id, !skill.enabled);
-            }}
-          >
-            <div
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors cursor-pointer ${
-                skill.enabled ? 'bg-primary' : 'bg-muted-foreground/40'
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 rounded-full bg-white dark:bg-foreground transition-transform ${
-                  skill.enabled ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
-            </div>
-          </div>
+          <Switch
+            checked={skill.enabled}
+            onCheckedChange={(checked) => void toggleSkill(skill.id, checked)}
+            aria-label={`${checkedLabel(skill.enabled)}技能 ${skill.name}`}
+          />
         )}
       </div>
-    </button>
+    </div>
   );
+}
+
+function checkedLabel(enabled: boolean): string {
+  return enabled ? '停用' : '启用';
 }

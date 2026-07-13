@@ -4,6 +4,10 @@ import {
   buildDetachedWorkspaceUpdate,
   buildSessionMountUpdate,
   buildWorkspaceMountUpdate,
+  findWorkspaceThreadMapConflict,
+  hasSessionMountConflict,
+  hasWorkspaceMountConflict,
+  matchesWorkspaceMount,
   resolveChannelMountTarget,
 } from '../src/channel-mount-service.js';
 import {
@@ -167,6 +171,43 @@ describe('channel binding product contract', () => {
     );
     expect(workspaceBound.target_agent_id).toBeUndefined();
     expect(workspaceBound.target_main_jid).toBe('web:workspace-a');
+  });
+
+  test('centralizes conflict and legacy workspace matching semantics', () => {
+    const sessionBound = {
+      ...makeWorkspace('Channel', 'channel-a'),
+      target_agent_id: 'session-a',
+    };
+    expect(hasSessionMountConflict(sessionBound, 'session-a')).toBe(false);
+    expect(hasSessionMountConflict(sessionBound, 'session-b')).toBe(true);
+
+    const workspaceBound = {
+      ...makeWorkspace('Topic', 'channel-b'),
+      target_main_jid: 'web:workspace-folder',
+      binding_mode: 'thread_map' as const,
+    };
+    expect(
+      matchesWorkspaceMount(
+        workspaceBound,
+        'web:workspace-uuid',
+        'web:workspace-folder',
+      ),
+    ).toBe(true);
+    expect(
+      hasWorkspaceMountConflict(
+        workspaceBound,
+        'web:workspace-uuid',
+        'web:workspace-folder',
+      ),
+    ).toBe(false);
+    expect(
+      findWorkspaceThreadMapConflict(
+        { 'feishu:topic': workspaceBound },
+        'feishu:other',
+        'web:workspace-uuid',
+        'web:workspace-folder',
+      )?.[0],
+    ).toBe('feishu:topic');
   });
 
   test('detaching a topic workspace preserves its data and only resets navigation', () => {

@@ -243,7 +243,6 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
         identityPrompt: '',
         includeClaudePreset: true,
         runtimePolicy: {
-          provider_id: null,
           context: { source: 'host_claude' },
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'inherit', ids: [] },
@@ -351,7 +350,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         identityPrompt: '',
         includeClaudePreset: true,
         runtimePolicy: {
-          provider_id: null,
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'inherit', ids: [] },
           tools: { mode: 'readonly' },
@@ -394,7 +392,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         identityPrompt: '',
         includeClaudePreset: true,
         runtimePolicy: {
-          provider_id: null,
           skills: { mode: 'custom', ids: ['review'] },
           mcp: { mode: 'inherit', ids: [] },
           tools: { mode: 'inherit' },
@@ -427,7 +424,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       identityPrompt: '',
       includeClaudePreset: true,
       runtimePolicy: {
-        provider_id: null,
         skills: { mode: 'custom' as const, ids: ['review'] },
         mcp: { mode: 'inherit' as const, ids: [] },
         tools: { mode: 'inherit' as const },
@@ -483,7 +479,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       identityPrompt: '',
       includeClaudePreset: true,
       runtimePolicy: {
-        provider_id: null,
         skills: { mode: 'custom' as const, ids: ['review'] },
         mcp: { mode: 'inherit' as const, ids: [] },
         tools: { mode: 'inherit' as const },
@@ -520,7 +515,7 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
     );
   });
 
-  test('custom MCP policy replaces settings with only selected servers', () => {
+  test('custom managed MCP is additive to project MCP and excludes unselected managed servers', () => {
     const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
     fs.mkdirSync(mcpDir, { recursive: true });
     fs.writeFileSync(
@@ -530,6 +525,14 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
           github: { enabled: true, command: 'github-mcp' },
           slack: { enabled: true, command: 'slack-mcp' },
         },
+      }),
+    );
+    const workspaceDir = path.join(tmpDataDir, 'groups', 'grp-policy-mcp');
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workspaceDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { projectDb: { command: 'project-db-mcp' } },
       }),
     );
 
@@ -550,7 +553,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         identityPrompt: '',
         includeClaudePreset: true,
         runtimePolicy: {
-          provider_id: null,
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
           tools: { mode: 'inherit' },
@@ -568,7 +570,11 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
     const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) as {
       mcpServers?: Record<string, unknown>;
     };
-    expect(Object.keys(settings.mcpServers ?? {})).toEqual(['github']);
+    expect(Object.keys(settings.mcpServers ?? {}).sort()).toEqual([
+      'github',
+      'projectDb',
+    ]);
+    expect(settings.mcpServers).not.toHaveProperty('slack');
     const envFile = path.join(tmpDataDir, 'env', 'grp-policy-mcp', 'env');
     expect(fs.readFileSync(envFile, 'utf8')).toContain(
       "HAPPYCLAW_AGENT_MCP_POLICY='custom'",
@@ -612,7 +618,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       identityPrompt: '',
       includeClaudePreset: true,
       runtimePolicy: {
-        provider_id: null,
         skills: { mode: 'inherit' as const, ids: [] },
         mcp: { mode: 'custom' as const, ids: ['github'] },
         tools: { mode: 'inherit' as const },

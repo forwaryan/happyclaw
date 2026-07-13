@@ -112,4 +112,22 @@ describe('buildSendMessageData — task attribution stamping', () => {
     expect(data.taskId).toBe('task-42');
     expect(data.isScheduledTask).toBe(true);
   });
+
+  test('file payload: task metadata follows the file through task IPC', () => {
+    const ctx = baseCtx({ currentTaskId: 'task-file', isScheduledTask: true });
+    const data = buildSendMessageData(ctx, {
+      type: 'send_file',
+      filePath: 'output/report.pdf',
+      fileName: 'report.pdf',
+    });
+    expect(data).toMatchObject({
+      type: 'send_file',
+      chatJid: 'web:ws-x',
+      groupFolder: 'ws-x',
+      filePath: 'output/report.pdf',
+      fileName: 'report.pdf',
+      taskId: 'task-file',
+      isScheduledTask: true,
+    });
+  });
 });

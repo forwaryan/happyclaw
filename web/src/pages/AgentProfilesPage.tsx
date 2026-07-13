@@ -3,9 +3,7 @@ import { useLocation, useSearchParams } from 'react-router-dom';
 import {
   ArrowRight,
   Bot,
-  Link2,
   Loader2,
-  MessagesSquare,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -13,7 +11,6 @@ import {
   Trash2,
   Upload,
   Wand2,
-  Workflow,
   X,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -37,6 +34,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { AgentPromptAssistant } from '../components/agents/AgentPromptAssistant';
+import { EffectiveCapabilitiesPreview } from '../components/agents/EffectiveCapabilitiesPreview';
+import { AgentGovernanceSection } from '../components/agents/AgentGovernanceSection';
 import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker';
 import { EmojiAvatar } from '../components/common/EmojiAvatar';
 import { EmojiPicker } from '../components/common/EmojiPicker';
@@ -53,7 +52,6 @@ import {
 import { getCustomAgentProfiles } from '../utils/agent-product';
 
 const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
-  provider_id: null,
   context: {
     source: 'managed',
     auto_compact_window: 0,
@@ -71,7 +69,6 @@ function normalizeRuntimePolicy(
   policy?: Partial<AgentProfileRuntimePolicy> | null,
 ): AgentProfileRuntimePolicy {
   return {
-    provider_id: null,
     context: {
       source: getAgentContextSource(policy),
       auto_compact_window:
@@ -277,7 +274,6 @@ export function AgentProfilesPage() {
   const currentRuntimePolicy = useMemo(
     () =>
       normalizeRuntimePolicy({
-        provider_id: null,
         context: {
           source: contextSource,
           auto_compact_window: useSdkCompactDefault
@@ -424,12 +420,6 @@ export function AgentProfilesPage() {
   const governance = selected ? governanceByProfile[selected.id] : undefined;
   const governanceBusy = selected ? !!governanceLoading[selected.id] : false;
   const governanceError = selected ? governanceErrors[selected.id] : undefined;
-  const governanceRuntimeSessionCount =
-    governance?.workspaces.reduce(
-      (sum, workspace) => sum + workspace.runtime_sessions.length,
-      0,
-    ) ?? 0;
-
   const skillOptions = useMemo(() => {
     const available = skills
       .filter((skill) => skill.source === 'user' && skill.enabled)
@@ -558,14 +548,25 @@ export function AgentProfilesPage() {
     if (!selected || !name.trim() || autoCompactError) return;
     setSaving(true);
     try {
-      const profile = await updateProfile(selected.id, {
-        name: name.trim(),
-        identity_prompt: identityPrompt.trim(),
-        include_claude_preset: includeClaudePreset,
-        avatar_emoji: avatarEmoji,
-        avatar_color: avatarColor,
-        runtime_policy: currentRuntimePolicy,
-      });
+      const changes: Parameters<typeof updateProfile>[1] = {};
+      if (name.trim() !== selected.name) changes.name = name.trim();
+      if (identityPrompt.trim() !== selected.identity_prompt) {
+        changes.identity_prompt = identityPrompt.trim();
+      }
+      if (includeClaudePreset !== selected.include_claude_preset) {
+        changes.include_claude_preset = includeClaudePreset;
+      }
+      if (avatarEmoji !== selected.avatar_emoji) {
+        changes.avatar_emoji = avatarEmoji;
+      }
+      if (avatarColor !== selected.avatar_color) {
+        changes.avatar_color = avatarColor;
+      }
+      if (!sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy)) {
+        changes.runtime_policy = currentRuntimePolicy;
+      }
+      if (Object.keys(changes).length === 0) return;
+      const profile = await updateProfile(selected.id, changes);
       setSelectedId(profile.id);
       toast.success('已保存');
     } catch (err) {
@@ -1120,10 +1121,12 @@ export function AgentProfilesPage() {
                   >
                     <div className="border-b border-border px-5 py-4">
                       <h2 className="text-sm font-semibold text-foreground">
-                        Agent 能力
+                        能力配置
                       </h2>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        这里是能力的唯一配置入口；所属工作区统一继承。模型、Provider
+                        这里控制 HappyClaw 附加给 Agent 的用户 Skills、用户 MCP
+                        和工具边界。工作区中的 CLAUDE.md、.claude/skills 与项目
+                        MCP 仍作为项目上下文加载；模型、Provider
                         与凭据使用系统设置。
                       </p>
                     </div>
@@ -1186,12 +1189,14 @@ export function AgentProfilesPage() {
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value="inherit">
-                                使用全部已启用 MCP
+                                使用全部 HappyClaw 用户 MCP
                               </SelectItem>
                               <SelectItem value="custom">
-                                只允许所选 MCP
+                                只允许所选 HappyClaw 用户 MCP
                               </SelectItem>
-                              <SelectItem value="disabled">关闭 MCP</SelectItem>
+                              <SelectItem value="disabled">
+                                关闭 HappyClaw 用户 MCP
+                              </SelectItem>
                             </SelectContent>
                           </Select>
                           {mcpMode === 'custom' && (
@@ -1206,8 +1211,10 @@ export function AgentProfilesPage() {
                             />
                           )}
                           <p className="text-[11px] leading-5 text-muted-foreground">
-                            选择这个 Agent 可以连接的用户
-                            MCP；“只读”或“严格只读” 能力边界会统一关闭 MCP。
+                            只控制 HappyClaw 附加的用户 MCP；项目 MCP
+                            与管理员授权的宿主机 MCP 仍作为 Claude
+                            上下文加载。“只读”或“严格只读”能力边界会统一关闭外部
+                            MCP。
                           </p>
                         </div>
                       </div>
@@ -1346,246 +1353,32 @@ export function AgentProfilesPage() {
                     </div>
                   </section>
                   {!draftMode && selected && (
-                    <section className="space-y-4 rounded-xl border border-border bg-card p-5">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold text-foreground">
-                            治理概览
-                          </div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            工作区、运行态会话和渠道绑定的当前归属
-                          </div>
-                        </div>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() =>
-                            void loadProfileGovernance(selected.id)
-                          }
-                          disabled={governanceBusy}
-                        >
-                          <RefreshCw
-                            className={
-                              governanceBusy
-                                ? 'h-4 w-4 animate-spin'
-                                : 'h-4 w-4'
-                            }
-                          />
-                          刷新
-                        </Button>
-                      </div>
-
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                            <Workflow className="h-3.5 w-3.5" />
-                            工作区
-                          </div>
-                          <div className="mt-1 text-lg font-semibold text-foreground">
-                            {governance?.workspaces.length ?? 0}
-                          </div>
-                        </div>
-                        <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                            <MessagesSquare className="h-3.5 w-3.5" />
-                            运行态会话
-                          </div>
-                          <div className="mt-1 text-lg font-semibold text-foreground">
-                            {governanceRuntimeSessionCount}
-                          </div>
-                        </div>
-                        <div className="min-w-0 rounded-md bg-muted/30 px-3 py-2">
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                            <Link2 className="h-3.5 w-3.5" />
-                            渠道绑定
-                          </div>
-                          <div className="mt-1 text-lg font-semibold text-foreground">
-                            {governance?.channel_mounts.length ?? 0}
-                          </div>
-                        </div>
-                      </div>
-
-                      {governanceError && !governance ? (
-                        <div className="flex flex-wrap items-center gap-3 rounded-md border border-error/30 bg-error-bg px-3 py-3 text-sm text-error">
-                          <span className="min-w-0 flex-1">
-                            {governanceError}
-                          </span>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() =>
-                              void loadProfileGovernance(selected.id)
-                            }
-                          >
-                            重试
-                          </Button>
-                        </div>
-                      ) : governanceBusy && !governance ? (
-                        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                          正在加载
-                        </div>
-                      ) : (
-                        <div className="grid gap-4 xl:grid-cols-2">
-                          <div className="min-w-0 space-y-2">
-                            <div className="text-xs font-medium text-muted-foreground">
-                              工作区与运行态会话
-                            </div>
-                            <div className="max-h-64 overflow-auto rounded-md border">
-                              {(governance?.workspaces.length ?? 0) === 0 ? (
-                                <div className="px-3 py-4 text-sm text-muted-foreground">
-                                  暂无工作区
-                                </div>
-                              ) : (
-                                governance?.workspaces.map((workspace) => (
-                                  <div
-                                    key={workspace.jid}
-                                    className="border-b px-3 py-2 last:border-b-0"
-                                  >
-                                    <div className="flex min-w-0 items-center justify-between gap-2">
-                                      <div className="min-w-0">
-                                        <div className="truncate text-sm font-medium text-foreground">
-                                          {workspace.name}
-                                        </div>
-                                        <div className="truncate text-xs text-muted-foreground">
-                                          {workspace.folder}
-                                        </div>
-                                      </div>
-                                      <Badge variant="secondary">
-                                        {workspace.runtime_sessions.length}{' '}
-                                        个运行态会话
-                                      </Badge>
-                                    </div>
-                                    {workspace.runtime_sessions.length > 0 && (
-                                      <div className="mt-2 space-y-1">
-                                        {workspace.runtime_sessions.map(
-                                          (session) => (
-                                            <div
-                                              key={`${workspace.jid}:${session.runtime_agent_id || 'main'}`}
-                                              className="truncate text-xs text-muted-foreground"
-                                            >
-                                              {session.runtime_agent_id ||
-                                                'main'}{' '}
-                                              · {session.sdk_session_id || '-'}
-                                            </div>
-                                          ),
-                                        )}
-                                      </div>
-                                    )}
-                                    <div className="mt-2 flex items-center gap-2">
-                                      <Select
-                                        value={
-                                          workspaceMoveTargets[workspace.jid] ||
-                                          ''
-                                        }
-                                        onValueChange={(value) =>
-                                          setWorkspaceMoveTargets(
-                                            (current) => ({
-                                              ...current,
-                                              [workspace.jid]: value,
-                                            }),
-                                          )
-                                        }
-                                      >
-                                        <SelectTrigger className="h-8 min-w-0 flex-1 text-xs">
-                                          <SelectValue placeholder="迁移到其他 Agent" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                          {profiles
-                                            .filter(
-                                              (profile) =>
-                                                profile.id !== selected.id,
-                                            )
-                                            .map((profile) => (
-                                              <SelectItem
-                                                key={profile.id}
-                                                value={profile.id}
-                                              >
-                                                {profile.is_default
-                                                  ? '主 Agent'
-                                                  : profile.name}
-                                              </SelectItem>
-                                            ))}
-                                        </SelectContent>
-                                      </Select>
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        className="h-8"
-                                        disabled={
-                                          movingWorkspaceJid ===
-                                            workspace.jid ||
-                                          !workspaceMoveTargets[workspace.jid]
-                                        }
-                                        onClick={() =>
-                                          void handleMoveWorkspace(
-                                            workspace.jid,
-                                            workspaceMoveTargets[workspace.jid],
-                                          )
-                                        }
-                                      >
-                                        {movingWorkspaceJid ===
-                                        workspace.jid ? (
-                                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                        ) : (
-                                          <ArrowRight className="h-3.5 w-3.5" />
-                                        )}
-                                        迁移
-                                      </Button>
-                                    </div>
-                                  </div>
-                                ))
-                              )}
-                            </div>
-                          </div>
-
-                          <div className="min-w-0 space-y-2">
-                            <div className="text-xs font-medium text-muted-foreground">
-                              渠道绑定
-                            </div>
-                            <div className="max-h-64 overflow-auto rounded-md border">
-                              {(governance?.channel_mounts.length ?? 0) ===
-                              0 ? (
-                                <div className="px-3 py-4 text-sm text-muted-foreground">
-                                  暂无渠道绑定
-                                </div>
-                              ) : (
-                                governance?.channel_mounts.map((mount) => (
-                                  <div
-                                    key={mount.channel_jid}
-                                    className="border-b px-3 py-2 last:border-b-0"
-                                  >
-                                    <div className="flex min-w-0 items-center justify-between gap-2">
-                                      <div className="min-w-0">
-                                        <div className="truncate text-sm font-medium text-foreground">
-                                          {mount.channel_jid}
-                                        </div>
-                                        <div className="truncate text-xs text-muted-foreground">
-                                          {mount.workspace_folder ||
-                                            mount.workspace_jid}
-                                        </div>
-                                      </div>
-                                      <Badge variant="outline">
-                                        {mount.channel_type}
-                                      </Badge>
-                                    </div>
-                                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                                      <span>
-                                        {mount.session_id
-                                          ? `session ${mount.session_id}`
-                                          : 'main'}
-                                      </span>
-                                      <span>{mount.routing_mode}</span>
-                                      <span>{mount.reply_policy}</span>
-                                    </div>
-                                  </div>
-                                ))
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </section>
+                    <EffectiveCapabilitiesPreview
+                      profileId={selected.id}
+                      runtimePolicy={currentRuntimePolicy}
+                      workspaces={governance?.workspaces ?? []}
+                    />
+                  )}
+                  {!draftMode && selected && (
+                    <AgentGovernanceSection
+                      selected={selected}
+                      profiles={profiles}
+                      governance={governance}
+                      busy={governanceBusy}
+                      error={governanceError}
+                      workspaceMoveTargets={workspaceMoveTargets}
+                      movingWorkspaceJid={movingWorkspaceJid}
+                      onRefresh={() => void loadProfileGovernance(selected.id)}
+                      onMoveTargetChange={(workspaceJid, targetProfileId) =>
+                        setWorkspaceMoveTargets((current) => ({
+                          ...current,
+                          [workspaceJid]: targetProfileId,
+                        }))
+                      }
+                      onMoveWorkspace={(workspaceJid, targetProfileId) =>
+                        void handleMoveWorkspace(workspaceJid, targetProfileId)
+                      }
+                    />
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2 border-t border-border pt-5">

@@ -113,6 +113,10 @@ import {
   buildDetachedWorkspaceUpdate,
   buildUnmountUpdate,
   buildWorkspaceMountUpdate,
+  commitChannelMountUpdate,
+  findWorkspaceThreadMapConflict,
+  hasSessionMountConflict,
+  hasWorkspaceMountConflict,
 } from '../channel-mount-service.js';
 import { isThreadMapCapableChat } from '../im-channel-capabilities.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
@@ -945,13 +949,7 @@ function resolveProxyInfo(
 
 /** Persist a RegisteredGroup update and sync to the in-memory cache. */
 function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
-  setRegisteredGroup(imJid, updated);
-  const webDeps = getWebDeps();
-  if (webDeps) {
-    const groups = webDeps.getRegisteredGroups();
-    if (groups[imJid]) groups[imJid] = updated;
-    webDeps.clearImFailCounts?.(imJid);
-  }
+  commitChannelMountUpdate(imJid, updated);
 }
 
 function applyRegisteredGroupUpdate(
@@ -3364,9 +3362,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-    const hasConflict =
-      (imGroup.target_agent_id && imGroup.target_agent_id !== sessionId) ||
-      !!imGroup.target_main_jid;
+    const hasConflict = hasSessionMountConflict(imGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
@@ -3420,25 +3416,15 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       imJid,
       imGroup,
     );
-    if (!threadCapable) {
-      return c.json(
-        {
-          error:
-            'Only topic/thread channels can bind to a workspace; ordinary channels must bind to a session',
-        },
-        400,
-      );
-    }
-
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
     const legacyMainJid = `web:${targetGroup.folder}`;
-    const hasConflict =
-      !!imGroup.target_agent_id ||
-      (imGroup.target_main_jid &&
-        imGroup.target_main_jid !== targetMainJid &&
-        imGroup.target_main_jid !== legacyMainJid);
+    const hasConflict = hasWorkspaceMountConflict(
+      imGroup,
+      targetMainJid,
+      legacyMainJid,
+    );
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
@@ -3453,12 +3439,11 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
 
     if (threadCapable) {
-      const currentThreadMap = Object.entries(getAllRegisteredGroups()).find(
-        ([otherJid, otherGroup]) =>
-          otherJid !== imJid &&
-          otherGroup.binding_mode === 'thread_map' &&
-          (otherGroup.target_main_jid === targetMainJid ||
-            otherGroup.target_main_jid === legacyMainJid),
+      const currentThreadMap = findWorkspaceThreadMapConflict(
+        getAllRegisteredGroups(),
+        imJid,
+        targetMainJid,
+        legacyMainJid,
       );
       if (currentThreadMap) {
         return c.json(
@@ -3469,11 +3454,16 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
 
     const updated: RegisteredGroup = {
-      ...buildWorkspaceMountUpdate(imGroup, targetMainJid, 'thread_map', {
-        replyPolicy,
-        ...(activationMode !== undefined ? { activationMode } : {}),
-        ...(ownerImId !== undefined ? { ownerImId } : {}),
-      }),
+      ...buildWorkspaceMountUpdate(
+        imGroup,
+        targetMainJid,
+        threadCapable ? 'thread_map' : 'single_session',
+        {
+          replyPolicy,
+          ...(activationMode !== undefined ? { activationMode } : {}),
+          ...(ownerImId !== undefined ? { ownerImId } : {}),
+        },
+      ),
       feishu_chat_mode: feishuInfo?.chat_mode ?? imGroup.feishu_chat_mode,
       feishu_group_message_type:
         feishuInfo?.group_message_type ?? imGroup.feishu_group_message_type,

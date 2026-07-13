@@ -33,6 +33,11 @@ const LOG_STATUS_STYLES: Record<
   string,
   { bg: string; text: string; label: string }
 > = {
+  queued: {
+    bg: 'bg-slate-100 dark:bg-slate-800/60',
+    text: 'text-slate-700 dark:text-slate-300',
+    label: '已排队',
+  },
   running: {
     bg: 'bg-blue-100 dark:bg-blue-900/40',
     text: 'text-blue-700 dark:text-blue-300',

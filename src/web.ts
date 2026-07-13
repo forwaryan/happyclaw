@@ -79,6 +79,7 @@ import {
   updateAgentContextInfo,
   updateChatName,
 } from './db.js';
+import { getGroupAllowedUserIds } from './group-broadcast-acl.js';
 import { markdownToPlainText } from './im-utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
@@ -1737,54 +1738,6 @@ function safeBroadcast(
  * - Set<string>: the owner user ID
  * - null: ownership unresolvable → default-deny
  */
-const allowedUserIdsCache = new Map<
-  string,
-  { ids: Set<string> | null; expiry: number }
->();
-const ALLOWED_CACHE_TTL = 10_000; // 10 seconds
-
-function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
-  const now = Date.now();
-  const cached = allowedUserIdsCache.get(chatJid);
-  if (cached && cached.expiry > now) return cached.ids;
-
-  const result = computeGroupAllowedUserIds(chatJid);
-  allowedUserIdsCache.set(chatJid, {
-    ids: result,
-    expiry: now + ALLOWED_CACHE_TTL,
-  });
-  return result;
-}
-
-function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
-  const group = getRegisteredGroup(chatJid);
-  if (!group) return null; // Unknown group → deny by default
-
-  const allowed = new Set<string>();
-
-  // Add owner
-  let ownerId: string | null = group.created_by ?? null;
-
-  // Legacy fallback: IM group without created_by, resolve by sibling home group.
-  if (!ownerId && !chatJid.startsWith('web:')) {
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const siblingJid of siblingJids) {
-      if (!siblingJid.startsWith('web:')) continue;
-      const siblingGroup = getRegisteredGroup(siblingJid);
-      if (siblingGroup?.is_home && siblingGroup.created_by) {
-        ownerId = siblingGroup.created_by;
-        break;
-      }
-    }
-  }
-
-  if (!ownerId) return null;
-
-  allowed.add(ownerId);
-
-  return allowed;
-}
-
 /** Check if a chatJid belongs to a host-mode group (for broadcast filtering) */
 function isHostGroupJid(chatJid: string): boolean {
   const group = getRegisteredGroup(chatJid);

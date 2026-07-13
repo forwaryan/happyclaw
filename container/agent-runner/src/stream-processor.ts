@@ -101,7 +101,10 @@ export class StreamEventProcessor {
   // back to the tool_use_id used at creation time.
   private readonly sdkTaskIdToToolUseId = new Map<string, string>();
 
-  // 尚未 settle 的 SDK 任务（task_id → description）。
+  // 尚未 settle 的 SDK 任务。local_bash 在 SDK 明确报告
+  // is_backgrounded=true 后属于已成功启动的 detached process：它仍保持
+  // stream 存活，但不再阻止当前输入 receipt 提交。其他 Agent/workflow
+  // 后台任务仍必须等待最终汇总后才能确认输入。
   // task_started 时登记；settle 走两条互补路径（缺一不可，不是重复防御）：
   // - task_notification：后台任务 / stopTask 的权威 settle 信号，任意 status
   //  （completed/failed/stopped）都算 settle；
@@ -111,7 +114,11 @@ export class StreamEventProcessor {
   // 存活的后台任务（异步 Agent / backgrounded Bash）——runner 据此决定 result
   // 后是否推迟关流，避免把它们连坐杀掉。
   // skip_transcript 的 housekeeping 任务不登记，防止内部自务任务卡住收尾。
-  private readonly pendingSdkTasks = new Map<string, string>();
+  private readonly pendingSdkTasks = new Map<string, {
+    description: string;
+    taskType?: string;
+    isBackgrounded: boolean;
+  }>();
 
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
@@ -782,7 +789,11 @@ export class StreamEventProcessor {
       const effectiveToolUseId = message.tool_use_id || this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
       const desc = message.description || message.prompt || '';
       if (message.task_id && !message.skip_transcript) {
-        this.pendingSdkTasks.set(message.task_id, desc);
+        this.pendingSdkTasks.set(message.task_id, {
+          description: desc,
+          taskType: typeof message.task_type === 'string' ? message.task_type : undefined,
+          isBackgrounded: false,
+        });
         this.log(`[pending-tasks] +${message.task_id.slice(0, 12)} (${shorten(desc, 60)}) → ${this.pendingSdkTasks.size} pending`);
       }
       this.emitStreamEvent({
@@ -822,6 +833,10 @@ export class StreamEventProcessor {
     if (message.subtype === 'task_updated') {
       const effectiveToolUseId = this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
       const patchStatus = message.patch?.status;
+      const pending = this.pendingSdkTasks.get(message.task_id);
+      if (pending && message.patch?.is_backgrounded === true) {
+        pending.isBackgrounded = true;
+      }
       if (patchStatus && SDK_TERMINAL_TASK_STATUSES.has(patchStatus)) {
         this.settlePendingSdkTask(message.task_id, `task_updated:${patchStatus}`);
       }
@@ -1358,9 +1373,22 @@ export class StreamEventProcessor {
     return this.pendingSdkTasks.size;
   }
 
+  /** Tasks which still make replay unsafe. A detached local bash command has
+   * acknowledged startup and may outlive the turn; finite Agent/workflow tasks
+   * still require their final summary. */
+  getBlockingPendingSdkTaskCount(): number {
+    let count = 0;
+    for (const pending of this.pendingSdkTasks.values()) {
+      if (!(pending.taskType === 'local_bash' && pending.isBackgrounded)) count++;
+    }
+    return count;
+  }
+
   /** pending 任务的简述列表，用于日志与前端提示。 */
   describePendingSdkTasks(): string[] {
-    return [...this.pendingSdkTasks.values()].map((d) => shorten(d, 80));
+    return [...this.pendingSdkTasks.values()].map((pending) =>
+      shorten(pending.description, 80),
+    );
   }
 
   /**

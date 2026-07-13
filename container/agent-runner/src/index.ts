@@ -71,7 +71,11 @@ import {
   requeueIpcInputMessages,
   type IpcInputMessage,
 } from './ipc-delivery.js';
-import { resolveAutoCompactWindow } from './context-window.js';
+import {
+  isExtendedContextModel,
+  resolveAutoCompactWindow,
+  resolveLegacyAutoCompactWindow,
+} from './context-window.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -1915,14 +1919,20 @@ async function runQuery(
     process.env.AUTO_COMPACT_WINDOW ?? '0',
     10,
   );
+  const safeLegacyAutoCompactWindow = resolveLegacyAutoCompactWindow(
+    CLAUDE_MODEL,
+    legacyAutoCompactWindow,
+  );
   const flagSettings: Record<string, unknown> = {};
   if (percentageWindow !== undefined) {
     flagSettings.autoCompactWindow = percentageWindow;
-  } else if (
-    Number.isFinite(legacyAutoCompactWindow) &&
-    legacyAutoCompactWindow > 0
-  ) {
-    flagSettings.autoCompactWindow = legacyAutoCompactWindow;
+  } else if (safeLegacyAutoCompactWindow !== undefined) {
+    flagSettings.autoCompactWindow = safeLegacyAutoCompactWindow;
+    if (safeLegacyAutoCompactWindow !== legacyAutoCompactWindow) {
+      log(
+        `[WARN] AUTO_COMPACT_WINDOW=${legacyAutoCompactWindow} exceeds the safe window for ${CLAUDE_MODEL}; clamped to ${safeLegacyAutoCompactWindow}`,
+      );
+    }
   }
   Object.assign(
     flagSettings,
@@ -2291,7 +2301,7 @@ async function runQuery(
         // 静默退回（例如 200K），在此立即暴露而非等到溢出。push 进 warnings 会让下方
         // emit 的 displayLevel 自动升为 'primary'，在前端醒目展示。
         if (
-          CLAUDE_MODEL.includes('[1m]') &&
+          isExtendedContextModel(CLAUDE_MODEL) &&
           contextUsage &&
           contextUsage.maxTokens > 0 &&
           contextUsage.maxTokens < 900_000
@@ -2416,6 +2426,9 @@ async function runQuery(
         const pendingBgTasks = emitOutput
           ? processor.getPendingSdkTaskCount()
           : 0;
+        const blockingPendingBgTasks = emitOutput
+          ? processor.getBlockingPendingSdkTaskCount()
+          : 0;
         if (pendingBgTasks > 0) {
           sawPendingBackgroundTasks = true;
         }
@@ -2467,7 +2480,7 @@ async function runQuery(
           suspectTruncatedTail = undefined;
         }
         const inputTurnCompleted = isHealthyInputTurnCompletion(
-          pendingBgTasks,
+          blockingPendingBgTasks,
           suspectTruncated,
         );
         const ipcReceipts = inputTurnCompleted

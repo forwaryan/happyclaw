@@ -70,6 +70,7 @@ import {
   setRouterState,
   setSession,
   deleteSession,
+  deleteMessagesForChatJid,
   storeMessageDirect,
   updateLatestMessageTokenUsage,
   updateChatName,
@@ -145,6 +146,10 @@ import {
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
+import {
+  awaitRequiredIpcSideEffects,
+  tryCleanupCompletedIsolatedTaskRunIpc,
+} from './isolated-task-ipc.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
   applyAutoIsolateContextForGroups,
@@ -210,6 +215,10 @@ import {
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { checkOwnerActive } from './owner-gate.js';
+import {
+  canExecuteOnHost,
+  HOST_EXECUTION_FORBIDDEN_ERROR,
+} from './host-execution-policy.js';
 import {
   ensureAgentDirectories,
   isRealpathInside,
@@ -3189,10 +3198,20 @@ function buildExpandContext(
   group: RegisteredGroup,
   ownerOverride?: string | null,
 ): ExpandContext | null {
+  const ownerId = ownerOverride ?? group.created_by;
+  if (
+    (group.executionMode || 'container') === 'host' &&
+    !canExecuteOnHost(ownerId ? getUserById(ownerId) : undefined)
+  ) {
+    // Plugin slash commands may execute inline Bash before the Agent runner is
+    // started. Apply the same live host authorization boundary here so a
+    // downgraded owner cannot bypass the runHostAgent gate.
+    return null;
+  }
   return makeExpandContext({
     chatJid,
     groupFolder: group.folder,
-    ownerId: ownerOverride ?? group.created_by,
+    ownerId,
     executionMode: group.executionMode,
     customCwd: group.customCwd,
     groupsDir: GROUPS_DIR,
@@ -5139,6 +5158,19 @@ async function runAgent(
     let output: ContainerOutput;
 
     if (executionMode === 'host') {
+      // Re-read the owner at the last possible point before spawning a host
+      // process. A persisted host workspace is not an authorization grant:
+      // role/status changes take effect immediately without rewriting it.
+      const currentOwner = group.created_by
+        ? getUserById(group.created_by)
+        : undefined;
+      if (!canExecuteOnHost(currentOwner)) {
+        logger.warn(
+          { chatJid, groupFolder: group.folder, ownerId: group.created_by },
+          'Blocked host workspace execution for non-admin owner',
+        );
+        return { status: 'error', error: HOST_EXECUTION_FORBIDDEN_ERROR };
+      }
       output = await runHostAgent(
         group,
         {
@@ -5759,29 +5791,32 @@ function startIpcWatcher(): void {
                         routingDecision.taskChatJid !== data.chatJid &&
                         routingDecision.taskChatJid !== ipcImRoute
                       ) {
-                        sendImWithFailTracking(
-                          routingDecision.taskChatJid,
-                          data.text,
-                          taskLocalImages,
-                        );
+                        await awaitRequiredIpcSideEffects([
+                          sendImWithRetry(
+                            routingDecision.taskChatJid,
+                            data.text,
+                            taskLocalImages,
+                          ),
+                        ]);
                       }
                     } else {
                       // Fallback: broadcast to all connected IM channels
                       const alreadySent = new Set<string>(
                         [data.chatJid, ipcImRoute].filter(Boolean) as string[],
                       );
+                      const pendingSends: Promise<boolean>[] = [];
                       broadcastToOwnerIMChannels(
                         sourceGroupEntry.created_by,
                         broadcastFolder,
                         alreadySent,
-                        (jid) =>
-                          sendImWithFailTracking(
-                            jid,
-                            data.text,
-                            taskLocalImages,
-                          ),
+                        (jid) => {
+                          pendingSends.push(
+                            sendImWithRetry(jid, data.text, taskLocalImages),
+                          );
+                        },
                         routingDecision.notifyChannels,
                       );
+                      await awaitRequiredIpcSideEffects(pendingSends);
                     }
                   }
                 }
@@ -5904,10 +5939,8 @@ function startIpcWatcher(): void {
                   });
                   broadcastToWebClients(imgChatJid, displayText);
 
-                  // Scheduled-task image routing. Same decision function as the
-                  // message branch; image IPC has no direct-to-chat_jid mode
-                  // (images only ever fan out), so we ignore 'direct' and
-                  // broadcast on either 'direct' or 'broadcast'.
+                  // Scheduled-task image routing uses the same direct target /
+                  // notify-channel fan-out contract as text and file outputs.
                   const imgRoutingDecision = ipcAgentId
                     ? { mode: 'none' as const }
                     : resolveTaskRoutingDecision(
@@ -5920,30 +5953,50 @@ function startIpcWatcher(): void {
                     imgRoutingDecision.mode !== 'none' &&
                     sourceGroupEntry?.created_by
                   ) {
-                    const alreadySent = new Set<string>(
-                      [data.chatJid, imgImRoute].filter(Boolean) as string[],
-                    );
-                    broadcastToOwnerIMChannels(
-                      sourceGroupEntry.created_by,
-                      broadcastFolder,
-                      alreadySent,
-                      (jid) =>
-                        imManager
-                          .sendImage(
-                            jid,
+                    if (imgRoutingDecision.mode === 'direct') {
+                      await retryImOperation(
+                        'send_task_image',
+                        imgRoutingDecision.taskChatJid,
+                        () =>
+                          imManager.sendImage(
+                            imgRoutingDecision.taskChatJid,
                             imageBuffer,
                             mimeType,
                             caption,
                             fileName,
-                          )
-                          .catch((err) =>
-                            logger.warn(
-                              { jid, err },
-                              'Failed to broadcast task image to IM',
-                            ),
                           ),
-                      imgRoutingDecision.notifyChannels,
-                    );
+                      );
+                    } else {
+                      const alreadySent = new Set<string>(
+                        [data.chatJid, imgImRoute].filter(Boolean) as string[],
+                      );
+                      const pendingSends: Promise<unknown>[] = [];
+                      broadcastToOwnerIMChannels(
+                        sourceGroupEntry.created_by,
+                        broadcastFolder,
+                        alreadySent,
+                        (jid) => {
+                          pendingSends.push(
+                            imManager
+                              .sendImage(
+                                jid,
+                                imageBuffer,
+                                mimeType,
+                                caption,
+                                fileName,
+                              )
+                              .catch((err) =>
+                                logger.warn(
+                                  { jid, err },
+                                  'Failed to broadcast task image to IM',
+                                ),
+                              ),
+                          );
+                        },
+                        imgRoutingDecision.notifyChannels,
+                      );
+                      await Promise.allSettled(pendingSends);
+                    }
                   }
 
                   logger.info(
@@ -6074,6 +6127,7 @@ function startIpcWatcher(): void {
               sourceGroupEntry,
               tasksDir,
               ipcAgentId,
+              ipcTaskId,
             );
             await fsp.unlink(filePath);
           } catch (err) {
@@ -6118,6 +6172,50 @@ function startIpcWatcher(): void {
           logger.error(
             { err, sourceGroup },
             'Error reading IPC tasks directory',
+          );
+        }
+      }
+
+      // The scheduler only marks isolated IPC namespaces complete.  Output
+      // files remain authoritative until this watcher has finished their side
+      // effects and unlinked/archived them.  Cleaning here also recovers runs
+      // left behind by a process crash: the startup full scan drains the files
+      // first, then removes the completed namespace.
+      if (ipcTaskId) {
+        try {
+          if (
+            tryCleanupCompletedIsolatedTaskRunIpc(ipcRoot, (completion) => {
+              if (
+                completion.taskRunId !== ipcTaskId ||
+                completion.workspaceFolder !== sourceGroup
+              ) {
+                throw new Error(
+                  'Isolated task completion marker does not match its IPC namespace',
+                );
+              }
+              deleteSession(sourceGroup, completion.sessionAgentId);
+              deleteMessagesForChatJid(completion.virtualChatJid);
+              fs.rmSync(
+                path.join(
+                  DATA_DIR,
+                  'sessions',
+                  sourceGroup,
+                  'agents',
+                  completion.sessionAgentId,
+                ),
+                { recursive: true, force: true },
+              );
+            })
+          ) {
+            logger.debug(
+              { sourceGroup, taskRunId: ipcTaskId },
+              'Cleaned completed isolated task IPC namespace after drain',
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            { sourceGroup, taskRunId: ipcTaskId, err },
+            'Failed to clean completed isolated task IPC namespace',
           );
         }
       }
@@ -6210,6 +6308,7 @@ async function processTaskIpc(
   data: {
     type: string;
     taskId?: string;
+    isScheduledTask?: boolean;
     prompt?: string;
     schedule_type?: string;
     schedule_value?: string;
@@ -6245,7 +6344,16 @@ async function processTaskIpc(
   sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
   tasksDir: string, // The exact ipcRoot/tasks dir the request was read from (for result write-back)
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
+  ipcTaskId: string | null = null, // Non-null for an isolated scheduled-task run namespace
 ): Promise<void> {
+  const ownerHomeFolderCandidate = sourceGroupEntry?.created_by
+    ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder
+    : null;
+  const broadcastFolder = resolveBroadcastFolder(
+    sourceGroup,
+    ownerHomeFolderCandidate,
+  );
+
   switch (data.type) {
     case 'schedule_task': {
       const failSchedule = (error: string): void => {
@@ -7017,13 +7125,24 @@ async function processTaskIpc(
             }
           }
 
-          const fileImRoute = resolveImRoute({
-            ipcAgentId,
-            isHome,
-            chatJid: data.chatJid,
-            sourceGroup,
-          });
-          if (fileImRoute) {
+          const fileRoutingDecision = ipcAgentId
+            ? { mode: 'none' as const }
+            : resolveTaskRoutingDecision(
+                data,
+                ipcTaskId,
+                !!sourceGroupEntry?.created_by,
+                { getTaskById, getChannelType },
+              );
+          const regularFileImRoute =
+            fileRoutingDecision.mode === 'none'
+              ? resolveImRoute({
+                  ipcAgentId,
+                  isHome,
+                  chatJid: data.chatJid,
+                  sourceGroup,
+                })
+              : null;
+          if (regularFileImRoute || fileRoutingDecision.mode !== 'none') {
             // Symlink-escape protection: the lexical startsWith check above does
             // not stop a symlink (inside the workspace) pointing at host/other-user
             // files. Re-verify the final path (original OR downloads fallback)
@@ -7037,17 +7156,59 @@ async function processTaskIpc(
               break;
             }
             const imFileName = data.fileName || path.basename(resolvedPath);
-            const sent = await retryImOperation('send_file', fileImRoute, () =>
-              imManager.sendFile(fileImRoute, resolvedPath, imFileName),
-            );
-            if (!sent) {
-              const failMsg = `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`;
-              broadcastToWebClients(sourceGroup, failMsg);
-              // Also notify via DingTalk directly so the user sees it there
-              try {
-                await imManager.sendMessage(fileImRoute, failMsg);
-              } catch {
-                // ignore — failure notification itself failing should not crash
+            if (fileRoutingDecision.mode === 'direct') {
+              const targetJid = fileRoutingDecision.taskChatJid;
+              const sent = await retryImOperation(
+                'send_task_file',
+                targetJid,
+                () => imManager.sendFile(targetJid, resolvedPath, imFileName),
+              );
+              if (!sent) {
+                broadcastToWebClients(
+                  sourceGroup,
+                  `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`,
+                );
+              }
+            } else if (fileRoutingDecision.mode === 'broadcast') {
+              const pendingSends: Promise<unknown>[] = [];
+              broadcastToOwnerIMChannels(
+                sourceGroupEntry!.created_by!,
+                broadcastFolder,
+                new Set<string>(),
+                (jid) => {
+                  pendingSends.push(
+                    imManager
+                      .sendFile(jid, resolvedPath, imFileName)
+                      .catch((err) =>
+                        logger.warn(
+                          { jid, err },
+                          'Failed to broadcast task file to IM',
+                        ),
+                      ),
+                  );
+                },
+                fileRoutingDecision.notifyChannels,
+              );
+              await Promise.allSettled(pendingSends);
+            } else if (regularFileImRoute) {
+              const sent = await retryImOperation(
+                'send_file',
+                regularFileImRoute,
+                () =>
+                  imManager.sendFile(
+                    regularFileImRoute,
+                    resolvedPath,
+                    imFileName,
+                  ),
+              );
+              if (!sent) {
+                const failMsg = `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`;
+                broadcastToWebClients(sourceGroup, failMsg);
+                try {
+                  await imManager.sendMessage(regularFileImRoute, failMsg);
+                } catch {
+                  // ignore — failure notification itself failing should not crash
+                }
               }
             }
           } else {
@@ -7064,7 +7225,11 @@ async function processTaskIpc(
               sourceGroup,
               chatJid: data.chatJid,
               fileName: data.fileName,
-              imRoute: fileImRoute,
+              imRoute:
+                fileRoutingDecision.mode === 'direct'
+                  ? fileRoutingDecision.taskChatJid
+                  : regularFileImRoute,
+              taskRoutingMode: fileRoutingDecision.mode,
             },
             'File sent via IPC',
           );
@@ -8216,6 +8381,21 @@ async function processAgentConversation(
 
     let output: ContainerOutput;
     if (executionMode === 'host') {
+      const currentOwner = effectiveGroup.created_by
+        ? getUserById(effectiveGroup.created_by)
+        : undefined;
+      if (!canExecuteOnHost(currentOwner)) {
+        logger.warn(
+          {
+            chatJid,
+            agentId,
+            groupFolder: effectiveGroup.folder,
+            ownerId: effectiveGroup.created_by,
+          },
+          'Blocked host conversation execution for non-admin owner',
+        );
+        throw new Error(HOST_EXECUTION_FORBIDDEN_ERROR);
+      }
       output = await runHostAgent(
         effectiveGroup,
         containerInput,

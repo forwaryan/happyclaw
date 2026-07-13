@@ -33,7 +33,7 @@ vi.mock('../src/logger.js', () => ({
   logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
 }));
 
-const { runContainerAgentMock } = vi.hoisted(() => ({
+const { runContainerAgentMock, runHostAgentMock } = vi.hoisted(() => ({
   runContainerAgentMock: vi.fn(async (_group, input, onProcess, onOutput) => {
     const sessionDir = path.join(
       tmpDir,
@@ -67,6 +67,10 @@ const { runContainerAgentMock } = vi.hoisted(() => ({
       newSessionId: `task-session:${input.taskRunId}`,
     };
   }),
+  runHostAgentMock: vi.fn(async () => ({
+    status: 'success',
+    result: 'host result',
+  })),
 }));
 
 vi.mock('../src/container-runner.js', async (importOriginal) => {
@@ -75,6 +79,7 @@ vi.mock('../src/container-runner.js', async (importOriginal) => {
   return {
     ...actual,
     runContainerAgent: runContainerAgentMock,
+    runHostAgent: runHostAgentMock,
   };
 });
 
@@ -98,6 +103,7 @@ function makeDeps(groups: Record<string, any>) {
       },
     ),
     closeStdin: vi.fn(),
+    enqueueMessageCheck: vi.fn(),
     isShuttingDown: () => false,
   };
 
@@ -151,6 +157,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   runContainerAgentMock.mockClear();
+  runHostAgentMock.mockClear();
   db.setRegisteredGroup(GROUP_JID, {
     name: 'Task Contract Workspace',
     folder: GROUP_FOLDER,
@@ -226,6 +233,7 @@ describe('scheduled task workspace/session contract', () => {
     expect(input.sessionAgentId).toBe(`task-${input.taskRunId}`);
     expect(input.sessionAgentId).toMatch(/^[a-zA-Z0-9_-]+$/);
     expect(input.isScheduledTask).toBe(true);
+    expect(input.messageTaskId).toBe(taskId);
 
     expect(db.getSession(GROUP_FOLDER)).toBe('main-session');
     expect(db.getSession(GROUP_FOLDER, input.sessionAgentId)).toBeUndefined();
@@ -284,6 +292,66 @@ describe('scheduled task workspace/session contract', () => {
     expect(secondInput.taskRunId).not.toBe(firstInput.taskRunId);
     expect(firstInput.sessionAgentId).toBe(`task-${firstInput.taskRunId}`);
     expect(secondInput.sessionAgentId).toBe(`task-${secondInput.taskRunId}`);
+  });
+
+  test('group-mode delivery is logged as queued, not falsely completed', async () => {
+    const taskId = createTask({
+      id: 'task-group-queued-status',
+      context_mode: 'group',
+    });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    const { deps, queue } = makeDeps(groups);
+
+    expect(triggerTaskNow(taskId, deps).success).toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(queue.enqueueMessageCheck).toHaveBeenCalledWith(GROUP_JID);
+    expect(db.getTaskRunLogs(taskId, 1)[0]).toMatchObject({
+      status: 'queued',
+      result: '已排队到源工作区，等待 Agent 执行',
+      error: null,
+    });
+  });
+
+  test('host task cannot use an admin creator to bypass a downgraded workspace owner', async () => {
+    const now = new Date().toISOString();
+    for (const id of ['host-workspace-owner', 'host-task-creator']) {
+      db.createUser({
+        id,
+        username: id,
+        password_hash: 'hash',
+        display_name: id,
+        role: 'admin',
+        status: 'active',
+        must_change_password: false,
+        created_at: now,
+        updated_at: now,
+      });
+    }
+    const hostGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      created_by: 'host-workspace-owner',
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(GROUP_JID, hostGroup);
+    db.updateUserFields('host-workspace-owner', { role: 'member' });
+    const taskId = createTask({
+      id: 'host-owner-revoked-task',
+      execution_mode: 'host',
+      created_by: 'host-task-creator',
+    });
+    const { deps, waitForRun } = makeDeps({ [GROUP_JID]: hostGroup });
+
+    expect(triggerTaskNow(taskId, deps).success).toBe(true);
+    await waitForRun();
+
+    expect(runHostAgentMock).not.toHaveBeenCalled();
+    expect(db.getTaskRunLogs(taskId, 1)[0]).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('active administrator'),
+    });
   });
 
   test('manual trigger reserves a capacity-blocked task and releases after execution', async () => {

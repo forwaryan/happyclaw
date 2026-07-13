@@ -68,7 +68,10 @@ export function CreateContainerDialog({
   );
   const inheritsHostClaude =
     canHostExec &&
-    getAgentContextSource(selectedProfile?.runtime_policy) === 'host_claude';
+    getAgentContextSource(
+      selectedProfile?.effective_runtime_policy ??
+        selectedProfile?.runtime_policy,
+    ) === 'host_claude';
 
   useEffect(() => {
     if (open) void loadProfiles();

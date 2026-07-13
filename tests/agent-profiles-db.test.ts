@@ -70,7 +70,6 @@ describe('AgentProfile DB model', () => {
     expect(profiles[0].identity_prompt).toBe('');
     expect(profiles[0].include_claude_preset).toBe(true);
     expect(profiles[0].runtime_policy).toEqual({
-      provider_id: null,
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -176,7 +175,6 @@ describe('AgentProfile DB model', () => {
         tools: { mode: 'readonly' },
       } as any),
     ).toEqual({
-      provider_id: null,
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -311,7 +309,6 @@ describe('AgentProfile DB model', () => {
       name: 'Policy Agent',
       identityPrompt: '按策略运行。',
       runtimePolicy: {
-        provider_id: 'provider-a',
         skills: { mode: 'custom', ids: ['review', 'research', 'review'] },
         mcp: { mode: 'disabled', ids: ['ignored'] },
         tools: { mode: 'readonly' },
@@ -319,7 +316,6 @@ describe('AgentProfile DB model', () => {
     });
 
     expect(profile.runtime_policy).toEqual({
-      provider_id: null,
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -352,7 +348,6 @@ describe('AgentProfile DB model', () => {
       'agent-profile-user-policy',
       {
         runtimePolicy: {
-          provider_id: 'provider-b',
           context: { source: 'host_claude' },
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
@@ -362,7 +357,6 @@ describe('AgentProfile DB model', () => {
     );
     expect(updated?.version).toBe(profile.version + 1);
     expect(updated?.runtime_policy).toEqual({
-      provider_id: null,
       context: {
         source: 'host_claude',
         auto_compact_window: 0,
@@ -388,7 +382,6 @@ describe('AgentProfile DB model', () => {
       ownerUserId: 'agent-profile-user-policy-merge',
       name: 'Strict Policy Agent',
       runtimePolicy: {
-        provider_id: 'provider-fixed',
         context: { source: 'host_claude' },
         skills: { mode: 'disabled', ids: ['kept-for-audit'] },
         mcp: { mode: 'custom', ids: ['github'] },
@@ -403,7 +396,6 @@ describe('AgentProfile DB model', () => {
     );
 
     expect(updated?.runtime_policy).toEqual({
-      provider_id: null,
       context: {
         source: 'host_claude',
         auto_compact_window: 0,

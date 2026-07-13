@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Bot,
   Cpu,
+  FolderCog,
   Loader2,
   Puzzle,
   Server,
@@ -20,7 +21,6 @@ interface WorkspaceCapabilitiesPanelProps {
 }
 
 const DEFAULT_POLICY: AgentProfileRuntimePolicy = {
-  provider_id: null,
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
   tools: { mode: 'inherit' },
@@ -92,7 +92,7 @@ export function WorkspaceCapabilitiesPanel({
               {agentName}
             </h3>
             <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-              能力由 Agent 统一定义，并被它所属的所有工作区继承。
+              Agent 管理系统附加能力；工作区继续提供项目自己的上下文。
             </p>
           </div>
           <span className="ml-auto shrink-0 rounded-md bg-brand-50 px-2 py-1 text-[10px] font-medium text-primary dark:bg-brand-700/20 dark:text-brand-300">
@@ -135,6 +135,13 @@ export function WorkspaceCapabilitiesPanel({
         />
 
         <CapabilitySection
+          icon={FolderCog}
+          title="项目上下文"
+          value="随工作区加载"
+          detail="工作区中的 CLAUDE.md、.claude/skills 和项目 MCP 属于项目本身；Agent 策略决定 HappyClaw 管理的用户 Skills、用户 MCP 和工具边界。"
+        />
+
+        <CapabilitySection
           icon={Server}
           title="MCP"
           value={strictBoundary ? '外部 MCP 已关闭' : policyLabel(policy.mcp)}
@@ -149,7 +156,7 @@ export function WorkspaceCapabilitiesPanel({
           icon={Cpu}
           title="模型与运行环境"
           value="系统统一管理"
-          detail="模型、Provider 与凭据使用系统配置；工作区不再提供能力覆盖。"
+          detail="模型、Provider 与凭据使用系统配置；项目需要的普通环境变量可在工作区高级设置中管理。"
         />
 
         {loading && (

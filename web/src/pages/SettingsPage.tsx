@@ -13,6 +13,7 @@ import { SecuritySection } from '../components/settings/SecuritySection';
 import { AboutSection } from '../components/settings/AboutSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
 import { MainAgentIdentitySection } from '../components/settings/MainAgentIdentitySection';
+import { MainAgentCapabilitiesSection } from '../components/settings/MainAgentCapabilitiesSection';
 import {
   HostIntegrationSettingsSection,
   SystemSettingsSection,
@@ -243,12 +244,15 @@ export function SettingsPage() {
                     </CardTitle>
                     <CardDescription>
                       {activeTab === 'main-agent'
-                        ? '管理全局主 Agent 的头像、宿主机配置继承和上下文压缩策略。'
+                        ? '管理主 Agent 的头像、系统附加能力、宿主机配置继承和上下文压缩策略。'
                         : '管理宿主机 Claude 目录以及共享 Plugin Catalog 的来源。'}
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
                     {activeTab === 'main-agent' && <MainAgentIdentitySection />}
+                    {activeTab === 'main-agent' && (
+                      <MainAgentCapabilitiesSection />
+                    )}
                     <div className={activeTab === 'main-agent' ? 'pt-6' : ''}>
                       <HostIntegrationSettingsSection
                         scope={

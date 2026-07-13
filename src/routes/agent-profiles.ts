@@ -10,6 +10,7 @@ import {
   AgentProfileGenerateSchema,
   AgentProfilePatchSchema,
   AgentProfileRefinePromptSchema,
+  AgentProfileRuntimePolicySchema,
 } from '../schemas.js';
 import type { AuthUser } from '../types.js';
 import {
@@ -18,11 +19,13 @@ import {
 } from '../agent-profile-generator.js';
 import { logger } from '../logger.js';
 import { DATA_DIR } from '../config.js';
+import { buildAgentCapabilityPreview } from '../agent-capability-preview.js';
 import { loadUserMcpServers } from '../mcp-utils.js';
 import { validateSkillId } from '../skill-utils.js';
 import {
   listWorkspaceGroupsForAgentProfile,
   quiesceWorkspaceRunnersAroundCommit,
+  resolveEffectiveAgentProfile,
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
@@ -114,7 +117,16 @@ function hasInvalidRuntimePolicyReferences(
 agentProfileRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const profiles = listAgentProfilesForUser(user.id);
-  return c.json({ profiles });
+  return c.json({
+    profiles: profiles.map((profile) => ({
+      ...profile,
+      // Persisted policy is kept for editing. The effective policy includes
+      // system defaults and the current role check used at execution time.
+      effective_runtime_policy:
+        resolveEffectiveAgentProfile(profile)?.runtime_policy ??
+        profile.runtime_policy,
+    })),
+  });
 });
 
 agentProfileRoutes.post('/', authMiddleware, async (c) => {
@@ -175,6 +187,80 @@ agentProfileRoutes.post('/generate', authMiddleware, async (c) => {
     return c.json({ error: message }, message.includes('未配置') ? 503 : 502);
   }
 });
+
+agentProfileRoutes.post(
+  '/:id/effective-capabilities',
+  authMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const id = c.req.param('id');
+    const existing = getAgentProfileForUser(id, user.id);
+    if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    const parsedPolicy =
+      body.runtime_policy === undefined
+        ? { success: true as const, data: undefined }
+        : AgentProfileRuntimePolicySchema.safeParse(body.runtime_policy);
+    if (!parsedPolicy.success)
+      return c.json({ error: 'Invalid runtime policy' }, 400);
+    if (isUnauthorizedHostClaudeContext(user, parsedPolicy.data)) {
+      return c.json(
+        { error: 'host_claude context requires an admin role' },
+        403,
+      );
+    }
+
+    const previewProfile = resolveEffectiveAgentProfile({
+      ...existing,
+      runtime_policy:
+        parsedPolicy.data === undefined
+          ? existing.runtime_policy
+          : mergeAgentProfileRuntimePolicy(
+              existing.runtime_policy,
+              parsedPolicy.data,
+            ),
+    })!;
+    const workspaceJid =
+      typeof body.workspace_jid === 'string' && body.workspace_jid.trim()
+        ? body.workspace_jid.trim()
+        : undefined;
+    let workspace:
+      | {
+          jid: string;
+          group: ReturnType<typeof getAllRegisteredGroups>[string];
+        }
+      | undefined;
+    if (workspaceJid) {
+      const group = getAllRegisteredGroups()[workspaceJid];
+      const defaultProfile = getOrCreateDefaultAgentProfile(user.id);
+      const mappedProfileId = group
+        ? (getWorkspaceAgentProfileId(group.folder) ?? defaultProfile.id)
+        : undefined;
+      if (
+        !group ||
+        !workspaceJid.startsWith('web:') ||
+        group.created_by !== user.id ||
+        mappedProfileId !== id
+      ) {
+        return c.json(
+          { error: 'Workspace does not belong to this Agent' },
+          400,
+        );
+      }
+      workspace = { jid: workspaceJid, group };
+    }
+
+    return c.json({
+      preview: buildAgentCapabilityPreview({
+        profile: previewProfile,
+        workspace,
+      }),
+    });
+  },
+);
 
 agentProfileRoutes.post('/:id/avatar', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
@@ -318,11 +404,17 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
       );
     }
 
-    const sensitivePayloadProvided =
-      parsed.data.name !== undefined ||
-      parsed.data.identity_prompt !== undefined ||
-      parsed.data.include_claude_preset !== undefined ||
-      parsed.data.runtime_policy !== undefined;
+    const sensitiveConfigurationChanged =
+      (parsed.data.name !== undefined && parsed.data.name !== existing.name) ||
+      (parsed.data.identity_prompt !== undefined &&
+        parsed.data.identity_prompt !== existing.identity_prompt) ||
+      (parsed.data.include_claude_preset !== undefined &&
+        parsed.data.include_claude_preset !== existing.include_claude_preset) ||
+      (parsed.data.runtime_policy !== undefined &&
+        JSON.stringify(effectiveRuntimePolicy) !==
+          JSON.stringify(
+            normalizeAgentProfileRuntimePolicy(existing.runtime_policy),
+          ));
 
     let invalidatedRuntimeJids = 0;
     const commit = () =>
@@ -336,10 +428,10 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
       });
     let profile;
     const deps = getWebDeps();
-    const workspaces = sensitivePayloadProvided
+    const workspaces = sensitiveConfigurationChanged
       ? listWorkspaceGroupsForAgentProfile(user.id, id)
       : [];
-    if (sensitivePayloadProvided && deps && workspaces.length > 0) {
+    if (sensitiveConfigurationChanged && deps && workspaces.length > 0) {
       try {
         const result = await quiesceWorkspaceRunnersAroundCommit(
           deps,
@@ -347,7 +439,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
             folder: workspace.group.folder,
             primaryJid: workspace.jid,
           })),
-          { reason: `Agent profile ${id} sensitive configuration submitted` },
+          { reason: `Agent profile ${id} sensitive configuration changed` },
           commit,
         );
         profile = result.value;

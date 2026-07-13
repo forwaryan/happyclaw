@@ -6,6 +6,7 @@ import { useAuthStore } from '../../stores/auth';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { FilePanel } from './FilePanel';
+import { ContainerEnvPanel } from './ContainerEnvPanel';
 import {
   Sheet,
   SheetContent,
@@ -18,6 +19,7 @@ import { PromptDialog } from '@/components/common/PromptDialog';
 import {
   ArrowLeft,
   ChevronRight,
+  Folder,
   Link,
   Monitor,
   Moon,
@@ -47,6 +49,7 @@ import { getAgentProfileDisplayName } from '../../utils/agent-product';
 
 /** Sentinel value for binding the main conversation (vs. a specific agent) */
 const MAIN_BINDING = '__main__' as const;
+const WORKSPACE_BINDING = '__workspace__' as const;
 
 const POLL_INTERVAL_MS = 2000;
 const TERMINAL_MIN_HEIGHT = 150;
@@ -67,6 +70,9 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const { theme, toggle: toggleTheme } = useTheme();
   const [panelOpen, setPanelOpen] = useState(false);
   const [mobileContextOpen, setMobileContextOpen] = useState(false);
+  const [contextPanelView, setContextPanelView] = useState<
+    'files' | 'env'
+  >('files');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const [resetAgentId, setResetAgentId] = useState<string | null>(null);
@@ -166,6 +172,12 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   // ACL result is propagated via the `can_modify` field; trust it as the
   // single source of truth to avoid frontend/backend divergence.
   const canModifyWorkspaceConfig = !!group?.can_modify;
+
+  useEffect(() => {
+    if (!canModifyWorkspaceConfig && contextPanelView === 'env') {
+      setContextPanelView('files');
+    }
+  }, [canModifyWorkspaceConfig, contextPanelView]);
 
   // Fetch IM connection status for home groups
   const isOwnHome =
@@ -642,7 +654,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       }}
       onDeleteSession={handleDeleteSession}
       onBindSession={(id) => {
-        setBindingAgentId(id);
+        setBindingAgentId(id ?? MAIN_BINDING);
       }}
     />
   );
@@ -658,13 +670,37 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const renderContextPanel = () => (
     <div className="flex h-full min-h-0 w-full flex-col bg-background">
       <div className="border-b border-border/70 p-2">
-        <div className="flex min-h-10 items-center gap-3 rounded-md px-2.5 text-xs text-foreground">
-          <Server className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span className="flex-1">环境</span>
-          <span className="text-muted-foreground">
-            {group?.execution_mode === 'host' ? '宿主机' : 'Docker'}
-          </span>
-        </div>
+        {canModifyWorkspaceConfig && (
+          <button
+            type="button"
+            onClick={() => setContextPanelView('env')}
+            aria-current={contextPanelView === 'env' ? 'page' : undefined}
+            className={cn(
+              'flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer',
+              contextPanelView === 'env' && 'bg-accent/70',
+            )}
+          >
+            <Server className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span className="flex-1">工作区环境</span>
+            <span className="text-muted-foreground">
+              {group?.execution_mode === 'host' ? '宿主机' : 'Docker'}
+            </span>
+            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => setContextPanelView('files')}
+          aria-current={contextPanelView === 'files' ? 'page' : undefined}
+          className={cn(
+            'flex min-h-10 w-full items-center gap-3 rounded-md px-2.5 text-left text-xs text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer',
+            contextPanelView === 'files' && 'bg-accent/70',
+          )}
+        >
+          <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="flex-1">项目文件</span>
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+        </button>
         {canUseTerminal && (
           <button
             type="button"
@@ -693,7 +729,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
-        <FilePanel groupJid={groupJid} />
+        {contextPanelView === 'env' && canModifyWorkspaceConfig ? (
+          <ContainerEnvPanel groupJid={groupJid} />
+        ) : (
+          <FilePanel groupJid={groupJid} />
+        )}
       </div>
     </div>
   );
@@ -781,7 +821,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           {!isHome && canModifyWorkspaceConfig && (
             <button
               type="button"
-              onClick={() => setBindingAgentId(MAIN_BINDING)}
+              onClick={() => setBindingAgentId(WORKSPACE_BINDING)}
               className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
               title="管理工作区绑定"
               aria-label="管理工作区绑定"
@@ -1057,9 +1097,18 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         <ImBindingDialog
           open={!!bindingAgentId}
           groupJid={groupJid}
-          agentId={bindingAgentId === MAIN_BINDING ? null : bindingAgentId}
+          agentId={
+            bindingAgentId === MAIN_BINDING ||
+            bindingAgentId === WORKSPACE_BINDING
+              ? null
+              : bindingAgentId
+          }
+          targetMode={
+            bindingAgentId === WORKSPACE_BINDING ? 'workspace' : 'session'
+          }
           agent={
-            bindingAgentId !== MAIN_BINDING
+            bindingAgentId !== MAIN_BINDING &&
+            bindingAgentId !== WORKSPACE_BINDING
               ? agents.find((a) => a.id === bindingAgentId)
               : undefined
           }

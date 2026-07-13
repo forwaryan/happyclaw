@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { ChildProcess, execFile, spawn } from 'child_process';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
@@ -14,6 +14,16 @@ export interface ScriptRunResult {
 }
 
 let activeScriptCount = 0;
+let nextScriptRunId = 1;
+
+interface ActiveScriptRun {
+  child: ChildProcess;
+  ownerId?: string;
+  groupFolder: string;
+  settled: Promise<void>;
+}
+
+const activeScriptRuns = new Map<number, ActiveScriptRun>();
 
 export function getActiveScriptCount(): number {
   return activeScriptCount;
@@ -24,11 +34,51 @@ export function hasScriptCapacity(): boolean {
   return activeScriptCount < maxConcurrentScripts;
 }
 
+function killScriptProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => undefined);
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already exited */
+    }
+  }
+}
+
+export async function terminateScriptsForOwner(userId: string): Promise<number> {
+  const targets = [...activeScriptRuns.values()].filter(
+    (run) => run.ownerId === userId,
+  );
+  for (const run of targets) killScriptProcessTree(run.child);
+  await Promise.all(
+    targets.map((run) =>
+      Promise.race([
+        run.settled,
+        new Promise<void>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Timed out terminating host script task')),
+            5_000,
+          ).unref?.(),
+        ),
+      ]),
+    ),
+  );
+  return targets.length;
+}
+
 const MAX_BUFFER = 1024 * 1024; // 1MB
 
 export async function runScript(
   command: string,
   groupFolder: string,
+  options?: { ownerId?: string },
 ): Promise<ScriptRunResult> {
   const { scriptTimeout } = getSystemSettings();
   const cwd = path.join(GROUPS_DIR, groupFolder);
@@ -38,12 +88,17 @@ export async function runScript(
 
   try {
     return await new Promise<ScriptRunResult>((resolve) => {
-      const child = exec(
-        command,
-        {
+      const runId = nextScriptRunId++;
+      let settleRun!: () => void;
+      const settled = new Promise<void>((settle) => {
+        settleRun = settle;
+      });
+      let stdout = '';
+      let stderr = '';
+      let timedOut = false;
+      let finished = false;
+      const child = spawn(command, {
           cwd,
-          timeout: scriptTimeout,
-          maxBuffer: MAX_BUFFER,
           env: {
             PATH: process.env.PATH,
             LANG: process.env.LANG || 'en_US.UTF-8',
@@ -54,11 +109,27 @@ export async function runScript(
             HOME: process.env.HOME || cwd,
           },
           shell: '/bin/sh',
-        },
-        (error, stdout, stderr) => {
+          detached: process.platform !== 'win32',
+        });
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        killScriptProcessTree(child);
+      }, scriptTimeout);
+      timeout.unref?.();
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        if (stdout.length < MAX_BUFFER) stdout += chunk.toString();
+      });
+      child.stderr?.on('data', (chunk: Buffer | string) => {
+        if (stderr.length < MAX_BUFFER) stderr += chunk.toString();
+      });
+      const finish = (exitCode: number | null, spawnError?: Error) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+          activeScriptRuns.delete(runId);
           activeScriptCount--;
+          settleRun();
           const durationMs = Date.now() - startTime;
-          const timedOut = error?.killed === true;
 
           if (timedOut) {
             logger.warn(
@@ -69,13 +140,20 @@ export async function runScript(
 
           resolve({
             stdout: stdout.slice(0, MAX_BUFFER),
-            stderr: stderr.slice(0, MAX_BUFFER),
-            exitCode: timedOut ? null : (child.exitCode ?? (error ? 1 : 0)),
+            stderr: (spawnError?.message || stderr).slice(0, MAX_BUFFER),
+            exitCode: timedOut ? null : (exitCode ?? (spawnError ? 1 : 0)),
             timedOut,
             durationMs,
           });
-        },
-      );
+      };
+      child.once('error', (err) => finish(1, err));
+      child.once('close', (code) => finish(code));
+      activeScriptRuns.set(runId, {
+        child,
+        ownerId: options?.ownerId,
+        groupFolder,
+        settled,
+      });
     });
   } catch (err) {
     activeScriptCount--;

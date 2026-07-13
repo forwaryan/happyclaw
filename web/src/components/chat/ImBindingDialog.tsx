@@ -34,6 +34,7 @@ interface ImBindingDialogProps {
   /** session id for workspace-session binding; null for main session binding */
   agentId: string | null;
   agent?: AgentInfo;
+  targetMode?: 'workspace' | 'session';
   onClose: () => void;
 }
 
@@ -52,6 +53,7 @@ export function ImBindingDialog({
   groupJid,
   agentId,
   agent,
+  targetMode = 'session',
   onClose,
 }: ImBindingDialogProps) {
   const [imGroups, setImGroups] = useState<AvailableImGroup[]>([]);
@@ -75,13 +77,14 @@ export function ImBindingDialog({
   const unbindMainImGroup = useChatStore((s) => s.unbindMainImGroup);
 
   const isMainMode = agentId === null;
+  const isWorkspaceMode = targetMode === 'workspace';
 
   const compatibleGroups = useMemo(
     () =>
       imGroups.filter((group) =>
-        isMainMode ? !!group.is_thread_capable : !group.is_thread_capable,
+        isWorkspaceMode ? !!group.is_thread_capable : !group.is_thread_capable,
       ),
-    [imGroups, isMainMode],
+    [imGroups, isWorkspaceMode],
   );
 
   const loadGroupsForDialog = useCallback(async () => {
@@ -292,9 +295,9 @@ export function ImBindingDialog({
     setActionLoading(null);
   };
 
-  const title = isMainMode
+  const title = isWorkspaceMode
     ? '工作区绑定'
-    : `会话绑定${agent ? ` — ${agent.name}` : ''}`;
+    : `会话绑定${agent ? ` — ${agent.name}` : ' — 主会话'}`;
 
   const renderThreadCapability = (group: AvailableImGroup) => {
     if (!group.is_thread_capable) return null;
@@ -317,7 +320,7 @@ export function ImBindingDialog({
           </DialogHeader>
 
           <div className="rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
-            {isMainMode
+            {isWorkspaceMode
               ? '绑定飞书话题群后，每个话题会在当前工作区生成一个独立会话。'
               : '将普通群或私聊绑定到当前会话，后续消息会继续使用这段上下文。'}
           </div>
@@ -380,7 +383,7 @@ export function ImBindingDialog({
 
             {!loading && !loadError && compatibleGroups.length === 0 && (
               <div className="text-center py-8 text-muted-foreground text-sm">
-                {isMainMode
+                {isWorkspaceMode
                   ? '暂无可绑定的飞书话题群。请先将 Bot 加入话题群，并发送一条消息。'
                   : '暂无可绑定的普通群或私聊。请先在对应渠道中向 Bot 发送一条消息。'}
               </div>
@@ -597,7 +600,7 @@ export function ImBindingDialog({
         title="确认换绑"
         message={
           rebindTarget
-            ? `该渠道当前已绑定到${describeBindTarget(rebindTarget.group)}，确认换绑到当前${isMainMode ? '工作区' : '会话'}吗？`
+            ? `该渠道当前已绑定到${describeBindTarget(rebindTarget.group)}，确认换绑到当前${isWorkspaceMode ? '工作区' : '会话'}吗？`
             : ''
         }
         confirmText="换绑"

@@ -28,6 +28,7 @@ import {
   getJidsByFolder,
   updateChatName,
   deleteSession,
+  deleteWorkspaceSessions,
   deleteChatHistory,
   deleteGroupData,
   deleteImGroupRecord,
@@ -60,6 +61,7 @@ import {
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
 import {
+  getWorkspaceRuntimeJids,
   quiesceWorkspaceRunnersAroundCommit,
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
@@ -169,7 +171,8 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     if (isHost && !isAdmin && !(isHome && group.created_by === user.id))
       continue;
 
-    // User isolation: users only see groups they own.
+    // Workspaces are private to their creator. IM rows without created_by use
+    // the legacy sibling-home fallback inside canAccessGroup.
     if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid }))
       continue;
 
@@ -793,9 +796,70 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           : existing.activation_mode,
     };
 
-    setRegisteredGroup(jid, updated);
-    if (name) updateChatName(jid, name);
-    deps.getRegisteredGroups()[jid] = updated;
+    const commitUpdate = () => {
+      setRegisteredGroup(jid, updated);
+      if (name) updateChatName(jid, name);
+      deps.getRegisteredGroups()[jid] = updated;
+      if (
+        execution_mode !== undefined &&
+        execution_mode !== (existing.executionMode || 'container')
+      ) {
+        // SDK resume state is environment-bound. Never carry a host session
+        // into a container (or vice versa) after the old runner is stopped.
+        deleteWorkspaceSessions(existing.folder);
+        delete deps.sessions[existing.folder];
+      }
+    };
+
+    const executionModeChanged =
+      execution_mode !== undefined &&
+      execution_mode !== (existing.executionMode || 'container');
+    const runtimeWasSafetyBlocked =
+      execution_mode !== undefined &&
+      (deps.queue?.isGroupRuntimeSafetyBlocked?.(jid) ?? false);
+    if (executionModeChanged || (execution_mode !== undefined && runtimeWasSafetyBlocked)) {
+      const runtimeJids = getWorkspaceRuntimeJids(
+        deps,
+        existing.folder,
+        jid,
+      );
+      try {
+        await quiesceWorkspaceRunnersAroundCommit(
+          deps,
+          [{ folder: existing.folder, primaryJid: jid }],
+          {
+            reason: `Workspace ${jid} execution mode changed`,
+            onPostCommitFailure: (failedRuntimeJids) =>
+              deps.queue?.blockGroupsForRuntimeSafety?.(
+                failedRuntimeJids,
+                `Workspace ${jid} runtime cleanup failed after execution mode commit`,
+              ),
+          },
+          commitUpdate,
+        );
+        deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
+      } catch (err) {
+        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+        if (err.persisted) {
+          deps.queue?.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `Workspace ${jid} runtime cleanup failed after execution mode commit`,
+          );
+        }
+        return c.json(
+          {
+            error: err.persisted
+              ? 'Execution mode changed, but runtime cleanup failed; retry the request'
+              : 'Failed to stop the active workspace; execution mode was not changed',
+            persisted: err.persisted,
+            retryable: true,
+          },
+          503,
+        );
+      }
+    } else {
+      commitUpdate();
+    }
   }
 
   return c.json({ success: true, pinned_at });

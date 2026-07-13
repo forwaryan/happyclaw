@@ -317,4 +317,26 @@ describe('GroupQueue mutation pause', () => {
     expect(dropped).toBe(2);
     expect(taskRuns).toBe(0);
   });
+
+  test('runtime safety block parks new work until cleanup is explicitly confirmed', async () => {
+    let runs = 0;
+    queue.setProcessMessagesFn(async () => {
+      runs++;
+      return true;
+    });
+    queue.blockGroupsForRuntimeSafety(
+      [WEB_JID, IM_JID],
+      'post-commit stop failed',
+    );
+    expect(queue.isGroupRuntimeSafetyBlocked(WEB_JID)).toBe(true);
+    queue.enqueueMessageCheck(IM_JID);
+    await tick();
+    expect(runs).toBe(0);
+
+    queue.unblockGroupsForRuntimeSafety([WEB_JID, IM_JID]);
+    await tick();
+    await tick();
+    expect(queue.isGroupRuntimeSafetyBlocked(WEB_JID)).toBe(false);
+    expect(runs).toBe(1);
+  });
 });

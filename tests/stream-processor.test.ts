@@ -12,6 +12,40 @@ function makeProcessor() {
 }
 
 describe('StreamEventProcessor observability mapping', () => {
+  test('detached local bash does not block input receipt, while finite background Agent still does', () => {
+    const { processor } = makeProcessor();
+
+    processor.processSystemMessage({
+      type: 'system', subtype: 'task_started', task_id: 'bash-1',
+      description: 'npm run dev', task_type: 'local_bash',
+    });
+    processor.processSystemMessage({
+      type: 'system', subtype: 'task_started', task_id: 'agent-1',
+      description: 'review the code', task_type: 'local_agent',
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(2);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(2);
+
+    processor.processSystemMessage({
+      type: 'system', subtype: 'task_updated', task_id: 'bash-1',
+      patch: { status: 'running', is_backgrounded: true },
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(2);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+
+    processor.processSystemMessage({
+      type: 'system', subtype: 'task_updated', task_id: 'agent-1',
+      patch: { status: 'running', is_backgrounded: true },
+    });
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+
+    processor.processSystemMessage({
+      type: 'system', subtype: 'task_updated', task_id: 'agent-1',
+      patch: { status: 'completed' },
+    });
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+  });
+
   test('maps SDK task_progress to structured task_progress event', () => {
     const { processor, outputs } = makeProcessor();
 

@@ -7,7 +7,7 @@ existing group/session runtime. The product model and the persisted runtime mode
 explicitly distinct:
 
 - Agent is the top-level product identity and policy owner.
-- Workspace is the filesystem, membership, routing, and host/container isolation boundary.
+- Workspace is the private filesystem, routing, and host/container isolation boundary owned by its creator.
 - Runtime session is an execution record inside a workspace; it is not another product-level Agent.
 
 The correct target hierarchy is:
@@ -16,7 +16,7 @@ The correct target hierarchy is:
 Agent
   - identity prompt
   - Claude preset inclusion policy
-  - provider / user Skill / user MCP / tool policy
+  - user Skill / user MCP / tool policy（Provider 与凭据由系统统一管理）
   - channel mounts
   - workspaces
       - runtime isolation boundary
@@ -50,14 +50,16 @@ by the old in-memory runner. This must be fixed before deeper schema migration.
 
 ### Frontend
 
-- Desktop and mobile navigation preserve `Agent -> Workspace` grouping for personal, pinned,
-  and collaborative workspaces; the home workspace displays its actual Agent.
+- Desktop and mobile navigation preserve `Agent -> Workspace` grouping for the creator's home,
+  pinned, and additional workspaces; the home workspace displays its actual Agent.
 - Workspace creation requires an explicitly loaded and selected Agent. A failed Agent request
   is an error state, never an implicit default selection.
 - Agent governance shows workspaces, runtime sessions, and channel mounts. A workspace can be
   migrated explicitly, and deleting a non-default Agent requires pre-migration.
-- Runtime-policy editors use the live Provider, user Skill, and user MCP catalogs rather than
-  free-form identifiers.
+- Runtime-policy editors use the live user Skill and user MCP catalogs rather than free-form
+  identifiers. Provider selection is not part of Agent policy.
+- The effective-capability preview resolves host, HappyClaw-managed, and workspace project layers,
+  and reports name conflicts and tool-boundary shutdowns before execution.
 - Agent and IM load failures are distinct from valid empty states and expose retry actions.
 
 ## Target Domain Model
@@ -73,7 +75,7 @@ Fields:
 - `name`
 - `identity_prompt`
 - `include_claude_preset`
-- `runtime_policy` (`provider_id`, user Skill policy, user MCP policy, tool boundary)
+- `runtime_policy` (user Skill policy, user MCP policy, context policy, tool boundary；不包含 Provider)
 - `identity_hash`
 - `version`
 - `status`
@@ -196,7 +198,7 @@ Status: implemented for navigation, creation, assignment governance, and deletio
 Implementation:
 
 - Sidebar exposes Agent management as a primary item.
-- Workspaces are displayed under their owning Agent in personal, pinned, and collaborative lists.
+- Workspaces are displayed under their owning Agent in home, pinned, and personal lists.
 - Workspace creation requires an explicit Agent selection after the catalog loads successfully.
 - Agent governance is the explicit assignment surface: it lists workspace/runtime/mount ownership,
   supports migration, and requires migration before deleting a non-default Agent.
@@ -229,6 +231,8 @@ Implementation:
 - Maintain `agent_channel_mounts`.
 - Backfill from current binding fields.
 - Write both old fields and new mount records.
+- Route every bind/unbind mutation through one commit service. The DB transaction updates legacy
+  routing columns and normalized mount mirrors together, then refreshes the live router cache.
 - Keep route resolution on validated legacy state until mount-first cutover is separately shipped.
 - Expose mounts under Agent and workspace governance while keeping binding actions targeted at a
   workspace or runtime session.
@@ -241,9 +245,13 @@ Status: implemented as a versioned JSON runtime policy, deliberately narrower th
 
 Implementation:
 
-- Provider policy either fixes an enabled Provider or inherits the global balancing pool.
+- Provider, model, and credentials remain system-managed. Runtime sessions may retain a sticky
+  Provider binding selected by the system pool, but Agent policy does not select a Provider.
 - User Skill policy inherits, selects, or disables enabled user Skills. Project, external, and
   plugin Skills are outside the selector.
+- User Skills can be installed from skills.sh, imported from a safe HTTPS Git repository, or
+  uploaded as a validated ZIP. Import rejects traversal/symlink payloads, stops on conflicts by
+  default, and records source URL, commit/version, and install time.
 - User MCP policy inherits, selects, or disables enabled user MCP servers.
 - `readonly` and `restricted` are security boundaries: both enable strict MCP config, disable user
   MCP and user plugins, block write/Bash/sub-Agent tools, and default-deny unclassified HappyClaw
@@ -272,7 +280,7 @@ Status: implemented.
 - Workspace creation cannot silently fall back when Agent loading fails.
 - Agent deletion refreshes governance and requires all attached workspaces to migrate first;
   channel-mount Agent ownership changes with the workspace mapping.
-- Navigation preserves Agent hierarchy for home, pinned, personal, and collaborative workspaces.
+- Navigation preserves Agent hierarchy for home, pinned, and personal workspaces.
 - Editing a task from a host workspace to a container workspace submits `execution_mode=container`.
 - Agent/IM request failure, valid empty state, and loading state are visually distinct.
 - Build and tests pass.

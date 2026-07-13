@@ -2755,6 +2755,16 @@ export function deleteSession(
   })();
 }
 
+/** Invalidate every SDK resume token associated with a workspace. */
+export function deleteWorkspaceSessions(groupFolder: string): void {
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+    ).run(groupFolder);
+  })();
+}
+
 /**
  * Get the provider_id bound to a session (group_folder + agent_id).
  * Returns undefined if no row or no binding recorded.
@@ -2829,7 +2839,6 @@ export function getSessionAgentIdentity(
 }
 
 const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
-  provider_id: null,
   context: {
     source: 'managed',
     auto_compact_window: 0,
@@ -2841,7 +2850,6 @@ const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
 };
 
 type RuntimePolicyInput = Partial<{
-  provider_id: string | null;
   context: Partial<AgentProfileRuntimePolicy['context']> | null;
   skills: Partial<AgentProfileRuntimePolicy['skills']> | null;
   mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
@@ -2875,7 +2883,6 @@ export function normalizeAgentProfileRuntimePolicy(
 ): AgentProfileRuntimePolicy {
   const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
   const normalized: AgentProfileRuntimePolicy = {
-    provider_id: null,
     context: {
       source: normalizeMode(
         raw.context?.source,
@@ -2953,7 +2960,6 @@ export function mergeAgentProfileRuntimePolicy(
   };
 
   return normalizeAgentProfileRuntimePolicy({
-    provider_id: has('provider_id') ? patch.provider_id : current.provider_id,
     context: has('context')
       ? patch.context === null
         ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context
@@ -3064,14 +3070,12 @@ export function computeAgentProfileIdentityHash(
     name?: string;
   } = { identityPrompt, includeClaudePreset };
   const identityPolicy = {
-    provider_id: normalizedPolicy.provider_id,
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
     mcp: normalizedPolicy.mcp,
     tools: normalizedPolicy.tools,
   };
   const defaultIdentityPolicy = {
-    provider_id: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.provider_id,
     context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
     skills: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.skills,
     mcp: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.mcp,

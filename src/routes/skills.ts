@@ -13,6 +13,10 @@ import { DATA_DIR } from '../config.js';
 import { getEffectiveExternalDir } from '../runtime-config.js';
 import { validateSafeHttpsUrl } from '../url-safety.js';
 import {
+  importSkillsFromGit,
+  importSkillsFromZip,
+} from '../skill-import-service.js';
+import {
   parseFrontmatter,
   validateSkillId,
   validateSkillPath,
@@ -35,6 +39,9 @@ interface Skill {
   enabled: boolean;
   packageName?: string;
   installedAt?: string;
+  installSource?: string;
+  sourceUrl?: string;
+  version?: string;
   userInvocable: boolean;
   allowedTools: string[];
   argumentHint: string | null;
@@ -50,9 +57,11 @@ interface SkillsManifest {
   skills: Record<
     string,
     {
-      packageName: string;
+      packageName?: string;
       installedAt: string;
       source: string;
+      sourceUrl?: string;
+      version?: string;
     }
   >;
 }
@@ -116,6 +125,30 @@ function updateSkillsManifest(
   writeSkillsManifest(userId, manifest);
 }
 
+function recordImportedSkills(
+  userId: string,
+  installedSkillIds: string[],
+  metadata: Omit<SkillsManifest['skills'][string], 'installedAt'>,
+): void {
+  const manifest = readSkillsManifest(userId);
+  const installedAt = new Date().toISOString();
+  for (const id of installedSkillIds) {
+    manifest.skills[id] = { ...metadata, installedAt };
+  }
+  writeSkillsManifest(userId, manifest);
+}
+
+function applyManifestMetadata(
+  skill: Skill,
+  meta: SkillsManifest['skills'][string],
+): void {
+  skill.packageName = meta.packageName;
+  skill.installedAt = meta.installedAt;
+  skill.installSource = meta.source;
+  skill.sourceUrl = meta.sourceUrl;
+  skill.version = meta.version;
+}
+
 /**
  * Remove a skill from the manifest when it is deleted.
  */
@@ -157,8 +190,7 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
   for (const skill of userSkills) {
     const meta = skillsManifest.skills[skill.id];
     if (meta) {
-      skill.packageName = meta.packageName;
-      skill.installedAt = meta.installedAt;
+      applyManifestMetadata(skill, meta);
     }
   }
 
@@ -174,10 +206,17 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
   return result;
 }
 
-function getSkillDetail(skillId: string, userId: string, userRole?: string): SkillDetail | null {
+function getSkillDetail(
+  skillId: string,
+  userId: string,
+  userRole?: string,
+): SkillDetail | null {
   if (!validateSkillId(skillId)) return null;
 
-  const searchDirs: Array<{ rootDir: string; source: 'user' | 'project' | 'external' }> = [
+  const searchDirs: Array<{
+    rootDir: string;
+    source: 'user' | 'project' | 'external';
+  }> = [
     { rootDir: getUserSkillsDir(userId), source: 'user' },
     { rootDir: getProjectSkillsDir(), source: 'project' },
   ];
@@ -239,8 +278,7 @@ function getSkillDetail(skillId: string, userId: string, userRole?: string): Ski
       if (source === 'user') {
         const meta = skillsManifest.skills[skillId];
         if (meta) {
-          detail.packageName = meta.packageName;
-          detail.installedAt = meta.installedAt;
+          applyManifestMetadata(detail, meta);
         }
       }
 
@@ -588,6 +626,84 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
   return c.json({ detail: null });
 });
 
+skillsRoutes.post('/import/git', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const body = (await c.req.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  const url = typeof body.url === 'string' ? body.url.trim() : '';
+  const ref = typeof body.ref === 'string' ? body.ref.trim() : undefined;
+  const subdirectory =
+    typeof body.subdirectory === 'string'
+      ? body.subdirectory.trim()
+      : undefined;
+  if (!url) return c.json({ error: 'Git URL is required' }, 400);
+
+  try {
+    const result = await withSkillInstallLock(() =>
+      importSkillsFromGit({
+        url,
+        ref: ref || undefined,
+        subdirectory: subdirectory || undefined,
+        targetRoot: getUserSkillsDir(authUser.id),
+        replace: body.replace === true,
+      }),
+    );
+    recordImportedSkills(authUser.id, result.installed, {
+      source: 'git',
+      sourceUrl: result.sourceUrl,
+      version: result.version,
+    });
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : 'Git import failed';
+    return c.json(
+      { error: message },
+      message.startsWith('Skill already exists:') ? 409 : 400,
+    );
+  }
+});
+
+skillsRoutes.post('/import/archive', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  let formData: FormData;
+  try {
+    formData = await c.req.formData();
+  } catch {
+    return c.json({ error: 'A multipart ZIP archive is required' }, 400);
+  }
+  const archive = formData.get('archive');
+  if (
+    !(archive instanceof File) ||
+    !archive.name.toLowerCase().endsWith('.zip')
+  ) {
+    return c.json({ error: 'archive must be a ZIP file' }, 400);
+  }
+  try {
+    const result = await withSkillInstallLock(async () =>
+      importSkillsFromZip({
+        archive: Buffer.from(await archive.arrayBuffer()),
+        archiveName: archive.name,
+        targetRoot: getUserSkillsDir(authUser.id),
+        replace: formData.get('replace') === 'true',
+      }),
+    );
+    recordImportedSkills(authUser.id, result.installed, {
+      source: 'zip',
+      sourceUrl: archive.name,
+    });
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : 'ZIP import failed';
+    return c.json(
+      { error: message },
+      message.startsWith('Skill already exists:') ? 409 : 400,
+    );
+  }
+});
 
 skillsRoutes.get('/:id', authMiddleware, (c) => {
   const id = c.req.param('id');
@@ -700,7 +816,9 @@ skillsRoutes.delete('/user-all', authMiddleware, (c) => {
         try {
           fs.rmSync(p, { recursive: true, force: true });
           deleted++;
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     }
   } catch {
@@ -923,7 +1041,8 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
         fs.renameSync(dir, backupDir);
         savedBackupDir = backupDir;
       }
-      if (entry) backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
+      if (entry)
+        backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
       removeFromSkillsManifest(authUser.id, sid);
     }
   } catch (err) {

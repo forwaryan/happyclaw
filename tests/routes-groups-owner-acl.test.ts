@@ -216,6 +216,49 @@ describe('PATCH /:jid preserves owner fields on rename (regression)', () => {
   });
 });
 
+describe('PATCH /:jid execution mode runtime boundary', () => {
+  test('quiesces the old runtime and invalidates SDK resume state before switching', async () => {
+    const jid = 'web:mode-switch';
+    const folder = 'mode-switch';
+    db.setRegisteredGroup(jid, {
+      name: 'Mode Switch',
+      folder,
+      added_at: new Date().toISOString(),
+      created_by: ADMIN_ID,
+      executionMode: 'host',
+    });
+    db.setSession(folder, 'sdk-session-before-switch');
+
+    const stopGroup = vi.fn(async () => {});
+    const sessions = { [folder]: 'sdk-session-before-switch' };
+    webContext.setWebDeps({
+      getRegisteredGroups: () => webDepsCache,
+      sessions,
+      queue: {
+        pauseGroupsForMutation: () => ({ id: 1 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        listDescendantJids: () => [],
+        stopGroup,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    asUser(ADMIN_ID, 'admin');
+    const response = await groupRoutes.request(`/${encodeURIComponent(jid)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ execution_mode: 'container' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getRegisteredGroup(jid)?.executionMode).toBe('container');
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(sessions[folder]).toBeUndefined();
+    expect(stopGroup).toHaveBeenCalledTimes(2);
+
+    db.deleteGroupData(jid, folder);
+  });
+});
+
 describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
   const JID = 'web:mounted-delete-block';
   const FOLDER = 'mounted-delete-block';

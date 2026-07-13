@@ -73,7 +73,10 @@ export function resolveAgentToolPolicy(
       // Plugins may declare opaque MCP servers. An exact Agent MCP policy
       // therefore cannot safely load the plugin bundle as a side channel.
       loadUserPlugins: !exactUserMcpSet,
-      includeUserMcpServers: mcpMode !== 'disabled',
+      // container-runner materializes Claude-native project/authorized-host
+      // MCP plus the Agent-filtered HappyClaw user MCP into one trusted map.
+      // Even `disabled` means "disable managed user MCP", not project context.
+      includeUserMcpServers: true,
       // Keep project/user setting sources for context and managed Skills, but
       // ignore their MCP declarations. Selected user MCP is supplied through
       // options.mcpServers by the runner.

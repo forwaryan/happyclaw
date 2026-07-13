@@ -28,7 +28,7 @@ export interface TaskRunLog {
   task_id: string;
   run_at: string;
   duration_ms: number;
-  status: 'running' | 'success' | 'error';
+  status: 'queued' | 'running' | 'success' | 'error';
   result?: string | null;
   error?: string | null;
 }

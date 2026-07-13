@@ -23,7 +23,7 @@ export function CapabilitiesPage() {
       <div className="sticky top-0 z-20 border-b border-border bg-background/95 px-4 py-3 backdrop-blur lg:px-6">
         <div className="mx-auto flex max-w-7xl items-center gap-2">
           <span className="mr-2 text-sm font-semibold text-foreground">
-            能力
+            能力库
           </span>
           {sections.map(({ key, label, icon: Icon }) => (
             <NavLink
@@ -42,6 +42,13 @@ export function CapabilitiesPage() {
             </NavLink>
           ))}
         </div>
+      </div>
+
+      <div className="border-b border-border/70 bg-muted/30 px-4 py-2.5 lg:px-6">
+        <p className="mx-auto max-w-7xl text-xs leading-5 text-muted-foreground">
+          在这里安装和管理可复用资源；到具体 Agent 的“能力配置”中决定是否启用。
+          工作区自带的 CLAUDE.md、.claude/skills 与项目 MCP 不在这里分配。
+        </p>
       </div>
 
       {section === 'skills' && <SkillsPage />}

@@ -179,7 +179,7 @@ describe('AgentProfile runtime tool capability matrix', () => {
     expect(parseAgentToolPolicyMode('unknown')).toBe('inherit');
   });
 
-  test('custom MCP is an exact external set without project or plugin bypass', () => {
+  test('custom managed MCP keeps materialized project/host context but blocks plugin bypass', () => {
     const policy = resolveAgentToolPolicy(
       'inherit',
       registeredHappyClawTools(),
@@ -191,11 +191,11 @@ describe('AgentProfile runtime tool capability matrix', () => {
     expect(policy.settingSources).toEqual(['project', 'user']);
   });
 
-  test('disabled MCP removes all external servers but preserves builtin MCP', () => {
+  test('disabled managed MCP keeps materialized project/host context and builtin MCP', () => {
     const tools = registeredHappyClawTools();
     const policy = resolveAgentToolPolicy('inherit', tools, 'disabled');
     expect(policy.loadUserPlugins).toBe(false);
-    expect(policy.includeUserMcpServers).toBe(false);
+    expect(policy.includeUserMcpServers).toBe(true);
     expect(policy.strictMcpConfig).toBe(true);
     expect(policy.allowedHappyclawTools).toBeUndefined();
     expect(parseAgentMcpPolicyMode('disabled')).toBe('disabled');

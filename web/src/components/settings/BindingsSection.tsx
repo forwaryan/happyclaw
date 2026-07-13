@@ -90,6 +90,7 @@ export function BindingsSection() {
         description: '话题群按话题自动生成独立会话',
         items: filtered.filter(
           (item) =>
+            item.is_thread_capable &&
             !(item.bound_session_id ?? item.bound_agent_id) &&
             !!(item.bound_workspace_jid ?? item.bound_main_jid),
         ),
@@ -98,8 +99,11 @@ export function BindingsSection() {
         key: 'session',
         title: '会话绑定',
         description: '普通群和私聊继续使用指定会话上下文',
-        items: filtered.filter((item) =>
-          Boolean(item.bound_session_id ?? item.bound_agent_id),
+        items: filtered.filter(
+          (item) =>
+            Boolean(item.bound_session_id ?? item.bound_agent_id) ||
+            (!item.is_thread_capable &&
+              Boolean(item.bound_workspace_jid ?? item.bound_main_jid)),
         ),
       },
       {
@@ -126,7 +130,7 @@ export function BindingsSection() {
     return targets.filter((target) =>
       rebindGroup.is_thread_capable
         ? target.type === 'main'
-        : target.type === 'session',
+        : target.type === 'session' || target.type === 'main',
     );
   }, [rebindGroup?.is_thread_capable, targets]);
 
@@ -212,7 +216,7 @@ export function BindingsSection() {
 
       const hasBound =
         !!(rebindGroup.bound_session_id ?? rebindGroup.bound_agent_id) ||
-        !!rebindGroup.bound_main_jid;
+        !!(rebindGroup.bound_workspace_jid ?? rebindGroup.bound_main_jid);
       const payload: {
         target_session_id?: string;
         target_main_jid?: string;
@@ -265,7 +269,7 @@ export function BindingsSection() {
               渠道绑定
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              话题群绑定工作区并按话题生成会话；普通群和私聊绑定到具体会话。
+              话题群绑定工作区并按话题生成会话；普通群和私聊可绑定主会话或其他会话。
             </p>
           </div>
           <Button

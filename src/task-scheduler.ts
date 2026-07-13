@@ -54,8 +54,16 @@ import {
 } from './types.js';
 import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
 import { checkOwnerActive } from './owner-gate.js';
+import {
+  canExecuteOnHost,
+  HOST_EXECUTION_FORBIDDEN_ERROR,
+} from './host-execution-policy.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import { stripAgentInternalTags } from './utils.js';
+import {
+  markIsolatedTaskRunIpcComplete,
+  tryCleanupCompletedIsolatedTaskRunIpc,
+} from './isolated-task-ipc.js';
 
 /**
  * Resolve the actual group JID to send a task to.
@@ -267,36 +275,45 @@ function cleanupIsolatedTaskRun(
   const sessionAgentId = createTaskSessionAgentId(taskRunId);
   const virtualChatJid = `${workspace.jid}#task:${taskRunId}`;
 
-  try {
+  const sessionPath = path.join(
+    DATA_DIR,
+    'sessions',
+    workspace.folder,
+    'agents',
+    sessionAgentId,
+  );
+  const cleanupRuntimeArtifacts = () => {
     deleteSession(workspace.folder, sessionAgentId);
-  } catch (err) {
-    logger.warn(
-      { taskId: task.id, taskRunId, err },
-      'Failed to delete isolated task session rows',
-    );
-  }
-  try {
     deleteMessagesForChatJid(virtualChatJid);
+    fs.rmSync(sessionPath, { recursive: true, force: true });
+  };
+
+  // send_message writes happen before the runner returns, but the host watcher
+  // consumes them asynchronously.  Mark the producer complete and only remove
+  // the IPC namespace when the watcher has ACKed every file by unlinking it.
+  // If anything is still pending, leave the directory for the normal/startup
+  // IPC scan; that scan performs the same cleanup once delivery succeeds.
+  const ipcRunPath = path.join(
+    DATA_DIR,
+    'ipc',
+    workspace.folder,
+    'tasks-run',
+    taskRunId,
+  );
+  try {
+    markIsolatedTaskRunIpcComplete(ipcRunPath, {
+      taskId: task.id,
+      taskRunId,
+      workspaceFolder: workspace.folder,
+      virtualChatJid,
+      sessionAgentId,
+    });
+    tryCleanupCompletedIsolatedTaskRunIpc(ipcRunPath, cleanupRuntimeArtifacts);
   } catch (err) {
     logger.warn(
-      { taskId: task.id, taskRunId, err },
-      'Failed to delete isolated task virtual chat',
+      { taskId: task.id, taskRunId, runPath: ipcRunPath, err },
+      'Failed to mark/clean completed isolated task IPC directory',
     );
-  }
-
-  const paths = [
-    path.join(DATA_DIR, 'sessions', workspace.folder, 'agents', sessionAgentId),
-    path.join(DATA_DIR, 'ipc', workspace.folder, 'tasks-run', taskRunId),
-  ];
-  for (const runPath of paths) {
-    try {
-      fs.rmSync(runPath, { recursive: true, force: true });
-    } catch (err) {
-      logger.warn(
-        { taskId: task.id, taskRunId, runPath, err },
-        'Failed to delete isolated task run directory',
-      );
-    }
   }
 }
 
@@ -873,6 +890,15 @@ async function runTaskInner(
 
   try {
     const executionMode = resolveTaskExecutionMode(task, deps);
+    const workspaceOwnerId = workspaceGroup.created_by;
+    if (
+      executionMode === 'host' &&
+      !canExecuteOnHost(
+        workspaceOwnerId ? getUserById(workspaceOwnerId) : undefined,
+      )
+    ) {
+      throw new Error(HOST_EXECUTION_FORBIDDEN_ERROR);
+    }
     const runAgent =
       executionMode === 'host' ? runHostAgent : runContainerAgent;
 
@@ -893,6 +919,9 @@ async function runTaskInner(
         isAdminHome,
         isScheduledTask: true,
         taskRunId: options?.taskRunId,
+        // The run ID is only an IPC/session namespace.  Routing must use the
+        // stable scheduled-task ID so notify_channels and chat_jid resolve.
+        messageTaskId: task.id,
         sessionAgentId: taskSessionAgentId,
         agentProfile: toRunnerAgentProfile(agentProfile),
       },
@@ -1012,7 +1041,12 @@ async function runTaskInner(
     if (text) {
       try {
         await deps.storeResultAndNotify(effectiveJid, text, {
-          ownerId: taskOwnerId || undefined,
+          // Successful scheduled Agent runs deliver user-visible output via
+          // send_message/send_image.  Their IPC payload carries task.id and is
+          // routed to chat_jid/notify_channels by the host watcher.  Keep the
+          // SDK final in the web task session for audit, but do not broadcast
+          // it a second time.  Failures still need the scheduler fallback.
+          ownerId: error ? taskOwnerId || undefined : undefined,
           notifyChannels: task.notify_channels,
           sourceKind: 'sdk_final',
           // Use source workspace folder for IM routing; task sessions are virtual
@@ -1203,9 +1237,21 @@ async function runScriptTaskInner(
   let error: string | null = null;
 
   try {
+    // Script tasks execute directly on the host even when their source
+    // workspace is container-backed. Re-authorize against the current DB role
+    // immediately before spawning the process.
+    const currentOwnerId = deps.registeredGroups()[groupJid]?.created_by;
+    if (
+      !canExecuteOnHost(
+        currentOwnerId ? getUserById(currentOwnerId) : undefined,
+      )
+    ) {
+      throw new Error(HOST_EXECUTION_FORBIDDEN_ERROR);
+    }
     const scriptResult = await runScript(
       task.script_command,
       task.group_folder,
+      { ownerId: currentOwnerId },
     );
 
     if (scriptResult.timedOut) {
@@ -1324,7 +1370,7 @@ async function runGroupModeTask(
   const startTime = Date.now();
   if (!manualRun && !claimScheduledRun(task.id, 'group-mode task')) return;
   runningTaskIds.add(task.id);
-  let resultSummary = '已注入到源工作区';
+  let resultSummary = '已排队到源工作区，等待 Agent 执行';
 
   try {
     // Resolve task owner for sender attribution
@@ -1357,8 +1403,8 @@ async function runGroupModeTask(
       task_id: task.id,
       run_at: new Date().toISOString(),
       duration_ms: Date.now() - startTime,
-      status: 'success',
-      result: '已注入到源工作区',
+      status: 'queued',
+      result: resultSummary,
       error: null,
     });
   } catch (err) {

@@ -117,7 +117,6 @@ export interface AgentProfile {
 }
 
 export interface AgentProfileRuntimePolicy {
-  provider_id: string | null;
   context: {
     source: 'managed' | 'host_claude';
     auto_compact_window: number;
@@ -212,7 +211,9 @@ export interface TaskRunLog {
   task_id: string;
   run_at: string;
   duration_ms: number;
-  status: 'running' | 'success' | 'error';
+  /** `queued` means a group-mode prompt was delivered to the workspace queue;
+   * it does not claim that the Agent has finished executing it. */
+  status: 'running' | 'queued' | 'success' | 'error';
   result: string | null;
   error: string | null;
 }

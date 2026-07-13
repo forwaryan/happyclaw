@@ -5,6 +5,8 @@ import type {
   SubAgent,
 } from './types.js';
 import { getChannelType } from './im-channel.js';
+import { setRegisteredGroup } from './db.js';
+import { getWebDeps } from './web-context.js';
 
 export interface ChannelMountResolutionDeps {
   getAgent: (
@@ -225,6 +227,71 @@ export function buildUnmountUpdate(
     binding_mode: 'single_context',
     ...(options.resetActivation ? { activation_mode: 'auto' as const } : {}),
   };
+}
+
+/**
+ * Canonical write path for IM channel bindings. `setRegisteredGroup` updates
+ * both the legacy routing columns and the normalized channel-mount mirrors in
+ * one DB transaction; this function also keeps the live router cache aligned.
+ */
+export function commitChannelMountUpdate(
+  channelJid: string,
+  updated: RegisteredGroup,
+): void {
+  setRegisteredGroup(channelJid, updated);
+  const deps = getWebDeps();
+  if (!deps) return;
+  const groups = deps.getRegisteredGroups();
+  if (groups[channelJid]) groups[channelJid] = updated;
+  deps.clearImFailCounts?.(channelJid);
+}
+
+export function hasSessionMountConflict(
+  group: RegisteredGroup,
+  sessionId: string,
+): boolean {
+  return (
+    (group.target_agent_id !== undefined &&
+      group.target_agent_id !== sessionId) ||
+    !!group.target_main_jid
+  );
+}
+
+export function matchesWorkspaceMount(
+  group: RegisteredGroup,
+  workspaceJid: string,
+  legacyWorkspaceJid: string,
+): boolean {
+  return (
+    group.target_main_jid === workspaceJid ||
+    group.target_main_jid === legacyWorkspaceJid
+  );
+}
+
+export function hasWorkspaceMountConflict(
+  group: RegisteredGroup,
+  workspaceJid: string,
+  legacyWorkspaceJid: string,
+): boolean {
+  return (
+    !!group.target_agent_id ||
+    (!!group.target_main_jid &&
+      !matchesWorkspaceMount(group, workspaceJid, legacyWorkspaceJid))
+  );
+}
+
+export function findWorkspaceThreadMapConflict(
+  groups: Record<string, RegisteredGroup>,
+  channelJid: string,
+  workspaceJid: string,
+  legacyWorkspaceJid: string,
+): [string, RegisteredGroup] | undefined {
+  return Object.entries(groups).find(
+    ([otherJid, otherGroup]) =>
+      otherJid !== channelJid &&
+      otherGroup.binding_mode === 'thread_map' &&
+      matchesWorkspaceMount(otherGroup, workspaceJid, legacyWorkspaceJid),
+  );
 }
 
 /**

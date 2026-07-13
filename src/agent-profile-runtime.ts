@@ -32,7 +32,7 @@ export function resolveEffectiveAgentProfile(
   if (!profile) return undefined;
   const owner = getUserById(profile.owner_user_id);
   const contextSource =
-    owner?.role !== 'admin'
+    owner?.role !== 'admin' || owner.status !== 'active'
       ? 'managed'
       : profile.is_default
         ? getSystemSettings().mainAgentContextSource
@@ -232,7 +232,13 @@ async function forceStopRuntimeJids(
 export async function quiesceWorkspaceRunnersAroundCommit<T>(
   deps: WebDeps,
   targets: WorkspaceRuntimeQuiesceTarget[],
-  options: { reason: string },
+  options: {
+    reason: string;
+    /** Called before the mutation pause is released when commit succeeded but
+     * runtime teardown did not. Use it to install a persistent fail-closed
+     * queue gate without a resume/drain race. */
+    onPostCommitFailure?: (runtimeJids: string[]) => void;
+  },
   commit: () => T,
 ): Promise<{ value: T; runtimeJids: string[] }> {
   const preCommitJids = collectWorkspaceRuntimeJids(deps, targets);
@@ -271,6 +277,7 @@ export async function quiesceWorkspaceRunnersAroundCommit<T>(
       { preserveQueuedWork: true },
     );
     if (postCommitFailures.length > 0) {
+      options.onPostCommitFailure?.(postCommitJids);
       logger.error(
         {
           phase: 'post_commit',

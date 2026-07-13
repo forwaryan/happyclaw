@@ -40,7 +40,6 @@ function workspace(
 describe('Agent-first frontend product contracts', () => {
   it('treats managed and host Claude context as an Agent setting independent of execution mode', () => {
     const managedPolicy: AgentProfileRuntimePolicy = {
-      provider_id: null,
       context: { source: 'managed' },
       skills: { mode: 'custom', ids: ['review'] },
       mcp: { mode: 'custom', ids: ['github'] },

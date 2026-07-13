@@ -209,15 +209,6 @@ const AgentProfileRuntimePolicyModeSchema = z.enum([
 
 export const AgentProfileRuntimePolicySchema = z
   .object({
-    provider_id: z
-      .string()
-      .trim()
-      .max(128)
-      .nullable()
-      .optional()
-      .transform((val) =>
-        val === undefined ? undefined : val && val.trim() ? val.trim() : null,
-      ),
     context: z
       .object({
         source: z.enum(['managed', 'host_claude']).optional(),

@@ -420,13 +420,11 @@ Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
           };
         }
 
-        const data = {
+        const data = buildSendMessageData(ctx, {
           type: 'send_file',
-          chatJid: ctx.chatJid,
           filePath: relativePath,
           fileName: args.fileName,
-          timestamp: new Date().toISOString(),
-        };
+        });
         writeIpcFile(TASKS_DIR, data);
         return {
           content: [

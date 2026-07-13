@@ -28,6 +28,8 @@ describe('settings information architecture', () => {
   test('moves product resources out of settings while preserving old links', () => {
     const app = read('web/src/App.tsx');
     const settings = read('web/src/pages/SettingsPage.tsx');
+    const navItems = read('web/src/components/layout/nav-items.ts');
+    const capabilities = read('web/src/pages/CapabilitiesPage.tsx');
 
     expect(app).toContain('path="/capabilities/:section?"');
     expect(app).toContain('path="/usage"');
@@ -37,6 +39,22 @@ describe('settings information architecture', () => {
     expect(settings).toContain("plugins: '/capabilities/plugins'");
     expect(settings).toContain(
       "bindings: '/settings?tab=my-channels&view=bindings'",
+    );
+    expect(navItems).toContain("label: '能力库'");
+    expect(capabilities).toMatch(/能力库[\s\S]*具体 Agent 的“能力配置”/);
+  });
+
+  test('keeps workspaces private and removes the abandoned collaboration surface', () => {
+    const database = read('src/db.ts');
+    const groupRoutes = read('src/routes/groups.ts');
+    const chatView = read('web/src/components/chat/ChatView.tsx');
+    const groupTypes = read('web/src/types.ts');
+
+    expect(database).toContain('DROP TABLE IF EXISTS group_members');
+    expect(groupRoutes).not.toMatch(/\/:jid\/members|canManageGroupMembers/);
+    expect(chatView).not.toMatch(/共享成员|GroupMembersPanel/);
+    expect(groupTypes).not.toMatch(
+      /GroupMember|can_manage_members|member_role/,
     );
   });
 
@@ -89,5 +107,107 @@ describe('settings information architecture', () => {
     expect(provider).toContain("balancingStrategy === 'weighted-round-robin'");
     expect(settings).toContain('toast.success(message)');
     expect(settings).toContain('toast.error(message)');
+  });
+
+  test('keeps Agent add-ons, project context, and Provider settings in distinct layers', () => {
+    const settings = read('web/src/pages/SettingsPage.tsx');
+    const mainCapabilities = read(
+      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
+    );
+    const workspaceCapabilities = read(
+      'web/src/components/chat/WorkspaceCapabilitiesPanel.tsx',
+    );
+    const workspaceEnv = read('web/src/components/chat/ContainerEnvPanel.tsx');
+    const chatView = read('web/src/components/chat/ChatView.tsx');
+    const agentProfiles = read('web/src/pages/AgentProfilesPage.tsx');
+    const effectivePreview = read(
+      'web/src/components/agents/EffectiveCapabilitiesPreview.tsx',
+    );
+
+    expect(settings).toContain('<MainAgentCapabilitiesSection />');
+    expect(mainCapabilities).toMatch(/用户 Skills|用户 MCP|工具与扩展能力边界/);
+    expect(mainCapabilities).toContain('/api/agent-profiles/');
+    expect(workspaceCapabilities).toMatch(
+      /CLAUDE\.md、\.claude\/skills 和项目 MCP/,
+    );
+    expect(workspaceEnv).toMatch(/Provider\s+地址和凭据由系统管理员统一管理/);
+    expect(workspaceEnv).not.toContain('MODEL_PRESETS');
+    expect(workspaceEnv).not.toContain('setAuthToken');
+    expect(workspaceEnv).toContain("anthropicModel: ''");
+    expect(workspaceEnv).toMatch(
+      /config\?\.anthropicModel[\s\S]*config\?\.anthropicBaseUrl[\s\S]*hasAnthropicAuthToken/,
+    );
+    expect(workspaceEnv).toMatch(/环境变量加载失败|保存失败/);
+    expect(chatView).toContain('{canModifyWorkspaceConfig && (');
+    expect(chatView).toContain(
+      "contextPanelView === 'env' && canModifyWorkspaceConfig",
+    );
+    expect(agentProfiles).toContain('能力配置');
+    expect(agentProfiles).toContain('<EffectiveCapabilitiesPreview');
+    expect(effectivePreview).toMatch(/最终生效能力|同名覆盖|预览工作区/);
+  });
+
+  test('supports governed Skill imports and preserves read-only sources', () => {
+    const dialog = read('web/src/components/skills/InstallSkillDialog.tsx');
+    const card = read('web/src/components/skills/SkillCard.tsx');
+    const routes = read('src/routes/skills.ts');
+    const importer = read('src/skill-import-service.ts');
+
+    expect(dialog).toMatch(
+      /搜索市场|HTTPS Git 仓库地址|技能 ZIP 文件|覆盖同名用户级技能/,
+    );
+    expect(routes).toMatch(
+      /\/import\/git|\/import\/archive|recordImportedSkills/,
+    );
+    expect(importer).toMatch(/path traversal|symbolic links|MAX_ARCHIVE_BYTES/);
+    expect(card).toContain("const isReadonly = skill.source !== 'user'");
+    expect(card).toContain('<Switch');
+  });
+
+  test('uses one channel binding commit path across settings and workspace routes', () => {
+    const service = read('src/channel-mount-service.ts');
+    const configRoutes = read('src/routes/config.ts');
+    const agentRoutes = read('src/routes/agents.ts');
+
+    expect(service).toMatch(
+      /commitChannelMountUpdate[\s\S]*setRegisteredGroup/,
+    );
+    expect(configRoutes).toContain('commitChannelMountUpdate(imJid, updated)');
+    expect(agentRoutes).toContain('commitChannelMountUpdate(imJid, updated)');
+    expect(agentRoutes).not.toContain('setRegisteredGroup(imJid, updated)');
+  });
+
+  test('exposes main-session binding and complete mobile workspace actions', () => {
+    const sessions = read('web/src/components/chat/SessionSidebar.tsx');
+    const chatView = read('web/src/components/chat/ChatView.tsx');
+    const bindingDialog = read('web/src/components/chat/ImBindingDialog.tsx');
+    const bindings = read('web/src/components/settings/BindingsSection.tsx');
+    const mobileChat = read('web/src/pages/ChatPage.tsx');
+    const createWorkspace = read(
+      'web/src/components/chat/CreateContainerDialog.tsx',
+    );
+    const bindingRoute = read('src/routes/config.ts');
+
+    expect(sessions).toContain('? () => onBindSession(null)');
+    expect(chatView).toContain('setBindingAgentId(id ?? MAIN_BINDING)');
+    expect(chatView).toContain("? 'workspace' : 'session'");
+    expect(bindingDialog).toContain(
+      'isWorkspaceMode ? !!group.is_thread_capable : !group.is_thread_capable',
+    );
+    expect(bindings).toContain(
+      "target.type === 'session' || target.type === 'main'",
+    );
+    expect(mobileChat).toMatch(/onRename=|onTogglePin=|onDelete=/);
+    expect(createWorkspace).toContain('effective_runtime_policy');
+    expect(bindingRoute).toContain(
+      "threadCapable ? 'thread_map' : 'single_session'",
+    );
+    expect(bindingRoute).not.toContain(
+      'ordinary channels must bind to a session',
+    );
+    const sessionBindingRoute = read('src/routes/agents.ts');
+    expect(sessionBindingRoute).toContain(
+      "threadCapable ? 'thread_map' : 'single_session'",
+    );
   });
 });

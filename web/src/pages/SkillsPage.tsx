@@ -20,6 +20,8 @@ export function SkillsPage() {
     installing,
     loadSkills,
     installSkill,
+    importSkillFromGit,
+    importSkillArchive,
     deleteAllUserSkills,
   } = useSkillsStore();
 
@@ -58,7 +60,7 @@ export function SkillsPage() {
         {/* Header */}
         <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
-            title="技能(Skill)管理"
+            title="Skills"
             subtitle={`用户级 ${userSkills.length}${externalSkills.length > 0 ? ` · 宿主机 ${externalSkills.length}` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
             actions={
               <div className="flex items-center gap-3">
@@ -224,6 +226,8 @@ export function SkillsPage() {
         open={showInstallDialog}
         onClose={() => setShowInstallDialog(false)}
         onInstall={handleInstall}
+        onImportGit={importSkillFromGit}
+        onImportArchive={importSkillArchive}
         installing={installing}
       />
     </div>

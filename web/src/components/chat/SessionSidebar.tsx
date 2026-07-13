@@ -35,7 +35,7 @@ interface SessionSidebarProps {
   onCreateSession?: () => void;
   onRenameSession?: (id: string, name: string) => void;
   onDeleteSession: (id: string) => void;
-  onBindSession?: (id: string) => void;
+  onBindSession?: (id: string | null) => void;
 }
 
 function sessionActivityAt(session: AgentInfo): string {
@@ -212,6 +212,11 @@ export function SessionSidebar({
           isMain
           canModify={canModify}
           onSelect={() => onSelectSession(null)}
+          onBind={
+            onBindSession && !isTopicWorkspace
+              ? () => onBindSession(null)
+              : undefined
+          }
         />
 
         {visibleSessions.length === 0 ? (

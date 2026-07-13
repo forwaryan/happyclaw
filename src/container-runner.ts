@@ -44,6 +44,10 @@ import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import { loadUserMcpServers } from './mcp-utils.js';
 import {
+  loadClaudeContextMcpServers,
+  mergeMcpServerLayers,
+} from './mcp-context.js';
+import {
   getUserRuntimeRoot,
   loadUserPlugins,
   CONTAINER_PLUGINS_PATH,
@@ -757,6 +761,7 @@ export function buildVolumeMounts(
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
+  const groupDir = path.join(GROUPS_DIR, group.folder);
 
   // Per-user global memory directory:
   // Each user gets their own user-global/{userId}/ mounted as /workspace/global
@@ -847,9 +852,21 @@ export function buildVolumeMounts(
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
   const mcpPolicy = resolveAgentProfileMcpPolicy(mcpServers, agentProfile);
-  ensureSettingsJson(settingsFile, mcpPolicy.servers, {
-    replaceMcpServers: mcpPolicy.replaceMcpServers,
+  const contextMcpServers = loadClaudeContextMcpServers({
+    workspaceDir: groupDir,
+    externalClaudeDir: getEffectiveExternalDir(),
+    includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
   });
+  ensureSettingsJson(
+    settingsFile,
+    mergeMcpServerLayers(contextMcpServers, mcpPolicy.servers),
+    {
+      // The session settings file is HappyClaw-owned. Always replace this map
+      // with the resolved layers so removed/unselected managed MCP cannot
+      // survive from a previous Agent run.
+      replaceMcpServers: true,
+    },
+  );
 
   mounts.push({
     hostPath: groupSessionsDir,
@@ -1727,9 +1744,18 @@ export async function runHostAgent(
     hostMcpServers,
     input.agentProfile,
   );
-  ensureSettingsJson(settingsFile, hostMcpPolicy.servers, {
-    replaceMcpServers: hostMcpPolicy.replaceMcpServers,
+  const hostContextMcpServers = loadClaudeContextMcpServers({
+    workspaceDir: groupDir,
+    externalClaudeDir: getEffectiveExternalDir(),
+    includeHostClaudeContext: shouldIncludeHostClaudeContext(
+      input.agentProfile,
+    ),
   });
+  ensureSettingsJson(
+    settingsFile,
+    mergeMcpServerLayers(hostContextMcpServers, hostMcpPolicy.servers),
+    { replaceMcpServers: true },
+  );
 
   // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
   // 宿主 Claude 配置与 HappyClaw 记忆层始终叠加，冲突通过 audit 明示。
