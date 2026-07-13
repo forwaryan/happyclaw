@@ -15,7 +15,11 @@ describe('host execution live authorization', () => {
   });
 
   test('fails closed while an administrator revocation is in flight', () => {
-    const owner = { id: 'admin-1', role: 'admin' as const, status: 'active' as const };
+    const owner = {
+      id: 'admin-1',
+      role: 'admin' as const,
+      status: 'active' as const,
+    };
     beginHostPrivilegeRevocation(owner.id);
     expect(canExecuteOnHost(owner)).toBe(false);
     endHostPrivilegeRevocation(owner.id);

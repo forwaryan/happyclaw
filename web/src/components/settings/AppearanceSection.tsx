@@ -21,7 +21,10 @@ export function AppearanceSection() {
   const canManage = hasPermission('manage_system_config');
 
   useEffect(() => {
-    if (!canManage) { setLoading(false); return; }
+    if (!canManage) {
+      setLoading(false);
+      return;
+    }
     (async () => {
       setLoading(true);
       try {
@@ -60,14 +63,18 @@ export function AppearanceSection() {
   }
 
   if (!canManage) {
-    return <div className="text-sm text-muted-foreground">需要系统配置权限才能修改全局外观设置。</div>;
+    return (
+      <div className="text-sm text-muted-foreground">
+        需要系统配置权限才能修改全局外观设置。
+      </div>
+    );
   }
 
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground bg-muted rounded-lg px-4 py-3">
-        系统品牌只影响站点标题和欢迎文案，不会改变 HappyClaw 或自定义
-        Agent 的名称。
+        系统品牌只影响站点标题和欢迎文案，不会改变 HappyClaw 或自定义 Agent
+        的名称。
       </p>
 
       <Section

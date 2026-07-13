@@ -817,12 +817,11 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     const runtimeWasSafetyBlocked =
       execution_mode !== undefined &&
       (deps.queue?.isGroupRuntimeSafetyBlocked?.(jid) ?? false);
-    if (executionModeChanged || (execution_mode !== undefined && runtimeWasSafetyBlocked)) {
-      const runtimeJids = getWorkspaceRuntimeJids(
-        deps,
-        existing.folder,
-        jid,
-      );
+    if (
+      executionModeChanged ||
+      (execution_mode !== undefined && runtimeWasSafetyBlocked)
+    ) {
+      const runtimeJids = getWorkspaceRuntimeJids(deps, existing.folder, jid);
       try {
         await quiesceWorkspaceRunnersAroundCommit(
           deps,

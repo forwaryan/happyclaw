@@ -125,10 +125,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  for (const id of [
-    'dirty-source-task',
-    'queued-route-task',
-  ]) {
+  for (const id of ['dirty-source-task', 'queued-route-task']) {
     try {
       db.deleteTask(id);
     } catch {
@@ -199,10 +196,7 @@ describe('tasks route ownership and cleanup contract', () => {
     } as any;
 
     expect(
-      enqueueIsolatedScheduledTask(
-        db.getTaskById('queued-route-task')!,
-        deps,
-      ),
+      enqueueIsolatedScheduledTask(db.getTaskById('queued-route-task')!, deps),
     ).toBe(true);
     expect(getRunningTaskIds()).toContain('queued-route-task');
 
@@ -222,10 +216,7 @@ describe('tasks route ownership and cleanup contract', () => {
     expect(db.getTaskById('queued-route-task')?.chat_jid).toBe(targetJid);
 
     expect(
-      enqueueIsolatedScheduledTask(
-        db.getTaskById('queued-route-task')!,
-        deps,
-      ),
+      enqueueIsolatedScheduledTask(db.getTaskById('queued-route-task')!, deps),
     ).toBe(true);
     expect(queue.enqueueTask).toHaveBeenCalledTimes(2);
     droppedCallbacks.shift()?.();

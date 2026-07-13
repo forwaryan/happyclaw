@@ -58,7 +58,9 @@ function scanInputDir(
 ): void {
   let filenames: string[];
   try {
-    filenames = fs.readdirSync(inputDir).filter((name) => name.endsWith('.json'));
+    filenames = fs
+      .readdirSync(inputDir)
+      .filter((name) => name.endsWith('.json'));
   } catch {
     return;
   }
@@ -76,7 +78,8 @@ export function discardStartupTypedIpcDeliveries(
   ipcRoot: string,
   beforeDiscard?: (receipts: IpcDeliveryReceipt[]) => void,
 ): IpcDeliveryReceipt[] {
-  const recovered: Array<{ filepath: string; receipt: IpcDeliveryReceipt }> = [];
+  const recovered: Array<{ filepath: string; receipt: IpcDeliveryReceipt }> =
+    [];
   let folders: fs.Dirent[];
   try {
     folders = fs.readdirSync(ipcRoot, { withFileTypes: true });

@@ -294,10 +294,7 @@ app.post('/api/messages', authMiddleware, async (c) => {
         { ...group, jid: chatJid },
       )
     ) {
-      return c.json(
-        { error: 'Only the workspace owner can run /clear' },
-        403,
-      );
+      return c.json({ error: 'Only the workspace owner can run /clear' }, 403);
     }
     if (!deps) return c.json({ error: 'Server not initialized' }, 500);
     try {
@@ -475,8 +472,7 @@ async function handleWebUserMessage(
   // so cold-start re-expands and inline runs again. Lead-approved tradeoff;
   // log a warn line so we can confirm rarity in production.
   let sendContent = content;
-  const eagerExpandActive =
-    deps.queue.hasActiveMainRunnerForMessage(chatJid);
+  const eagerExpandActive = deps.queue.hasActiveMainRunnerForMessage(chatJid);
   if (eagerExpandActive) {
     // Use the effective (sibling-resolved) group so non-home groups bound to a
     // home sibling inherit executionMode / customCwd / created_by — otherwise
@@ -563,18 +559,16 @@ async function handleWebUserMessage(
   // Idle path: skip expander entirely; cold-start will expand once from the
   // original DB row via `expandMessagesIfNeeded` (handles reply/expanded/miss).
 
-  const formatted = deps.formatMessages(
-    [
-      {
-        id: messageId,
-        chat_jid: chatJid,
-        sender: userId,
-        sender_name: displayName,
-        content: sendContent,
-        timestamp,
-      },
-    ],
-  );
+  const formatted = deps.formatMessages([
+    {
+      id: messageId,
+      chat_jid: chatJid,
+      sender: userId,
+      sender_name: displayName,
+      content: sendContent,
+      timestamp,
+    },
+  ]);
 
   // IPC-inject the message into the running agent process.  For home groups,
   // the reply route is dynamically updated via activeRouteUpdaters so we no
@@ -639,9 +633,7 @@ function generateAutoTitle(content: string): string | null {
   const trimmed = content.trim();
   if (!trimmed || trimmed.startsWith('/')) return null;
 
-  const text = markdownToPlainText(trimmed)
-    .replace(/\n+/g, ' ')
-    .trim();
+  const text = markdownToPlainText(trimmed).replace(/\n+/g, ' ').trim();
 
   if (!text) return null;
 
@@ -712,7 +704,13 @@ async function handleAgentConversationMessage(
     if (autoTitle) {
       updateAgentContextInfo(agentId, { name: autoTitle });
       updateChatName(virtualChatJid, autoTitle);
-      broadcastAgentStatus(chatJid, agentId, agent.status as AgentStatus, autoTitle, agent.prompt);
+      broadcastAgentStatus(
+        chatJid,
+        agentId,
+        agent.status as AgentStatus,
+        autoTitle,
+        agent.prompt,
+      );
     }
   }
 
@@ -796,11 +794,7 @@ async function handleAgentConversationMessage(
           // (#27 round-17 P2-2) — direct overwrite would regress cursor on
           // same-millisecond batches and re-fire the reply.
           const replyCursor = { timestamp, id: messageId };
-          completeWebOutOfBandMessage(
-            deps,
-            virtualChatJid,
-            replyCursor,
-          );
+          completeWebOutOfBandMessage(deps, virtualChatJid, replyCursor);
           return;
         }
         if (expansion.kind === 'expanded') {
@@ -835,18 +829,16 @@ async function handleAgentConversationMessage(
   // `expandMessagesIfNeeded` (handles reply/expanded/miss uniformly).
 
   // Format for agent
-  const formatted = deps.formatMessages(
-    [
-      {
-        id: messageId,
-        chat_jid: virtualChatJid,
-        sender: userId,
-        sender_name: displayName,
-        content: agentSendContent,
-        timestamp,
-      },
-    ],
-  );
+  const formatted = deps.formatMessages([
+    {
+      id: messageId,
+      chat_jid: virtualChatJid,
+      sender: userId,
+      sender_name: displayName,
+      content: agentSendContent,
+      timestamp,
+    },
+  ]);
 
   // Try to pipe into running agent process
   const agentImages = toAgentImages(normalizedAttachments);
@@ -962,7 +954,10 @@ function setupWebSocket(server: any): WebSocketServer {
   // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
   // 而不是把 ws frame 单帧打到 100MB），也防止认证用户用单帧 OOM 服务器
   // （ws 库默认 100 MiB；详见 node_modules/ws/lib/websocket-server.js）。
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 8 * 1024 * 1024,
+  });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
@@ -986,7 +981,9 @@ function setupWebSocket(server: any): WebSocketServer {
         try {
           const originHost = new URL(origin).host;
           sameOrigin = originHost === host;
-        } catch { /* invalid origin */ }
+        } catch {
+          /* invalid origin */
+        }
       }
       if (!sameOrigin) {
         const allowed = isAllowedOrigin(origin);
@@ -1012,9 +1009,15 @@ function setupWebSocket(server: any): WebSocketServer {
     // WebSocket upgrade cannot return Set-Cookie, so legacy cookies are
     // accepted here but upgraded on the next HTTP request instead.
     const cookieHeader = request.headers.cookie as string | undefined;
-    let allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_SECURE);
+    let allCookieValues = getAllCookieValues(
+      cookieHeader,
+      SESSION_COOKIE_NAME_SECURE,
+    );
     if (allCookieValues.length === 0) {
-      allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_PLAIN);
+      allCookieValues = getAllCookieValues(
+        cookieHeader,
+        SESSION_COOKIE_NAME_PLAIN,
+      );
     }
     if (allCookieValues.length === 0) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -1067,7 +1070,9 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
-    const connSession = sessionId ? getCachedSessionWithUser(sessionId) : undefined;
+    const connSession = sessionId
+      ? getCachedSessionWithUser(sessionId)
+      : undefined;
     wsClients.set(ws, {
       sessionId: sessionId || '',
       userId: connSession?.user_id || '',
@@ -1086,7 +1091,15 @@ function setupWebSocket(server: any): WebSocketServer {
           continue;
         }
         // Skip empty snapshots
-        if (!snap.partialText && !snap.thinkingText && snap.activeTools.length === 0 && snap.recentEvents.length === 0 && snap.traceEvents.length === 0 && Object.keys(snap.taskStates).length === 0 && !snap.contextAudit) {
+        if (
+          !snap.partialText &&
+          !snap.thinkingText &&
+          snap.activeTools.length === 0 &&
+          snap.recentEvents.length === 0 &&
+          snap.traceEvents.length === 0 &&
+          Object.keys(snap.taskStates).length === 0 &&
+          !snap.contextAudit
+        ) {
           continue;
         }
         // Strip #agent: suffix for ACL lookup (virtual JIDs not in registered_groups)
@@ -1094,25 +1107,29 @@ function setupWebSocket(server: any): WebSocketServer {
         const allowed = getGroupAllowedUserIds(baseJid);
         if (allowed === null || !allowed.has(userId)) continue;
         try {
-          ws.send(JSON.stringify({
-            type: 'stream_snapshot',
-            chatJid: jid,
-            snapshot: {
-              partialText: snap.partialText,
-              thinkingText: snap.thinkingText,
-              activeTools: snap.activeTools,
-              recentEvents: snap.recentEvents,
-              traceEvents: snap.traceEvents,
-              taskStates: snap.taskStates,
-              contextAudit: snap.contextAudit,
-              todos: snap.todos,
-              systemStatus: snap.systemStatus,
-              isThinking: snap.isThinking,
-              activeHook: snap.activeHook,
-              turnId: snap.turnId,
-            },
-          } satisfies WsMessageOut));
-        } catch { /* client not ready */ }
+          ws.send(
+            JSON.stringify({
+              type: 'stream_snapshot',
+              chatJid: jid,
+              snapshot: {
+                partialText: snap.partialText,
+                thinkingText: snap.thinkingText,
+                activeTools: snap.activeTools,
+                recentEvents: snap.recentEvents,
+                traceEvents: snap.traceEvents,
+                taskStates: snap.taskStates,
+                contextAudit: snap.contextAudit,
+                todos: snap.todos,
+                systemStatus: snap.systemStatus,
+                isThinking: snap.isThinking,
+                activeHook: snap.activeHook,
+                turnId: snap.turnId,
+              },
+            } satisfies WsMessageOut),
+          );
+        } catch {
+          /* client not ready */
+        }
       }
     }
 
@@ -1129,12 +1146,16 @@ function setupWebSocket(server: any): WebSocketServer {
         const allowed = getGroupAllowedUserIds(g.jid);
         if (allowed === null || !allowed.has(userId)) continue;
         try {
-          ws.send(JSON.stringify({
-            type: 'runner_state',
-            chatJid: jid,
-            state: 'running',
-          } satisfies WsMessageOut));
-        } catch { /* client not ready */ }
+          ws.send(
+            JSON.stringify({
+              type: 'runner_state',
+              chatJid: jid,
+              state: 'running',
+            } satisfies WsMessageOut),
+          );
+        } catch {
+          /* client not ready */
+        }
       }
     }
 
@@ -1201,7 +1222,10 @@ function setupWebSocket(server: any): WebSocketServer {
           if (!wsValidation.success) {
             sendWsError('消息格式无效', msg.chatJid);
             logger.warn(
-              { chatJid: msg.chatJid, issues: wsValidation.error.issues.map(i => i.message) },
+              {
+                chatJid: msg.chatJid,
+                issues: wsValidation.error.issues.map((i) => i.message),
+              },
               'WebSocket send_message validation failed',
             );
             return;
@@ -1252,7 +1276,8 @@ function setupWebSocket(server: any): WebSocketServer {
                 const userMsgTs = new Date().toISOString();
                 ensureChatExists(effectiveChatJid);
                 storeMessageDirect(
-                  userMsgId, effectiveChatJid,
+                  userMsgId,
+                  effectiveChatJid,
                   session.user_id,
                   session.display_name || session.username,
                   content.trim(),
@@ -1261,7 +1286,8 @@ function setupWebSocket(server: any): WebSocketServer {
                   { meta: { sourceKind: 'user_command' } },
                 );
                 broadcastNewMessage(effectiveChatJid, {
-                  id: userMsgId, chat_jid: effectiveChatJid,
+                  id: userMsgId,
+                  chat_jid: effectiveChatJid,
                   sender: session.user_id,
                   sender_name: session.display_name || session.username,
                   content: content.trim(),
@@ -1321,10 +1347,7 @@ function setupWebSocket(server: any): WebSocketServer {
                 agentId,
               );
             } catch (err) {
-              logger.error(
-                { chatJid, agentId, err },
-                '/clear command failed',
-              );
+              logger.error({ chatJid, agentId, err }, '/clear command failed');
               const errId = crypto.randomUUID();
               const errTs = new Date().toISOString();
               ensureChatExists(errorTargetJid);
@@ -1691,10 +1714,7 @@ function safeBroadcast(
 
     const session = getCachedSessionWithUser(clientInfo.sessionId);
     const expired = !!session && isSessionExpired(session.expires_at);
-    const invalid =
-      !session ||
-      expired ||
-      session.status !== 'active';
+    const invalid = !session || expired || session.status !== 'active';
     if (invalid) {
       if (expired) {
         deleteUserSession(clientInfo.sessionId);
@@ -1828,12 +1848,30 @@ interface StreamingSnapshotEntry {
     id: string;
     timestamp: number;
     text: string;
-    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
+    kind:
+      | 'tool'
+      | 'skill'
+      | 'hook'
+      | 'status'
+      | 'task'
+      | 'memory'
+      | 'context'
+      | 'debug'
+      | 'permission';
   }>;
   traceEvents: Array<{
     id: string;
     timestamp: number;
-    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
+    kind:
+      | 'tool'
+      | 'skill'
+      | 'hook'
+      | 'status'
+      | 'task'
+      | 'memory'
+      | 'context'
+      | 'debug'
+      | 'permission';
     scope?: StreamEvent['agentScope'];
     title: string;
     summary?: string;
@@ -1844,19 +1882,22 @@ interface StreamingSnapshotEntry {
     displayLevel?: StreamEvent['displayLevel'];
   }>;
   contextAudit?: StreamEvent['contextAudit'];
-  taskStates: Record<string, {
-    id: string;
-    title: string;
-    status: 'running' | 'completed' | 'error' | 'backgrounded';
-    subagentType?: string;
-    latestSummary?: string;
-    lastToolName?: string;
-    thinkingTail: string;
-    textTail: string;
-    activeTools: StreamingSnapshotEntry['activeTools'];
-    recentTools: StreamingSnapshotEntry['recentEvents'];
-    updatedAt: number;
-  }>;
+  taskStates: Record<
+    string,
+    {
+      id: string;
+      title: string;
+      status: 'running' | 'completed' | 'error' | 'backgrounded';
+      subagentType?: string;
+      latestSummary?: string;
+      lastToolName?: string;
+      thinkingTail: string;
+      textTail: string;
+      activeTools: StreamingSnapshotEntry['activeTools'];
+      recentTools: StreamingSnapshotEntry['recentEvents'];
+      updatedAt: number;
+    }
+  >;
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
   /** Whether the agent is mid-thinking (no text emitted yet) — kept in the
@@ -1885,31 +1926,67 @@ const MAX_SNAPSHOT_TRACE_EVENTS = 200;
 const MAX_SNAPSHOT_TASK_TAIL = 4000;
 
 /** Push a recent event entry and truncate to MAX_SNAPSHOT_EVENTS. */
-function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission' }): void {
+function pushRecentEvent(
+  snap: StreamingSnapshotEntry,
+  event: {
+    id: string;
+    timestamp: number;
+    text: string;
+    kind:
+      | 'tool'
+      | 'skill'
+      | 'hook'
+      | 'status'
+      | 'task'
+      | 'memory'
+      | 'context'
+      | 'debug'
+      | 'permission';
+  },
+): void {
   snap.recentEvents.push(event);
   if (snap.recentEvents.length > MAX_SNAPSHOT_EVENTS) {
     snap.recentEvents = snap.recentEvents.slice(-MAX_SNAPSHOT_EVENTS);
   }
 }
 
-function pushTraceEvent(snap: StreamingSnapshotEntry, event: StreamEvent): void {
-  if (event.eventType === 'text_delta' || event.eventType === 'thinking_delta' || event.eventType === 'usage' || event.eventType === 'init') return;
-  const kind =
-    event.eventType.startsWith('tool_') ? (event.skillName ? 'skill' : 'tool') :
-    event.eventType.startsWith('hook_') ? 'hook' :
-    event.eventType.startsWith('task_') ? 'task' :
-    event.eventType === 'memory_recall' || event.eventType === 'compact_boundary' ? 'memory' :
-    event.eventType === 'context_audit' ? 'context' :
-    event.eventType === 'permission_denied' ? 'permission' :
-    event.eventType === 'raw_sdk_event' ? 'debug' :
-    'status';
-  const title = event.title
-    || event.summary
-    || event.taskSummary
-    || event.statusText
-    || event.toolName
-    || event.rawType
-    || event.eventType;
+function pushTraceEvent(
+  snap: StreamingSnapshotEntry,
+  event: StreamEvent,
+): void {
+  if (
+    event.eventType === 'text_delta' ||
+    event.eventType === 'thinking_delta' ||
+    event.eventType === 'usage' ||
+    event.eventType === 'init'
+  )
+    return;
+  const kind = event.eventType.startsWith('tool_')
+    ? event.skillName
+      ? 'skill'
+      : 'tool'
+    : event.eventType.startsWith('hook_')
+      ? 'hook'
+      : event.eventType.startsWith('task_')
+        ? 'task'
+        : event.eventType === 'memory_recall' ||
+            event.eventType === 'compact_boundary'
+          ? 'memory'
+          : event.eventType === 'context_audit'
+            ? 'context'
+            : event.eventType === 'permission_denied'
+              ? 'permission'
+              : event.eventType === 'raw_sdk_event'
+                ? 'debug'
+                : 'status';
+  const title =
+    event.title ||
+    event.summary ||
+    event.taskSummary ||
+    event.statusText ||
+    event.toolName ||
+    event.rawType ||
+    event.eventType;
   snap.traceEvents.push({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: Date.now(),
@@ -1933,17 +2010,26 @@ function tailText(text: string, max: number): string {
 }
 
 function snapshotTaskId(event: StreamEvent): string | null {
-  return event.parentToolUseId || event.taskId || (
-    event.eventType.startsWith('task_') ? event.toolUseId || null : null
+  return (
+    event.parentToolUseId ||
+    event.taskId ||
+    (event.eventType.startsWith('task_') ? event.toolUseId || null : null)
   );
 }
 
-function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): void {
+function updateSnapshotTask(
+  snap: StreamingSnapshotEntry,
+  event: StreamEvent,
+): void {
   const taskId = snapshotTaskId(event);
   if (!taskId) return;
   const task = snap.taskStates[taskId] || {
     id: taskId,
-    title: event.taskDescription || event.toolInputSummary || event.summary || 'Task',
+    title:
+      event.taskDescription ||
+      event.toolInputSummary ||
+      event.summary ||
+      'Task',
     status: 'running' as const,
     subagentType: event.subagentType,
     thinkingTail: '',
@@ -1953,25 +2039,39 @@ function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): v
     updatedAt: Date.now(),
   };
   task.updatedAt = Date.now();
-  if (event.taskDescription && (!task.title || task.title === 'Task')) task.title = event.taskDescription;
+  if (event.taskDescription && (!task.title || task.title === 'Task'))
+    task.title = event.taskDescription;
   if (event.subagentType) task.subagentType = event.subagentType;
   if (event.eventType === 'text_delta') {
-    task.textTail = tailText(task.textTail + (event.text || ''), MAX_SNAPSHOT_TASK_TAIL);
+    task.textTail = tailText(
+      task.textTail + (event.text || ''),
+      MAX_SNAPSHOT_TASK_TAIL,
+    );
   } else if (event.eventType === 'thinking_delta') {
-    task.thinkingTail = tailText(task.thinkingTail + (event.text || ''), MAX_SNAPSHOT_TASK_TAIL);
+    task.thinkingTail = tailText(
+      task.thinkingTail + (event.text || ''),
+      MAX_SNAPSHOT_TASK_TAIL,
+    );
   } else if (event.eventType === 'task_progress') {
-    task.latestSummary = event.summary || event.taskSummary || event.taskDescription || task.latestSummary;
+    task.latestSummary =
+      event.summary ||
+      event.taskSummary ||
+      event.taskDescription ||
+      task.latestSummary;
     task.lastToolName = event.lastToolName || task.lastToolName;
     task.status = 'running';
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed') task.status = 'error';
+    else if (patch?.status === 'failed' || patch?.status === 'killed')
+      task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
-    task.latestSummary = event.summary || patch?.description || patch?.error || task.latestSummary;
+    task.latestSummary =
+      event.summary || patch?.description || patch?.error || task.latestSummary;
   } else if (event.eventType === 'task_notification') {
     task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
-    task.latestSummary = event.taskSummary || event.summary || task.latestSummary;
+    task.latestSummary =
+      event.taskSummary || event.summary || task.latestSummary;
   } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
     const tool = {
       toolName: event.toolName || 'unknown',
@@ -1980,16 +2080,25 @@ function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): v
       toolInputSummary: event.toolInputSummary,
       parentToolUseId: event.parentToolUseId,
     };
-    task.activeTools = task.activeTools.some(t => t.toolUseId === tool.toolUseId && tool.toolUseId)
-      ? task.activeTools.map(t => (t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t))
+    task.activeTools = task.activeTools.some(
+      (t) => t.toolUseId === tool.toolUseId && tool.toolUseId,
+    )
+      ? task.activeTools.map((t) =>
+          t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t,
+        )
       : [...task.activeTools, tool];
   } else if (event.eventType === 'tool_use_end' && event.parentToolUseId) {
-    task.activeTools = task.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+    task.activeTools = task.activeTools.filter(
+      (t) => t.toolUseId !== event.toolUseId,
+    );
   }
   snap.taskStates[taskId] = task;
 }
 
-function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): void {
+function updateStreamingSnapshot(
+  normalizedJid: string,
+  event: StreamEvent,
+): void {
   // turn 干净结束（silent-success）：删除快照而非累积，避免 WS 重连恢复到
   // 「生成中」僵尸快照。前端收到同一 idle 事件后清 waiting/streaming。
   if (event.eventType === 'status' && event.statusText === 'idle') {
@@ -2046,7 +2155,10 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
           snap.partialText = snap.partialText.slice(-MAX_SNAPSHOT_TEXT);
         }
         // Accumulate full (non-truncated) text for shutdown persistence
-        streamingFullTexts.set(normalizedJid, (streamingFullTexts.get(normalizedJid) || '') + event.text);
+        streamingFullTexts.set(
+          normalizedJid,
+          (streamingFullTexts.get(normalizedJid) || '') + event.text,
+        );
       }
       break;
 
@@ -2082,15 +2194,20 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
     case 'tool_use_end':
       if (event.toolUseId) {
-        snap.activeTools = snap.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+        snap.activeTools = snap.activeTools.filter(
+          (t) => t.toolUseId !== event.toolUseId,
+        );
       }
       break;
 
     case 'tool_progress':
       if (event.toolUseId) {
-        const tool = snap.activeTools.find(t => t.toolUseId === event.toolUseId);
+        const tool = snap.activeTools.find(
+          (t) => t.toolUseId === event.toolUseId,
+        );
         if (tool) {
-          if (event.toolInputSummary) tool.toolInputSummary = event.toolInputSummary;
+          if (event.toolInputSummary)
+            tool.toolInputSummary = event.toolInputSummary;
         }
       }
       break;
@@ -2135,7 +2252,10 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       break;
 
     case 'hook_started':
-      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      snap.activeHook = {
+        hookName: event.hookName || '',
+        hookEvent: event.hookEvent || '',
+      };
       if (event.hookName) {
         pushRecentEvent(snap, {
           id: `hook-${Date.now()}`,
@@ -2147,7 +2267,10 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       break;
 
     case 'hook_progress':
-      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      snap.activeHook = {
+        hookName: event.hookName || '',
+        hookEvent: event.hookEvent || '',
+      };
       break;
 
     case 'hook_response':
@@ -2178,7 +2301,11 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
     case 'todo_update':
       if (event.todos) {
-        snap.todos = event.todos.map(t => ({ id: t.id, content: t.content, status: t.status }));
+        snap.todos = event.todos.map((t) => ({
+          id: t.id,
+          content: t.content,
+          status: t.status,
+        }));
       }
       break;
   }
@@ -2232,7 +2359,11 @@ export function broadcastGroupCreated(
   userId?: string,
 ): void {
   const allowedUserIds = userId ? new Set([userId]) : undefined;
-  safeBroadcast({ type: 'group_created', jid, folder, name }, false, allowedUserIds);
+  safeBroadcast(
+    { type: 'group_created', jid, folder, name },
+    false,
+    allowedUserIds,
+  );
 }
 
 export function broadcastBillingUpdate(
@@ -2302,7 +2433,15 @@ export function broadcastAgentRemoved(
   agentId: string,
   name: string,
 ): void {
-  broadcastAgentStatus(chatJid, agentId, 'error', name, '', '__removed__', 'conversation');
+  broadcastAgentStatus(
+    chatJid,
+    agentId,
+    'error',
+    name,
+    '',
+    '__removed__',
+    'conversation',
+  );
 }
 
 /**
@@ -2350,8 +2489,12 @@ export function broadcastRunnerState(
     streamingFullTexts.delete(jid);
     // Collect keys first, then delete (avoid mutating Map during iteration)
     const agentPrefix = jid + '#agent:';
-    const snapshotKeysToDelete = [...streamingSnapshots.keys()].filter(k => k.startsWith(agentPrefix));
-    const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter(k => k.startsWith(agentPrefix));
+    const snapshotKeysToDelete = [...streamingSnapshots.keys()].filter((k) =>
+      k.startsWith(agentPrefix),
+    );
+    const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter((k) =>
+      k.startsWith(agentPrefix),
+    );
     for (const key of snapshotKeysToDelete) streamingSnapshots.delete(key);
     for (const key of fullTextKeysToDelete) streamingFullTexts.delete(key);
     // 墓碑：拦截本 run 残留 outputChain 回调对快照的迟到重建。同粒度落键——

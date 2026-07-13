@@ -1,5 +1,11 @@
 import { useEffect, useState } from 'react';
-import { ArrowRight, Loader2, MessageSquare, QrCode, SkipForward } from 'lucide-react';
+import {
+  ArrowRight,
+  Loader2,
+  MessageSquare,
+  QrCode,
+  SkipForward,
+} from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 import { Input } from '@/components/ui/input';
@@ -133,20 +139,27 @@ export function SetupChannelsPage() {
           <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center mx-auto mb-4">
             <MessageSquare className="w-6 h-6 text-primary" />
           </div>
-          <h1 className="text-2xl font-bold text-foreground mb-2">接入消息渠道（可选）</h1>
+          <h1 className="text-2xl font-bold text-foreground mb-2">
+            接入消息渠道（可选）
+          </h1>
           <p className="text-sm text-muted-foreground">
-            绑定飞书 / Telegram / QQ / Discord / WhatsApp / 微信，即可通过 IM 与 AI 对话。跳过后也可在设置中随时配置。
+            绑定飞书 / Telegram / QQ / Discord / WhatsApp / 微信，即可通过 IM 与
+            AI 对话。跳过后也可在设置中随时配置。
           </p>
         </div>
 
         {error && (
-          <div className="p-3 rounded-lg bg-error-bg border border-error/30 text-error text-sm">{error}</div>
+          <div className="p-3 rounded-lg bg-error-bg border border-error/30 text-error text-sm">
+            {error}
+          </div>
         )}
 
         {/* Feishu */}
         <Card className="shadow-sm">
           <CardContent>
-            <h2 className="text-base font-semibold text-foreground mb-3">飞书</h2>
+            <h2 className="text-base font-semibold text-foreground mb-3">
+              飞书
+            </h2>
             <p className="text-xs text-muted-foreground mb-3">
               填写你的飞书应用凭证，绑定后即可在飞书中与 AI 对话。
             </p>
@@ -176,7 +189,9 @@ export function SetupChannelsPage() {
         {/* Telegram */}
         <Card className="shadow-sm">
           <CardContent>
-            <h2 className="text-base font-semibold text-foreground mb-3">Telegram</h2>
+            <h2 className="text-base font-semibold text-foreground mb-3">
+              Telegram
+            </h2>
             <p className="text-xs text-muted-foreground mb-3">
               填写 Telegram Bot Token，绑定后即可在 Telegram 中与 AI 对话。
             </p>
@@ -225,7 +240,9 @@ export function SetupChannelsPage() {
         {/* Discord */}
         <Card className="shadow-sm">
           <CardContent>
-            <h2 className="text-base font-semibold text-foreground mb-3">Discord</h2>
+            <h2 className="text-base font-semibold text-foreground mb-3">
+              Discord
+            </h2>
             <p className="text-xs text-muted-foreground mb-3">
               填写 Discord Bot Token，绑定后即可在 Discord 中与 AI 对话。
             </p>
@@ -250,7 +267,8 @@ export function SetupChannelsPage() {
                   WhatsApp
                 </h2>
                 <p className="text-xs text-muted-foreground">
-                  基于 Baileys 协议扫码登录。启用后，请到「设置 → 渠道接入」扫码完成接入。
+                  基于 Baileys 协议扫码登录。启用后，请到「设置 →
+                  渠道接入」扫码完成接入。
                 </p>
               </div>
               <label className="flex items-center gap-2 text-xs text-muted-foreground shrink-0">
@@ -264,7 +282,9 @@ export function SetupChannelsPage() {
               </label>
             </div>
             <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-              ⚠️ Baileys 是逆向 WhatsApp Web 协议的社区方案，存在封号风险；商用场景建议改用 Meta 官方 Cloud API。
+              ⚠️ Baileys 是逆向 WhatsApp Web
+              协议的社区方案，存在封号风险；商用场景建议改用 Meta 官方 Cloud
+              API。
             </div>
           </CardContent>
         </Card>

@@ -8,7 +8,9 @@ import {
 describe('background task summary guard', () => {
   test('detects the stale wait reply from the Matt Pocock incident', () => {
     expect(
-      isStaleBackgroundWaitReply('1/6 完成（执行层），已落盘。等待其余 5 个 Agent。'),
+      isStaleBackgroundWaitReply(
+        '1/6 完成（执行层），已落盘。等待其余 5 个 Agent。',
+      ),
     ).toBe(true);
   });
 
@@ -19,7 +21,9 @@ describe('background task summary guard', () => {
       ),
     ).toBe(true);
     expect(
-      isStaleBackgroundWaitReply("I'll wait for the remaining 3 agents before summarizing."),
+      isStaleBackgroundWaitReply(
+        "I'll wait for the remaining 3 agents before summarizing.",
+      ),
     ).toBe(true);
   });
 

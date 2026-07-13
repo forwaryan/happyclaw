@@ -7027,7 +7027,7 @@ async function processTaskIpc(
           break;
         }
 
-        const result = deleteSkillForUser(userId, skillId);
+        const result = await deleteSkillForUser(userId, skillId);
         const tmpPath = `${resultFilePath}.tmp`;
         fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
         fs.writeFileSync(tmpPath, JSON.stringify(result));

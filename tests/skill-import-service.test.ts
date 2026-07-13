@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
   importSkillsFromGit,
   importSkillsFromZip,
+  runCommandWithDirectoryQuota,
 } from '../src/skill-import-service.js';
 
 let tempDir: string;
@@ -84,6 +85,49 @@ describe('skill import service', () => {
     expect(
       fs.readFileSync(path.join(targetRoot, 'review', 'SKILL.md'), 'utf8'),
     ).toContain('replacement');
+  });
+
+  test('rolls back installed directories when metadata commit fails', () => {
+    fs.mkdirSync(path.join(targetRoot, 'review'), { recursive: true });
+    fs.writeFileSync(path.join(targetRoot, 'review', 'SKILL.md'), 'existing');
+
+    expect(() =>
+      importSkillsFromZip({
+        archive: createSkillArchive({ review: 'replacement' }),
+        archiveName: 'skills.zip',
+        targetRoot,
+        replace: true,
+        commit: () => {
+          throw new Error('manifest write failed');
+        },
+      }),
+    ).toThrow('manifest write failed');
+    expect(
+      fs.readFileSync(path.join(targetRoot, 'review', 'SKILL.md'), 'utf8'),
+    ).toBe('existing');
+  });
+
+  test('terminates a command when its working data exceeds the quota', async () => {
+    const watchDir = path.join(tempDir, 'quota');
+    fs.mkdirSync(watchDir);
+    const writer = [
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      'const root = process.argv[1]',
+      'for (let i = 0; i < 8; i++) fs.writeFileSync(path.join(root, String(i)), Buffer.alloc(512 * 1024))',
+      'setInterval(() => {}, 1000)',
+    ].join(';');
+
+    await expect(
+      runCommandWithDirectoryQuota({
+        command: process.execPath,
+        args: ['-e', writer, watchDir],
+        watchDir,
+        maxBytes: 1024 * 1024,
+        timeoutMs: 5_000,
+        pollIntervalMs: 10,
+      }),
+    ).rejects.toThrow('size limit');
   });
 
   test('rejects path traversal and unsafe Git URLs before writing files', async () => {

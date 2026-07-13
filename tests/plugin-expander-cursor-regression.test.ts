@@ -342,7 +342,10 @@ describe('web path expansion — #20 P2-4 round-12: skip expander when idle', ()
     const result = webPathRun({
       hasActiveRunner: false,
       originalContent: '/codex:status',
-      expander: () => ({ kind: 'reply', text: '请先发起对话启动工作区后重试。' }),
+      expander: () => ({
+        kind: 'reply',
+        text: '请先发起对话启动工作区后重试。',
+      }),
       spy,
     });
     expect(spy.calls).toBe(0);
@@ -355,7 +358,10 @@ describe('web path expansion — #20 P2-4 round-12: skip expander when idle', ()
     const result = webPathRun({
       hasActiveRunner: true,
       originalContent: '/codex:status',
-      expander: () => ({ kind: 'reply', text: '请先发起对话启动工作区后重试。' }),
+      expander: () => ({
+        kind: 'reply',
+        text: '请先发起对话启动工作区后重试。',
+      }),
       spy,
     });
     expect(spy.calls).toBe(1);

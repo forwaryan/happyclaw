@@ -15,7 +15,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 
 const SHARED_TMP =
   process.env.HAPPYCLAW_TEST_DATA_DIR ??
@@ -61,9 +69,8 @@ vi.mock('../src/middleware/auth.ts', () => ({
   },
 }));
 
-const workspaceConfigRoutesModule = await import(
-  '../src/routes/workspace-config.js'
-);
+const workspaceConfigRoutesModule =
+  await import('../src/routes/workspace-config.js');
 const db = await import('../src/db.js');
 const config = await import('../src/config.js');
 
@@ -222,7 +229,6 @@ describe('workspace-config ACL — MCP servers', () => {
     expect(status).toBe(404);
     expect(body.error).toMatch(/not found/i);
   });
-
 });
 
 describe('workspace-config ACL — skills', () => {

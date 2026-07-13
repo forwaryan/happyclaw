@@ -12,10 +12,13 @@ export const CHANNEL_COLORS: Record<string, string> = {
   feishu: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
   telegram: 'bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300',
   qq: 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300',
-  wechat: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
+  wechat:
+    'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
   dingtalk: 'bg-cyan-100 dark:bg-cyan-900/40 text-cyan-700 dark:text-cyan-300',
-  discord: 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300',
-  whatsapp: 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300',
+  discord:
+    'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300',
+  whatsapp:
+    'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300',
 };
 
 const FeishuIcon = () => (
@@ -78,7 +81,8 @@ export const CHANNEL_ICON: Record<string, React.FC> = {
  */
 export function formatGroupLabel(jid: string, name: string): string {
   const channelType = jid.split(':')[0];
-  const channelLabel = CHANNEL_LABEL[channelType] || (channelType === 'web' ? 'Web' : channelType);
+  const channelLabel =
+    CHANNEL_LABEL[channelType] || (channelType === 'web' ? 'Web' : channelType);
   const shortId = jid.split(':').slice(1).join(':');
   return `[${channelLabel}] ${name} (${shortId})`;
 }
@@ -87,7 +91,9 @@ export function formatGroupLabel(jid: string, name: string): string {
 export function ChannelBadge({ channelType }: { channelType: string }) {
   const Icon = CHANNEL_ICON[channelType];
   return (
-    <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 ${CHANNEL_COLORS[channelType] || 'bg-muted text-muted-foreground'}`}>
+    <span
+      className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium inline-flex items-center gap-0.5 ${CHANNEL_COLORS[channelType] || 'bg-muted text-muted-foreground'}`}
+    >
       {Icon && <Icon />}
       {CHANNEL_LABEL[channelType] || channelType}
     </span>

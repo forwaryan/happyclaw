@@ -18,11 +18,8 @@ vi.mock('../src/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-const {
-  getActiveScriptCount,
-  runScript,
-  terminateScriptsForOwner,
-} = await import('../src/script-runner.js');
+const { getActiveScriptCount, runScript, terminateScriptsForOwner } =
+  await import('../src/script-runner.js');
 
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 

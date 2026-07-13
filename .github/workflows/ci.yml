@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: container/agent-runner/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm --prefix web install
+          npm --prefix container/agent-runner ci
+
+      - name: Check changed-file formatting
+        run: npm run format:check
+        env:
+          FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test -- --run
+
+      - name: Build
+        run: npm run build:all
+
+      - name: Agent runner self-test
+        run: npm run self-test:agent-runner

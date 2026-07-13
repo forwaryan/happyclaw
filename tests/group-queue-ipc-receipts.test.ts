@@ -131,10 +131,9 @@ describe('GroupQueue IPC delivery receipts', () => {
     await startRunner();
     let committedId = 'm0';
     const orderedIds = ['m1', 'm2'];
-    queue.setIpcDeliveryCommitEligibilityChecker((receipt) =>
-      !orderedIds.some(
-        (id) => id > committedId && id < receipt.cursor.id,
-      ),
+    queue.setIpcDeliveryCommitEligibilityChecker(
+      (receipt) =>
+        !orderedIds.some((id) => id > committedId && id < receipt.cursor.id),
     );
     const commits: Receipt[] = [];
     const commit = (receipts: Receipt[]) => {
@@ -163,8 +162,7 @@ describe('GroupQueue IPC delivery receipts', () => {
         (receipt.coveredCursors ?? [receipt.cursor]).map((item) => item.id),
       );
       return !orderedIds.some(
-        (id) =>
-          id > committedId && id <= receipt.cursor.id && !covered.has(id),
+        (id) => id > committedId && id <= receipt.cursor.id && !covered.has(id),
       );
     });
     const commits: Receipt[] = [];
@@ -204,8 +202,7 @@ describe('GroupQueue IPC delivery receipts', () => {
         (receipt.coveredCursors ?? [receipt.cursor]).map((item) => item.id),
       );
       return !orderedIds.some(
-        (id) =>
-          id > committedId && id <= receipt.cursor.id && !covered.has(id),
+        (id) => id > committedId && id <= receipt.cursor.id && !covered.has(id),
       );
     });
     const commits: Receipt[] = [];
@@ -241,8 +238,7 @@ describe('GroupQueue IPC delivery receipts', () => {
         (receipt.coveredCursors ?? [receipt.cursor]).map((item) => item.id),
       );
       return !orderedIds.some(
-        (id) =>
-          id > committedId && id <= receipt.cursor.id && !covered.has(id),
+        (id) => id > committedId && id <= receipt.cursor.id && !covered.has(id),
       );
     });
     const commits: Receipt[] = [];
@@ -268,10 +264,9 @@ describe('GroupQueue IPC delivery receipts', () => {
     await startRunner();
     let committedId = 'm0';
     const orderedIds = ['m1', 'm2'];
-    queue.setIpcDeliveryCommitEligibilityChecker((receipt) =>
-      !orderedIds.some(
-        (id) => id > committedId && id < receipt.cursor.id,
-      ),
+    queue.setIpcDeliveryCommitEligibilityChecker(
+      (receipt) =>
+        !orderedIds.some((id) => id > committedId && id < receipt.cursor.id),
     );
     const commits: Receipt[] = [];
     const commit = (receipts: Receipt[]) => {

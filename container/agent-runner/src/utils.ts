@@ -19,7 +19,11 @@ export function shorten(input: string, maxLen = 180): string {
 export function redactSensitive(input: unknown, depth = 0): unknown {
   if (depth > 3) return '[truncated]';
   if (input == null) return input;
-  if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+  if (
+    typeof input === 'string' ||
+    typeof input === 'number' ||
+    typeof input === 'boolean'
+  ) {
     return input;
   }
   if (Array.isArray(input)) {
@@ -29,7 +33,9 @@ export function redactSensitive(input: unknown, depth = 0): unknown {
     const obj = input as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (/(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)) {
+      if (
+        /(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)
+      ) {
         out[k] = '[REDACTED]';
       } else {
         out[k] = redactSensitive(v, depth + 1);
@@ -66,8 +72,10 @@ export function redactInlineSecrets(value: string): string {
       // to cover postgres / mongodb / redis / mysql / ftp / ssh / git etc.
       // The DSN form `<scheme>://user:pass@host/...` is universal; restrict
       // the scheme to a reasonable identifier shape to avoid colon-rich text.
-      .replace(/(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
-        '$1[REDACTED]$2')
+      .replace(
+        /(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
+        '$1[REDACTED]$2',
+      )
       // key=value / key:value with explicit secret-shaped key. Anchor 不再
       // 用 lazy `[A-Za-z0-9_]*?` 兜底（O(n^2) ReDoS 源头），改成显式枚举
       // 常见前缀 + 限定长度。截止字符增加 ; , 拦多 cookie 行。
@@ -95,7 +103,10 @@ export function redactInlineSecrets(value: string): string {
       .replace(/\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}/g, '[REDACTED]')
       .replace(/\bnpm_[A-Za-z0-9]{30,}/g, '[REDACTED]')
       // private key / pem 头标识，整段一路擦到 END 标记
-      .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]')
+      .replace(
+        /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+        '[REDACTED PRIVATE KEY]',
+      )
   );
 }
 
@@ -112,7 +123,15 @@ export function summarizeToolInput(input: unknown): string | undefined {
 
   if (typeof input === 'object') {
     const obj = input as Record<string, unknown>;
-    const keyCandidates = ['command', 'query', 'path', 'pattern', 'prompt', 'url', 'name'];
+    const keyCandidates = [
+      'command',
+      'query',
+      'path',
+      'pattern',
+      'prompt',
+      'url',
+      'name',
+    ];
     for (const key of keyCandidates) {
       const value = obj[key];
       if (typeof value === 'string' && value.trim()) {
@@ -140,7 +159,10 @@ export function summarizeToolInput(input: unknown): string | undefined {
  * and clamp the length so the trace stays readable without dumping a 10K-line
  * bash output into the card. Returns undefined for empty / non-textual results.
  */
-export function summarizeToolResult(content: unknown, maxLen = 400): string | undefined {
+export function summarizeToolResult(
+  content: unknown,
+  maxLen = 400,
+): string | undefined {
   let text: string | undefined;
   if (typeof content === 'string') {
     text = content;
@@ -167,7 +189,10 @@ export function summarizeToolResult(content: unknown, maxLen = 400): string | un
  * Extract a skill name from Skill tool input.
  * Tries skillName, skill, name, command fields, then regex-matches leading slashes.
  */
-export function extractSkillName(toolName: unknown, input: unknown): string | undefined {
+export function extractSkillName(
+  toolName: unknown,
+  input: unknown,
+): string | undefined {
   if (toolName !== 'Skill') return undefined;
   if (!input || typeof input !== 'object') return undefined;
   const obj = input as Record<string, unknown>;
@@ -240,10 +265,14 @@ const STALE_BACKGROUND_WAIT_PATTERNS = [
  * progress update ("1/6 done, waiting for the rest"). Only use this predicate
  * after this query has already emitted a result with pending background tasks.
  */
-export function isStaleBackgroundWaitReply(text: string | null | undefined): boolean {
+export function isStaleBackgroundWaitReply(
+  text: string | null | undefined,
+): boolean {
   const trimmed = text?.trim();
   if (!trimmed) return false;
-  return STALE_BACKGROUND_WAIT_PATTERNS.some((pattern) => pattern.test(trimmed));
+  return STALE_BACKGROUND_WAIT_PATTERNS.some((pattern) =>
+    pattern.test(trimmed),
+  );
 }
 
 export function shouldForceBackgroundTaskSummary(params: {
@@ -301,7 +330,11 @@ export class AssistantTextTracker {
   addContentBlocks(blocks: AssistantContentBlock[]): boolean {
     let sawText = false;
     for (const block of blocks) {
-      if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+      if (
+        block.type === 'text' &&
+        typeof block.text === 'string' &&
+        block.text
+      ) {
         this.currentSegment += block.text;
         sawText = true;
       } else if (block.type === 'tool_use') {

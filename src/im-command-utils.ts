@@ -149,9 +149,10 @@ export function resolveLocationInfo(
     folder = group.folder;
   }
 
-  const replyPolicy = group.target_main_jid || group.target_agent_id
-    ? (group.reply_policy || 'source_only')
-    : null;
+  const replyPolicy =
+    group.target_main_jid || group.target_agent_id
+      ? group.reply_policy || 'source_only'
+      : null;
 
   return { locationLine, folder, replyPolicy };
 }
@@ -338,9 +339,11 @@ export function checkImOwnerCommand(
  */
 export function isDirectMessageJid(chatJid: string): boolean {
   if (chatJid.startsWith('qq:')) return chatJid.startsWith('qq:c2c:');
-  if (chatJid.startsWith('dingtalk:')) return chatJid.startsWith('dingtalk:c2c:');
+  if (chatJid.startsWith('dingtalk:'))
+    return chatJid.startsWith('dingtalk:c2c:');
   if (chatJid.startsWith('discord:')) return chatJid.startsWith('discord:dm:');
-  if (chatJid.startsWith('whatsapp:')) return chatJid.endsWith('@s.whatsapp.net');
+  if (chatJid.startsWith('whatsapp:'))
+    return chatJid.endsWith('@s.whatsapp.net');
   if (chatJid.startsWith('wechat:')) return true; // WeChat integration is 1:1 only
   if (chatJid.startsWith('telegram:')) {
     const id = Number(chatJid.slice('telegram:'.length));

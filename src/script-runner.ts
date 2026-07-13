@@ -52,7 +52,9 @@ function killScriptProcessTree(child: ChildProcess): void {
   }
 }
 
-export async function terminateScriptsForOwner(userId: string): Promise<number> {
+export async function terminateScriptsForOwner(
+  userId: string,
+): Promise<number> {
   const targets = [...activeScriptRuns.values()].filter(
     (run) => run.ownerId === userId,
   );
@@ -98,19 +100,18 @@ export async function runScript(
       let timedOut = false;
       let finished = false;
       const child = spawn(command, {
-          cwd,
-          env: {
-            PATH: process.env.PATH,
-            LANG: process.env.LANG || 'en_US.UTF-8',
-            TZ:
-              process.env.TZ ||
-              Intl.DateTimeFormat().resolvedOptions().timeZone,
-            GROUP_FOLDER: groupFolder,
-            HOME: process.env.HOME || cwd,
-          },
-          shell: '/bin/sh',
-          detached: process.platform !== 'win32',
-        });
+        cwd,
+        env: {
+          PATH: process.env.PATH,
+          LANG: process.env.LANG || 'en_US.UTF-8',
+          TZ:
+            process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
+          GROUP_FOLDER: groupFolder,
+          HOME: process.env.HOME || cwd,
+        },
+        shell: '/bin/sh',
+        detached: process.platform !== 'win32',
+      });
       const timeout = setTimeout(() => {
         timedOut = true;
         killScriptProcessTree(child);
@@ -126,25 +127,25 @@ export async function runScript(
         if (finished) return;
         finished = true;
         clearTimeout(timeout);
-          activeScriptRuns.delete(runId);
-          activeScriptCount--;
-          settleRun();
-          const durationMs = Date.now() - startTime;
+        activeScriptRuns.delete(runId);
+        activeScriptCount--;
+        settleRun();
+        const durationMs = Date.now() - startTime;
 
-          if (timedOut) {
-            logger.warn(
-              { command: command.slice(0, 100), groupFolder, durationMs },
-              'Script timed out',
-            );
-          }
+        if (timedOut) {
+          logger.warn(
+            { command: command.slice(0, 100), groupFolder, durationMs },
+            'Script timed out',
+          );
+        }
 
-          resolve({
-            stdout: stdout.slice(0, MAX_BUFFER),
-            stderr: (spawnError?.message || stderr).slice(0, MAX_BUFFER),
-            exitCode: timedOut ? null : (exitCode ?? (spawnError ? 1 : 0)),
-            timedOut,
-            durationMs,
-          });
+        resolve({
+          stdout: stdout.slice(0, MAX_BUFFER),
+          stderr: (spawnError?.message || stderr).slice(0, MAX_BUFFER),
+          exitCode: timedOut ? null : (exitCode ?? (spawnError ? 1 : 0)),
+          timedOut,
+          durationMs,
+        });
       };
       child.once('error', (err) => finish(1, err));
       child.once('close', (code) => finish(code));

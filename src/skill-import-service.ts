@@ -1,23 +1,162 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { lookup } from 'node:dns/promises';
 import AdmZip from 'adm-zip';
 import { validateSkillId } from './skill-utils.js';
 import { isPrivateHostname, validateSafeHttpsUrl } from './url-safety.js';
+import { SKILL_ARCHIVE_MAX_FILE_BYTES } from './http-upload-policy.js';
 
 const execFileAsync = promisify(execFile);
-const MAX_ARCHIVE_BYTES = 10 * 1024 * 1024;
 const MAX_EXPANDED_BYTES = 25 * 1024 * 1024;
 const MAX_ENTRIES = 1_000;
 const MAX_SCAN_DEPTH = 5;
+export const MAX_GIT_REPOSITORY_BYTES = 64 * 1024 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 
 export interface SkillImportResult {
   installed: string[];
   sourceUrl?: string;
   version?: string;
+}
+
+interface DirectoryQuotaCommandOptions {
+  command: string;
+  args: string[];
+  watchDir: string;
+  maxBytes: number;
+  timeoutMs: number;
+  env?: NodeJS.ProcessEnv;
+  pollIntervalMs?: number;
+  label?: string;
+}
+
+function directorySizeUntil(root: string, maxBytes: number): number {
+  if (!fs.existsSync(root)) return 0;
+  let total = 0;
+  const pending = [root];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isDirectory()) {
+      for (const entry of fs.readdirSync(current)) {
+        pending.push(path.join(current, entry));
+      }
+      continue;
+    }
+    if (stat.isFile()) {
+      total += stat.size;
+      if (total > maxBytes) return total;
+    }
+  }
+  return total;
+}
+
+export function runCommandWithDirectoryQuota(
+  options: DirectoryQuotaCommandOptions,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const label = options.label ?? 'Command';
+    const child = spawn(options.command, options.args, {
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+    });
+    let output = '';
+    let quotaExceeded = false;
+    let timedOut = false;
+    let monitorError: Error | undefined;
+    let settled = false;
+
+    const appendOutput = (chunk: Buffer): void => {
+      if (output.length >= MAX_COMMAND_OUTPUT_BYTES) return;
+      output += chunk
+        .toString()
+        .slice(0, MAX_COMMAND_OUTPUT_BYTES - output.length);
+    };
+    child.stdout?.on('data', appendOutput);
+    child.stderr?.on('data', appendOutput);
+
+    const stopProcessGroup = (): void => {
+      if (!child.pid) return;
+      try {
+        if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    };
+
+    const monitor = setInterval(() => {
+      try {
+        if (
+          directorySizeUntil(options.watchDir, options.maxBytes) >
+          options.maxBytes
+        ) {
+          quotaExceeded = true;
+          stopProcessGroup();
+        }
+      } catch (error) {
+        monitorError =
+          error instanceof Error ? error : new Error(String(error));
+        stopProcessGroup();
+      }
+    }, options.pollIntervalMs ?? 50);
+    monitor.unref();
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      stopProcessGroup();
+    }, options.timeoutMs);
+    timeout.unref();
+
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearInterval(monitor);
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve();
+    };
+
+    child.once('error', (error) => finish(error));
+    child.once('close', (code, signal) => {
+      try {
+        if (
+          directorySizeUntil(options.watchDir, options.maxBytes) >
+          options.maxBytes
+        ) {
+          quotaExceeded = true;
+        }
+      } catch (error) {
+        monitorError =
+          error instanceof Error ? error : new Error(String(error));
+      }
+      if (quotaExceeded) {
+        finish(
+          new Error(
+            `${label} exceeds the ${Math.floor(options.maxBytes / 1024 / 1024)} MB size limit`,
+          ),
+        );
+      } else if (timedOut) {
+        finish(new Error(`${label} timed out`));
+      } else if (monitorError) {
+        finish(monitorError);
+      } else if (code !== 0) {
+        const details = output.trim();
+        finish(
+          new Error(
+            `${label} failed${signal ? ` (${signal})` : ''}${details ? `: ${details}` : ''}`,
+          ),
+        );
+      } else {
+        finish();
+      }
+    });
+  });
 }
 
 function isSymlinkMode(attributes: number): boolean {
@@ -102,10 +241,11 @@ function findSkillDirectories(
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function installSkillDirectories(
+export function installSkillDirectoriesTransactionally(
   candidates: Array<{ id: string; dir: string }>,
   targetRoot: string,
   replace: boolean,
+  commit?: (installed: string[]) => void,
 ): string[] {
   fs.mkdirSync(targetRoot, { recursive: true });
   const conflicts = candidates.filter(({ id }) =>
@@ -136,6 +276,7 @@ function installSkillDirectories(
       fs.renameSync(path.join(transactionDir, candidate.id), destination);
       installed.push(candidate.id);
     }
+    commit?.([...installed]);
     for (const { backup } of backups)
       fs.rmSync(backup, { recursive: true, force: true });
     return installed;
@@ -157,6 +298,7 @@ export async function importSkillsFromGit(options: {
   subdirectory?: string;
   targetRoot: string;
   replace?: boolean;
+  commit?: (result: SkillImportResult) => void;
 }): Promise<SkillImportResult> {
   const reason = validateSafeHttpsUrl(options.url);
   if (reason) throw new Error(`Refused Git URL: ${reason}`);
@@ -210,8 +352,13 @@ export async function importSkillsFromGit(options: {
     ];
     if (options.ref) args.push('--branch', options.ref);
     args.push('--', options.url, repoDir);
-    await execFileAsync('git', args, {
-      timeout: 60_000,
+    await runCommandWithDirectoryQuota({
+      command: 'git',
+      args,
+      watchDir: tempDir,
+      maxBytes: MAX_GIT_REPOSITORY_BYTES,
+      timeoutMs: 60_000,
+      label: 'Git repository',
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',
@@ -229,18 +376,25 @@ export async function importSkillsFromGit(options: {
     }
     const candidates = findSkillDirectories(scanRoot);
     for (const candidate of candidates) assertSafeSkillTree(candidate.dir);
-    const installed = installSkillDirectories(
-      candidates,
-      options.targetRoot,
-      options.replace === true,
-    );
     const { stdout } = await execFileAsync('git', [
       '-C',
       repoDir,
       'rev-parse',
       'HEAD',
     ]);
-    return { installed, sourceUrl: options.url, version: stdout.trim() };
+    const version = stdout.trim();
+    const installed = installSkillDirectoriesTransactionally(
+      candidates,
+      options.targetRoot,
+      options.replace === true,
+      (installedIds) =>
+        options.commit?.({
+          installed: installedIds,
+          sourceUrl: options.url,
+          version,
+        }),
+    );
+    return { installed, sourceUrl: options.url, version };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -251,10 +405,11 @@ export function importSkillsFromZip(options: {
   archiveName: string;
   targetRoot: string;
   replace?: boolean;
+  commit?: (result: SkillImportResult) => void;
 }): SkillImportResult {
   if (
     options.archive.byteLength === 0 ||
-    options.archive.byteLength > MAX_ARCHIVE_BYTES
+    options.archive.byteLength > SKILL_ARCHIVE_MAX_FILE_BYTES
   ) {
     throw new Error('ZIP archive must be between 1 byte and 10 MB');
   }
@@ -278,14 +433,17 @@ export function importSkillsFromZip(options: {
     zip.extractAllTo(tempDir, true, false);
     assertSafeSkillTree(tempDir);
     const candidates = findSkillDirectories(tempDir);
-    return {
-      installed: installSkillDirectories(
-        candidates,
-        options.targetRoot,
-        options.replace === true,
-      ),
-      sourceUrl: options.archiveName,
-    };
+    const installed = installSkillDirectoriesTransactionally(
+      candidates,
+      options.targetRoot,
+      options.replace === true,
+      (installedIds) =>
+        options.commit?.({
+          installed: installedIds,
+          sourceUrl: options.archiveName,
+        }),
+    );
+    return { installed, sourceUrl: options.archiveName };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

@@ -8,12 +8,22 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 
 const SHARED_TMP =
   process.env.HAPPYCLAW_TEST_DATA_DIR ??
   (() => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-stop-interrupt-'));
+    const d = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'happyclaw-stop-interrupt-'),
+    );
     process.env.HAPPYCLAW_TEST_DATA_DIR = d;
     return d;
   })();
@@ -43,7 +53,9 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
       c.set('user', {
         id: process.env.HAPPYCLAW_TEST_USER_ID ?? 'alice',
         username: 'alice',
-        role: (process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member') as 'admin' | 'member',
+        role: (process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member') as
+          | 'admin'
+          | 'member',
         permissions: [],
       });
       return next();
@@ -84,7 +96,9 @@ function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
   process.env.HAPPYCLAW_TEST_USER_ROLE = role;
 }
 
-async function post(pathSuffix: string): Promise<{ status: number; body: any }> {
+async function post(
+  pathSuffix: string,
+): Promise<{ status: number; body: any }> {
   const res = await groupRoutes.request(
     `/${encodeURIComponent(GROUP_JID)}${pathSuffix}`,
     { method: 'POST' },

@@ -1262,25 +1262,53 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
 
       {/* Preview / Editor Overlays */}
       {preview?.kind === 'image' && (
-        <ImagePreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <ImagePreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'edit' && (
-        <TextEditor groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <TextEditor
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'markdown' && (
-        <MarkdownFileViewer groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <MarkdownFileViewer
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'pdf' && (
-        <PdfPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <PdfPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'video' && (
-        <VideoPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <VideoPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'audio' && (
-        <AudioPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <AudioPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'text' && (
-        <GenericTextPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <GenericTextPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
     </div>
   );

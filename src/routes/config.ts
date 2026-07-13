@@ -8,6 +8,10 @@ import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
 import { Hono } from 'hono';
 import { DATA_DIR, updateWeChatNoProxy } from '../config.js';
+import {
+  avatarUploadBodyLimit,
+  AVATAR_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
 import type { Variables } from '../web-context.js';
 import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
 import { extractChatId, getChannelType } from '../im-channel.js';
@@ -1293,7 +1297,6 @@ const SYSTEM_AGENT_AVATAR_EXTENSIONS: Record<string, string> = {
   'image/gif': '.gif',
   'image/webp': '.webp',
 };
-const SYSTEM_AGENT_AVATAR_MAX_SIZE = 3 * 1024 * 1024;
 
 function removeStaleSystemAgentAvatars(keep?: string): void {
   if (!fs.existsSync(SYSTEM_AGENT_AVATARS_DIR)) return;
@@ -1345,6 +1348,7 @@ configRoutes.post(
   '/appearance/avatar',
   authMiddleware,
   adminRoleMiddleware,
+  avatarUploadBodyLimit,
   async (c) => {
     if (!(c.req.header('content-type') || '').includes('multipart/form-data')) {
       return c.json({ error: 'Expected multipart/form-data' }, 400);
@@ -1354,8 +1358,8 @@ configRoutes.post(
     if (!file || !(file instanceof File)) {
       return c.json({ error: 'No avatar file provided' }, 400);
     }
-    if (file.size > SYSTEM_AGENT_AVATAR_MAX_SIZE) {
-      return c.json({ error: 'File too large (max 3MB)' }, 400);
+    if (file.size > AVATAR_MAX_FILE_BYTES) {
+      return c.json({ error: 'File too large (max 3MB)' }, 413);
     }
     const extension = SYSTEM_AGENT_AVATAR_EXTENSIONS[file.type];
     if (!extension) {

@@ -32,6 +32,18 @@ function archiveFile(): File {
 }
 
 describe('Skills import routes', () => {
+  test('rejects an oversized archive before multipart parsing', async () => {
+    const response = await routes.request('/import/archive', {
+      method: 'POST',
+      headers: {
+        'content-type': 'multipart/form-data; boundary=test',
+        'content-length': String(11 * 1024 * 1024),
+      },
+      body: '--test--',
+    });
+    expect(response.status).toBe(413);
+  });
+
   test('imports ZIP skills and exposes source metadata', async () => {
     const form = new FormData();
     form.append('archive', archiveFile());

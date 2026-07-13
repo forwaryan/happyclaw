@@ -159,9 +159,7 @@ describe('agent-runner IPC delivery turn tracker', () => {
       parseIpcReceipt({
         deliveryId: 'd',
         chatJid: 'web:main',
-        coveredCursors: [
-          { timestamp: '2026-07-10T00:00:02.000Z', id: 'm2' },
-        ],
+        coveredCursors: [{ timestamp: '2026-07-10T00:00:02.000Z', id: 'm2' }],
         cursor: { timestamp: '2026-07-10T00:00:01.000Z', id: 'm1' },
       }),
     ).toBeUndefined();

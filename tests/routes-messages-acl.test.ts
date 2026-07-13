@@ -26,12 +26,22 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 
 const SHARED_TMP =
   process.env.HAPPYCLAW_TEST_DATA_DIR ??
   (() => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-routes-messages-'));
+    const d = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'happyclaw-routes-messages-'),
+    );
     process.env.HAPPYCLAW_TEST_DATA_DIR = d;
     return d;
   })();
@@ -65,7 +75,9 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
         id: process.env.HAPPYCLAW_TEST_USER_ID ?? 'alice',
         username: 'alice',
         display_name: 'Alice',
-        role: (process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member') as 'admin' | 'member',
+        role: (process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member') as
+          | 'admin'
+          | 'member',
         permissions: [],
       });
       return next();
@@ -119,7 +131,9 @@ function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
   process.env.HAPPYCLAW_TEST_USER_ROLE = role;
 }
 
-async function postMessage(body: unknown): Promise<{ status: number; body: any }> {
+async function postMessage(
+  body: unknown,
+): Promise<{ status: number; body: any }> {
   const res = await app.request('/api/messages', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -172,7 +186,10 @@ describe('POST /api/messages — /clear interception ACL', () => {
   test('non-owner is denied (403 Access denied)', async () => {
     seedTestGroup();
     asUser(OUTSIDER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '/clear' });
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '/clear',
+    });
     expect(status).toBe(403);
     expect(body.error).toMatch(/access denied/i);
     expect(stopGroupCalls).toHaveLength(0);
@@ -181,21 +198,29 @@ describe('POST /api/messages — /clear interception ACL', () => {
   test('owner can /clear (200, session reset)', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '/clear' });
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '/clear',
+    });
     expect(status).toBe(200);
     expect(body.cleared).toBe(true);
     // executeSessionReset stopped the folder's sibling containers …
     expect(stopGroupCalls.length).toBeGreaterThan(0);
     expect(stopGroupCalls.every((c) => c.opts?.force === true)).toBe(true);
     // … and wrote a context_reset divider into the chat history.
-    const msgs = db.getMessagesPage(GROUP_JID, undefined, 10) as Array<{ content: string }>;
+    const msgs = db.getMessagesPage(GROUP_JID, undefined, 10) as Array<{
+      content: string;
+    }>;
     expect(msgs.some((m) => m.content === 'context_reset')).toBe(true);
   });
 
   test('owner with leading/trailing whitespace still triggers /clear', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '  /clear  ' });
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '  /clear  ',
+    });
     expect(status).toBe(200);
     expect(body.cleared).toBe(true);
   });

@@ -23,6 +23,10 @@ import { buildAgentCapabilityPreview } from '../agent-capability-preview.js';
 import { loadUserMcpServers } from '../mcp-utils.js';
 import { validateSkillId } from '../skill-utils.js';
 import {
+  avatarUploadBodyLimit,
+  AVATAR_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
+import {
   listWorkspaceGroupsForAgentProfile,
   quiesceWorkspaceRunnersAroundCommit,
   resolveEffectiveAgentProfile,
@@ -46,7 +50,6 @@ import {
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
-const MAX_AVATAR_SIZE = 3 * 1024 * 1024;
 const AVATAR_EXTENSIONS: Record<string, string> = {
   'image/jpeg': '.jpg',
   'image/png': '.png',
@@ -262,47 +265,52 @@ agentProfileRoutes.post(
   },
 );
 
-agentProfileRoutes.post('/:id/avatar', authMiddleware, async (c) => {
-  const user = c.get('user') as AuthUser;
-  const id = c.req.param('id');
-  const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
-  if (profile.is_default) {
-    return c.json(
-      { error: 'Configure the main HappyClaw avatar in system settings' },
-      400,
-    );
-  }
-  if (!(c.req.header('content-type') || '').includes('multipart/form-data')) {
-    return c.json({ error: 'Expected multipart/form-data' }, 400);
-  }
-  const formData = await c.req.formData();
-  const file = formData.get('avatar');
-  if (!file || !(file instanceof File)) {
-    return c.json({ error: 'No avatar file provided' }, 400);
-  }
-  if (file.size > MAX_AVATAR_SIZE) {
-    return c.json({ error: 'File too large (max 3MB)' }, 400);
-  }
-  const extension = AVATAR_EXTENSIONS[file.type];
-  if (!extension) {
-    return c.json(
-      { error: 'Unsupported image type. Use jpg, png, gif or webp' },
-      400,
-    );
-  }
+agentProfileRoutes.post(
+  '/:id/avatar',
+  authMiddleware,
+  avatarUploadBodyLimit,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const id = c.req.param('id');
+    const profile = getAgentProfileForUser(id, user.id);
+    if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+    if (profile.is_default) {
+      return c.json(
+        { error: 'Configure the main HappyClaw avatar in system settings' },
+        400,
+      );
+    }
+    if (!(c.req.header('content-type') || '').includes('multipart/form-data')) {
+      return c.json({ error: 'Expected multipart/form-data' }, 400);
+    }
+    const formData = await c.req.formData();
+    const file = formData.get('avatar');
+    if (!file || !(file instanceof File)) {
+      return c.json({ error: 'No avatar file provided' }, 400);
+    }
+    if (file.size > AVATAR_MAX_FILE_BYTES) {
+      return c.json({ error: 'File too large (max 3MB)' }, 413);
+    }
+    const extension = AVATAR_EXTENSIONS[file.type];
+    if (!extension) {
+      return c.json(
+        { error: 'Unsupported image type. Use jpg, png, gif or webp' },
+        400,
+      );
+    }
 
-  fs.mkdirSync(AVATARS_DIR, { recursive: true });
-  const filename = `agent-profile-${id}-${randomBytes(4).toString('hex')}${extension}`;
-  const destination = path.join(AVATARS_DIR, filename);
-  const temporary = `${destination}.tmp`;
-  fs.writeFileSync(temporary, Buffer.from(await file.arrayBuffer()));
-  fs.renameSync(temporary, destination);
-  const avatarUrl = `/api/auth/avatars/${filename}`;
-  const updated = updateAgentProfile(id, user.id, { avatarUrl });
-  removeProfileAvatarFiles(id, filename);
-  return c.json({ profile: updated, avatarUrl });
-});
+    fs.mkdirSync(AVATARS_DIR, { recursive: true });
+    const filename = `agent-profile-${id}-${randomBytes(4).toString('hex')}${extension}`;
+    const destination = path.join(AVATARS_DIR, filename);
+    const temporary = `${destination}.tmp`;
+    fs.writeFileSync(temporary, Buffer.from(await file.arrayBuffer()));
+    fs.renameSync(temporary, destination);
+    const avatarUrl = `/api/auth/avatars/${filename}`;
+    const updated = updateAgentProfile(id, user.id, { avatarUrl });
+    removeProfileAvatarFiles(id, filename);
+    return c.json({ profile: updated, avatarUrl });
+  },
+);
 
 agentProfileRoutes.delete('/:id/avatar', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;

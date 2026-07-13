@@ -70,9 +70,9 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const { theme, toggle: toggleTheme } = useTheme();
   const [panelOpen, setPanelOpen] = useState(false);
   const [mobileContextOpen, setMobileContextOpen] = useState(false);
-  const [contextPanelView, setContextPanelView] = useState<
-    'files' | 'env'
-  >('files');
+  const [contextPanelView, setContextPanelView] = useState<'files' | 'env'>(
+    'files',
+  );
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const [resetAgentId, setResetAgentId] = useState<string | null>(null);

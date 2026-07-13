@@ -7,10 +7,7 @@ import {
 } from '../src/delivery-cursor.js';
 import type { MessageCursor } from '../src/types.js';
 
-function after(
-  candidate: MessageCursor,
-  base: MessageCursor,
-): boolean {
+function after(candidate: MessageCursor, base: MessageCursor): boolean {
   return (
     candidate.timestamp > base.timestamp ||
     (candidate.timestamp === base.timestamp && candidate.id > base.id)
@@ -66,12 +63,12 @@ describe('out-of-band completion vs unacknowledged IPC cursor', () => {
     const m2 = { timestamp: '2026-07-10T00:00:02.000Z', id: 'm2' };
     const m3 = { timestamp: '2026-07-10T00:00:03.000Z', id: 'm3' };
 
-    expect(
-      hasUncoveredCursorMessageThrough([m1, m2], m2, [m1, m2]),
-    ).toBe(false);
-    expect(
-      hasUncoveredCursorMessageThrough([m1, m2, m3], m3, [m1, m3]),
-    ).toBe(true);
+    expect(hasUncoveredCursorMessageThrough([m1, m2], m2, [m1, m2])).toBe(
+      false,
+    );
+    expect(hasUncoveredCursorMessageThrough([m1, m2, m3], m3, [m1, m3])).toBe(
+      true,
+    );
   });
 
   test('acknowledging the gap flushes deferred replies through the durable cursor', () => {
@@ -100,8 +97,8 @@ describe('out-of-band completion vs unacknowledged IPC cursor', () => {
     commit(d1);
     expect(deferred.flush('web:main', hasEarlier, commit)).toEqual([d2, d3]);
     expect(committed).toEqual(d3);
-    expect(
-      dbMessages.filter((message) => after(message, committed)),
-    ).toEqual([]);
+    expect(dbMessages.filter((message) => after(message, committed))).toEqual(
+      [],
+    );
   });
 });

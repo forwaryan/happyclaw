@@ -84,11 +84,8 @@ vi.mock('../src/container-runner.js', async (importOriginal) => {
 });
 
 const db = await import('../src/db.js');
-const {
-  enqueueIsolatedScheduledTask,
-  getRunningTaskIds,
-  triggerTaskNow,
-} = await import('../src/task-scheduler.js');
+const { enqueueIsolatedScheduledTask, getRunningTaskIds, triggerTaskNow } =
+  await import('../src/task-scheduler.js');
 
 const GROUP_JID = 'web:task-contract';
 const GROUP_FOLDER = 'task-contract';
@@ -226,9 +223,7 @@ describe('scheduled task workspace/session contract', () => {
     const input = runContainerAgentMock.mock.calls[0][1];
     expect(input.groupFolder).toBe(GROUP_FOLDER);
     expect(input.chatJid).toBe(GROUP_JID);
-    expect(input.taskRunId).toMatch(
-      new RegExp(`^task-${taskId}-[a-f0-9-]+$`),
-    );
+    expect(input.taskRunId).toMatch(new RegExp(`^task-${taskId}-[a-f0-9-]+$`));
     expect(input.taskRunId).toMatch(/^[a-zA-Z0-9_-]+$/);
     expect(input.sessionAgentId).toBe(`task-${input.taskRunId}`);
     expect(input.sessionAgentId).toMatch(/^[a-zA-Z0-9_-]+$/);
@@ -258,13 +253,7 @@ describe('scheduled task workspace/session contract', () => {
     );
     expect(
       fs.existsSync(
-        path.join(
-          tmpDir,
-          'ipc',
-          GROUP_FOLDER,
-          'tasks-run',
-          input.taskRunId,
-        ),
+        path.join(tmpDir, 'ipc', GROUP_FOLDER, 'tasks-run', input.taskRunId),
       ),
     ).toBe(false);
     const storedTask = db.getTaskById(taskId)!;
@@ -504,9 +493,9 @@ describe('scheduled task workspace/session contract', () => {
         },
       },
     } as any;
-    expect(() =>
-      enqueueIsolatedScheduledTask(snapshot, throwingDeps),
-    ).toThrow('queue failed');
+    expect(() => enqueueIsolatedScheduledTask(snapshot, throwingDeps)).toThrow(
+      'queue failed',
+    );
     expect(getRunningTaskIds()).not.toContain(taskId);
 
     let queuedRun: (() => Promise<void>) | null = null;

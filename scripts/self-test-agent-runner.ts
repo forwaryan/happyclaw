@@ -52,7 +52,9 @@ for (const result of incidentReplay) {
     forced = true;
     const prompt = buildBackgroundTaskSummaryPrompt();
     if (!prompt.includes('Do not send another progress update')) {
-      throw new Error('Forced continuation prompt is missing the anti-progress-update instruction');
+      throw new Error(
+        'Forced continuation prompt is missing the anti-progress-update instruction',
+      );
     }
     continue;
   }
@@ -67,4 +69,6 @@ if (!forced) {
   throw new Error('Incident replay did not force a final-summary continuation');
 }
 
-console.log('agent-runner self-test passed: stale background-task wait reply is suppressed and continued');
+console.log(
+  'agent-runner self-test passed: stale background-task wait reply is suppressed and continued',
+);

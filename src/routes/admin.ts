@@ -13,7 +13,11 @@ import {
   AdminPatchUserSchema,
   InviteCreateSchema,
 } from '../schemas.js';
-import { isUsernameConflictError, toUserPublic, setSessionCookie } from './auth.js';
+import {
+  isUsernameConflictError,
+  toUserPublic,
+  setSessionCookie,
+} from './auth.js';
 import type {
   AuthUser,
   Permission,
@@ -34,7 +38,6 @@ import {
   updateUserFields,
   deleteUser,
   restoreUser,
-
   deleteUserSessionsByUserId,
   createUserSession,
   getActiveAdminCount,
@@ -466,9 +469,7 @@ adminRoutes.patch(
       updates.permissions = nextPermissions;
       // 权限变更也走作废逻辑，与角色变更对齐。比较使用规范化后的 permissions
       // 排序+JSON 字符串比对，避免顺序差异误判为变更。
-      const prevSorted = JSON.stringify(
-        [...(target.permissions ?? [])].sort(),
-      );
+      const prevSorted = JSON.stringify([...(target.permissions ?? [])].sort());
       const nextSorted = JSON.stringify([...nextPermissions].sort());
       if (prevSorted !== nextSorted) {
         postCommitActions.push(() => {
@@ -820,7 +821,12 @@ adminRoutes.delete(
       );
     }
     {
-      const denial = denyEscalationToTarget(c, actor, target, 'revoke sessions for');
+      const denial = denyEscalationToTarget(
+        c,
+        actor,
+        target,
+        'revoke sessions for',
+      );
       if (denial) return denial;
     }
 

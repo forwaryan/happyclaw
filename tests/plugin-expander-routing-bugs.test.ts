@@ -187,8 +187,14 @@ describe('cursor advance — #19 P1-1/P1-2 web reply must not commit past earlie
       lastCommittedCursor: {},
     };
     const jid = 'web:main';
-    const T1: MessageCursor = { timestamp: '2026-04-26T10:00:00Z', id: 'm1-earlier' };
-    const T2: MessageCursor = { timestamp: '2026-04-26T10:00:01Z', id: 'm2-reply' };
+    const T1: MessageCursor = {
+      timestamp: '2026-04-26T10:00:00Z',
+      id: 'm1-earlier',
+    };
+    const T2: MessageCursor = {
+      timestamp: '2026-04-26T10:00:01Z',
+      id: 'm2-reply',
+    };
 
     // Web reply path now uses advanceNextPullCursorOnly (post-fix).
     advanceNextPullCursorOnly(state, jid, T2);
@@ -208,8 +214,14 @@ describe('cursor advance — #19 P1-1/P1-2 web reply must not commit past earlie
       lastCommittedCursor: {},
     };
     const virtualJid = 'web:main#agent:abc-123';
-    const T1: MessageCursor = { timestamp: '2026-04-26T10:00:00Z', id: 'agent-msg-1' };
-    const T2: MessageCursor = { timestamp: '2026-04-26T10:00:01Z', id: 'agent-reply' };
+    const T1: MessageCursor = {
+      timestamp: '2026-04-26T10:00:00Z',
+      id: 'agent-msg-1',
+    };
+    const T2: MessageCursor = {
+      timestamp: '2026-04-26T10:00:01Z',
+      id: 'agent-reply',
+    };
 
     advanceNextPullCursorOnly(state, virtualJid, T2);
 
@@ -225,8 +237,14 @@ describe('cursor advance — P2-bug-2 cold-start must not commit past unprocesse
       lastCommittedCursor: {},
     };
     const jid = 'feishu:room';
-    const T1: MessageCursor = { timestamp: '2026-04-26T10:00:00Z', id: 'hello' };
-    const T2: MessageCursor = { timestamp: '2026-04-26T10:00:01Z', id: 'result' };
+    const T1: MessageCursor = {
+      timestamp: '2026-04-26T10:00:00Z',
+      id: 'hello',
+    };
+    const T2: MessageCursor = {
+      timestamp: '2026-04-26T10:00:01Z',
+      id: 'result',
+    };
 
     // State before: nothing committed, nothing pulled.
     // Cold-start expander processes /result reply but toSend = [hello] still pending.
@@ -249,7 +267,10 @@ describe('cursor advance — P2-bug-2 cold-start must not commit past unprocesse
       lastCommittedCursor: {},
     };
     const jid = 'feishu:room';
-    const T2: MessageCursor = { timestamp: '2026-04-26T10:00:01Z', id: 'result' };
+    const T2: MessageCursor = {
+      timestamp: '2026-04-26T10:00:01Z',
+      id: 'result',
+    };
 
     // toSend is empty → production picks setCursors.
     setCursors(state, jid, T2);

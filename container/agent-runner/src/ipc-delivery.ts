@@ -36,7 +36,8 @@ export function parseIpcReceipt(
     if (
       !Array.isArray(receipt.coveredCursors) ||
       receipt.coveredCursors.length === 0
-    ) return undefined;
+    )
+      return undefined;
     coveredCursors = [];
     for (const value of receipt.coveredCursors) {
       if (!value || typeof value !== 'object') return undefined;
@@ -44,7 +45,8 @@ export function parseIpcReceipt(
       if (
         typeof covered.timestamp !== 'string' ||
         typeof covered.id !== 'string'
-      ) return undefined;
+      )
+        return undefined;
       coveredCursors.push({ timestamp: covered.timestamp, id: covered.id });
     }
     const maximum = [...coveredCursors].sort((a, b) => {
@@ -54,10 +56,8 @@ export function parseIpcReceipt(
       if (a.id === b.id) return 0;
       return a.id < b.id ? -1 : 1;
     })[coveredCursors.length - 1];
-    if (
-      maximum.timestamp !== cursor.timestamp ||
-      maximum.id !== cursor.id
-    ) return undefined;
+    if (maximum.timestamp !== cursor.timestamp || maximum.id !== cursor.id)
+      return undefined;
   }
   return {
     deliveryId: receipt.deliveryId,

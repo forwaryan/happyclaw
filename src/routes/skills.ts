@@ -13,8 +13,14 @@ import { DATA_DIR } from '../config.js';
 import { getEffectiveExternalDir } from '../runtime-config.js';
 import { validateSafeHttpsUrl } from '../url-safety.js';
 import {
+  skillArchiveUploadBodyLimit,
+  SKILL_ARCHIVE_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
+import {
   importSkillsFromGit,
   importSkillsFromZip,
+  installSkillDirectoriesTransactionally,
+  runCommandWithDirectoryQuota,
 } from '../skill-import-service.js';
 import {
   parseFrontmatter,
@@ -25,7 +31,14 @@ import {
 } from '../skill-utils.js';
 
 const execFileAsync = promisify(execFile);
-let skillInstallLock: Promise<void> = Promise.resolve();
+const MAX_SKILL_INSTALL_BYTES = 64 * 1024 * 1024;
+
+interface SkillMutationLockState {
+  tail: Promise<void>;
+  references: number;
+}
+
+const skillMutationLocks = new Map<string, SkillMutationLockState>();
 
 const skillsRoutes = new Hono<{ Variables: Variables }>();
 
@@ -101,7 +114,13 @@ function readSkillsManifest(userId: string): SkillsManifest {
 function writeSkillsManifest(userId: string, manifest: SkillsManifest): void {
   const manifestPath = getSkillsManifestPath(userId);
   fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  const temporaryPath = `${manifestPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(manifest, null, 2));
+    fs.renameSync(temporaryPath, manifestPath);
+  } finally {
+    fs.rmSync(temporaryPath, { force: true });
+  }
 }
 
 /**
@@ -372,25 +391,6 @@ function findModifiedEntries(dir: string, afterMs: number): string[] {
   return result;
 }
 
-/**
- * Copy a skill entry (directory or symlink target) to dest.
- * Resolves symlinks and copies the real content so the copy is self-contained.
- */
-function copySkillToUser(src: string, dest: string): void {
-  // Resolve symlink to get the real directory
-  let realSrc = src;
-  try {
-    const lstat = fs.lstatSync(src);
-    if (lstat.isSymbolicLink()) {
-      realSrc = fs.realpathSync(src);
-    }
-  } catch {
-    // use src as-is
-  }
-
-  fs.cpSync(realSrc, dest, { recursive: true });
-}
-
 // --- Search cache (LRU, 5min TTL, max 100 entries) ---
 
 interface CacheEntry<T> {
@@ -528,18 +528,31 @@ async function fetchSkillMdFromGitHub(
   return null;
 }
 
-async function withSkillInstallLock<T>(fn: () => Promise<T>): Promise<T> {
-  const previous = skillInstallLock.catch(() => undefined);
+async function withUserSkillMutationLock<T>(
+  userId: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  let state = skillMutationLocks.get(userId);
+  if (!state) {
+    state = { tail: Promise.resolve(), references: 0 };
+    skillMutationLocks.set(userId, state);
+  }
+  state.references += 1;
+  const previous = state.tail.catch(() => undefined);
   let release: () => void = () => undefined;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  skillInstallLock = previous.then(() => current);
+  state.tail = previous.then(() => current);
   await previous;
   try {
     return await fn();
   } finally {
     release();
+    state.references -= 1;
+    if (state.references === 0 && skillMutationLocks.get(userId) === state) {
+      skillMutationLocks.delete(userId);
+    }
   }
 }
 
@@ -641,20 +654,21 @@ skillsRoutes.post('/import/git', authMiddleware, async (c) => {
   if (!url) return c.json({ error: 'Git URL is required' }, 400);
 
   try {
-    const result = await withSkillInstallLock(() =>
+    const result = await withUserSkillMutationLock(authUser.id, () =>
       importSkillsFromGit({
         url,
         ref: ref || undefined,
         subdirectory: subdirectory || undefined,
         targetRoot: getUserSkillsDir(authUser.id),
         replace: body.replace === true,
+        commit: (imported) =>
+          recordImportedSkills(authUser.id, imported.installed, {
+            source: 'git',
+            sourceUrl: imported.sourceUrl,
+            version: imported.version,
+          }),
       }),
     );
-    recordImportedSkills(authUser.id, result.installed, {
-      source: 'git',
-      sourceUrl: result.sourceUrl,
-      version: result.version,
-    });
     return c.json({ success: true, ...result });
   } catch (error) {
     const message =
@@ -666,44 +680,53 @@ skillsRoutes.post('/import/git', authMiddleware, async (c) => {
   }
 });
 
-skillsRoutes.post('/import/archive', authMiddleware, async (c) => {
-  const authUser = c.get('user') as AuthUser;
-  let formData: FormData;
-  try {
-    formData = await c.req.formData();
-  } catch {
-    return c.json({ error: 'A multipart ZIP archive is required' }, 400);
-  }
-  const archive = formData.get('archive');
-  if (
-    !(archive instanceof File) ||
-    !archive.name.toLowerCase().endsWith('.zip')
-  ) {
-    return c.json({ error: 'archive must be a ZIP file' }, 400);
-  }
-  try {
-    const result = await withSkillInstallLock(async () =>
-      importSkillsFromZip({
-        archive: Buffer.from(await archive.arrayBuffer()),
-        archiveName: archive.name,
-        targetRoot: getUserSkillsDir(authUser.id),
-        replace: formData.get('replace') === 'true',
-      }),
-    );
-    recordImportedSkills(authUser.id, result.installed, {
-      source: 'zip',
-      sourceUrl: archive.name,
-    });
-    return c.json({ success: true, ...result });
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : 'ZIP import failed';
-    return c.json(
-      { error: message },
-      message.startsWith('Skill already exists:') ? 409 : 400,
-    );
-  }
-});
+skillsRoutes.post(
+  '/import/archive',
+  authMiddleware,
+  skillArchiveUploadBodyLimit,
+  async (c) => {
+    const authUser = c.get('user') as AuthUser;
+    let formData: FormData;
+    try {
+      formData = await c.req.formData();
+    } catch {
+      return c.json({ error: 'A multipart ZIP archive is required' }, 400);
+    }
+    const archive = formData.get('archive');
+    if (
+      !(archive instanceof File) ||
+      !archive.name.toLowerCase().endsWith('.zip')
+    ) {
+      return c.json({ error: 'archive must be a ZIP file' }, 400);
+    }
+    if (archive.size > SKILL_ARCHIVE_MAX_FILE_BYTES) {
+      return c.json({ error: 'ZIP archive is too large (max 10MB)' }, 413);
+    }
+    try {
+      const result = await withUserSkillMutationLock(authUser.id, async () =>
+        importSkillsFromZip({
+          archive: Buffer.from(await archive.arrayBuffer()),
+          archiveName: archive.name,
+          targetRoot: getUserSkillsDir(authUser.id),
+          replace: formData.get('replace') === 'true',
+          commit: (imported) =>
+            recordImportedSkills(authUser.id, imported.installed, {
+              source: 'zip',
+              sourceUrl: imported.sourceUrl,
+            }),
+        }),
+      );
+      return c.json({ success: true, ...result });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'ZIP import failed';
+      return c.json(
+        { error: message },
+        message.startsWith('Skill already exists:') ? 409 : 400,
+      );
+    }
+  },
+);
 
 skillsRoutes.get('/:id', authMiddleware, (c) => {
   const id = c.req.param('id');
@@ -732,44 +755,46 @@ skillsRoutes.patch('/:id', authMiddleware, async (c) => {
 
   if (!validateSkillId(id)) return c.json({ error: 'Invalid skill ID' }, 400);
 
-  const userDir = getUserSkillsDir(authUser.id);
-  const skillDir = path.join(userDir, id);
+  return withUserSkillMutationLock(authUser.id, () => {
+    const userDir = getUserSkillsDir(authUser.id);
+    const skillDir = path.join(userDir, id);
 
-  if (!fs.existsSync(skillDir)) {
-    return c.json(
-      { error: 'Skill not found or is not a user-level skill' },
-      404,
+    if (!fs.existsSync(skillDir)) {
+      return c.json(
+        { error: 'Skill not found or is not a user-level skill' },
+        404,
+      );
+    }
+    if (!validateSkillPath(userDir, skillDir)) {
+      return c.json({ error: 'Invalid skill path' }, 400);
+    }
+
+    const srcPath = path.join(
+      skillDir,
+      enabled ? 'SKILL.md.disabled' : 'SKILL.md',
     );
-  }
-  if (!validateSkillPath(userDir, skillDir)) {
-    return c.json({ error: 'Invalid skill path' }, 400);
-  }
-
-  const srcPath = path.join(
-    skillDir,
-    enabled ? 'SKILL.md.disabled' : 'SKILL.md',
-  );
-  const dstPath = path.join(
-    skillDir,
-    enabled ? 'SKILL.md' : 'SKILL.md.disabled',
-  );
-
-  if (!fs.existsSync(srcPath)) {
-    return c.json(
-      { error: 'Skill not found or already in desired state' },
-      404,
+    const dstPath = path.join(
+      skillDir,
+      enabled ? 'SKILL.md' : 'SKILL.md.disabled',
     );
-  }
 
-  fs.renameSync(srcPath, dstPath);
-  return c.json({ success: true });
+    if (!fs.existsSync(srcPath)) {
+      return c.json(
+        { error: 'Skill not found or already in desired state' },
+        404,
+      );
+    }
+
+    fs.renameSync(srcPath, dstPath);
+    return c.json({ success: true });
+  });
 });
 
 /**
  * Delete a user-level skill by ID.
  * Reusable by both the HTTP route and IPC handler.
  */
-function deleteSkillForUser(
+function deleteSkillForUserUnlocked(
   userId: string,
   skillId: string,
 ): { success: boolean; error?: string } {
@@ -791,11 +816,27 @@ function deleteSkillForUser(
     return { success: false, error: 'Invalid skill path' };
   }
 
+  const backupDir = path.join(
+    userDir,
+    `.delete-${skillId}-${process.pid}-${Date.now()}`,
+  );
+  const previousManifest = readSkillsManifest(userId);
   try {
-    fs.rmSync(skillDir, { recursive: true, force: true });
-    removeFromSkillsManifest(userId, skillId);
+    fs.renameSync(skillDir, backupDir);
+    const nextManifest = structuredClone(previousManifest);
+    delete nextManifest.skills[skillId];
+    writeSkillsManifest(userId, nextManifest);
+    fs.rmSync(backupDir, { recursive: true, force: true });
     return { success: true };
   } catch (error) {
+    try {
+      if (fs.existsSync(backupDir) && !fs.existsSync(skillDir)) {
+        fs.renameSync(backupDir, skillDir);
+      }
+      writeSkillsManifest(userId, previousManifest);
+    } catch {
+      // Preserve the original error; a leftover hidden backup remains recoverable.
+    }
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
@@ -803,34 +844,55 @@ function deleteSkillForUser(
   }
 }
 
+async function deleteSkillForUser(
+  userId: string,
+  skillId: string,
+): Promise<{ success: boolean; error?: string }> {
+  return withUserSkillMutationLock(userId, () =>
+    deleteSkillForUserUnlocked(userId, skillId),
+  );
+}
+
 // 批量删除所有用户级技能（清理旧的同步副本）
-skillsRoutes.delete('/user-all', authMiddleware, (c) => {
+skillsRoutes.delete('/user-all', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
-  const userDir = getUserSkillsDir(authUser.id);
-  let deleted = 0;
-  try {
-    if (fs.existsSync(userDir)) {
+  return withUserSkillMutationLock(authUser.id, () => {
+    const userDir = getUserSkillsDir(authUser.id);
+    const previousManifest = readSkillsManifest(authUser.id);
+    const transactionDir = path.join(
+      userDir,
+      `.delete-all-${process.pid}-${Date.now()}`,
+    );
+    const moved: Array<{ source: string; backup: string }> = [];
+    try {
+      fs.mkdirSync(transactionDir, { recursive: true });
       for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
         if (entry.name.startsWith('.')) continue;
-        const p = path.join(userDir, entry.name);
-        try {
-          fs.rmSync(p, { recursive: true, force: true });
-          deleted++;
-        } catch {
-          /* ignore */
+        const source = path.join(userDir, entry.name);
+        const backup = path.join(transactionDir, entry.name);
+        fs.renameSync(source, backup);
+        moved.push({ source, backup });
+      }
+      writeSkillsManifest(authUser.id, { skills: {} });
+      fs.rmSync(transactionDir, { recursive: true, force: true });
+      return c.json({ success: true, deleted: moved.length });
+    } catch {
+      for (const { source, backup } of moved.reverse()) {
+        if (fs.existsSync(backup) && !fs.existsSync(source)) {
+          fs.renameSync(backup, source);
         }
       }
+      writeSkillsManifest(authUser.id, previousManifest);
+      fs.rmSync(transactionDir, { recursive: true, force: true });
+      return c.json({ error: 'Failed to delete user skills' }, 500);
     }
-  } catch {
-    return c.json({ error: 'Failed to delete user skills' }, 500);
-  }
-  return c.json({ success: true, deleted });
+  });
 });
 
 skillsRoutes.delete('/:id', authMiddleware, async (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
-  const result = deleteSkillForUser(authUser.id, id);
+  const result = await deleteSkillForUser(authUser.id, id);
 
   if (!result.success) {
     const status =
@@ -852,7 +914,7 @@ skillsRoutes.delete('/:id', authMiddleware, async (c) => {
  * the real ~/.claude/skills, eliminating race conditions across concurrent installs.
  * Reusable by both the HTTP route and IPC handler.
  */
-async function installSkillForUser(
+async function installSkillForUserUnlocked(
   userId: string,
   pkg: string,
 ): Promise<{ success: boolean; installed?: string[]; error?: string }> {
@@ -878,14 +940,24 @@ async function installSkillForUser(
   fs.mkdirSync(tempSkillsDir, { recursive: true });
 
   try {
-    await execFileAsync(
-      'npx',
-      ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
-      {
-        timeout: 60_000,
-        env: { ...process.env, HOME: tempHome },
-      },
-    );
+    await runCommandWithDirectoryQuota({
+      command: 'npx',
+      args: [
+        '-y',
+        'skills',
+        'add',
+        pkg,
+        '--global',
+        '--yes',
+        '-a',
+        'claude-code',
+      ],
+      watchDir: tempHome,
+      maxBytes: MAX_SKILL_INSTALL_BYTES,
+      timeoutMs: 60_000,
+      label: 'Skill package installation',
+      env: { ...process.env, HOME: tempHome },
+    });
 
     // Discover all skill directories installed into the temp location
     const installedEntries: string[] = [];
@@ -906,21 +978,17 @@ async function installSkillForUser(
       };
     }
 
-    // Copy resolved skill content to per-user directory
+    // Install all directories and their manifest metadata as one transaction.
     const userDir = getUserSkillsDir(userId);
-    fs.mkdirSync(userDir, { recursive: true });
-
-    for (const name of installedEntries) {
-      const src = path.join(tempSkillsDir, name);
-      const dest = path.join(userDir, name);
-      if (fs.existsSync(dest)) {
-        fs.rmSync(dest, { recursive: true, force: true });
-      }
-      copySkillToUser(src, dest);
-    }
-
-    // Write manifest metadata
-    updateSkillsManifest(userId, pkg, installedEntries);
+    installSkillDirectoriesTransactionally(
+      installedEntries.map((id) => ({
+        id,
+        dir: fs.realpathSync(path.join(tempSkillsDir, id)),
+      })),
+      userDir,
+      true,
+      (installedIds) => updateSkillsManifest(userId, pkg, installedIds),
+    );
 
     return { success: true, installed: installedEntries };
   } catch (error) {
@@ -936,6 +1004,15 @@ async function installSkillForUser(
       /* ignore cleanup errors */
     }
   }
+}
+
+async function installSkillForUser(
+  userId: string,
+  pkg: string,
+): Promise<{ success: boolean; installed?: string[]; error?: string }> {
+  return withUserSkillMutationLock(userId, () =>
+    installSkillForUserUnlocked(userId, pkg),
+  );
 }
 
 /**
@@ -972,115 +1049,117 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     return c.json({ error: 'Invalid skill ID' }, 400);
   }
 
-  const manifest = readSkillsManifest(authUser.id);
-  const meta = manifest.skills[id];
-  if (!meta?.packageName) {
-    return c.json(
-      { error: 'Skill has no package info — cannot reinstall' },
-      400,
+  return withUserSkillMutationLock(authUser.id, async () => {
+    const manifest = readSkillsManifest(authUser.id);
+    const meta = manifest.skills[id];
+    if (!meta?.packageName) {
+      return c.json(
+        { error: 'Skill has no package info — cannot reinstall' },
+        400,
+      );
+    }
+
+    // A package can install MULTIPLE sibling skills, and installSkillForUser
+    // rewrites EVERY skill dir the package ships (it rm's each destination before
+    // copying). Backing up only `id` would let a failed reinstall permanently
+    // destroy the live siblings it deleted. So back up every skill that shares
+    // this packageName (including `id`) and restore them all on failure.
+    const userDir = getUserSkillsDir(authUser.id);
+    const siblingIds = Object.keys(manifest.skills).filter(
+      (sid) => manifest.skills[sid]?.packageName === meta.packageName,
     );
-  }
+    if (!siblingIds.includes(id)) siblingIds.push(id);
 
-  // A package can install MULTIPLE sibling skills, and installSkillForUser
-  // rewrites EVERY skill dir the package ships (it rm's each destination before
-  // copying). Backing up only `id` would let a failed reinstall permanently
-  // destroy the live siblings it deleted. So back up every skill that shares
-  // this packageName (including `id`) and restore them all on failure.
-  const userDir = getUserSkillsDir(authUser.id);
-  const siblingIds = Object.keys(manifest.skills).filter(
-    (sid) => manifest.skills[sid]?.packageName === meta.packageName,
-  );
-  if (!siblingIds.includes(id)) siblingIds.push(id);
-
-  for (const sid of siblingIds) {
-    if (!validateSkillPath(userDir, path.join(userDir, sid))) {
-      return c.json({ error: 'Invalid skill path' }, 400);
-    }
-  }
-
-  type SkillBackup = {
-    sid: string;
-    dir: string;
-    // null when the sibling had a manifest entry but no on-disk dir (desync):
-    // there is nothing to rename back, only the manifest entry to restore.
-    backupDir: string | null;
-    meta: SkillsManifest['skills'][string];
-  };
-  const backups: SkillBackup[] = [];
-  // Restore every backed-up sibling (dir + manifest entry). Best-effort: a
-  // failure here leaves the *.reinstall-bak dir on disk for manual recovery.
-  const restoreBackups = (): void => {
-    for (const b of backups) {
-      try {
-        if (b.backupDir) {
-          fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
-          fs.renameSync(b.backupDir, b.dir);
-        }
-        const m = readSkillsManifest(authUser.id);
-        m.skills[b.sid] = b.meta;
-        writeSkillsManifest(authUser.id, m);
-      } catch {
-        /* best-effort rollback */
-      }
-    }
-  };
-
-  // Back up each sibling dir (rename, don't delete) so a failed reinstall can
-  // roll back instead of permanently destroying the user's skills. The manifest
-  // entry is recorded for backup whenever it exists — even if its dir is already
-  // missing (manifest/dir desync) — so removeFromSkillsManifest below is always
-  // recoverable on a failed reinstall.
-  try {
     for (const sid of siblingIds) {
-      const entry = manifest.skills[sid];
-      const dir = path.join(userDir, sid);
-      const backupDir = `${dir}.reinstall-bak`;
-      let savedBackupDir: string | null = null;
-      if (fs.existsSync(dir)) {
-        fs.rmSync(backupDir, { recursive: true, force: true }); // clear stale backup
-        fs.renameSync(dir, backupDir);
-        savedBackupDir = backupDir;
+      if (!validateSkillPath(userDir, path.join(userDir, sid))) {
+        return c.json({ error: 'Invalid skill path' }, 400);
       }
-      if (entry)
-        backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
-      removeFromSkillsManifest(authUser.id, sid);
     }
-  } catch (err) {
-    restoreBackups();
-    return c.json(
-      {
-        error: 'Failed to back up old skill',
-        details: err instanceof Error ? err.message : 'Unknown error',
-      },
-      500,
-    );
-  }
 
-  const installResult = await installSkillForUser(
-    authUser.id,
-    meta.packageName,
-  );
-  if (!installResult.success) {
-    // Roll back: restoreBackups removes any partial install dirs and restores
-    // every sibling so nothing is lost.
-    restoreBackups();
-    return c.json(
-      { error: 'Failed to reinstall skill', details: installResult.error },
-      500,
-    );
-  }
+    type SkillBackup = {
+      sid: string;
+      dir: string;
+      // null when the sibling had a manifest entry but no on-disk dir (desync):
+      // there is nothing to rename back, only the manifest entry to restore.
+      backupDir: string | null;
+      meta: SkillsManifest['skills'][string];
+    };
+    const backups: SkillBackup[] = [];
+    // Restore every backed-up sibling (dir + manifest entry). Best-effort: a
+    // failure here leaves the *.reinstall-bak dir on disk for manual recovery.
+    const restoreBackups = (): void => {
+      for (const b of backups) {
+        try {
+          if (b.backupDir) {
+            fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
+            fs.renameSync(b.backupDir, b.dir);
+          }
+          const m = readSkillsManifest(authUser.id);
+          m.skills[b.sid] = b.meta;
+          writeSkillsManifest(authUser.id, m);
+        } catch {
+          /* best-effort rollback */
+        }
+      }
+    };
 
-  // Success — drop all backups (skip entries that had no on-disk dir to back up).
-  for (const b of backups) {
-    if (!b.backupDir) continue;
+    // Back up each sibling dir (rename, don't delete) so a failed reinstall can
+    // roll back instead of permanently destroying the user's skills. The manifest
+    // entry is recorded for backup whenever it exists — even if its dir is already
+    // missing (manifest/dir desync) — so removeFromSkillsManifest below is always
+    // recoverable on a failed reinstall.
     try {
-      fs.rmSync(b.backupDir, { recursive: true, force: true });
-    } catch {
-      /* leftover backup is harmless */
+      for (const sid of siblingIds) {
+        const entry = manifest.skills[sid];
+        const dir = path.join(userDir, sid);
+        const backupDir = `${dir}.reinstall-bak`;
+        let savedBackupDir: string | null = null;
+        if (fs.existsSync(dir)) {
+          fs.rmSync(backupDir, { recursive: true, force: true }); // clear stale backup
+          fs.renameSync(dir, backupDir);
+          savedBackupDir = backupDir;
+        }
+        if (entry)
+          backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
+        removeFromSkillsManifest(authUser.id, sid);
+      }
+    } catch (err) {
+      restoreBackups();
+      return c.json(
+        {
+          error: 'Failed to back up old skill',
+          details: err instanceof Error ? err.message : 'Unknown error',
+        },
+        500,
+      );
     }
-  }
 
-  return c.json({ success: true, installed: installResult.installed });
+    const installResult = await installSkillForUserUnlocked(
+      authUser.id,
+      meta.packageName,
+    );
+    if (!installResult.success) {
+      // Roll back: restoreBackups removes any partial install dirs and restores
+      // every sibling so nothing is lost.
+      restoreBackups();
+      return c.json(
+        { error: 'Failed to reinstall skill', details: installResult.error },
+        500,
+      );
+    }
+
+    // Success — drop all backups (skip entries that had no on-disk dir to back up).
+    for (const b of backups) {
+      if (!b.backupDir) continue;
+      try {
+        fs.rmSync(b.backupDir, { recursive: true, force: true });
+      } catch {
+        /* leftover backup is harmless */
+      }
+    }
+
+    return c.json({ success: true, installed: installResult.installed });
+  });
 });
 
 export { getUserSkillsDir, installSkillForUser, deleteSkillForUser };

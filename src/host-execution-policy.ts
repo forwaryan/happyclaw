@@ -16,10 +16,7 @@ export function endHostPrivilegeRevocation(userId: string): void {
  * point of execution and pass that current record here.
  */
 export function canExecuteOnHost(
-  owner:
-    | (Pick<User, 'role' | 'status'> & { id?: string })
-    | null
-    | undefined,
+  owner: (Pick<User, 'role' | 'status'> & { id?: string }) | null | undefined,
 ): boolean {
   return (
     owner?.role === 'admin' &&

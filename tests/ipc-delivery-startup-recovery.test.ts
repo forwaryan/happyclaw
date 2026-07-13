@@ -64,7 +64,10 @@ describe('startup typed IPC delivery recovery', () => {
     writeDelivery(mainFile, 'web:main', 'm1');
     writeDelivery(agentFile, 'web:main#agent:agent-1', 'a1');
     writeDelivery(taskFile, 'web:main#task:task-1', 't1');
-    fs.writeFileSync(invalidFile, JSON.stringify({ type: 'message', text: 'legacy' }));
+    fs.writeFileSync(
+      invalidFile,
+      JSON.stringify({ type: 'message', text: 'legacy' }),
+    );
 
     let rewindPersistedBeforeDelete = false;
     const recovered = discardStartupTypedIpcDeliveries(root, () => {

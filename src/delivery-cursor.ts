@@ -14,7 +14,9 @@ export function hasEarlierCursorMessage(
 ): boolean {
   return pending.some((message) => {
     if (message.timestamp < candidate.timestamp) return true;
-    return message.timestamp === candidate.timestamp && message.id < candidate.id;
+    return (
+      message.timestamp === candidate.timestamp && message.id < candidate.id
+    );
   });
 }
 
@@ -47,8 +49,7 @@ export class DeferredOutOfBandCursorLedger {
     const cursors = this.entries.get(jid) ?? [];
     if (
       !cursors.some(
-        (item) =>
-          item.timestamp === cursor.timestamp && item.id === cursor.id,
+        (item) => item.timestamp === cursor.timestamp && item.id === cursor.id,
       )
     ) {
       cursors.push(cursor);
