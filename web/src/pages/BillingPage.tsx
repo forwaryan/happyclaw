@@ -71,7 +71,9 @@ export default function BillingPage({
 
   if (!billingStatusLoaded) {
     return (
-      <div className="h-full p-6 text-sm text-zinc-500">加载账单状态中...</div>
+      <div className="min-h-40 p-6 text-sm text-zinc-500">
+        加载账单状态中...
+      </div>
     );
   }
 
@@ -110,8 +112,8 @@ export default function BillingPage({
   const allTabs = managementOnly ? managementTabs : userTabs;
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="sticky top-0 z-10 bg-white dark:bg-zinc-900 border-b border-zinc-200 dark:border-zinc-800 px-4 py-3">
+    <div className="min-h-full">
+      <div className="sticky top-0 z-10 border-b border-border bg-background/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/85">
         <div className="flex items-center gap-4 overflow-x-auto">
           <h2 className="text-lg font-semibold flex items-center gap-2 shrink-0">
             <CreditCard className="w-5 h-5 text-primary" />
@@ -136,7 +138,7 @@ export default function BillingPage({
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6">
+      <div className="space-y-6 p-4 lg:p-6">
         {/* User: Overview */}
         {tab === 'overview' && (
           <>

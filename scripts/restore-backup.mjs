@@ -346,6 +346,113 @@ function replaceComponents(stagedDataDir, dataDir, stageRoot, manifest) {
   }
 }
 
+// A `.happyclaw-restore-*` staging directory (holding the pre-restore
+// rollback copy, i.e. real user secrets/DB) only survives past a restore
+// invocation if that invocation was killed hard enough to skip the
+// `finally` cleanup below (SIGKILL, OOM kill, host crash — not a normal
+// thrown error, which is already caught and cleaned up). Such a leaked
+// directory's `rollback/` subtree may be the ONLY surviving copy of good
+// pre-restore data (e.g. if that prior run was killed between moving the
+// live component out to rollback and moving the new one into place). It
+// must only be swept AFTER the current restore has proven the new backup
+// is valid and successfully applied to `dataDir` — sweeping it up front,
+// before this run's own archive/manifest/integrity validation, would
+// destroy the last recoverable copy if THIS run's archive later turns out
+// to be corrupt and the restore aborts, compounding data loss instead of
+// fixing it. `excludeStageRoot` skips the current run's own staging dir
+// (still in use; its own `finally` cleans it up separately).
+function cleanupOrphanedRestoreStagingDirs(parentDir, excludeStageRoot) {
+  let entries;
+  try {
+    entries = fs.readdirSync(parentDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('.happyclaw-restore-'))
+      continue;
+    const orphan = path.join(parentDir, entry.name);
+    if (excludeStageRoot && orphan === excludeStageRoot) continue;
+    try {
+      fs.rmSync(orphan, { recursive: true, force: true });
+      console.warn(
+        `⚠️  Removed orphaned restore staging directory from a previous interrupted restore: ${orphan}`,
+      );
+    } catch (error) {
+      console.warn(
+        `⚠️  Failed to remove orphaned restore staging directory ${orphan}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    // Signal 0 does no actual kill — it only checks the process exists and
+    // is signalable by us. Throws ESRCH if the pid is gone.
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM'; // exists, owned by another user — treat as alive
+  }
+}
+
+// Two concurrent restores targeting the same parentDir must not run at once:
+// cleanupOrphanedRestoreStagingDirs (called after a successful restore)
+// cannot distinguish "a genuinely abandoned staging dir from an earlier
+// crashed run" from "another restore's staging/rollback dir that is still
+// in active use right now" — both just look like a `.happyclaw-restore-*`
+// directory that isn't the current process's own stageRoot. Whichever
+// restore finishes first would delete the other's in-flight rollback data.
+// Serialize with a PID-stamped exclusive lock file instead of trying to
+// infer liveness from directory contents.
+//
+// Never auto-reclaim a stale lock. PID liveness is only a snapshot: between
+// checking a dead owner and renaming/unlinking the file, another process can
+// replace it with a fresh live lock. Portable Node filesystem APIs do not
+// provide compare-and-delete for a pathname, so automatic takeover cannot be
+// made race-free. Restore is destructive; fail closed and require an operator
+// to verify no restore is running before removing a stale lock manually.
+function acquireRestoreLock(parentDir) {
+  const lockPath = path.join(parentDir, '.happyclaw-restore.lock');
+  try {
+    fs.writeFileSync(lockPath, String(process.pid), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    return lockPath;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    let heldBy = NaN;
+    try {
+      heldBy = Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    } catch {
+      // An unreadable lock is still a lock: fail closed.
+    }
+    if (isProcessAlive(heldBy)) {
+      throw new Error(
+        `Another restore (pid ${heldBy}) is already in progress for ${parentDir}. ` +
+          'Wait for it to finish before starting a new restore.',
+      );
+    }
+    throw new Error(
+      `A stale or unreadable restore lock exists at ${lockPath}. ` +
+        'Verify that no restore is running, remove this lock manually, then retry.',
+    );
+  }
+}
+
+function releaseRestoreLock(lockPath) {
+  try {
+    if (fs.readFileSync(lockPath, 'utf8').trim() === String(process.pid)) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  } catch {
+    // Already gone or unreadable — nothing to release.
+  }
+}
+
 async function restore(archiveArg, dataDirArg, port) {
   // Check immediately before any filesystem mutation as well as in Makefile's
   // early preflight, closing the prompt-to-restore race window.
@@ -360,8 +467,13 @@ async function restore(archiveArg, dataDirArg, port) {
 
   const parentDir = path.dirname(dataDir);
   fs.mkdirSync(parentDir, { recursive: true });
-  const stageRoot = fs.mkdtempSync(path.join(parentDir, '.happyclaw-restore-'));
+  const lockPath = acquireRestoreLock(parentDir);
+  let stageRoot;
   try {
+    // Staging creation itself can fail (ENOSPC, inode exhaustion, quota,
+    // permissions). Keep it inside the lock's try/finally so such an early
+    // failure does not strand a stale lock that blocks every later restore.
+    stageRoot = fs.mkdtempSync(path.join(parentDir, '.happyclaw-restore-'));
     runTar(
       [
         '-xzf',
@@ -394,8 +506,16 @@ async function restore(archiveArg, dataDirArg, port) {
     fs.rmSync(`${stagedDbPath}-shm`, { force: true });
     restoreRecordedSymlinks(stagedDataDir);
     replaceComponents(stagedDataDir, dataDir, stageRoot, manifest);
+    // Only sweep leftover staging dirs from previous crashed attempts once
+    // THIS restore's archive has been fully validated and successfully
+    // applied — see the function's doc comment for why sweeping earlier is
+    // unsafe.
+    cleanupOrphanedRestoreStagingDirs(parentDir, stageRoot);
   } finally {
-    fs.rmSync(stageRoot, { recursive: true, force: true });
+    if (stageRoot) {
+      fs.rmSync(stageRoot, { recursive: true, force: true });
+    }
+    releaseRestoreLock(lockPath);
   }
 }
 

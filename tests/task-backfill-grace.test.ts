@@ -28,6 +28,7 @@ const {
   claimTaskForRun,
   advanceSkippedTask,
   updateTaskAfterRun,
+  clearStaleTaskLeases,
 } = await import('../src/db.js');
 
 const { shouldSkipBackfill } = await import('../src/task-scheduler.js');
@@ -139,6 +140,37 @@ describe('task backfill grace — db helpers', () => {
     const after = getTaskById(id)!;
     expect(after.running_until).toBeNull();
     expect(after.runner_id).toBeNull();
+  });
+
+  test('clearStaleTaskLeases releases a lease abandoned by a crashed runner so the task becomes due again', () => {
+    const id = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+    // Simulate a runner claiming the task, then crashing before it can call
+    // updateTaskAfterRun/advanceSkippedTask — running_until/runner_id are
+    // left set in the DB, exactly as they would be after a process kill.
+    expect(claimTaskForRun(id, 'crashed-runner', 30 * 60_000)).toBe(true);
+    expect(getDueTasks().map((t) => t.id)).not.toContain(id);
+
+    const cleared = clearStaleTaskLeases();
+    expect(cleared).toBeGreaterThanOrEqual(1);
+
+    const after = getTaskById(id)!;
+    expect(after.running_until).toBeNull();
+    expect(after.runner_id).toBeNull();
+    // The task must be immediately claimable again by the restarted
+    // scheduler, not hidden until the old (now-meaningless) lease expiry.
+    expect(getDueTasks().map((t) => t.id)).toContain(id);
+    expect(claimTaskForRun(id, 'new-runner', 30 * 60_000)).toBe(true);
+  });
+
+  test('clearStaleTaskLeases is a no-op when no task holds a lease', () => {
+    // A task with no lease at all must not be touched/counted.
+    makeTask({ next_run: new Date(Date.now() - 60_000).toISOString() });
+    const clearedFirst = clearStaleTaskLeases();
+    expect(clearedFirst).toBeGreaterThanOrEqual(0);
+    const clearedSecond = clearStaleTaskLeases();
+    expect(clearedSecond).toBe(0);
   });
 });
 

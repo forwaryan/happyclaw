@@ -67,6 +67,8 @@ import {
 import {
   IpcTurnDeliveryTracker,
   isHealthyInputTurnCompletion,
+  latestIpcDeliveryId,
+  latestIpcInputMessage,
   parseIpcReceipt,
   requeueIpcInputMessages,
   type IpcInputMessage,
@@ -1464,11 +1466,13 @@ function waitForIpcMessage(): Promise<
         }
         // Same convention for sourceJid: per-channel MCP tools should see the
         // chat the most recent message arrived from.
-        let combinedSourceJid: string | undefined;
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].sourceJid) {
-            combinedSourceJid = messages[i].sourceJid;
-            break;
+        let combinedSourceJid = latestIpcInputMessage(messages)?.sourceJid;
+        if (!combinedSourceJid) {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].sourceJid) {
+              combinedSourceJid = messages[i].sourceJid;
+              break;
+            }
           }
         }
         resolved = true;
@@ -1826,11 +1830,16 @@ async function runQuery(
     : 'memory-system.guest.md';
 
   const promptPieces: PromptPiece[] = [
+    // Agent identity must lead the workspace/context prompt material per
+    // docs/agent-first-architecture-plan.md's documented composition order
+    // ("Claude Code preset + Agent identity prompt + workspace/context
+    // prompt + message history") — the Agent's persona should not be
+    // subordinated to HappyClaw's own generic interaction guidance.
+    ...buildAgentIdentityPromptPiece(containerInput),
     {
       name: 'interaction.md',
       text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
     },
-    ...buildAgentIdentityPromptPiece(containerInput),
     {
       name: 'skill-routing.md',
       text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
@@ -2884,6 +2893,7 @@ async function main(): Promise<void> {
     isAdminHome,
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,
+    currentInputTurnId: containerInput.turnId,
     workspaceIpc: WORKSPACE_IPC,
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
@@ -2963,13 +2973,15 @@ async function main(): Promise<void> {
     }
     // The latest drained message reflects the freshest incoming chat —
     // override the startup chatJid so per-channel MCP tools see it correctly.
-    for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
-      const sj = pendingDrain.messages[i].sourceJid;
-      if (sj) {
-        mcpToolsConfig.chatJid = sj;
-        break;
-      }
+    const latestPendingSource = latestIpcInputMessage(
+      pendingDrain.messages,
+    )?.sourceJid;
+    if (latestPendingSource) {
+      mcpToolsConfig.chatJid = latestPendingSource;
     }
+    mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
+      pendingDrain.messages,
+    );
     // Likewise carry the task identity. A group-mode scheduled task injected
     // into this cold-start window (process registered, SDK transport not yet
     // ready) arrives via IPC with a taskId; without propagating it here the
@@ -3187,6 +3199,9 @@ async function main(): Promise<void> {
         promptImages = nextMessage.images;
         currentIpcMessages = nextMessage.messages;
         containerInput.turnId = generateTurnId();
+        mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
+          nextMessage.messages,
+        );
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
         // Update chatJid so per-channel MCP tools see the correct incoming chat.
@@ -3506,6 +3521,9 @@ async function main(): Promise<void> {
       promptImages = nextMessage.images;
       currentIpcMessages = nextMessage.messages;
       containerInput.turnId = generateTurnId();
+      mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
+        nextMessage.messages,
+      );
       // Clear per-turn task attribution: the previous query may have been a
       // scheduled-task turn, but this new IPC message is a regular follow-up
       // unless it explicitly carried a taskId (see nextMessage.taskId below).

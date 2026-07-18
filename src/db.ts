@@ -3453,6 +3453,28 @@ export function getDueTasks(): ScheduledTask[] {
     .map(mapTaskRow);
 }
 
+// Clear every task's run lease (running_until/runner_id) unconditionally.
+// Must be called once at scheduler process startup, before the first
+// getDueTasks() poll: a lease held in the DB can only have been acquired by
+// a runner process that no longer exists (this process just started, and
+// its own in-memory runningTaskIds is freshly cleared too), so any lease
+// still on disk is stale by definition — leaving it in place would hide a
+// crash-interrupted task from getDueTasks() until the lease's absolute
+// expiry, and if that expiry lands past the backfill grace window the
+// interrupted run is silently skipped forever instead of retried.
+export function clearStaleTaskLeases(): number {
+  const result = db
+    .prepare(
+      `
+    UPDATE scheduled_tasks
+    SET running_until = NULL, runner_id = NULL
+    WHERE running_until IS NOT NULL OR runner_id IS NOT NULL
+  `,
+    )
+    .run();
+  return result.changes;
+}
+
 export function claimTaskForRun(
   id: string,
   runnerId: string,

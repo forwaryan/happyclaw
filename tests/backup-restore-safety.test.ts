@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -122,6 +122,37 @@ describe('runtime backup and restore safety', () => {
     ).toHaveLength(0);
   });
 
+  test('refuses to create an unrestorable archive from hard-linked runtime files', async () => {
+    // A regular file with nlink > 1 is stored by tar as a link-type ('h')
+    // entry pointing at its first-seen sibling instead of a full copy.
+    // restore-backup.mjs's validateArchiveEntries rejects link-type entries
+    // outright, so a hard link that makes it into a backup produces an
+    // archive that reports "backup complete" but can never be restored.
+    // Must be caught at backup time, not discovered during a real restore.
+    const sourceData = path.join(tmp, 'hardlink-source-data');
+    const backupDir = path.join(tmp, 'hardlink-backups');
+    const dbDir = path.join(sourceData, 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    fs.mkdirSync(path.join(sourceData, 'config'), { recursive: true });
+    const original = path.join(sourceData, 'config', 'settings.json');
+    fs.writeFileSync(original, '{}');
+    fs.linkSync(original, path.join(sourceData, 'config', 'settings-2.json'));
+
+    await expect(
+      execFileAsync(
+        'make',
+        ['backup', `RUNTIME_DATA_DIR=${sourceData}`, `BACKUP_DIR=${backupDir}`],
+        { cwd: root },
+      ),
+    ).rejects.toThrow();
+    expect(
+      fs.existsSync(backupDir) ? fs.readdirSync(backupDir) : [],
+    ).toHaveLength(0);
+  });
+
   test('rejects symbolic links and other special archive entries before extraction', async () => {
     const archiveRoot = path.join(tmp, 'malicious-archive');
     const archive = path.join(tmp, 'malicious-backup.tar.gz');
@@ -223,6 +254,418 @@ describe('runtime backup and restore safety', () => {
       5_000,
     );
   }, 20_000);
+
+  test('sweeps an orphaned staging directory left by a previously killed restore', async () => {
+    // A `.happyclaw-restore-*` staging dir only survives past a restore
+    // invocation if that invocation was killed hard enough to skip its own
+    // `finally` cleanup (SIGKILL/OOM/host crash). It holds the pre-restore
+    // rollback copy — i.e. real secrets/DB — and must not accumulate on
+    // disk forever. Simulate that leak directly rather than reproducing a
+    // real SIGKILL race, then confirm the next restore invocation sweeps it.
+    const archiveRoot = path.join(tmp, 'orphan-sweep-archive');
+    const archive = path.join(tmp, 'orphan-sweep-backup.tar.gz');
+    const restoreData = path.join(tmp, 'orphan-sweep-restore', 'data');
+    const restoreParent = path.dirname(restoreData);
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    fs.mkdirSync(restoreParent, { recursive: true });
+    const orphan = fs.mkdtempSync(
+      path.join(restoreParent, '.happyclaw-restore-'),
+    );
+    fs.mkdirSync(path.join(orphan, 'rollback', 'db'), { recursive: true });
+    fs.writeFileSync(
+      path.join(orphan, 'rollback', 'db', 'messages.db'),
+      'leaked pre-restore bytes from a killed run',
+    );
+    expect(fs.existsSync(orphan)).toBe(true);
+
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await execFileAsync(
+      'node',
+      [
+        'scripts/restore-backup.mjs',
+        'restore',
+        archive,
+        restoreData,
+        String(port),
+      ],
+      { cwd: root },
+    );
+
+    expect(fs.existsSync(orphan)).toBe(false);
+    expect(
+      fs
+        .readdirSync(restoreParent)
+        .filter((name) => name.startsWith('.happyclaw-restore-')),
+    ).toHaveLength(0);
+    expect(fs.existsSync(path.join(restoreData, 'db', 'messages.db'))).toBe(
+      true,
+    );
+  });
+
+  test('preserves an orphaned rollback directory when the new restore attempt itself fails validation', async () => {
+    // A leaked `.happyclaw-restore-*` staging dir may hold the ONLY
+    // surviving copy of good pre-restore data (e.g. a prior run killed
+    // between moving the live component to rollback and moving the new one
+    // into place). If a later restore attempt sweeps that orphan BEFORE
+    // proving its own archive is valid, and that archive then fails
+    // validation (corrupt DB here), the orphan's data is gone forever with
+    // nothing successfully restored either — compounding data loss instead
+    // of just leaving the earlier problem in place. The orphan must survive
+    // a failed restore attempt.
+    const archiveRoot = path.join(tmp, 'orphan-preserve-archive');
+    const archive = path.join(tmp, 'orphan-preserve-backup.tar.gz');
+    const restoreData = path.join(tmp, 'orphan-preserve-restore', 'data');
+    const restoreParent = path.dirname(restoreData);
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    // Corrupt/invalid database content — validateDatabase's integrity_check
+    // will fail on this, aborting the restore after extraction.
+    fs.writeFileSync(path.join(dbDir, 'messages.db'), 'not a real sqlite db');
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    fs.mkdirSync(restoreParent, { recursive: true });
+    const orphan = fs.mkdtempSync(
+      path.join(restoreParent, '.happyclaw-restore-'),
+    );
+    fs.mkdirSync(path.join(orphan, 'rollback', 'db'), { recursive: true });
+    const survivingBytes = 'the only surviving copy of the old database';
+    fs.writeFileSync(
+      path.join(orphan, 'rollback', 'db', 'messages.db'),
+      survivingBytes,
+    );
+
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await expect(
+      execFileAsync(
+        'node',
+        [
+          'scripts/restore-backup.mjs',
+          'restore',
+          archive,
+          restoreData,
+          String(port),
+        ],
+        { cwd: root },
+      ),
+    ).rejects.toThrow();
+
+    // The failed attempt's own stage dir is cleaned by its `finally`, but
+    // the pre-existing orphan (and the only surviving data inside it) must
+    // still be there — untouched by this failed attempt.
+    expect(fs.existsSync(orphan)).toBe(true);
+    expect(
+      fs.readFileSync(
+        path.join(orphan, 'rollback', 'db', 'messages.db'),
+        'utf8',
+      ),
+    ).toBe(survivingBytes);
+  });
+
+  test("refuses to start a second restore while one is already in progress, so it cannot delete the other's in-flight staging dir", async () => {
+    // cleanupOrphanedRestoreStagingDirs cannot tell "an abandoned staging
+    // dir from a crashed run" apart from "another restore's staging/
+    // rollback dir that is still in active use right now" — both just look
+    // like a `.happyclaw-restore-*` directory that isn't this process's
+    // own. Without serialization, whichever restore finishes first would
+    // delete the other's in-flight rollback data. Simulate a live
+    // in-progress restore by writing a lock file stamped with our own pid
+    // (guaranteed alive for the duration of this test).
+    const archiveRoot = path.join(tmp, 'lock-live-archive');
+    const archive = path.join(tmp, 'lock-live-backup.tar.gz');
+    const restoreData = path.join(tmp, 'lock-live-restore', 'data');
+    const restoreParent = path.dirname(restoreData);
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    fs.mkdirSync(restoreParent, { recursive: true });
+    fs.writeFileSync(
+      path.join(restoreParent, '.happyclaw-restore.lock'),
+      String(process.pid),
+      { flag: 'wx' },
+    );
+
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await expect(
+      execFileAsync(
+        'node',
+        [
+          'scripts/restore-backup.mjs',
+          'restore',
+          archive,
+          restoreData,
+          String(port),
+        ],
+        { cwd: root },
+      ),
+    ).rejects.toThrow(/already in progress/);
+    expect(fs.existsSync(restoreData)).toBe(false);
+    // The live lock (still our own pid) must not have been touched.
+    expect(
+      fs.readFileSync(
+        path.join(restoreParent, '.happyclaw-restore.lock'),
+        'utf8',
+      ),
+    ).toBe(String(process.pid));
+  });
+
+  test('releases the restore lock when staging directory creation fails', async () => {
+    const archiveRoot = path.join(tmp, 'lock-mkdtemp-failure-archive');
+    const archive = path.join(tmp, 'lock-mkdtemp-failure-backup.tar.gz');
+    const restoreData = path.join(tmp, 'lock-mkdtemp-failure-restore', 'data');
+    const restoreParent = path.dirname(restoreData);
+    const lockPath = path.join(restoreParent, '.happyclaw-restore.lock');
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    // Inject a deterministic ENOSPC at the exact fs.mkdtempSync call used by
+    // restore-backup.mjs. The lock write immediately before it still succeeds,
+    // reproducing the early-failure window without relying on real disk
+    // exhaustion or filesystem-specific path-length limits.
+    const preload = path.join(tmp, 'fail-restore-mkdtemp.cjs');
+    fs.writeFileSync(
+      preload,
+      String.raw`
+const fs = require('node:fs');
+const originalMkdtempSync = fs.mkdtempSync;
+fs.mkdtempSync = function (prefix, ...args) {
+  if (String(prefix).endsWith('.happyclaw-restore-')) {
+    const error = new Error('simulated ENOSPC while creating restore staging directory');
+    error.code = 'ENOSPC';
+    throw error;
+  }
+  return originalMkdtempSync.call(this, prefix, ...args);
+};
+`,
+    );
+
+    fs.mkdirSync(restoreParent, { recursive: true });
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await expect(
+      execFileAsync(
+        'node',
+        [
+          'scripts/restore-backup.mjs',
+          'restore',
+          archive,
+          restoreData,
+          String(port),
+        ],
+        {
+          cwd: root,
+          env: {
+            ...process.env,
+            NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${preload}`]
+              .filter(Boolean)
+              .join(' '),
+          },
+        },
+      ),
+    ).rejects.toThrow(/simulated ENOSPC/);
+
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect(
+      fs
+        .readdirSync(restoreParent)
+        .filter((name) => name.startsWith('.happyclaw-restore-')),
+    ).toHaveLength(0);
+
+    // A normal retry must proceed immediately rather than fail closed on a
+    // stale lock left by the failed staging allocation.
+    await execFileAsync(
+      'node',
+      [
+        'scripts/restore-backup.mjs',
+        'restore',
+        archive,
+        restoreData,
+        String(port),
+      ],
+      { cwd: root },
+    );
+    expect(fs.existsSync(path.join(restoreData, 'db', 'messages.db'))).toBe(
+      true,
+    );
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  test('fails closed on a stale lock until an operator removes it', async () => {
+    const archiveRoot = path.join(tmp, 'lock-stale-archive');
+    const archive = path.join(tmp, 'lock-stale-backup.tar.gz');
+    const restoreData = path.join(tmp, 'lock-stale-restore', 'data');
+    const restoreParent = path.dirname(restoreData);
+    const dbDir = path.join(archiveRoot, 'data', 'db');
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'messages.db'));
+    db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY)');
+    db.close();
+    await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+
+    fs.mkdirSync(restoreParent, { recursive: true });
+    // Spawn a short-lived process and wait for it to exit so its pid is
+    // guaranteed dead, then stamp the lock with that now-unused pid —
+    // simulating a restore that was killed without releasing its lock.
+    const deadPid = await new Promise((resolve) => {
+      const child = spawn('node', ['-e', 'process.exit(0)']);
+      child.on('exit', () => resolve(child.pid));
+    });
+    fs.writeFileSync(
+      path.join(restoreParent, '.happyclaw-restore.lock'),
+      String(deadPid),
+      { flag: 'wx' },
+    );
+
+    const portProbe = net.createServer();
+    const port = await listen(portProbe);
+    await close(portProbe);
+    await expect(
+      execFileAsync(
+        'node',
+        [
+          'scripts/restore-backup.mjs',
+          'restore',
+          archive,
+          restoreData,
+          String(port),
+        ],
+        { cwd: root },
+      ),
+    ).rejects.toThrow(/remove this lock manually/);
+
+    expect(fs.existsSync(restoreData)).toBe(false);
+    // The script must not rename or unlink a pathname that could have been
+    // replaced by a newly acquired live lock after its liveness check.
+    expect(
+      fs.existsSync(path.join(restoreParent, '.happyclaw-restore.lock')),
+    ).toBe(true);
+
+    fs.rmSync(path.join(restoreParent, '.happyclaw-restore.lock'));
+    await execFileAsync(
+      'node',
+      [
+        'scripts/restore-backup.mjs',
+        'restore',
+        archive,
+        restoreData,
+        String(port),
+      ],
+      { cwd: root },
+    );
+    expect(fs.existsSync(path.join(restoreData, 'db', 'messages.db'))).toBe(
+      true,
+    );
+    expect(
+      fs.existsSync(path.join(restoreParent, '.happyclaw-restore.lock')),
+    ).toBe(false);
+  });
+
+  test('two restores observing the same stale lock both fail closed', async () => {
+    const archiveRootA = path.join(tmp, 'lock-race-archive-a');
+    const archiveRootB = path.join(tmp, 'lock-race-archive-b');
+    const archiveA = path.join(tmp, 'lock-race-backup-a.tar.gz');
+    const archiveB = path.join(tmp, 'lock-race-backup-b.tar.gz');
+    const restoreData = path.join(tmp, 'lock-race-restore', 'data');
+    const restoreParent = path.dirname(restoreData);
+
+    for (const [archiveRoot, archive, marker] of [
+      [archiveRootA, archiveA, 'A'],
+      [archiveRootB, archiveB, 'B'],
+    ] as const) {
+      const dbDir = path.join(archiveRoot, 'data', 'db');
+      fs.mkdirSync(dbDir, { recursive: true });
+      const db = new Database(path.join(dbDir, 'messages.db'));
+      db.exec('CREATE TABLE sample (id INTEGER PRIMARY KEY, marker TEXT)');
+      db.prepare('INSERT INTO sample (marker) VALUES (?)').run(marker);
+      db.close();
+      await execFileAsync('tar', ['-czf', archive, '-C', archiveRoot, 'data']);
+    }
+
+    fs.mkdirSync(restoreParent, { recursive: true });
+    const deadPid = await new Promise<number>((resolve) => {
+      const child = spawn('node', ['-e', 'process.exit(0)']);
+      child.on('exit', () => resolve(child.pid as number));
+    });
+    fs.writeFileSync(
+      path.join(restoreParent, '.happyclaw-restore.lock'),
+      String(deadPid),
+      { flag: 'wx' },
+    );
+
+    const portProbeA = net.createServer();
+    const portA = await listen(portProbeA);
+    await close(portProbeA);
+    const portProbeB = net.createServer();
+    const portB = await listen(portProbeB);
+    await close(portProbeB);
+
+    const runA = execFileAsync(
+      'node',
+      [
+        'scripts/restore-backup.mjs',
+        'restore',
+        archiveA,
+        restoreData,
+        String(portA),
+      ],
+      { cwd: root },
+    );
+    const runB = execFileAsync(
+      'node',
+      [
+        'scripts/restore-backup.mjs',
+        'restore',
+        archiveB,
+        restoreData,
+        String(portB),
+      ],
+      { cwd: root },
+    );
+
+    const [resultA, resultB] = await Promise.allSettled([runA, runB]);
+    const fulfilled = [resultA, resultB].filter(
+      (r) => r.status === 'fulfilled',
+    );
+    const rejected = [resultA, resultB].filter(
+      (r) => r.status === 'rejected',
+    ) as PromiseRejectedResult[];
+
+    expect(fulfilled).toHaveLength(0);
+    expect(rejected).toHaveLength(2);
+    for (const result of rejected) {
+      expect(String(result.reason)).toMatch(/remove this lock manually/);
+    }
+
+    expect(fs.existsSync(restoreData)).toBe(false);
+    // Neither contender may mutate the stale pathname or enter staging.
+    expect(
+      fs.existsSync(path.join(restoreParent, '.happyclaw-restore.lock')),
+    ).toBe(true);
+    const leftoverStaging = fs
+      .readdirSync(restoreParent)
+      .filter((name) => name.startsWith('.happyclaw-restore-'));
+    expect(leftoverStaging).toHaveLength(0);
+  });
 
   test('includes committed WAL rows and refuses restore while the service port is active', async () => {
     const sourceData = path.join(tmp, 'source-data');

@@ -21,6 +21,22 @@ function baseCtx(overrides: Partial<McpContext> = {}): McpContext {
 }
 
 describe('buildSendMessageData — task attribution stamping', () => {
+  test('stamps the exact current input-turn correlation id', () => {
+    const data = buildSendMessageData(
+      baseCtx({ currentInputTurnId: 'delivery-123' }),
+      { type: 'message', text: 'hi' },
+    );
+    expect(data.inputTurnId).toBe('delivery-123');
+  });
+
+  test('omits inputTurnId when no host-correlatable turn exists', () => {
+    const data = buildSendMessageData(baseCtx({ currentInputTurnId: null }), {
+      type: 'message',
+      text: 'hi',
+    });
+    expect('inputTurnId' in data).toBe(false);
+  });
+
   test('currentTaskId set → data includes taskId', () => {
     const ctx = baseCtx({ currentTaskId: 'task-42' });
     const data = buildSendMessageData(ctx, { type: 'message', text: 'hi' });

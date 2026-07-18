@@ -79,6 +79,17 @@ function walk(current) {
         `Unsafe runtime special file: ${toArchivePath(candidate)}`,
       );
     }
+    // A regular file with more than one hard link is stored by tar as a
+    // link-type ('h') entry pointing at its first-seen sibling instead of
+    // a full copy. restore-backup.mjs's validateArchiveEntries rejects
+    // link-type entries outright, so a hard link that slips through here
+    // produces a backup that reports success but can never be restored —
+    // fail fast during creation instead of failing silently at restore.
+    if (stat.nlink > 1) {
+      throw new Error(
+        `Unsafe runtime hard-linked file (nlink=${stat.nlink}): ${toArchivePath(candidate)}`,
+      );
+    }
   }
 }
 

@@ -21,13 +21,6 @@ import {
 import { UserChannelsSection } from '../components/settings/UserChannelsSection';
 import { UsersPage } from './UsersPage';
 import { MonitorPage } from './MonitorPage';
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card';
 import type { SettingsTab } from '../components/settings/types';
 
 const BillingPage = lazy(() => import('./BillingPage'));
@@ -165,12 +158,22 @@ export function SettingsPage() {
     monitor: '运行状态',
   };
 
+  const sectionDescription: Partial<Record<SettingsTab, string>> = {
+    'main-agent':
+      '管理主 Agent 的头像、系统附加能力、宿主机配置继承和上下文压缩策略。',
+    'host-integration':
+      '管理宿主机 Claude 目录以及共享 Plugin Catalog 的来源。',
+  };
+
   const legacyRoute =
     !mustChangePassword && rawTab ? LEGACY_TAB_ROUTES[rawTab] : undefined;
   if (legacyRoute) return <Navigate to={legacyRoute} replace />;
 
   return (
-    <div className="h-full bg-background flex flex-col lg:flex-row overflow-hidden">
+    <div
+      data-settings-page="true"
+      className="min-h-full bg-background lg:flex lg:items-start"
+    >
       {/* Mobile header */}
       <div className="lg:hidden sticky top-0 z-10 flex items-center bg-background border-b border-border px-4 h-12">
         <button
@@ -197,7 +200,7 @@ export function SettingsPage() {
         onOpenChange={setNavOpen}
       />
 
-      <div className="flex-1 min-w-0 overflow-y-auto">
+      <div data-settings-content="true" className="min-w-0 flex-1">
         {FULLPAGE_TABS.includes(activeTab) ? (
           <>
             {activeTab === 'users' && <UsersPage />}
@@ -209,86 +212,65 @@ export function SettingsPage() {
             )}
           </>
         ) : (
-          <div className="p-4 lg:p-8">
-            <div className="max-w-4xl mx-auto space-y-6">
-              <div>
+          <div className="px-4 py-6 sm:px-6 lg:px-10 lg:py-8">
+            <div className="mx-auto max-w-6xl">
+              <header className="mb-6">
                 <h1 className="text-2xl font-bold text-foreground">
                   {sectionTitle[activeTab]}
                 </h1>
-              </div>
+                {sectionDescription[activeTab] && (
+                  <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                    {sectionDescription[activeTab]}
+                  </p>
+                )}
+              </header>
 
               {mustChangePassword && (
-                <div className="bg-warning-bg border border-warning/20 rounded-xl px-4 py-3 text-sm text-warning">
+                <div className="mb-6 rounded-xl border border-warning/20 bg-warning-bg px-4 py-3 text-sm text-warning">
                   检测到首次登录或管理员重置密码，请先在“安全与设备”中修改密码；完成前其他设置暂不可用。
                 </div>
               )}
 
               {activeTab === 'system' || activeTab === 'automation' ? (
-                <Card className="overflow-visible">
-                  <CardContent>
-                    <SystemSettingsSection
-                      scope={
-                        activeTab === 'automation' ? 'automation' : 'runtime'
-                      }
-                    />
-                  </CardContent>
-                </Card>
+                <SystemSettingsSection
+                  scope={activeTab === 'automation' ? 'automation' : 'runtime'}
+                />
               ) : activeTab === 'main-agent' ||
                 activeTab === 'host-integration' ? (
-                <Card>
-                  <CardHeader className="border-b">
-                    <CardTitle>
-                      {activeTab === 'main-agent'
-                        ? '主 HappyClaw'
-                        : '宿主机 Claude 配置'}
-                    </CardTitle>
-                    <CardDescription>
-                      {activeTab === 'main-agent'
-                        ? '管理主 Agent 的头像、系统附加能力、宿主机配置继承和上下文压缩策略。'
-                        : '管理宿主机 Claude 目录以及共享 Plugin Catalog 的来源。'}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    {activeTab === 'main-agent' && <MainAgentIdentitySection />}
-                    {activeTab === 'main-agent' && (
-                      <MainAgentCapabilitiesSection />
-                    )}
-                    <div className={activeTab === 'main-agent' ? 'pt-6' : ''}>
-                      <HostIntegrationSettingsSection
-                        scope={
-                          activeTab === 'main-agent' ? 'main-agent' : 'host'
-                        }
-                      />
-                    </div>
-                  </CardContent>
-                </Card>
+                <div>
+                  {activeTab === 'main-agent' && <MainAgentIdentitySection />}
+                  {activeTab === 'main-agent' && (
+                    <MainAgentCapabilitiesSection />
+                  )}
+                  <div className={activeTab === 'main-agent' ? 'pt-6' : ''}>
+                    <HostIntegrationSettingsSection
+                      scope={activeTab === 'main-agent' ? 'main-agent' : 'host'}
+                    />
+                  </div>
+                </div>
               ) : (
-                <Card>
-                  <CardContent>
-                    {activeTab === 'claude' && (
-                      <ClaudeProviderSection
-                        setNotice={(message) =>
-                          message && toast.success(message)
-                        }
-                        setError={(message) => message && toast.error(message)}
-                      />
-                    )}
-                    {activeTab === 'registration' && (
-                      <div className="space-y-8">
-                        <RegistrationSection />
-                        <div className="border-t border-border pt-6">
-                          <SystemSettingsSection scope="security" />
-                        </div>
+                <>
+                  {activeTab === 'claude' && (
+                    <ClaudeProviderSection
+                      setNotice={(message) => message && toast.success(message)}
+                      setError={(message) => message && toast.error(message)}
+                    />
+                  )}
+                  {activeTab === 'registration' && (
+                    <div className="space-y-8">
+                      <RegistrationSection />
+                      <div className="border-t border-border pt-6">
+                        <SystemSettingsSection scope="security" />
                       </div>
-                    )}
-                    {activeTab === 'appearance' && <AppearanceSection />}
-                    {activeTab === 'profile' && <ProfileSection />}
-                    {activeTab === 'preferences' && <PreferencesSection />}
-                    {activeTab === 'my-channels' && <UserChannelsSection />}
-                    {activeTab === 'security' && <SecuritySection />}
-                    {activeTab === 'about' && <AboutSection />}
-                  </CardContent>
-                </Card>
+                    </div>
+                  )}
+                  {activeTab === 'appearance' && <AppearanceSection />}
+                  {activeTab === 'profile' && <ProfileSection />}
+                  {activeTab === 'preferences' && <PreferencesSection />}
+                  {activeTab === 'my-channels' && <UserChannelsSection />}
+                  {activeTab === 'security' && <SecuritySection />}
+                  {activeTab === 'about' && <AboutSection />}
+                </>
               )}
             </div>
           </div>

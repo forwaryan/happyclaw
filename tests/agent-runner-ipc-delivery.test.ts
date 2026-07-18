@@ -6,6 +6,8 @@ import { afterEach, describe, expect, test } from 'vitest';
 import {
   IpcTurnDeliveryTracker,
   isHealthyInputTurnCompletion,
+  latestIpcDeliveryId,
+  latestIpcInputMessage,
   parseIpcReceipt,
   requeueIpcInputMessages,
   serializeIpcInputMessage,
@@ -33,6 +35,31 @@ function message(id: string): IpcInputMessage {
 }
 
 describe('agent-runner IPC delivery turn tracker', () => {
+  test('selects the greatest receipt cursor regardless of filesystem order', () => {
+    const older = message('1');
+    const newerSameTimestamp: IpcInputMessage = {
+      text: 'newer',
+      receipt: {
+        deliveryId: 'delivery-newer',
+        chatJid: 'web:main',
+        cursor: {
+          timestamp: older.receipt!.cursor.timestamp,
+          id: 'z-newer',
+        },
+      },
+    };
+
+    expect(latestIpcDeliveryId([newerSameTimestamp, older])).toBe(
+      'delivery-newer',
+    );
+    expect(latestIpcDeliveryId([older, newerSameTimestamp])).toBe(
+      'delivery-newer',
+    );
+    expect(latestIpcInputMessage([newerSameTimestamp, older])).toBe(
+      newerSameTimestamp,
+    );
+  });
+
   test('startup and idle-drained batches acknowledge only their exact completed turn', () => {
     const startup = [message('1'), message('2')];
     const tracker = new IpcTurnDeliveryTracker(startup);

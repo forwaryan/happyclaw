@@ -22,6 +22,7 @@ import {
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
+  clearStaleTaskLeases,
   claimTaskForRun,
   deleteGroupData,
   getDueTasks,
@@ -709,6 +710,17 @@ async function runTaskInner(
     ? `${workspace.jid}#task:${options.taskRunId}`
     : workspace.jid;
   const taskOwnerId = task.created_by || workspaceGroup.created_by || null;
+  // The task's creator (taskOwnerId) can legitimately differ from the
+  // workspace's actual owner for admin-initiated cross-group tasks
+  // (hasCrossGroupAccess in mcp-tools.ts lets an admin home target another
+  // user's workspace via target_group_jid). Every check that decides what
+  // privileges/mounts/gates apply to the *execution context* must be scoped
+  // to the workspace being executed in, not to whoever scheduled the task —
+  // otherwise an admin-created task targeting a member's workspace would
+  // inherit admin privileges (isAdminHome mount, owner-active bypass,
+  // billing bypass) inside that member's own container. taskOwnerId is kept
+  // only for display/audit attribution (who scheduled this run).
+  const workspaceOwnerId = workspaceGroup.created_by || null;
 
   const groupDir = path.join(GROUPS_DIR, workspace.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -721,13 +733,13 @@ async function runTaskInner(
   // Owner gate before running task: a disabled/deleted owner's scheduled
   // tasks must stop firing (billing only checks balance, not status, and is
   // skipped for admins — so it can't cover this). See `src/owner-gate.ts`.
-  if (taskOwnerId) {
-    const ownerGate = checkOwnerActive(getUserById(taskOwnerId));
+  if (workspaceOwnerId) {
+    const ownerGate = checkOwnerActive(getUserById(workspaceOwnerId));
     if (!ownerGate.allowed) {
       logger.info(
         {
           taskId: task.id,
-          userId: taskOwnerId,
+          userId: workspaceOwnerId,
           ownerStatus: ownerGate.status,
         },
         'Owner not active, blocking scheduled task',
@@ -753,17 +765,22 @@ async function runTaskInner(
     }
   }
 
-  // Billing quota check before running task
-  if (isBillingEnabled() && taskOwnerId) {
-    const owner = getUserById(taskOwnerId);
+  // Billing quota check before running task. Gated on the workspace's real
+  // owner so an admin-created cross-group task still charges/limits the
+  // member workspace it actually runs in and consumes resources for.
+  if (isBillingEnabled() && workspaceOwnerId) {
+    const owner = getUserById(workspaceOwnerId);
     if (owner && owner.role !== 'admin') {
-      const accessResult = checkBillingAccessFresh(taskOwnerId, owner.role);
+      const accessResult = checkBillingAccessFresh(
+        workspaceOwnerId,
+        owner.role,
+      );
       if (!accessResult.allowed) {
         const reason = accessResult.reason || '当前账户不可用';
         logger.info(
           {
             taskId: task.id,
-            userId: taskOwnerId,
+            userId: workspaceOwnerId,
             reason,
             blockType: accessResult.blockType,
           },
@@ -794,8 +811,10 @@ async function runTaskInner(
 
   // Update tasks snapshot for container to read (filtered by group)
   const isHome = !!workspaceGroup.is_home;
-  const owner = taskOwnerId ? getUserById(taskOwnerId) : null;
-  const isAdminHome = isHome && owner?.role === 'admin';
+  const workspaceOwner = workspaceOwnerId
+    ? getUserById(workspaceOwnerId)
+    : null;
+  const isAdminHome = isHome && workspaceOwner?.role === 'admin';
   const tasks = getAllTasks();
   writeTasksSnapshot(
     workspace.folder,
@@ -811,12 +830,19 @@ async function runTaskInner(
     })),
   );
 
-  // Store task prompt as a user message in workspace chat so it's visible in conversation
+  // Store task prompt as a user message in workspace chat so it's visible in
+  // conversation. Sender attribution/audit must use the task's actual
+  // creator (taskOwnerId), NOT workspaceOwner — otherwise an admin-created
+  // cross-group task would be misattributed in the chat history and audit
+  // trail as if the target workspace's own member had typed the prompt
+  // themselves.
   if (deps.storePromptMessage) {
-    const senderName = owner?.display_name || owner?.username || '定时任务';
+    const taskCreator = taskOwnerId ? getUserById(taskOwnerId) : null;
+    const senderName =
+      taskCreator?.display_name || taskCreator?.username || '定时任务';
     deps.storePromptMessage(
       effectiveJid,
-      owner?.id || 'system',
+      taskCreator?.id || 'system',
       senderName,
       task.prompt,
       task.id,
@@ -855,7 +881,7 @@ async function runTaskInner(
     ? createTaskSessionAgentId(options.taskRunId)
     : `task-${task.id.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
   const agentProfile = resolveEffectiveAgentProfile(
-    getAgentProfileForWorkspace(workspace.folder, taskOwnerId),
+    getAgentProfileForWorkspace(workspace.folder, workspaceOwnerId),
   );
   if (
     taskSessionNeedsAgentProfileReset(
@@ -894,7 +920,6 @@ async function runTaskInner(
 
   try {
     const executionMode = resolveTaskExecutionMode(task, deps);
-    const workspaceOwnerId = workspaceGroup.created_by;
     if (
       executionMode === 'host' &&
       !canExecuteOnHost(
@@ -906,9 +931,12 @@ async function runTaskInner(
     const runAgent =
       executionMode === 'host' ? runHostAgent : runContainerAgent;
 
-    // Resolve owner's home folder for correct volume mounts (skills, memory, CLAUDE.md)
-    const ownerHomeFolder = taskOwnerId
-      ? getUserHomeGroup(taskOwnerId)?.folder || workspace.folder
+    // Resolve the workspace owner's home folder for correct volume mounts
+    // (skills, memory, CLAUDE.md). Must be the workspace's real owner, not
+    // the task creator — otherwise an admin-created cross-group task would
+    // mount the admin's own global skills/memory into a member's container.
+    const ownerHomeFolder = workspaceOwnerId
+      ? getUserHomeGroup(workspaceOwnerId)?.folder || workspace.folder
       : workspace.folder;
 
     const output = await runAgent(
@@ -1135,10 +1163,12 @@ async function runScriptTaskInner(
 
   // Owner gate before running script task: same as the Agent-task path, a
   // disabled/deleted owner's scheduled scripts must stop firing regardless of
-  // billing toggle or role. See `src/owner-gate.ts`.
+  // billing toggle or role. See `src/owner-gate.ts`. Must key off the
+  // group's actual owner, not the task's creator — a cross-group script
+  // task created by an admin must still stop when the target group's real
+  // owner is disabled, not when the admin is.
   {
-    const ownerId =
-      task.created_by || deps.registeredGroups()[groupJid]?.created_by;
+    const ownerId = deps.registeredGroups()[groupJid]?.created_by;
     if (ownerId) {
       const ownerGate = checkOwnerActive(getUserById(ownerId));
       if (!ownerGate.allowed) {
@@ -1167,11 +1197,14 @@ async function runScriptTaskInner(
     }
   }
 
-  // Billing quota check before running script task
+  // Billing quota check before running script task. Gated on the group's
+  // real owner so a cross-group admin-created script task still charges
+  // the target group's own quota rather than silently skipping because the
+  // task's creator happens to be an admin.
   if (isBillingEnabled() && task.group_folder) {
     const groups = deps.registeredGroups();
     const group = groups[groupJid];
-    const ownerId = task.created_by || group?.created_by;
+    const ownerId = group?.created_by;
     if (ownerId) {
       const owner = getUserById(ownerId);
       if (owner && owner.role !== 'admin') {
@@ -1456,6 +1489,17 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   runningTaskIds.clear();
   pendingManualTaskIds.clear();
   pendingScheduledTaskIds.clear();
+  try {
+    const clearedLeases = clearStaleTaskLeases();
+    if (clearedLeases > 0) {
+      logger.info(
+        { clearedLeases },
+        'Cleared stale scheduled_tasks run leases from previous process',
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to clear stale task run leases');
+  }
   try {
     const cleaned = cleanupStaleRunningLogs();
     if (cleaned > 0) {

@@ -271,6 +271,11 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	  echo "❌ 运行时数据包含不安全的链接或特殊文件，拒绝创建不可安全恢复的备份：$$UNSAFE_ENTRY"; \
 	  exit 1; \
 	fi; \
+	HARDLINK_ENTRY=$$(find "$$TMP_ROOT/data" -type f -links +1 -print -quit); \
+	if [ -n "$$HARDLINK_ENTRY" ]; then \
+	  echo "❌ 运行时数据包含硬链接文件，tar 会将其存为不完整的链接条目导致备份无法恢复，拒绝创建：$$HARDLINK_ENTRY"; \
+	  exit 1; \
+	fi; \
 	if [ -d "$$TMP_ROOT/data/groups" ]; then \
 	  find "$$TMP_ROOT/data/groups" -mindepth 2 -maxdepth 2 -type d -name logs \
 	    -prune -exec rm -rf {} +; \

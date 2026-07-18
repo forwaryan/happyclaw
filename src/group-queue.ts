@@ -1091,7 +1091,7 @@ export class GroupQueue {
     groupJid: string,
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
-    onInjected?: () => void,
+    onInjected?: (receipt?: IpcDeliveryReceipt) => void,
     sourceJid?: string,
     taskId?: string,
     deliveryTarget?: IpcDeliveryTarget,
@@ -1185,7 +1185,7 @@ export class GroupQueue {
         this.isIpcDeliveryCommitEligibleFn?.(receipt);
       }
       state.queryInFlight = true;
-      onInjected?.();
+      onInjected?.(receipt);
       return 'sent';
     } catch (err) {
       // 不静默：磁盘满 / 权限错 / inode 耗尽这些根因不应该被伪装成

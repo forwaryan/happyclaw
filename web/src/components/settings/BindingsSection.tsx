@@ -270,8 +270,8 @@ export function BindingsSection() {
   }, [restoreConfirmGroup, rebind]);
 
   return (
-    <div className="p-4 lg:p-8">
-      <div className="max-w-3xl mx-auto space-y-4">
+    <div>
+      <div className="space-y-4">
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>

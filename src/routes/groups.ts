@@ -93,6 +93,10 @@ import path from 'node:path';
 import { z } from 'zod';
 import { broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
+import {
+  buildPinnedGitEnvironment,
+  startPinnedHttpsProxy,
+} from '../safe-git-proxy.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -102,7 +106,10 @@ const execFileAsync = promisify(execFile);
  *
  * Re-export 自 ../url-safety.ts 以兼容已有调用方；新代码应直接 import 那里的版本。
  */
-import { isPrivateHostname } from '../url-safety.js';
+import {
+  assertResolvesToPublicAddress,
+  isPrivateHostname,
+} from '../url-safety.js';
 export { isPrivateHostname };
 
 const groupRoutes = new Hono<{ Variables: Variables }>();
@@ -529,12 +536,34 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       return c.json({ error: 'init_git_url must use https protocol' }, 400);
     }
 
-    // 阻止内网地址
+    // 阻止内网地址（字面量 IP/localhost）
     if (isPrivateHostname(gitUrl.hostname)) {
       return c.json(
         { error: 'init_git_url must not point to a private/internal address' },
         400,
       );
+    }
+
+    // URL 内嵌凭据会被传给 git 子进程，可能落进进程列表/日志；与
+    // skill-import-service.ts 的 importSkillsFromGit 保持一致，直接拒绝。
+    if (gitUrl.username || gitUrl.password) {
+      return c.json(
+        { error: 'init_git_url must not contain credentials' },
+        400,
+      );
+    }
+
+    // Early DNS check gives a fast 400 response. The actual clone is also
+    // forced through a connection-time validating proxy below, which pins
+    // each socket to the exact public IP it just validated.
+    try {
+      await assertResolvesToPublicAddress(
+        gitUrl.hostname,
+        'init_git_url hostname',
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: errMsg }, 400);
     }
   }
 
@@ -569,13 +598,49 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     }
 
     if (initGitUrl) {
-      await execFileAsync(
-        'git',
-        ['clone', '--depth', '1', initGitUrl, groupDir],
-        {
-          timeout: 120_000,
-        },
-      );
+      const reGitUrl = new URL(initGitUrl);
+      const gitProxy = await startPinnedHttpsProxy(reGitUrl.hostname, {
+        expectedPort: reGitUrl.port ? Number(reGitUrl.port) : 443,
+      });
+      // Hardening flags mirror skill-import-service.ts's importSkillsFromGit:
+      // - http.followRedirects=false: an initial 302 to a private/internal
+      //   address would otherwise bypass the DNS precheck above entirely.
+      // - protocol.file.allow=never: refuse a local-file clone smuggled in
+      //   via a redirect or a crafted URL scheme override.
+      // - submodule.recurse=false: don't let a malicious repo's submodules
+      //   pull from arbitrary, unvalidated URLs.
+      // - --no-tags --single-branch: minimize what an untrusted repo can
+      //   push into this clone beyond the requested ref.
+      // - GIT_TERMINAL_PROMPT=0: never hang waiting for credential input.
+      try {
+        await execFileAsync(
+          'git',
+          [
+            '-c',
+            `http.proxy=${gitProxy.url}`,
+            '-c',
+            'http.followRedirects=false',
+            '-c',
+            'protocol.file.allow=never',
+            '-c',
+            'submodule.recurse=false',
+            'clone',
+            '--depth',
+            '1',
+            '--no-tags',
+            '--single-branch',
+            '--',
+            initGitUrl,
+            groupDir,
+          ],
+          {
+            timeout: 120_000,
+            env: buildPinnedGitEnvironment(gitProxy.url),
+          },
+        );
+      } finally {
+        await gitProxy.close();
+      }
       logger.info(
         { folder, url: initGitUrl },
         'Workspace initialized from git clone',

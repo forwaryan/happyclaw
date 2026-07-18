@@ -27,6 +27,22 @@ describe('settings information architecture', () => {
     );
   });
 
+  test('uses the app scroll root and keeps settings content out of shell cards', () => {
+    const appLayout = read('web/src/components/layout/AppLayout.tsx');
+    const settings = read('web/src/pages/SettingsPage.tsx');
+    const billing = read('web/src/pages/BillingPage.tsx');
+
+    expect(appLayout).toContain('data-app-scroll-root="true"');
+    expect(settings).toContain('data-settings-page="true"');
+    expect(settings).toContain('data-settings-content="true"');
+    expect(settings).not.toContain('overflow-y-auto');
+    expect(settings).not.toContain('<Card');
+    expect(settings).not.toContain(
+      'h-full bg-background flex flex-col lg:flex-row overflow-hidden',
+    );
+    expect(billing).not.toContain('flex-1 overflow-y-auto');
+  });
+
   test('moves product resources out of settings while preserving old links', () => {
     const app = read('web/src/App.tsx');
     const settings = read('web/src/pages/SettingsPage.tsx');
@@ -99,13 +115,20 @@ describe('settings information architecture', () => {
     const bindings = read('web/src/components/settings/BindingsSection.tsx');
     const bindingRow = read('web/src/components/settings/ImBindingRow.tsx');
     const provider = read('web/src/components/settings/ProviderEditor.tsx');
+    const providerModel = read('web/src/utils/provider-model.ts');
     const settings = read('web/src/pages/SettingsPage.tsx');
 
     expect(bindings).toMatch(/解除发言者限制|不可恢复|解除绑定/);
     expect(bindingRow).toMatch(
       /消息响应方式|supports_owner_mention|require_mention/,
     );
-    expect(provider).toContain('高级设置 · 自定义环境变量');
+    expect(provider).toContain('高级设置 · 环境变量');
+    expect(provider).toContain('系统预填环境变量');
+    expect(provider).toContain('已自定义');
+    expect(provider).toContain('恢复默认值');
+    expect(providerModel).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
+    expect(provider).toContain('1M 上下文');
+    expect(provider).toContain('系统预填 Claude Code 运行环境');
     expect(provider).toContain("balancingStrategy === 'weighted-round-robin'");
     expect(settings).toContain('toast.success(message)');
     expect(settings).toContain('toast.error(message)');

@@ -980,26 +980,23 @@ type ChannelChatInfo = NativeContextMetadata & {
   user_count?: string;
 };
 
-async function checkThreadCapableBinding(
+// Only fetches live chat metadata — does NOT compute threadCapable. That
+// decision must be (re-)computed by the caller against a freshly re-read
+// imGroup taken AFTER this await, never against the pre-await snapshot —
+// see the identical helper's doc comment in routes/agents.ts for why.
+async function fetchLiveChatInfo(
   userId: string,
   imJid: string,
-  imGroup: RegisteredGroup,
-): Promise<{
-  threadCapable: boolean;
-  chatInfo?: ChannelChatInfo | null;
-}> {
+): Promise<{ chatInfo?: ChannelChatInfo | null }> {
   const channelType = getChannelType(imJid);
-  if (!channelType) return { threadCapable: false };
+  if (!channelType) return {};
   const webDeps = getWebDeps();
   const chatInfo = webDeps?.getChannelChatInfo
     ? ((await webDeps.getChannelChatInfo(imJid)) as ChannelChatInfo | null)
     : channelType === 'feishu' && webDeps?.getFeishuChatInfo
       ? await webDeps.getFeishuChatInfo(userId, extractChatId(imJid))
       : null;
-  return {
-    threadCapable: isNativeContextContainer(imJid, imGroup, chatInfo ?? {}),
-    chatInfo,
-  };
+  return { chatInfo };
 }
 
 function resolveWorkspaceForBinding(
@@ -3408,16 +3405,28 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
 
   // Unbind mode
   if (body.unbind === true) {
-    const previousTargetMainJid = imGroup.target_main_jid;
-    const wasThreadMap = imGroup.binding_mode === 'thread_map';
-    const { chatInfo } = await checkThreadCapableBinding(
-      user.id,
-      imJid,
-      imGroup,
-    );
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read + re-authorize after the await — fetchLiveChatInfo
+    // yields the event loop on a live network call, during which ownership
+    // or binding state may have changed. restoreDefaultChannelMount commits
+    // whatever `group` it's given, so building it from the stale pre-await
+    // snapshot would silently clobber a concurrent write and could cross
+    // the original authorization boundary.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    const previousTargetMainJid = freshImGroup.target_main_jid;
+    const wasThreadMap = freshImGroup.binding_mode === 'thread_map';
     const restored = restoreDefaultChannelMount(
       imJid,
-      imGroup,
+      freshImGroup,
       user.id,
       chatInfo ?? {},
     );
@@ -3480,12 +3489,29 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     ) {
       return c.json({ error: 'Forbidden' }, 403);
     }
-    const { threadCapable } = await checkThreadCapableBinding(
-      user.id,
-      imJid,
-      imGroup,
-    );
-    if (threadCapable) {
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read after the await: fetchLiveChatInfo makes a live network call
+    // that yields the event loop, during which a concurrent bind request or
+    // the message router's owner-learning path can commit a new mount for
+    // this exact imJid, or upgrade native_context_type from 'none' to
+    // 'thread'. Building the update, or computing threadCapable, from the
+    // pre-await snapshot would silently clobber that write or bind a
+    // now-thread-capable container as a fixed single session.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    // Re-run authorization against the fresh row — the handler's top-level
+    // checks only proved it against the stale imGroup read before the await.
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
       return c.json(
         {
           error:
@@ -3498,21 +3524,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-    const hasConflict = hasSessionMountConflict(imGroup, sessionId);
+    const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
 
     const updated: RegisteredGroup = buildSessionMountUpdate(
-      imGroup,
+      freshImGroup,
       sessionId,
       {
         replyPolicy,
       },
     );
     applyBindingUpdate(imJid, updated);
-    if (imGroup.binding_mode === 'thread_map') {
-      detachThreadMapWorkspaceIfLast(imGroup.target_main_jid, imJid);
+    if (freshImGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(freshImGroup.target_main_jid, imJid);
     }
     logger.info(
       { imJid, sessionId, userId: user.id },
@@ -3553,17 +3579,32 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     if (!canModifyGroup(user, { ...targetGroup, jid: targetMainJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
-    const { threadCapable, chatInfo } = await checkThreadCapableBinding(
-      user.id,
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read + re-authorize after the await — see the analogous comment
+    // in the session-bind branch above.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    const threadCapable = isNativeContextContainer(
       imJid,
-      imGroup,
+      freshImGroup,
+      chatInfo ?? {},
     );
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
     const legacyMainJid = `web:${targetGroup.folder}`;
     const hasConflict = hasWorkspaceMountConflict(
-      imGroup,
+      freshImGroup,
       targetMainJid,
       legacyMainJid,
     );
@@ -3572,7 +3613,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     const updated: RegisteredGroup = {
       ...buildWorkspaceMountUpdate(
-        imGroup,
+        freshImGroup,
         targetMainJid,
         threadCapable ? 'thread_map' : 'single_session',
         {
@@ -3581,14 +3622,14 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
           ...(ownerImId !== undefined ? { ownerImId } : {}),
         },
       ),
-      feishu_chat_mode: chatInfo?.chat_mode ?? imGroup.feishu_chat_mode,
+      feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
       feishu_group_message_type:
-        chatInfo?.group_message_type ?? imGroup.feishu_group_message_type,
+        chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
     };
     applyBindingUpdate(imJid, updated);
-    if (imGroup.binding_mode === 'thread_map') {
+    if (freshImGroup.binding_mode === 'thread_map') {
       detachThreadMapWorkspaceIfLast(
-        imGroup.target_main_jid,
+        freshImGroup.target_main_jid,
         imJid,
         targetMainJid,
         threadCapable ? 'thread_map' : 'single_session',

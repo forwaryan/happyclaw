@@ -202,7 +202,7 @@ export function SettingsNav({
 
   return (
     <>
-      <nav className="hidden w-56 shrink-0 overflow-y-auto border-r border-border bg-background px-3 py-6 lg:block">
+      <nav className="hidden w-56 shrink-0 border-r border-border bg-background px-3 py-6 lg:sticky lg:top-0 lg:block lg:h-dvh lg:self-start lg:overflow-y-auto">
         {navigation}
       </nav>
       <Sheet open={open} onOpenChange={onOpenChange}>

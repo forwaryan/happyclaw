@@ -406,8 +406,11 @@ function resolveAgentProfileUserSkillsPolicy(
       // Report the same policy failure for deleted and never-installed skills.
     }
     if (!isDirectory) {
+      // Deterministic misconfiguration (deleted/disabled skill), never
+      // transient — prefix lets index.ts fail fast instead of retrying with
+      // exponential backoff (same pattern as context_overflow: / see below).
       throw new Error(
-        `AgentProfile ${agentProfile.id} requires unavailable skill ${id}`,
+        `agent_profile_unavailable: AgentProfile ${agentProfile.id} requires unavailable skill ${id}`,
       );
     }
     let hasSkillDefinition = false;
@@ -418,7 +421,7 @@ function resolveAgentProfileUserSkillsPolicy(
     }
     if (!hasSkillDefinition) {
       throw new Error(
-        `AgentProfile ${agentProfile.id} requires unavailable skill definition ${id}/SKILL.md`,
+        `agent_profile_unavailable: AgentProfile ${agentProfile.id} requires unavailable skill definition ${id}/SKILL.md`,
       );
     }
     return { id, source };
@@ -466,8 +469,10 @@ function resolveAgentProfileMcpPolicy(
     policy ?? { mode: 'inherit', ids: [] },
   );
   if (resolved.missing.length > 0) {
+    // Deterministic misconfiguration (deleted/disabled MCP server), never
+    // transient — see agent_profile_unavailable: prefix note above.
     throw new Error(
-      `AgentProfile ${agentProfile?.id ?? 'unknown'} requires unavailable MCP server(s): ${resolved.missing.join(', ')}`,
+      `agent_profile_unavailable: AgentProfile ${agentProfile?.id ?? 'unknown'} requires unavailable MCP server(s): ${resolved.missing.join(', ')}`,
     );
   }
   return {

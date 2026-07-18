@@ -30,7 +30,7 @@ import {
   getChannelAccount,
 } from '../db.js';
 import { DATA_DIR } from '../config.js';
-import type { RegisteredGroup, SubAgent } from '../types.js';
+import type { AuthUser, RegisteredGroup, SubAgent } from '../types.js';
 import { logger } from '../logger.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
 import { ensureAgentDirectories } from '../utils.js';
@@ -58,27 +58,29 @@ type ChannelChatInfo = NativeContextMetadata & {
   user_count?: string;
 };
 
-/** Resolve native-context capability from live metadata, then persisted data. */
-async function checkThreadCapableBinding(
+// Only fetches live chat metadata — does NOT compute threadCapable. That
+// decision must be (re-)computed by the caller against a freshly re-read
+// imGroup taken AFTER this await, never against the pre-await snapshot:
+// getChannelChatInfo/getFeishuChatInfo is a real network call that yields
+// the event loop, during which the message router can upgrade
+// native_context_type from 'none' to 'thread' for this exact imJid. Using a
+// stale imGroup here would compute threadCapable from outdated persisted
+// state and could bind a now-native-thread-capable container as a fixed
+// single_session, breaking that thread's session isolation from its
+// siblings. See callers for the fresh-read + recompute pattern.
+async function fetchLiveChatInfo(
   userId: string,
   imJid: string,
-  imGroup: RegisteredGroup,
-): Promise<{
-  threadCapable: boolean;
-  chatInfo?: ChannelChatInfo | null;
-}> {
+): Promise<{ chatInfo?: ChannelChatInfo | null }> {
   const channelType = getChannelType(imJid);
-  if (!channelType) return { threadCapable: false };
+  if (!channelType) return {};
   const deps = getWebDeps();
   const chatInfo = deps?.getChannelChatInfo
     ? ((await deps.getChannelChatInfo(imJid)) as ChannelChatInfo | null)
     : channelType === 'feishu' && deps?.getFeishuChatInfo
       ? await deps.getFeishuChatInfo(userId, extractChatId(imJid))
       : null;
-  return {
-    threadCapable: isNativeContextContainer(imJid, imGroup, chatInfo ?? {}),
-    chatInfo,
-  };
+  return { chatInfo };
 }
 
 /** Update workspace RegisteredGroup in DB + in-memory cache. */
@@ -172,7 +174,7 @@ function isNativeManagedSession(
 }
 
 async function restoreBindingDefault(
-  userId: string,
+  user: Pick<AuthUser, 'id' | 'role'>,
   imJid: string,
   imGroup: RegisteredGroup,
 ): Promise<
@@ -186,18 +188,30 @@ async function restoreBindingDefault(
       reason: string;
     }
 > {
-  const { chatInfo } = await checkThreadCapableBinding(userId, imJid, imGroup);
+  const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+  // Re-read + re-authorize after the await — fetchLiveChatInfo
+  // yields the event loop on a live network call, during which ownership
+  // may have changed. restoreDefaultChannelMount commits whatever `group`
+  // it's given, so a stale pre-await snapshot could silently clobber a
+  // concurrent write or cross the caller's original authorization boundary.
+  const freshImGroup = getRegisteredGroup(imJid);
+  if (!freshImGroup) {
+    return { status: 'unavailable', reason: 'im_group_not_found' };
+  }
+  if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+    return { status: 'unavailable', reason: 'account_mismatch' };
+  }
   const restored = restoreDefaultChannelMount(
     imJid,
-    imGroup,
-    userId,
+    freshImGroup,
+    user.id,
     chatInfo ?? {},
   );
   if (restored.status !== 'resolved') return restored;
 
   detachPreviousThreadMapIfLast(
     imJid,
-    imGroup,
+    freshImGroup,
     restored.workspaceJid,
     restored.routingMode,
   );
@@ -1134,12 +1148,37 @@ router.put(
       ) {
         return c.json({ error: 'Session not found' }, 404);
       }
-      const { threadCapable } = await checkThreadCapableBinding(
-        user.id,
-        imJid,
-        imGroup,
-      );
-      if (threadCapable) {
+      const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+      // Re-read after the await: fetchLiveChatInfo makes a live network
+      // call (e.g. Feishu getFeishuChatInfo) that yields the event loop,
+      // during which a concurrent bind request or the message router's
+      // owner-learning path can commit a new mount for this exact imJid —
+      // or upgrade native_context_type from 'none' to 'thread'. Building
+      // the update, or computing threadCapable, from the pre-await
+      // snapshot would silently clobber that concurrent write, bypass the
+      // conflict check below (commitChannelMountUpdate persists the full
+      // row), or bind a now-thread-capable container as a fixed single
+      // session, breaking that thread's session isolation.
+      const freshImGroup = getRegisteredGroup(imJid);
+      if (!freshImGroup) {
+        return c.json({ error: 'IM group not found' }, 404);
+      }
+      // The pre-await canModifyGroup/hasConsistentChannelAccount checks
+      // above only proved authorization against the stale imGroup. During
+      // the await, ownership could have changed (credential transfer,
+      // delete+recreate, owner-learning) — re-run both checks against the
+      // fresh row before committing, or a mutation could cross the
+      // original authorization boundary.
+      if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+        return c.json({ error: 'Forbidden' }, 403);
+      }
+      if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+        return c.json(
+          { error: 'Invalid or inaccessible channel account' },
+          400,
+        );
+      }
+      if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
         return c.json(
           {
             error:
@@ -1148,16 +1187,16 @@ router.put(
           400,
         );
       }
-      const hasConflict = hasSessionMountConflict(imGroup, sessionId);
+      const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
       if (hasConflict && !force) {
         return c.json({ error: 'IM group is already bound elsewhere' }, 409);
       }
 
-      const updated = buildSessionMountUpdate(imGroup, sessionId, {
+      const updated = buildSessionMountUpdate(freshImGroup, sessionId, {
         replyPolicy,
       });
       commitChannelMountUpdate(imJid, updated);
-      detachPreviousThreadMapIfLast(imJid, imGroup);
+      detachPreviousThreadMapIfLast(imJid, freshImGroup);
       logger.info(
         { imJid, sessionId, userId: user.id },
         'IM group bound to workspace session',
@@ -1165,15 +1204,34 @@ router.put(
       return c.json({ success: true });
     }
 
-    const { threadCapable, chatInfo } = await checkThreadCapableBinding(
-      user.id,
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read after the await — see the analogous comment in the
+    // session-bind branch above: fetchLiveChatInfo yields the event loop
+    // on a live network call, and a concurrent write to this imJid must
+    // not be silently overwritten by the pre-await snapshot.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    // Re-run authorization against the fresh row — see the analogous
+    // comment in the session-bind branch above.
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    const threadCapable = isNativeContextContainer(
       imJid,
-      imGroup,
+      freshImGroup,
+      chatInfo ?? {},
     );
     const targetMainJid = jid;
     const legacyMainJid = `web:${group.folder}`;
     const hasConflict = hasWorkspaceMountConflict(
-      imGroup,
+      freshImGroup,
       targetMainJid,
       legacyMainJid,
     );
@@ -1202,7 +1260,7 @@ router.put(
 
     const updated: RegisteredGroup = {
       ...buildWorkspaceMountUpdate(
-        imGroup,
+        freshImGroup,
         targetMainJid,
         threadCapable ? 'thread_map' : 'single_session',
         {
@@ -1211,14 +1269,14 @@ router.put(
           ...(ownerImId !== undefined ? { ownerImId } : {}),
         },
       ),
-      feishu_chat_mode: chatInfo?.chat_mode ?? imGroup.feishu_chat_mode,
+      feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
       feishu_group_message_type:
-        chatInfo?.group_message_type ?? imGroup.feishu_group_message_type,
+        chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
     };
     commitChannelMountUpdate(imJid, updated);
     detachPreviousThreadMapIfLast(
       imJid,
-      imGroup,
+      freshImGroup,
       targetMainJid,
       threadCapable ? 'thread_map' : 'single_session',
     );
@@ -1276,7 +1334,7 @@ router.delete(
       if (imGroup.target_agent_id !== sessionId) {
         return c.json({ error: 'IM group is not bound to this session' }, 400);
       }
-      const restored = await restoreBindingDefault(user.id, imJid, imGroup);
+      const restored = await restoreBindingDefault(user, imJid, imGroup);
       if (restored.status !== 'resolved') {
         return c.json({ error: restoreDefaultError(restored) }, 409);
       }
@@ -1298,7 +1356,7 @@ router.delete(
     if (!matchesWorkspaceMount(imGroup, targetMainJid, legacyMainJid)) {
       return c.json({ error: 'IM group is not bound to this workspace' }, 400);
     }
-    const restored = await restoreBindingDefault(user.id, imJid, imGroup);
+    const restored = await restoreBindingDefault(user, imJid, imGroup);
     if (restored.status !== 'resolved') {
       return c.json({ error: restoreDefaultError(restored) }, 409);
     }
@@ -1366,12 +1424,22 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   if (!hasConsistentChannelAccount(user.id, imJid, imGroup)) {
     return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
   }
-  const { threadCapable } = await checkThreadCapableBinding(
-    user.id,
-    imJid,
-    imGroup,
-  );
-  if (threadCapable) {
+  const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+  // Re-read + re-authorize after the await — see the analogous comment on
+  // the PUT /:jid/sessions/:sessionId/im-binding route above.
+  const freshImGroup = getRegisteredGroup(imJid);
+  if (!freshImGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+  if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+    return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+  }
+  // Compute against freshImGroup, not the pre-await snapshot — see
+  // fetchLiveChatInfo's doc comment.
+  if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
     return c.json(
       {
         error:
@@ -1382,17 +1450,21 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   }
   const force = body.force === true;
   const replyPolicy = body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-  const hasConflict = hasSessionMountConflict(imGroup, agentId);
+  const hasConflict = hasSessionMountConflict(freshImGroup, agentId);
   if (hasConflict && !force) {
     return c.json({ error: 'IM group is already bound elsewhere' }, 409);
   }
 
   // Update DB + in-memory cache — clear target_main_jid to avoid conflicts
-  const updated: RegisteredGroup = buildSessionMountUpdate(imGroup, agentId, {
-    replyPolicy,
-  });
+  const updated: RegisteredGroup = buildSessionMountUpdate(
+    freshImGroup,
+    agentId,
+    {
+      replyPolicy,
+    },
+  );
   commitChannelMountUpdate(imJid, updated);
-  detachPreviousThreadMapIfLast(imJid, imGroup);
+  detachPreviousThreadMapIfLast(imJid, freshImGroup);
 
   logger.info(
     { imJid, sessionId: agentId, userId: user.id },
@@ -1442,7 +1514,7 @@ router.delete(
       return c.json({ error: 'IM group is not bound to this session' }, 400);
     }
 
-    const restored = await restoreBindingDefault(user.id, imJid, imGroup);
+    const restored = await restoreBindingDefault(user, imJid, imGroup);
     if (restored.status !== 'resolved') {
       return c.json({ error: restoreDefaultError(restored) }, 409);
     }
@@ -1502,10 +1574,28 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   if (!hasConsistentChannelAccount(user.id, imJid, imGroup)) {
     return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
   }
-  const { threadCapable, chatInfo } = await checkThreadCapableBinding(
-    user.id,
+  const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+  // Re-read after the await — fetchLiveChatInfo yields the event loop on a
+  // live network call, and a concurrent write to this imJid must not be
+  // silently overwritten by the pre-await snapshot below.
+  const freshImGroup = getRegisteredGroup(imJid);
+  if (!freshImGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  // Re-run authorization against the fresh row — the pre-await checks above
+  // only proved it against the stale imGroup.
+  if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+  if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+    return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+  }
+  // Compute against freshImGroup, not the pre-await snapshot — see
+  // fetchLiveChatInfo's doc comment.
+  const threadCapable = isNativeContextContainer(
     imJid,
-    imGroup,
+    freshImGroup,
+    chatInfo ?? {},
   );
   const targetMainJid = jid; // Use actual registered JID (not folder-based)
   const legacyMainJid = `web:${group.folder}`;
@@ -1518,7 +1608,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
         ? 'source_only'
         : undefined;
   const hasConflict = hasWorkspaceMountConflict(
-    imGroup,
+    freshImGroup,
     targetMainJid,
     legacyMainJid,
   );
@@ -1552,7 +1642,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   // Update DB + in-memory cache — clear target_agent_id to avoid conflicts
   const updated: RegisteredGroup = {
     ...buildWorkspaceMountUpdate(
-      imGroup,
+      freshImGroup,
       targetMainJid,
       threadCapable ? 'thread_map' : 'single_session',
       {
@@ -1561,14 +1651,14 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
         ...(ownerImId !== undefined ? { ownerImId } : {}),
       },
     ),
-    feishu_chat_mode: chatInfo?.chat_mode ?? imGroup.feishu_chat_mode,
+    feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
     feishu_group_message_type:
-      chatInfo?.group_message_type ?? imGroup.feishu_group_message_type,
+      chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
   };
   commitChannelMountUpdate(imJid, updated);
   detachPreviousThreadMapIfLast(
     imJid,
-    imGroup,
+    freshImGroup,
     targetMainJid,
     threadCapable ? 'thread_map' : 'single_session',
   );
@@ -1621,7 +1711,7 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
     return c.json({ error: 'IM group is not bound to this workspace' }, 400);
   }
 
-  const restored = await restoreBindingDefault(user.id, imJid, imGroup);
+  const restored = await restoreBindingDefault(user, imJid, imGroup);
   if (restored.status !== 'resolved') {
     return c.json({ error: restoreDefaultError(restored) }, 409);
   }

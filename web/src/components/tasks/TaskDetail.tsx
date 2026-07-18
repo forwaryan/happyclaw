@@ -498,7 +498,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
 
         <div>
           <div className="text-xs text-muted-foreground mb-1">执行模式</div>
-          {editing ? (
+          {editing && isAdmin ? (
             <>
               <select
                 value={editForm.execution_mode}

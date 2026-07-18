@@ -111,7 +111,7 @@ export function UserChannelsSection() {
         <ChannelAccountsManager />
       </TabsContent>
 
-      <TabsContent value="bindings" className="-mx-4 -my-4 lg:-mx-8 lg:-my-8">
+      <TabsContent value="bindings">
         <BindingsSection />
       </TabsContent>
     </Tabs>

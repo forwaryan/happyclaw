@@ -343,6 +343,70 @@ describe('scheduled task workspace/session contract', () => {
     });
   });
 
+  test('admin-created cross-group container task does not inherit isAdminHome from its creator', async () => {
+    const now = new Date().toISOString();
+    for (const id of ['xgroup-admin-creator', 'xgroup-member-owner']) {
+      db.createUser({
+        id,
+        username: id,
+        password_hash: 'hash',
+        display_name: id,
+        role: id === 'xgroup-admin-creator' ? 'admin' : 'member',
+        status: 'active',
+        must_change_password: false,
+        created_at: now,
+        updated_at: now,
+      });
+    }
+    const memberHomeJid = 'web:home-xgroup-member-owner';
+    const memberHomeGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: memberHomeJid,
+      folder: 'home-xgroup-member-owner',
+      created_by: 'xgroup-member-owner',
+      is_home: true,
+      executionMode: 'container' as const,
+    };
+    db.setRegisteredGroup(memberHomeJid, memberHomeGroup);
+    // The task is created_by the admin (as an MCP schedule_task call with
+    // target_group_jid would produce), but it targets the member's own
+    // home workspace. isAdminHome, the owner-active gate, and the billing
+    // gate must all key off the workspace's real owner (the member), not
+    // the admin who happened to create the task — otherwise the run would
+    // get an admin-privileged container mount inside the member's sandbox.
+    const taskId = createTask({
+      id: 'xgroup-admin-task',
+      group_folder: memberHomeGroup.folder,
+      chat_jid: memberHomeJid,
+      execution_mode: 'container',
+      created_by: 'xgroup-admin-creator',
+    });
+    const { deps, waitForRun } = makeDeps({ [memberHomeJid]: memberHomeGroup });
+
+    runContainerAgentMock.mockClear();
+    expect(triggerTaskNow(taskId, deps).success).toBe(true);
+    await waitForRun();
+
+    expect(runContainerAgentMock).toHaveBeenCalledTimes(1);
+    const input = runContainerAgentMock.mock.calls[0][1];
+    expect(input.isHome).toBe(true);
+    expect(input.isAdminHome).toBe(false);
+    expect(input.isMain).toBe(false);
+
+    // Security/execution-context fields must use the workspace's real
+    // owner (verified above), but the prompt message's sender attribution
+    // must still credit the actual task creator (the admin) — otherwise
+    // the chat history/audit trail would misattribute the admin's
+    // cross-group automation as if the member had typed it themselves.
+    expect(deps.storePromptMessage).toHaveBeenCalledWith(
+      expect.stringContaining(memberHomeJid),
+      'xgroup-admin-creator',
+      'xgroup-admin-creator',
+      expect.any(String),
+      taskId,
+    );
+  });
+
   test('manual trigger reserves a capacity-blocked task and releases after execution', async () => {
     const taskId = createTask({ id: 'task-manual-idempotency' });
     const groups = {

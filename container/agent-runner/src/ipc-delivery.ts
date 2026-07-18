@@ -74,6 +74,36 @@ export function isHealthyInputTurnCompletion(
   return pendingBackgroundTasks === 0 && !suspectTruncated;
 }
 
+/** Select the delivery id for the greatest durable DB cursor in a drained IPC
+ * batch. Files written in the same millisecond contain random suffixes, so
+ * readdir/filename order is not a reliable definition of the newest turn. */
+export function latestIpcDeliveryId(
+  messages: IpcInputMessage[],
+): string | undefined {
+  return latestIpcInputMessage(messages)?.receipt?.deliveryId;
+}
+
+/** Return the message with the greatest receipt cursor, falling back to the
+ * last array element for legacy inputs that carry no receipt. */
+export function latestIpcInputMessage(
+  messages: IpcInputMessage[],
+): IpcInputMessage | undefined {
+  let latest: IpcInputMessage | undefined;
+  for (const message of messages) {
+    const receipt = message.receipt;
+    if (!receipt) continue;
+    if (
+      !latest?.receipt ||
+      receipt.cursor.timestamp > latest.receipt.cursor.timestamp ||
+      (receipt.cursor.timestamp === latest.receipt.cursor.timestamp &&
+        receipt.cursor.id > latest.receipt.cursor.id)
+    ) {
+      latest = message;
+    }
+  }
+  return latest ?? messages[messages.length - 1];
+}
+
 /** Associates each accepted IPC batch with exactly one subsequent healthy SDK
  * result. Errors, interrupts, pending-background results and truncation do not
  * call completeNextTurn, so their messages remain replayable. */

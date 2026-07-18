@@ -1279,6 +1279,9 @@ export function AgentProfilesPage() {
                         currentPrompts={currentPrompts}
                         loadVersions={loadPromptVersions}
                         restoreVersion={restorePromptVersion}
+                        confirmDiscardUnsavedChanges={
+                          confirmDiscardUnsavedChanges
+                        }
                         onRestored={(profile) => {
                           setCurrentPrompts({
                             identity_prompt: profile.identity_prompt,

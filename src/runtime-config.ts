@@ -82,6 +82,31 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
 ]);
+
+const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
+  // These values receive provider-level defaults below, but remain editable
+  // through the provider's advanced settings. Workspace overrides stay
+  // blocked so one workspace cannot silently change provider behavior.
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_NO_FLICKER',
+  'API_TIMEOUT_MS',
+]);
+
+const THIRD_PARTY_RUNTIME_DEFAULTS = {
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  CLAUDE_CODE_EFFORT_LEVEL: 'max',
+  CLAUDE_CODE_NO_FLICKER: '1',
+  API_TIMEOUT_MS: '3000000',
+} as const;
+
+function isOneMillionContextModel(model: string): boolean {
+  return /\[1m\]$/i.test(model.trim());
+}
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
   'LD_PRELOAD',
@@ -2401,10 +2426,48 @@ export function buildClaudeEnvLines(
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
   }
 
-  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile
+  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile.
   const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
+
+  // Anthropic-compatible third-party endpoints need a predictable Claude Code
+  // runtime. Prefill the implementation-level environment from the model and
+  // [1m] suffix, while allowing provider-level advanced settings to replace
+  // any default explicitly.
+  if (config.anthropicBaseUrl) {
+    const configuredValue = (key: string, fallback: string): string =>
+      Object.hasOwn(customEnv, key)
+        ? sanitizeCustomEnvValue(key, customEnv[key])
+        : fallback;
+
+    if (config.anthropicModel) {
+      const model = sanitizeEnvValue(config.anthropicModel);
+      lines.push(
+        `ANTHROPIC_DEFAULT_OPUS_MODEL=${configuredValue('ANTHROPIC_DEFAULT_OPUS_MODEL', model)}`,
+      );
+      lines.push(
+        `ANTHROPIC_DEFAULT_SONNET_MODEL=${configuredValue('ANTHROPIC_DEFAULT_SONNET_MODEL', model)}`,
+      );
+      lines.push(
+        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${configuredValue('ANTHROPIC_DEFAULT_HAIKU_MODEL', model)}`,
+      );
+    }
+
+    lines.push(
+      `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${configuredValue(
+        'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        isOneMillionContextModel(config.anthropicModel) ? '1000000' : '200000',
+      )}`,
+    );
+    for (const [key, value] of Object.entries(THIRD_PARTY_RUNTIME_DEFAULTS)) {
+      lines.push(`${key}=${configuredValue(key, value)}`);
+    }
+  }
+
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
+    if (config.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key)) {
+      continue;
+    }
     lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
@@ -2831,6 +2894,16 @@ export function buildContainerEnvLines(
         logger.warn(
           { key },
           'Blocked dangerous env variable in buildContainerEnvLines',
+        );
+        continue;
+      }
+      if (
+        RESERVED_CLAUDE_ENV_KEYS.has(key) ||
+        (merged.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key))
+      ) {
+        logger.warn(
+          { key },
+          'Skipping managed Claude environment variable in workspace override',
         );
         continue;
       }

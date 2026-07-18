@@ -71,6 +71,7 @@ vi.mock('../src/web.js', () => ({
 const agentRoutesModule = await import('../src/routes/agents.js');
 const db = await import('../src/db.js');
 const mountService = await import('../src/channel-mount-service.js');
+const webContext = await import('../src/web-context.js');
 
 const agentRoutes = agentRoutesModule.default;
 
@@ -383,6 +384,126 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     });
   });
 
+  test('a concurrent write during checkThreadCapableBinding is not clobbered by the pre-await snapshot', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `qq-toctou-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'qq',
+      name: `QQ TOCTOU bot ${suffix}`,
+      secret_ref: `channel-account:qq-toctou-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `qq:c2c:user-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'QQ direct chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      native_context_type: 'none',
+    });
+
+    // checkThreadCapableBinding awaits deps.getChannelChatInfo — a real
+    // network call in production (e.g. Feishu getFeishuChatInfo). Use that
+    // await as the injection point to simulate a concurrent write landing
+    // on this exact imJid (e.g. the message router auto-learning
+    // owner_im_id, or a second bind request) while the first request is
+    // still suspended.
+    webContext.setWebDeps({
+      getChannelChatInfo: async () => {
+        const current = db.getRegisteredGroup(imJid)!;
+        db.setRegisteredGroup(imJid, {
+          ...current,
+          owner_im_id: 'concurrent-writer',
+        });
+        return null;
+      },
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const { status } = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+      });
+      expect(status).toBe(200);
+      const after = db.getRegisteredGroup(imJid);
+      // Both writes must survive: the intended bind (this request) and the
+      // concurrent write that landed mid-await. A stale pre-await snapshot
+      // would silently overwrite owner_im_id back to its original value.
+      expect(after).toMatchObject({
+        target_main_jid: GROUP_JID,
+        binding_mode: 'single_context',
+        owner_im_id: 'concurrent-writer',
+      });
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
+  test('a concurrent ownership transfer during checkThreadCapableBinding is rejected, not silently applied', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `qq-reauth-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'qq',
+      name: `QQ reauth bot ${suffix}`,
+      secret_ref: `channel-account:qq-reauth-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `qq:c2c:user-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'QQ direct chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      native_context_type: 'none',
+    });
+
+    // The pre-await canModifyGroup/hasConsistentChannelAccount checks only
+    // proved authorization against the row as it existed BEFORE the await.
+    // Simulate the row's ownership transferring to a different user (e.g.
+    // credential transfer, delete+recreate) during that await, and confirm
+    // the fresh re-read is re-authorized rather than committing a mutation
+    // that crosses the original authorization boundary.
+    webContext.setWebDeps({
+      getChannelChatInfo: async () => {
+        const current = db.getRegisteredGroup(imJid)!;
+        db.setRegisteredGroup(imJid, {
+          ...current,
+          created_by: OUTSIDER_ID,
+          channel_account_id: undefined,
+        });
+        return null;
+      },
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const { status, body } = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+      });
+      expect(status).toBe(403);
+      expect(body.error).toMatch(/forbidden/i);
+      // The mutation must not have been applied — the row still reflects
+      // only the concurrent write, not this request's intended bind.
+      const after = db.getRegisteredGroup(imJid);
+      expect(after?.target_main_jid).not.toBe(GROUP_JID);
+      expect(after?.created_by).toBe(OUTSIDER_ID);
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
   test('native thread containers reject a fixed session target', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
@@ -415,6 +536,119 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     expect(status).toBe(400);
     expect(body.error).toMatch(/native thread/i);
     expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBeUndefined();
+  });
+
+  test('a concurrent none->thread upgrade during the live chat-info fetch is still rejected for a session bind', async () => {
+    // The pre-await snapshot has native_context_type: 'none' (ordinary
+    // session-bindable chat). Simulate the message router upgrading it to
+    // a native thread container (native_context_type: 'thread') WHILE the
+    // live chat-info fetch is in flight. threadCapable must be computed
+    // against the fresh row, not the stale pre-await one — otherwise this
+    // request would incorrectly bind a now-thread-capable container as a
+    // fixed single session, breaking that thread's session isolation from
+    // its siblings.
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Racing session' });
+    const sessionId = created.body.session.id as string;
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `telegram-race-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'telegram',
+      name: `Forum race bot ${suffix}`,
+      secret_ref: `channel-account:telegram-race-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `telegram:forum-race-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Telegram Forum (about to upgrade)',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      native_context_type: 'none',
+    });
+
+    webContext.setWebDeps({
+      getChannelChatInfo: async () => {
+        const current = db.getRegisteredGroup(imJid)!;
+        db.setRegisteredGroup(imJid, {
+          ...current,
+          native_context_type: 'thread',
+        });
+        return null;
+      },
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const { status, body } = await req(
+        `/sessions/${sessionId}/im-binding`,
+        'PUT',
+        { im_jid: imJid },
+      );
+      expect(status).toBe(400);
+      expect(body.error).toMatch(/native thread/i);
+      // The bind must not have been applied.
+      expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBeUndefined();
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
+  test('a concurrent none->thread upgrade during the live chat-info fetch routes a workspace bind as thread_map, not single_session', async () => {
+    // Same race as above, but for the workspace-bind branch (sessionId
+    // 'main'), where threadCapable decides thread_map vs single_session
+    // routing mode rather than an outright rejection.
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `telegram-race-ws-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'telegram',
+      name: `Forum race workspace bot ${suffix}`,
+      secret_ref: `channel-account:telegram-race-ws-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `telegram:forum-race-ws-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Telegram Forum (about to upgrade, workspace bind)',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      native_context_type: 'none',
+    });
+
+    webContext.setWebDeps({
+      getChannelChatInfo: async () => {
+        const current = db.getRegisteredGroup(imJid)!;
+        db.setRegisteredGroup(imJid, {
+          ...current,
+          native_context_type: 'thread',
+        });
+        return null;
+      },
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const { status } = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+      });
+      expect(status).toBe(200);
+      // A stale (pre-upgrade) computation would have produced
+      // 'single_session' here instead.
+      expect(db.getRegisteredGroup(imJid)?.binding_mode).toBe('thread_map');
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
   });
 
   test('deleting a session binding restores the account default workspace', async () => {

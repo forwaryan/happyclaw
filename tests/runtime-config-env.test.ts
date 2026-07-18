@@ -2,12 +2,11 @@ import { describe, expect, test } from 'vitest';
 
 import {
   buildClaudeEnvLines,
+  buildContainerEnvLines,
   type ClaudeProviderConfig,
 } from '../src/runtime-config.js';
 
-function config(
-  patch: Partial<ClaudeProviderConfig>,
-): ClaudeProviderConfig {
+function config(patch: Partial<ClaudeProviderConfig>): ClaudeProviderConfig {
   return {
     anthropicBaseUrl: 'https://example.test/anthropic',
     anthropicAuthToken: '',
@@ -56,5 +55,67 @@ describe('buildClaudeEnvLines', () => {
     });
 
     expect(lines).toContain('ANTHROPIC_CUSTOM_HEADERS=x-one: 1\nx-two: 2');
+  });
+
+  test('derives managed Claude Code defaults for third-party models', () => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicModel: 'glm-5.2[1m]' }),
+      NO_CUSTOM_ENV,
+    );
+
+    expect(lines).toContain('ANTHROPIC_MODEL=glm-5.2[1m]');
+    expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.2[1m]');
+    expect(lines).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.2[1m]');
+    expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.2[1m]');
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
+    expect(lines).toContain('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
+    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
+    expect(lines).toContain('CLAUDE_CODE_NO_FLICKER=1');
+    expect(lines).toContain('API_TIMEOUT_MS=3000000');
+  });
+
+  test('uses defaults but lets provider settings override third-party values', () => {
+    const lines = buildClaudeEnvLines(config({ anthropicModel: 'k3' }), {
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '999999',
+      CLAUDE_CODE_EFFORT_LEVEL: 'low',
+      CUSTOM_FLAG: 'kept',
+    });
+
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=999999');
+    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
+    expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
+    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
+    expect(lines).toContain('CUSTOM_FLAG=kept');
+  });
+
+  test('keeps runtime tuning customizable for official providers', () => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicBaseUrl: '', anthropicModel: 'sonnet' }),
+      { CLAUDE_CODE_EFFORT_LEVEL: 'low' },
+    );
+
+    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
+    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
+    expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
+  });
+
+  test('prevents workspace overrides from replacing third-party managed values', () => {
+    const lines = buildContainerEnvLines(
+      config({ anthropicModel: 'glm-5.2[1m]' }),
+      {
+        customEnv: {
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-model',
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: '42',
+          PROJECT_ENV: 'kept',
+        },
+      },
+      NO_CUSTOM_ENV,
+    );
+
+    expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.2[1m]');
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
+    expect(lines).not.toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=stale-model');
+    expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=42');
+    expect(lines).toContain('PROJECT_ENV=kept');
   });
 });

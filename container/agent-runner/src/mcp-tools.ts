@@ -27,6 +27,10 @@ export interface McpContext {
    * Cleared between turns by the agent-runner main loop so that regular
    * follow-up messages aren't misattributed to the prior task. */
   currentTaskId?: string | null;
+  /** Mutable correlation id for the user input currently being answered.
+   * Cold starts use the triggering message id; IPC turns use the host-issued
+   * delivery id from their receipt. */
+  currentInputTurnId?: string | null;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
@@ -66,10 +70,12 @@ async function pollIpcResult(
   data: Record<string, unknown> & { requestId: string },
   resultFilePrefix: string,
   timeoutMs: number = 30_000,
+  resultDir: string = dir,
 ): Promise<Record<string, unknown>> {
   const resultFileName = `${resultFilePrefix}_${data.requestId}.json`;
-  const resultFilePath = path.join(dir, resultFileName);
+  const resultFilePath = path.join(resultDir, resultFileName);
 
+  fs.mkdirSync(resultDir, { recursive: true });
   writeIpcFile(dir, data);
 
   const pollInterval = 500;
@@ -192,6 +198,9 @@ export function buildSendMessageData(
   if (ctx.currentTaskId) {
     data.taskId = ctx.currentTaskId;
   }
+  if (ctx.currentInputTurnId) {
+    data.inputTurnId = ctx.currentInputTurnId;
+  }
   return data;
 }
 
@@ -200,6 +209,7 @@ export function buildSendMessageData(
  */
 export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   const MESSAGES_DIR = path.join(ctx.workspaceIpc, 'messages');
+  const MESSAGE_RESULTS_DIR = path.join(ctx.workspaceIpc, 'message-results');
   const TASKS_DIR = path.join(ctx.workspaceIpc, 'tasks');
   const hasCrossGroupAccess = ctx.isAdminHome;
   const toRelativePath = createToRelativePath(ctx);
@@ -214,8 +224,22 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         const data = buildSendMessageData(ctx, {
           type: 'message',
           text: args.text,
+          requestId: newRequestId(),
         });
-        writeIpcFile(MESSAGES_DIR, data);
+        const result = await pollIpcResult(
+          MESSAGES_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_message_result',
+          120_000,
+          MESSAGE_RESULTS_DIR,
+        );
+        if (!result.success) {
+          throw new Error(
+            typeof result.error === 'string'
+              ? result.error
+              : 'Message delivery failed.',
+          );
+        }
         return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
       },
     ),

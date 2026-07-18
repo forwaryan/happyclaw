@@ -15,6 +15,7 @@ interface AgentPromptVersionHistoryProps {
   loadVersions: (profileId: string) => Promise<AgentProfilePromptVersion[]>;
   restoreVersion: (profileId: string, version: number) => Promise<AgentProfile>;
   onRestored: (profile: AgentProfile) => void;
+  confirmDiscardUnsavedChanges: () => boolean;
 }
 
 export function AgentPromptVersionHistory({
@@ -24,6 +25,7 @@ export function AgentPromptVersionHistory({
   loadVersions,
   restoreVersion,
   onRestored,
+  confirmDiscardUnsavedChanges,
 }: AgentPromptVersionHistoryProps) {
   const [versions, setVersions] = useState<AgentProfilePromptVersion[]>([]);
   const [loading, setLoading] = useState(true);
@@ -43,6 +45,7 @@ export function AgentPromptVersionHistory({
   }, [loadVersions, profileId]);
 
   const handleRestore = async (version: number) => {
+    if (!confirmDiscardUnsavedChanges()) return;
     if (!confirm(`恢复 v${version} 的四段提示词？系统会先保留当前版本。`))
       return;
     setRestoring(version);

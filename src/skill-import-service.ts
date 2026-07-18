@@ -3,11 +3,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lookup } from 'node:dns/promises';
 import AdmZip from 'adm-zip';
 import { validateSkillId } from './skill-utils.js';
-import { isPrivateHostname, validateSafeHttpsUrl } from './url-safety.js';
+import {
+  assertResolvesToPublicAddress,
+  validateSafeHttpsUrl,
+} from './url-safety.js';
 import { SKILL_ARCHIVE_MAX_FILE_BYTES } from './http-upload-policy.js';
+import {
+  buildPinnedGitEnvironment,
+  startPinnedHttpsProxy,
+} from './safe-git-proxy.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_EXPANDED_BYTES = 25 * 1024 * 1024;
@@ -306,18 +312,7 @@ export async function importSkillsFromGit(options: {
   if (parsedUrl.username || parsedUrl.password) {
     throw new Error('Git URLs containing credentials are not allowed');
   }
-  let addresses: Array<{ address: string }>;
-  try {
-    addresses = await lookup(parsedUrl.hostname, { all: true });
-  } catch {
-    throw new Error('Git hostname could not be resolved');
-  }
-  if (
-    addresses.length === 0 ||
-    addresses.some(({ address }) => isPrivateHostname(address))
-  ) {
-    throw new Error('Git hostname resolves to a private or link-local address');
-  }
+  await assertResolvesToPublicAddress(parsedUrl.hostname, 'Git hostname');
   if (options.ref && !/^[\w./-]{1,200}$/.test(options.ref)) {
     throw new Error('Invalid Git ref');
   }
@@ -337,7 +332,12 @@ export async function importSkillsFromGit(options: {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-git-import-'));
   const repoDir = path.join(tempDir, 'repo');
   try {
+    const gitProxy = await startPinnedHttpsProxy(parsedUrl.hostname, {
+      expectedPort: parsedUrl.port ? Number(parsedUrl.port) : 443,
+    });
     const args = [
+      '-c',
+      `http.proxy=${gitProxy.url}`,
       '-c',
       'http.followRedirects=false',
       '-c',
@@ -352,19 +352,19 @@ export async function importSkillsFromGit(options: {
     ];
     if (options.ref) args.push('--branch', options.ref);
     args.push('--', options.url, repoDir);
-    await runCommandWithDirectoryQuota({
-      command: 'git',
-      args,
-      watchDir: tempDir,
-      maxBytes: MAX_GIT_REPOSITORY_BYTES,
-      timeoutMs: 60_000,
-      label: 'Git repository',
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: '0',
-        GIT_LFS_SKIP_SMUDGE: '1',
-      },
-    });
+    try {
+      await runCommandWithDirectoryQuota({
+        command: 'git',
+        args,
+        watchDir: tempDir,
+        maxBytes: MAX_GIT_REPOSITORY_BYTES,
+        timeoutMs: 60_000,
+        label: 'Git repository',
+        env: buildPinnedGitEnvironment(gitProxy.url),
+      });
+    } finally {
+      await gitProxy.close();
+    }
     const scanRoot = options.subdirectory
       ? path.resolve(repoDir, options.subdirectory)
       : repoDir;

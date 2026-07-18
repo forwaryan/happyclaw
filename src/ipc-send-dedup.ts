@@ -11,6 +11,11 @@ export interface IpcSendDedupDeps {
 
 export function createIpcSendDeduplicator(deps: IpcSendDedupDeps): {
   isRetryDuplicate(sourceGroup: string, chatJid: string, text: string): boolean;
+  recordSuccessfulSend(
+    sourceGroup: string,
+    chatJid: string,
+    text: string,
+  ): void;
 } {
   const recentSends = new Map<string, number>(); // key -> expireAt
   const now = deps.now ?? Date.now;
@@ -40,13 +45,22 @@ export function createIpcSendDeduplicator(deps: IpcSendDedupDeps): {
           }
         }
       }
-      const isDup = !!(exp && exp > currentTime) && inRetry;
-      recentSends.set(key, currentTime + IPC_SEND_DEDUP_TTL_MS);
+      return !!(exp && exp > currentTime) && inRetry;
+    },
+    recordSuccessfulSend(
+      sourceGroup: string,
+      chatJid: string,
+      text: string,
+    ): void {
+      const key = `${sourceGroup}|${chatJid}|${crypto
+        .createHash('md5')
+        .update(text)
+        .digest('hex')}`;
+      recentSends.set(key, now() + IPC_SEND_DEDUP_TTL_MS);
       for (const k of recentSends.keys()) {
         if (recentSends.size <= IPC_SEND_DEDUP_MAX) break;
         recentSends.delete(k);
       }
-      return isDup;
     },
   };
 }

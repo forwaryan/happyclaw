@@ -22,6 +22,13 @@ import {
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
+import {
+  acknowledgeIpcReplyTurn,
+  isGenuineReplyResult,
+  setIpcReplyInputTurn,
+  shouldSkipRetryAfterLateError,
+  type IpcReplyTurnTracker,
+} from './reply-delivery.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
 import {
   DeferredOutOfBandCursorLedger,
@@ -947,13 +954,22 @@ const OOM_AUTO_RESET_THRESHOLD = 2;
 // Per-folder reply route updater: lets sendMessage callers update the
 // reply routing of a running processGroupMessages without killing the process.
 // Key is group folder (one active processGroupMessages per folder).
-type ReplyRouteUpdater = (newSourceJid: string | null) => void;
+type ReplyRouteUpdater = (
+  newSourceJid: string | null,
+  inputTurnId?: string,
+  inputCursor?: MessageCursor,
+) => void;
 const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 
 // Per-folder IM reply route: tracks the current replySourceImJid for each
 // running processGroupMessages.  IPC watcher reads this to forward send_message
 // outputs to the correct IM channel (the running session holds the truth).
 const activeImReplyRoutes = new Map<string, string | null>();
+
+// Exact active-turn trackers shared with the independent IPC watcher. Keeping
+// only the currently running object avoids stale timestamps/message-id reuse
+// across later turns and sibling JIDs that share one folder.
+const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
 
 // ── 卡片挂起完成机制的共享工具 ──
 // 挂起卡内各 turn 文本之间的分隔线（最终定稿卡片正文按时间序拼接各 turn）。
@@ -1030,6 +1046,14 @@ function isRetryDuplicateIpcSend(
   text: string,
 ): boolean {
   return ipcSendDedup.isRetryDuplicate(sourceGroup, chatJid, text);
+}
+
+function recordSuccessfulIpcSend(
+  sourceGroup: string,
+  chatJid: string,
+  text: string,
+): void {
+  ipcSendDedup.recordSuccessfulSend(sourceGroup, chatJid, text);
 }
 
 // Track consecutive IM send failures per JID for auto-unbind
@@ -3568,6 +3592,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await setTyping(chatJid, true);
   let hadError = false;
   let sentReply = false;
+  // Narrower than sentReply: true only for a genuine completed SDK final
+  // result (sourceKind 'sdk_final'/finalizationReason 'completed'), never
+  // for an interrupt/error partial fallback save (sourceKind
+  // 'interrupt_partial', always sendToIM:false). Those partial saves are
+  // written to DB/web history for continuity but are NOT delivered to the
+  // user's actual IM channel on non-card channels (only Feishu's streaming
+  // card shows partial content live) — treating them as "the user got a
+  // reply" would let an error-exit silently drop the message forever with
+  // nothing ever reaching a Telegram/QQ/DingTalk/Discord/WhatsApp/WeChat
+  // user. sentReply itself still gates the true duplicate-reply guard.
+  let genuineReplyDelivered = false;
   let lastError = '';
   let cursorCommitted = false;
   let healthyInputTurnCompleted = false;
@@ -3575,6 +3610,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let lastSavedTurnId: string | undefined; // tracks last turnId saved to DB, prevents UPSERT overwrite
   const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
+  // Cold-start MCP output uses the triggering DB message id. Warm IPC turns
+  // replace this with the receipt delivery id through activeRouteUpdaters.
+  const ipcReplyTurnTracker: IpcReplyTurnTracker = {
+    inputTurnId: lastProcessed.id,
+    delivered: false,
+  };
+  let currentInputCursor: MessageCursor = {
+    timestamp: lastProcessed.timestamp,
+    id: lastProcessed.id,
+  };
 
   // ── Feishu Streaming Card ──
   // Create a streaming session for Feishu channels (typing-machine effect).
@@ -3684,92 +3729,107 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Allows IPC-injected messages (from web.ts / IM polling) to update the
   // reply routing target without killing the agent process.  This replaces
   // the old "closeStdin + restart" approach for home groups (#99).
-  activeRouteUpdaters.set(effectiveGroup.folder, async (newSourceJid) => {
-    const newImJid =
-      newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
-    // 用户新消息注入：挂起中的卡片先定稿轮换——IM 时间线上旧卡在用户消息
-    // 之前，新 turn 的回复不能长在旧卡里。route updater 在所有用户消息
-    // 注入点（index.ts 消息循环 / web.ts）都会被调用，是天然的挂钩位置。
-    await finalizeHeldCardForNewMessage().catch((err) => {
-      logger.warn(
-        { err, chatJid },
-        'Failed to finalize held streaming card on new message',
+  activeRouteUpdaters.set(
+    effectiveGroup.folder,
+    async (newSourceJid, inputTurnId, inputCursor) => {
+      if (inputTurnId) {
+        const isCurrentOrNewer =
+          !inputCursor ||
+          isCursorAfter(inputCursor, currentInputCursor) ||
+          (inputCursor.timestamp === currentInputCursor.timestamp &&
+            inputCursor.id === currentInputCursor.id);
+        if (!isCurrentOrNewer) return;
+        if (inputCursor) currentInputCursor = inputCursor;
+        setIpcReplyInputTurn(ipcReplyTurnTracker, inputTurnId);
+      }
+      const newImJid =
+        newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
+      // 用户新消息注入：挂起中的卡片先定稿轮换——IM 时间线上旧卡在用户消息
+      // 之前，新 turn 的回复不能长在旧卡里。route updater 在所有用户消息
+      // 注入点（index.ts 消息循环 / web.ts）都会被调用，是天然的挂钩位置。
+      await finalizeHeldCardForNewMessage().catch((err) => {
+        logger.warn(
+          { err, chatJid },
+          'Failed to finalize held streaming card on new message',
+        );
+      });
+      // New IPC user message arrived — reset sentReply so the next result
+      // can be delivered to IM. This is the correct place to reset, NOT
+      // in the streaming session rebuild (which also fires on SDK Task
+      // completion and would cause multi-result IM spam).
+      sentReply = false;
+      genuineReplyDelivered = false;
+      if (newImJid === replySourceImJid) {
+        // 同一路由下，若上一轮卡片因连续更新失败进入 error 态被冻结（防同轮刷屏，
+        // 见下方 stream 事件处理的 sessionErrored 分支），在新用户消息开启新一轮时
+        // 重建一张干净卡片，恢复流式展示能力。
+        if (
+          streamingSession &&
+          (streamingSession as { currentState?: string }).currentState ===
+            'error'
+        ) {
+          unregisterStreamingSession(streamingSessionJid);
+          streamingAccumulatedText = '';
+          streamingAccumulatedThinking = '';
+          streamInterrupted = false;
+          try {
+            streamingSession = await imManager.createStreamingSession(
+              streamingSessionJid,
+              makeOnCardCreated(streamingSessionJid),
+            );
+          } catch (err: any) {
+            logger.warn(
+              { err: err?.message, streamingSessionJid },
+              'Failed to rebuild streaming session after card error',
+            );
+            streamingSession = undefined;
+          }
+          if (streamingSession) {
+            registerStreamingSession(streamingSessionJid, streamingSession);
+          }
+        }
+        return; // no route change
+      }
+      logger.debug(
+        { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
+        'Reply route updated via IPC injection',
       );
-    });
-    // New IPC user message arrived — reset sentReply so the next result
-    // can be delivered to IM. This is the correct place to reset, NOT
-    // in the streaming session rebuild (which also fires on SDK Task
-    // completion and would cause multi-result IM spam).
-    sentReply = false;
-    if (newImJid === replySourceImJid) {
-      // 同一路由下，若上一轮卡片因连续更新失败进入 error 态被冻结（防同轮刷屏，
-      // 见下方 stream 事件处理的 sessionErrored 分支），在新用户消息开启新一轮时
-      // 重建一张干净卡片，恢复流式展示能力。
-      if (
-        streamingSession &&
-        (streamingSession as { currentState?: string }).currentState === 'error'
-      ) {
-        unregisterStreamingSession(streamingSessionJid);
-        streamingAccumulatedText = '';
-        streamingAccumulatedThinking = '';
-        streamInterrupted = false;
+      replySourceImJid = newImJid;
+      activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
+
+      // Rebuild streaming session if the target channel changed.
+      // When the route is cleared to null (web message injected into IM-originated
+      // session), fall back to the web JID — NOT the original IM chatJid — so the
+      // Feishu streaming card is properly disposed.
+      const newStreamingJid =
+        replySourceImJid ??
+        (directImReply ? `web:${effectiveGroup.folder}` : chatJid);
+      if (newStreamingJid !== streamingSessionJid) {
+        if (streamingSession) {
+          if (streamingSession.isActive()) streamingSession.dispose();
+          unregisterStreamingSession(streamingSessionJid);
+        }
+        streamingSessionJid = newStreamingJid;
         try {
           streamingSession = await imManager.createStreamingSession(
             streamingSessionJid,
             makeOnCardCreated(streamingSessionJid),
           );
         } catch (err: any) {
-          logger.warn(
-            { err: err?.message, streamingSessionJid },
-            'Failed to rebuild streaming session after card error',
+          logger.error(
+            { err: err.message, streamingSessionJid },
+            'Failed to create streaming session in route updater',
           );
           streamingSession = undefined;
         }
+        streamingAccumulatedText = '';
+        streamingAccumulatedThinking = '';
         if (streamingSession) {
           registerStreamingSession(streamingSessionJid, streamingSession);
         }
       }
-      return; // no route change
-    }
-    logger.debug(
-      { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
-      'Reply route updated via IPC injection',
-    );
-    replySourceImJid = newImJid;
-    activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
-
-    // Rebuild streaming session if the target channel changed.
-    // When the route is cleared to null (web message injected into IM-originated
-    // session), fall back to the web JID — NOT the original IM chatJid — so the
-    // Feishu streaming card is properly disposed.
-    const newStreamingJid =
-      replySourceImJid ??
-      (directImReply ? `web:${effectiveGroup.folder}` : chatJid);
-    if (newStreamingJid !== streamingSessionJid) {
-      if (streamingSession) {
-        if (streamingSession.isActive()) streamingSession.dispose();
-        unregisterStreamingSession(streamingSessionJid);
-      }
-      streamingSessionJid = newStreamingJid;
-      try {
-        streamingSession = await imManager.createStreamingSession(
-          streamingSessionJid,
-          makeOnCardCreated(streamingSessionJid),
-        );
-      } catch (err: any) {
-        logger.error(
-          { err: err.message, streamingSessionJid },
-          'Failed to create streaming session in route updater',
-        );
-        streamingSession = undefined;
-      }
-      streamingAccumulatedText = '';
-      streamingAccumulatedThinking = '';
-      if (streamingSession) {
-        registerStreamingSession(streamingSessionJid, streamingSession);
-      }
-    }
-  });
+    },
+  );
 
   const pickRunningTaskForNotification = (): string | null => {
     const runningInQuery = Array.from(queryTaskIds)
@@ -3855,6 +3915,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // different chat (e.g. web message before the Discord one arrived).
   const currentSourceJid =
     missedMessages[missedMessages.length - 1]?.source_jid || chatJid;
+  activeIpcReplyTurnTrackers.set(effectiveGroup.folder, ipcReplyTurnTracker);
   try {
     output = await runAgent(
       effectiveGroup,
@@ -4559,6 +4620,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
 
               sentReply = true;
+              // See isGenuineReplyResult's doc comment (src/reply-delivery.ts)
+              // for why a held/partial result must not count. Only ever SET
+              // to true, never overwrite back to false: a later held/partial
+              // result within the same multi-result turn (e.g. a follow-up
+              // SDK task result after the main reply already completed)
+              // must not erase an earlier genuine delivery in this same run.
+              if (
+                isGenuineReplyResult({
+                  holdReason,
+                  sourceKind: result.sourceKind,
+                  finalizationReason: result.finalizationReason,
+                })
+              ) {
+                genuineReplyDelivered = true;
+              }
               // Clear streaming snapshot so the next turn starts fresh.
               // Without this, saveInterruptedStreamingMessages() would merge
               // text from multiple turns into one message on shutdown.
@@ -4600,6 +4676,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
     activeImReplyRoutes.delete(effectiveGroup.folder);
+    if (
+      activeIpcReplyTurnTrackers.get(effectiveGroup.folder) ===
+      ipcReplyTurnTracker
+    ) {
+      activeIpcReplyTurnTrackers.delete(effectiveGroup.folder);
+    }
 
     // ── 检测中断：有累积文本但从未发送回复 ──
     const wasInterrupted = streamInterrupted && !sentReply;
@@ -4858,12 +4940,35 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (isErrorExit && !healthyInputTurnCompleted) {
     // Partial/interrupted text is useful to persist, but it is not a delivery
     // acknowledgement. Keep the recovery cursor behind so the user input is
-    // replayed at least once after the failed runner exits.
-    if (sentReply) return false;
-    // Only roll back cursor if no reply was sent — if the agent already
-    // replied successfully, a subsequent timeout is not a real error and
-    // rolling back would cause the same messages to be re-processed,
-    // leading to duplicate replies.
+    // replayed at least once after the failed runner exits — UNLESS a
+    // genuine complete reply was already delivered (below). Only skip retry
+    // when a *genuine* reply went out: if the agent already replied (e.g.
+    // via send_message before the runner hit a late-turn error/timeout), a
+    // retry would re-run the agent against the same messages via
+    // getMessagesSince(uncommitted cursor) and can produce a second,
+    // separate reply to a request that already got one. Commit here and
+    // stop instead of returning false into a retry.
+    //
+    // sentReply alone is NOT sufficient for this decision: it also becomes
+    // true for interrupt/error partial fallback saves (sourceKind
+    // 'interrupt_partial', always sendToIM:false) which are persisted to
+    // DB/web history for continuity but never actually reach the user's IM
+    // channel on non-card channels. Gating on sentReply there would commit
+    // the cursor and silently drop the message forever with nothing ever
+    // delivered. genuineReplyDelivered excludes those fallback saves.
+    //
+    // A send_message MCP call mid-turn is ALSO a genuine delivery, but only
+    // after the host acknowledges the exact current input turn and confirms
+    // the relevant Web/IM target was actually reached.
+    if (
+      shouldSkipRetryAfterLateError({
+        genuineReplyDelivered,
+        ipcReplyDeliveredForInputTurn: ipcReplyTurnTracker.delivered,
+      })
+    ) {
+      commitCursor();
+      return true;
+    }
     const errorDetail = output.error || lastError || '未知错误';
 
     // 上下文溢出错误：跳过重试，提交游标，通知用户
@@ -4873,6 +4978,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.warn(
         { group: group.name, error: overflowMsg },
         'Context overflow detected, skipping retry',
+      );
+      commitCursor();
+      return true;
+    }
+
+    // AgentProfile 引用的 skill/MCP 已被删除或禁用：确定性配置错误，重试
+    // 永远不会成功，跳过指数退避重试，直接提交游标并告知用户。
+    if (errorDetail.startsWith('agent_profile_unavailable:')) {
+      const profileMsg = errorDetail.replace(
+        /^agent_profile_unavailable:\s*/,
+        '',
+      );
+      sendSystemMessage(chatJid, 'system_error', profileMsg);
+      logger.warn(
+        { group: group.name, error: profileMsg },
+        'AgentProfile references unavailable skill/MCP, skipping retry',
       );
       commitCursor();
       return true;
@@ -5324,13 +5445,22 @@ async function runAgent(
   }
 }
 
-async function sendMessage(
+interface SendMessageOutcome {
+  messageId?: string;
+  /** True only when the logical target actually received the message. For an
+   * IM JID this requires connector success; for a Web/virtual JID it requires
+   * successful persistence+broadcast. */
+  targetDelivered: boolean;
+}
+
+async function sendMessageWithOutcome(
   jid: string,
   text: string,
   options: SendMessageOptions = {},
-): Promise<string | undefined> {
+): Promise<SendMessageOutcome> {
   const isIMChannel = getChannelType(jid) !== null;
   const sendToIM = options.sendToIM ?? isIMChannel;
+  let targetDelivered = false;
   try {
     if (sendToIM && isIMChannel) {
       try {
@@ -5339,6 +5469,7 @@ async function sendMessage(
           options.localImagePaths ??
           extractLocalImImagePaths(imText, resolveEffectiveFolder(jid));
         await imManager.sendMessage(jid, imText, localImagePaths);
+        targetDelivered = true;
       } catch (err) {
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
@@ -5358,6 +5489,7 @@ async function sendMessage(
       true,
       { meta: options.messageMeta },
     );
+    if (!isIMChannel) targetDelivered = true;
 
     broadcastNewMessage(
       jid,
@@ -5386,11 +5518,19 @@ async function sendMessage(
     if (!options.source) {
       broadcastToWebClients(jid, text);
     }
-    return persistedMsgId;
+    return { messageId: persistedMsgId, targetDelivered };
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
-    return undefined;
+    return { targetDelivered };
   }
+}
+
+async function sendMessage(
+  jid: string,
+  text: string,
+  options: SendMessageOptions = {},
+): Promise<string | undefined> {
+  return (await sendMessageWithOutcome(jid, text, options)).messageId;
 }
 
 export function buildInterruptedReply(
@@ -5762,7 +5902,10 @@ function startIpcWatcher(): void {
       taskId: ipcTaskId,
     } of ipcRoots) {
       const messagesDir = path.join(ipcRoot, 'messages');
+      const messageResultsDir = path.join(ipcRoot, 'message-results');
       const tasksDir = path.join(ipcRoot, 'tasks');
+
+      await cleanupStaleIpcMessageResults(messageResultsDir);
 
       // Process messages from this group's IPC directory
       try {
@@ -5770,14 +5913,38 @@ function startIpcWatcher(): void {
         const messageFiles = messageEntries.filter((f) => f.endsWith('.json'));
         for (const file of messageFiles) {
           const filePath = path.join(messagesDir, file);
+          let messageRequestId: string | undefined;
+          let messageResultWritten = false;
           try {
             const raw = await fsp.readFile(filePath, 'utf-8');
             const data = JSON.parse(raw);
+            messageRequestId =
+              typeof data.requestId === 'string' ? data.requestId : undefined;
+            if (
+              data.type === 'message' &&
+              (typeof data.chatJid !== 'string' ||
+                !data.chatJid ||
+                typeof data.text !== 'string' ||
+                !data.text)
+            ) {
+              messageResultWritten = writeIpcMessageResult(
+                messageResultsDir,
+                messageRequestId,
+                { success: false, error: 'Invalid message request.' },
+              );
+              await fsp.unlink(filePath);
+              continue;
+            }
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = registeredGroups[data.chatJid];
+              let messageDelivered = false;
               if (
                 isRetryDuplicateIpcSend(sourceGroup, data.chatJid, data.text)
               ) {
+                // The deduplicator only records confirmed deliveries, so a
+                // replay hit is itself evidence that the prior attempt reached
+                // the user. Failed attempts are deliberately never recorded.
+                messageDelivered = true;
                 logger.info(
                   { sourceGroup, chatJid: data.chatJid },
                   'Duplicate IPC send_message suppressed (retry replay window)',
@@ -5807,11 +5974,16 @@ function startIpcWatcher(): void {
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
                 const cardText = extractFeishuCardText(data.text);
                 const webText = cardText || data.text;
-                await sendMessage(effectiveChatJid, webText, {
-                  messageMeta: {
-                    sourceKind: 'sdk_send_message',
+                const sendOutcome = await sendMessageWithOutcome(
+                  effectiveChatJid,
+                  webText,
+                  {
+                    messageMeta: {
+                      sourceKind: 'sdk_send_message',
+                    },
                   },
-                });
+                );
+                messageDelivered = sendOutcome.targetDelivered;
 
                 // Forward to IM channel — but NOT for conversation agent messages.
                 // Conversation agents handle their own IM routing in
@@ -5828,7 +6000,14 @@ function startIpcWatcher(): void {
                       data.text,
                       sourceGroup,
                     );
-                    sendImWithFailTracking(ipcImRoute, data.text, localImages);
+                    // A Web persistence success is not enough when this turn
+                    // originated from IM. Wait for the connector result so the
+                    // MCP tool and retry logic never acknowledge a failed send.
+                    messageDelivered = await sendImWithRetry(
+                      ipcImRoute,
+                      data.text,
+                      localImages,
+                    );
                   }
 
                   // Scheduled-task output routing. Decision logic is in
@@ -5884,6 +6063,9 @@ function startIpcWatcher(): void {
                     }
                   }
                 }
+                if (messageDelivered) {
+                  recordSuccessfulIpcSend(sourceGroup, data.chatJid, data.text);
+                }
                 logger.info(
                   {
                     chatJid: effectiveChatJid,
@@ -5898,6 +6080,34 @@ function startIpcWatcher(): void {
                   'Unauthorized IPC message attempt blocked',
                 );
               }
+              const isMainUserTurnReply = !(
+                data.isScheduledTask ||
+                data.taskId ||
+                ipcTaskId ||
+                ipcAgentId
+              );
+              if (
+                messageDelivered &&
+                isMainUserTurnReply &&
+                typeof data.inputTurnId === 'string' &&
+                data.inputTurnId
+              ) {
+                const activeTracker =
+                  activeIpcReplyTurnTrackers.get(sourceGroup);
+                if (activeTracker) {
+                  acknowledgeIpcReplyTurn(activeTracker, data.inputTurnId);
+                }
+              }
+              messageResultWritten = writeIpcMessageResult(
+                messageResultsDir,
+                messageRequestId,
+                messageDelivered
+                  ? { success: true }
+                  : {
+                      success: false,
+                      error: 'Message could not be delivered to its target.',
+                    },
+              );
             } else if (
               data.type === 'image' &&
               data.chatJid &&
@@ -6088,6 +6298,12 @@ function startIpcWatcher(): void {
             }
             await fsp.unlink(filePath);
           } catch (err) {
+            if (!messageResultWritten) {
+              writeIpcMessageResult(messageResultsDir, messageRequestId, {
+                success: false,
+                error: 'Internal error while delivering message.',
+              });
+            }
             logger.error(
               { file, sourceGroup, err },
               'Error processing IPC message',
@@ -6318,6 +6534,78 @@ function startIpcWatcher(): void {
   ipcWatcherManager.startFallback();
 
   logger.info('IPC watcher started (event-driven + 5s fallback)');
+}
+
+/** Atomically acknowledge send_message only after the host has completed its
+ * real delivery side effects. Results live outside messages/ so the host
+ * watcher cannot consume its own acknowledgement before the runner sees it. */
+function writeIpcMessageResult(
+  resultsDir: string,
+  requestId: string | undefined,
+  payload: Record<string, unknown>,
+): boolean {
+  if (!requestId) return false; // backwards compatibility with older runners
+  if (!SAFE_REQUEST_ID_RE.test(requestId)) {
+    logger.warn(
+      { resultsDir, requestId },
+      'Rejected message result with invalid requestId',
+    );
+    return false;
+  }
+  const dirResolved = path.resolve(resultsDir);
+  const resultFilePath = path.resolve(
+    resultsDir,
+    `send_message_result_${requestId}.json`,
+  );
+  if (!resultFilePath.startsWith(`${dirResolved}${path.sep}`)) return false;
+  try {
+    fs.mkdirSync(resultsDir, { recursive: true });
+    const tmpPath = `${resultFilePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload));
+    fs.renameSync(tmpPath, resultFilePath);
+    return true;
+  } catch (err) {
+    logger.error(
+      { resultsDir, requestId, err },
+      'Failed to write message IPC result',
+    );
+    return false;
+  }
+}
+
+async function cleanupStaleIpcMessageResults(
+  resultsDir: string,
+): Promise<void> {
+  try {
+    const entries = await fs.promises.readdir(resultsDir, {
+      withFileTypes: true,
+    });
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    await Promise.all(
+      entries
+        .filter(
+          (entry) =>
+            entry.isFile() &&
+            entry.name.startsWith('send_message_result_') &&
+            entry.name.endsWith('.json'),
+        )
+        .map(async (entry) => {
+          const resultPath = path.join(resultsDir, entry.name);
+          try {
+            const stat = await fs.promises.stat(resultPath);
+            if (stat.mtimeMs < cutoff) {
+              await fs.promises.unlink(resultPath);
+            }
+          } catch {
+            // Concurrent runner consumption or cleanup is harmless.
+          }
+        }),
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warn({ resultsDir, err }, 'Failed to clean message IPC results');
+    }
+  }
 }
 
 /**
@@ -9015,9 +9303,13 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             formatted,
             imagesForAgent,
-            () => {
+            (receipt) => {
               // IPC write succeeded — update reply route for the running agent
-              activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
+              activeRouteUpdaters.get(group.folder)?.(
+                lastSourceJidForRoute,
+                receipt?.deliveryId,
+                receipt?.cursor,
+              );
             },
             lastSourceJidForRoute,
             injectionTaskId,
@@ -11778,8 +12070,13 @@ async function main(): Promise<void> {
       imHealthCheckFailCounts.delete(jid);
     },
     removeImGroupRecord,
-    updateReplyRoute: (folder: string, sourceJid: string | null) => {
-      activeRouteUpdaters.get(folder)?.(sourceJid);
+    updateReplyRoute: (
+      folder: string,
+      sourceJid: string | null,
+      inputTurnId?: string,
+      inputCursor?: MessageCursor,
+    ) => {
+      activeRouteUpdaters.get(folder)?.(sourceJid, inputTurnId, inputCursor);
     },
     finalizeHeldCard: (key: string) => {
       activeHeldCardFinalizers.get(key)?.();

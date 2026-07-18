@@ -33,6 +33,11 @@ describe('IPC send_message retry dedup', () => {
         'hello',
       ),
     ).toBe(false);
+    dedup.recordSuccessfulSend(
+      'flow-abc123',
+      'web:7b1f0c1e-1234-dead-beef',
+      'hello',
+    );
     expect(
       dedup.isRetryDuplicate(
         'flow-abc123',
@@ -49,6 +54,7 @@ describe('IPC send_message retry dedup', () => {
     });
 
     expect(dedup.isRetryDuplicate('main', 'web:main', 'same')).toBe(false);
+    dedup.recordSuccessfulSend('main', 'web:main', 'same');
     expect(dedup.isRetryDuplicate('main', 'web:main', 'same')).toBe(true);
     expect(getJidsByFolder).not.toHaveBeenCalled();
   });
@@ -94,9 +100,19 @@ describe('IPC send_message retry dedup', () => {
     expect(
       dedup.isRetryDuplicate('shared-folder', 'feishu:oc_retrying', 'report'),
     ).toBe(false);
+    dedup.recordSuccessfulSend('shared-folder', 'feishu:oc_retrying', 'report');
     expect(
       dedup.isRetryDuplicate('shared-folder', 'feishu:oc_retrying', 'report'),
     ).toBe(true);
     expect(getRetryCount).toHaveBeenCalledWith('feishu:oc_retrying');
+  });
+
+  test('a failed/unconfirmed attempt is never recorded as a retry duplicate', () => {
+    const { dedup } = makeDedup({
+      retryCounts: { 'web:main': 1 },
+    });
+
+    expect(dedup.isRetryDuplicate('main', 'web:main', 'retry me')).toBe(false);
+    expect(dedup.isRetryDuplicate('main', 'web:main', 'retry me')).toBe(false);
   });
 });

@@ -479,7 +479,7 @@ export function SystemSettingsSection({
         ))}
       </div>
 
-      <div className="sticky bottom-0 z-10 -mx-4 mt-2 flex min-h-16 items-center justify-between gap-4 border-t border-border bg-card/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-card/85">
+      <div className="sticky bottom-0 z-10 -mx-4 mt-2 flex min-h-16 items-center justify-between gap-4 border-t border-border bg-background/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/85">
         <p className="text-xs text-muted-foreground" aria-live="polite">
           {dirty ? '有尚未保存的系统参数' : '系统参数已保存'}
         </p>

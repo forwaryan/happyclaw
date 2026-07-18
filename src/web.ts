@@ -584,10 +584,10 @@ async function handleWebUserMessage(
     chatJid,
     formatted,
     images,
-    () => {
+    (receipt) => {
       // IPC write succeeded — update reply route for home groups.
       // Web messages have no IM source, so clear the IM route.
-      updateRoute?.(group.folder, null);
+      updateRoute?.(group.folder, null, receipt?.deliveryId, receipt?.cursor);
     },
     chatJid,
     undefined,

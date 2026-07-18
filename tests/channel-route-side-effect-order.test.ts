@@ -51,4 +51,26 @@ describe('stale routes are rejected before connector side effects', () => {
       'storeMessageDirect(',
     ]);
   });
+
+  test('Telegram intercepts slash commands before the route resolver, registration, and persistence', () => {
+    // resolveAdmittedChannelRoute's resolver (opts.resolveEffectiveChatJid)
+    // can have side effects for native-thread routing (creating a
+    // conversation agent/chat/mount row for a not-yet-seen topic). A slash
+    // command like /status in a brand-new topic must be intercepted before
+    // that side effect runs, the same way Feishu checks for a slash command
+    // ahead of its own route resolution.
+    const body = source('telegram.ts');
+    const slashCheck = body.indexOf(
+      'match(/^\\/(\\S+?)(?:@\\S+)?(?:\\s+(.*))?$/i)',
+    );
+    const routeResolve = body.indexOf('const resolvedRoute =');
+    expect(slashCheck).toBeGreaterThan(-1);
+    expect(routeResolve).toBeGreaterThan(-1);
+    expect(slashCheck).toBeLessThan(routeResolve);
+
+    expectRouteBeforeSideEffects(body, 'const resolvedRoute =', [
+      'opts.onNewChat(jid, chatName)',
+      'storeMessageDirect(',
+    ]);
+  });
 });

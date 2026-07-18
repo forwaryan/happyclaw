@@ -1164,6 +1164,32 @@ export function createFeishuConnection(
       // Validate the binding before registration, owner learning, metadata or
       // attachment downloads. The title/context metadata available here is
       // sufficient for native-thread routing; downloaded paths are payload.
+      //
+      // Group chats get an external ownership signal before their first
+      // message can ever arrive here (im.chat.member.bot.added_v1 →
+      // onBotAddedToGroup, wired to the same onNewChat below), so the route
+      // check below can safely fail-closed on an unregistered group chat —
+      // it should never actually be unregistered by the time a message
+      // shows up. P2P chats have no equivalent bootstrap event: the first
+      // DM IS the "bot added" signal (mirrors the "/pair establishes
+      // ownership before routing" contract other channels use — see
+      // channel-admission.ts). Without this, resolveAdmittedChannelRoute
+      // would fail-closed on every message from a brand-new P2P chat
+      // forever, since registration (below) never gets a chance to run.
+      // onNewChat/onP2pSender are idempotent no-ops once already
+      // registered, so calling them again in their normal position below
+      // is safe and keeps this bootstrap narrowly scoped to P2P.
+      if (
+        chatType === 'p2p' &&
+        resolveEffectiveChatJid &&
+        !resolveEffectiveChatJid(chatJid)
+      ) {
+        onNewChat?.(chatJid, resolvedChatName);
+        if (senderOpenId && onP2pSender) {
+          onP2pSender(senderOpenId);
+        }
+      }
+
       const admittedRoute = resolveAdmittedChannelRoute<FeishuMessageMeta>(
         chatJid,
         resolveEffectiveChatJid,

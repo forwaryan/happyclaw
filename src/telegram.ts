@@ -684,31 +684,17 @@ export function createTelegramConnection(
               return;
             }
 
-            const resolvedRoute = resolveAdmittedChannelRoute(
-              routeJid,
-              opts.resolveEffectiveChatJid
-                ? () => opts.resolveEffectiveChatJid!(jid, messageMeta)
-                : undefined,
-            );
-            if (!resolvedRoute) {
-              logger.warn(
-                { jid, routeJid },
-                'Telegram message dropped: binding resolver rejected route',
-              );
-              return;
-            }
-            const { targetJid, routing: agentRouting } = resolvedRoute;
-            const sourceJid = agentRouting?.sourceJid ?? routeJid;
-
-            // ── Authorized chat: normal flow ──
-            await reportNativeContext(opts, jid, ctx.message.message_thread_id);
-            // 自动注册（确保 metadata 和名称同步）
-            storeChatMetadata(jid, new Date().toISOString());
-            updateChatName(jid, chatName);
-            opts.onNewChat(jid, chatName);
-
             // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
             // Telegram 群聊中会追加 @BotUsername，需要去掉
+            //
+            // Must run BEFORE resolveAdmittedChannelRoute: that resolver
+            // (opts.resolveEffectiveChatJid, when native-thread routing is
+            // in play) has side effects — it can create a conversation
+            // agent/chat/workspace-mount row for a not-yet-seen thread.
+            // A command like /status in a brand-new topic must not spend
+            // that side effect before it's even known to be a command,
+            // the same way Feishu intercepts slash commands ahead of its
+            // own route resolution (see feishu.ts).
             const tgSlashMatch = text
               .trim()
               .match(/^\/(\S+?)(?:@\S+)?(?:\s+(.*))?$/i);
@@ -746,6 +732,29 @@ export function createTelegramConnection(
                 return;
               }
             }
+
+            const resolvedRoute = resolveAdmittedChannelRoute(
+              routeJid,
+              opts.resolveEffectiveChatJid
+                ? () => opts.resolveEffectiveChatJid!(jid, messageMeta)
+                : undefined,
+            );
+            if (!resolvedRoute) {
+              logger.warn(
+                { jid, routeJid },
+                'Telegram message dropped: binding resolver rejected route',
+              );
+              return;
+            }
+            const { targetJid, routing: agentRouting } = resolvedRoute;
+            const sourceJid = agentRouting?.sourceJid ?? routeJid;
+
+            // ── Authorized chat: normal flow ──
+            await reportNativeContext(opts, jid, ctx.message.message_thread_id);
+            // 自动注册（确保 metadata 和名称同步）
+            storeChatMetadata(jid, new Date().toISOString());
+            updateChatName(jid, chatName);
+            opts.onNewChat(jid, chatName);
 
             // Reaction 确认
             try {
