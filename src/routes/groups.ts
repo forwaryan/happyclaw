@@ -2,12 +2,17 @@ import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
+  GroupAgentProfilePatchSchema,
   GroupCreateSchema,
   GroupPatchSchema,
-  GroupMemberAddSchema,
   ContainerEnvSchema,
 } from '../schemas.js';
-import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
+import type {
+  AuthUser,
+  ConversationSource,
+  RegisteredGroup,
+  ExecutionMode,
+} from '../types.js';
 import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
@@ -16,7 +21,6 @@ import {
   canAccessGroup,
   canModifyGroup,
   canDeleteGroup,
-  canManageGroupMembers,
   MAX_GROUP_NAME_LEN,
   getWebDeps,
 } from '../web-context.js';
@@ -29,6 +33,7 @@ import {
   getJidsByFolder,
   updateChatName,
   deleteSession,
+  deleteWorkspaceSessions,
   deleteChatHistory,
   deleteGroupData,
   deleteImGroupRecord,
@@ -38,16 +43,12 @@ import {
   getMessagesAfter,
   getMessagesPageMulti,
   getMessagesAfterMulti,
-  addGroupMember,
-  removeGroupMember,
-  getGroupMembers,
-  getGroupMemberRole,
-  getUserById,
   getAgent,
-  listUsers,
   listAgentsByJid,
   getGroupsByTargetAgent,
   getGroupsByTargetMainJid,
+  listChannelMountsByWorkspace,
+  listImContextBindingsByWorkspace,
   getMessage,
   deleteMessage,
   getUserPinnedGroups,
@@ -55,9 +56,21 @@ import {
   unpinGroup,
   deleteAgent,
   deleteImContextBindingsByWorkspace,
+  assignWorkspaceAgentProfile,
+  deleteWorkspaceAgentProfile,
+  getAgentProfileForUser,
+  getAgentProfileForWorkspace,
+  getOrCreateDefaultAgentProfile,
+  getWorkspaceAgentProfileId,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
+import {
+  getWorkspaceRuntimeJids,
+  quiesceWorkspaceRunnersAroundCommit,
+  withAgentProfileLocks,
+  WorkspaceRuntimeQuiesceError,
+} from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
   saveContainerEnvConfig,
@@ -78,8 +91,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
 import { z } from 'zod';
-import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
+import { broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
+import {
+  buildPinnedGitEnvironment,
+  startPinnedHttpsProxy,
+} from '../safe-git-proxy.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -89,7 +106,10 @@ const execFileAsync = promisify(execFile);
  *
  * Re-export 自 ../url-safety.ts 以兼容已有调用方；新代码应直接 import 那里的版本。
  */
-import { isPrivateHostname } from '../url-safety.js';
+import {
+  assertResolvesToPublicAddress,
+  isPrivateHostname,
+} from '../url-safety.js';
 export { isPrivateHostname };
 
 const groupRoutes = new Hono<{ Variables: Variables }>();
@@ -114,15 +134,22 @@ interface GroupPayloadItem {
   custom_cwd?: string;
   is_home?: boolean;
   is_my_home?: boolean;
-  is_shared?: boolean;
-  member_role?: 'owner' | 'member';
-  member_count?: number;
   can_modify?: boolean;
-  can_manage_members?: boolean;
   pinned_at?: string;
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
-  conversation_source?: 'manual' | 'feishu_thread';
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
+  conversation_source?: ConversationSource;
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
+  agent_profile_id?: string;
+  agent_profile_name?: string;
+  agent_profile_version?: number;
+  agent_profile_avatar_emoji?: string | null;
+  agent_profile_avatar_color?: string | null;
+  agent_profile_avatar_url?: string | null;
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -156,7 +183,8 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     if (isHost && !isAdmin && !(isHome && group.created_by === user.id))
       continue;
 
-    // User isolation: all users only see their own groups + shared groups
+    // Workspaces are private to their creator. IM rows without created_by use
+    // the legacy sibling-home fallback inside canAccessGroup.
     if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid }))
       continue;
 
@@ -186,29 +214,14 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   // Fetch user's pinned groups
   const pins = getUserPinnedGroups(user.id);
 
-  // Cache member info per folder (avoid repeated queries)
-  const memberCache = new Map<
-    string,
-    { count: number; role: 'owner' | 'member' | null }
-  >();
-  function getMemberInfo(folder: string) {
-    let cached = memberCache.get(folder);
-    if (!cached) {
-      const members = getGroupMembers(folder);
-      const role = members.find((m) => m.user_id === user.id)?.role ?? null;
-      cached = { count: members.length, role };
-      memberCache.set(folder, cached);
-    }
-    return cached;
-  }
-
   for (const [jid, group] of visibleEntries) {
     const isHome = !!group.is_home;
     const isWeb = jid.startsWith('web:');
 
     const latest = latestByJid.get(jid);
-    const memberInfo = !isHome ? getMemberInfo(group.folder) : null;
-    const isShared = memberInfo ? memberInfo.count > 1 : false;
+    const agentProfile = isWeb
+      ? getAgentProfileForWorkspace(group.folder, group.created_by)
+      : undefined;
 
     result[jid] = {
       name: group.name,
@@ -226,18 +239,17 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
       is_my_home: (isHome && group.created_by === user.id) || undefined,
-      is_shared: isShared || undefined,
-      member_role: memberInfo?.role ?? undefined,
-      member_count: isShared ? memberInfo?.count : undefined,
       can_modify: canModifyGroup(user, { ...group, jid }),
-      // owner-only, matching the member-management routes' canManageGroupMembers
-      // checks (no admin override — admin is not a workspace owner, consistent
-      // with canModifyGroup / canDeleteGroup).
-      can_manage_members: canManageGroupMembers(user, { ...group, jid }),
       pinned_at: pins[jid] || undefined,
       activation_mode: group.activation_mode ?? 'auto',
       conversation_source: group.conversation_source ?? 'manual',
       conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
+      agent_profile_id: agentProfile?.id,
+      agent_profile_name: agentProfile?.name,
+      agent_profile_version: agentProfile?.version,
+      agent_profile_avatar_emoji: agentProfile?.avatar_emoji,
+      agent_profile_avatar_color: agentProfile?.avatar_color,
+      agent_profile_avatar_url: agentProfile?.avatar_url,
     };
   }
 
@@ -247,6 +259,13 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
 import { removeFlowArtifacts } from '../file-manager.js';
 import { clearSessionFiles } from '../session-files.js';
 export { removeFlowArtifacts };
+
+class WorkspaceMissingDuringMigrationError extends Error {
+  constructor() {
+    super('Workspace no longer exists or changed during migration');
+    this.name = 'WorkspaceMissingDuringMigrationError';
+  }
+}
 
 function resetWorkspaceForGroup(folder: string): void {
   // 1. 清除工作目录（Agent 文件、CLAUDE.md、logs/ 等），然后重建空目录
@@ -318,11 +337,19 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   // If user didn't specify execution mode, pick based on Docker availability
-  const executionMode = validation.data.execution_mode || (await isDockerAvailable() ? 'container' : 'host');
+  const executionMode =
+    validation.data.execution_mode ||
+    ((await isDockerAvailable()) ? 'container' : 'host');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
   const authUser = c.get('user') as AuthUser;
+  const agentProfile = validation.data.agent_profile_id
+    ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
+    : getOrCreateDefaultAgentProfile(authUser.id);
+  if (!agentProfile) {
+    return c.json({ error: 'Agent profile not found' }, 404);
+  }
 
   // Billing: check group limit
   const groupLimit = checkGroupLimit(authUser.id, authUser.role);
@@ -509,12 +536,34 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       return c.json({ error: 'init_git_url must use https protocol' }, 400);
     }
 
-    // 阻止内网地址
+    // 阻止内网地址（字面量 IP/localhost）
     if (isPrivateHostname(gitUrl.hostname)) {
       return c.json(
         { error: 'init_git_url must not point to a private/internal address' },
         400,
       );
+    }
+
+    // URL 内嵌凭据会被传给 git 子进程，可能落进进程列表/日志；与
+    // skill-import-service.ts 的 importSkillsFromGit 保持一致，直接拒绝。
+    if (gitUrl.username || gitUrl.password) {
+      return c.json(
+        { error: 'init_git_url must not contain credentials' },
+        400,
+      );
+    }
+
+    // Early DNS check gives a fast 400 response. The actual clone is also
+    // forced through a connection-time validating proxy below, which pins
+    // each socket to the exact public IP it just validated.
+    try {
+      await assertResolvesToPublicAddress(
+        gitUrl.hostname,
+        'init_git_url hostname',
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: errMsg }, 400);
     }
   }
 
@@ -533,16 +582,11 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     created_by: authUser.id,
   };
 
-  setRegisteredGroup(jid, group);
-  updateChatName(jid, name);
-  deps.getRegisteredGroups()[jid] = group;
-
-  // Register creator as owner in group_members
-  addGroupMember(folder, authUser.id, 'owner', authUser.id);
-
-  // 工作区初始化
+  // Initialize private filesystem state before publishing either the
+  // registered workspace or its Agent membership. This removes the rollback
+  // race entirely: while clone/copy awaits, migration/delete routes cannot see
+  // the workspace, and a failure has no DB membership to undo.
   const groupDir = path.join(GROUPS_DIR, folder);
-
   try {
     if (initSourcePath) {
       await fsp.mkdir(groupDir, { recursive: true });
@@ -554,31 +598,111 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     }
 
     if (initGitUrl) {
-      await execFileAsync(
-        'git',
-        ['clone', '--depth', '1', initGitUrl, groupDir],
-        {
-          timeout: 120_000,
-        },
-      );
+      const reGitUrl = new URL(initGitUrl);
+      const gitProxy = await startPinnedHttpsProxy(reGitUrl.hostname, {
+        expectedPort: reGitUrl.port ? Number(reGitUrl.port) : 443,
+      });
+      // Hardening flags mirror skill-import-service.ts's importSkillsFromGit:
+      // - http.followRedirects=false: an initial 302 to a private/internal
+      //   address would otherwise bypass the DNS precheck above entirely.
+      // - protocol.file.allow=never: refuse a local-file clone smuggled in
+      //   via a redirect or a crafted URL scheme override.
+      // - submodule.recurse=false: don't let a malicious repo's submodules
+      //   pull from arbitrary, unvalidated URLs.
+      // - --no-tags --single-branch: minimize what an untrusted repo can
+      //   push into this clone beyond the requested ref.
+      // - GIT_TERMINAL_PROMPT=0: never hang waiting for credential input.
+      try {
+        await execFileAsync(
+          'git',
+          [
+            '-c',
+            `http.proxy=${gitProxy.url}`,
+            '-c',
+            'http.followRedirects=false',
+            '-c',
+            'protocol.file.allow=never',
+            '-c',
+            'submodule.recurse=false',
+            'clone',
+            '--depth',
+            '1',
+            '--no-tags',
+            '--single-branch',
+            '--',
+            initGitUrl,
+            groupDir,
+          ],
+          {
+            timeout: 120_000,
+            env: buildPinnedGitEnvironment(gitProxy.url),
+          },
+        );
+      } finally {
+        await gitProxy.close();
+      }
       logger.info(
         { folder, url: initGitUrl },
         'Workspace initialized from git clone',
       );
     }
   } catch (err) {
-    // 初始化失败时清理
-    logger.error(
-      { folder, err },
-      'Workspace initialization failed, cleaning up',
-    );
+    logger.error({ folder, err }, 'Workspace initialization failed');
     fs.rmSync(groupDir, { recursive: true, force: true });
-    deleteRegisteredGroup(jid);
-    deleteChatHistory(jid);
-    delete deps.getRegisteredGroups()[jid];
-
     const errMsg = err instanceof Error ? err.message : String(err);
     return c.json({ error: `Workspace initialization failed: ${errMsg}` }, 500);
+  }
+
+  let publishedAgentProfile;
+  try {
+    publishedAgentProfile = await withAgentProfileLocks(
+      [agentProfile.id],
+      () => {
+        // The target may have been archived while the request performed its
+        // filesystem/network validation. Recheck under the same lock used by
+        // Agent DELETE/PATCH and workspace migration.
+        const lockedProfile = getAgentProfileForUser(
+          agentProfile.id,
+          authUser.id,
+        );
+        if (!lockedProfile) return undefined;
+
+        try {
+          // Mapping first and registered-group publication immediately after
+          // it occur in one synchronous critical section. Agent PATCH cannot
+          // snapshot between them: it holds this same profile lock.
+          assignWorkspaceAgentProfile(folder, lockedProfile.id);
+          setRegisteredGroup(jid, group);
+          updateChatName(jid, name);
+          deps.getRegisteredGroups()[jid] = group;
+          return lockedProfile;
+        } catch (err) {
+          // setRegisteredGroup may fail after the mapping write. Clear both
+          // sides before releasing the profile lock so no partial membership
+          // can become visible to the next mutation.
+          try {
+            deleteRegisteredGroup(jid);
+          } catch {
+            /* best-effort cleanup continues below */
+          }
+          deleteWorkspaceAgentProfile(folder);
+          deleteChatHistory(jid);
+          delete deps.getRegisteredGroups()[jid];
+          throw err;
+        }
+      },
+    );
+  } catch (err) {
+    logger.error({ err, jid, folder }, 'Workspace publication failed');
+    fs.rmSync(groupDir, { recursive: true, force: true });
+    return c.json({ error: 'Workspace publication failed' }, 500);
+  }
+  if (!publishedAgentProfile) {
+    fs.rmSync(groupDir, { recursive: true, force: true });
+    return c.json(
+      { error: 'Agent profile is no longer active; choose another Agent' },
+      409,
+    );
   }
 
   // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
@@ -587,10 +711,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   // Mirror buildGroupsPayload ACL shape so the frontend doesn't need to
-  // refetch /api/groups just to learn the writer can edit Skills/MCP/members.
-  // Creator is always owner of a fresh non-home web group, so both checks
-  // resolve true here; we still go through the helpers to keep one source of
-  // truth and avoid drift if the rules change later.
+  // refetch /api/groups just to learn the writer can edit Skills/MCP.
   const groupWithJid = { ...group, jid };
   const isAdmin = hasHostExecutionPermission(authUser);
   const responseGroup: GroupPayloadItem = {
@@ -605,14 +726,16 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     execution_mode: group.executionMode || 'container',
     custom_cwd: isAdmin ? group.customCwd : undefined,
     is_my_home: undefined,
-    is_shared: undefined,
-    member_role: 'owner',
-    member_count: undefined,
     can_modify: canModifyGroup(authUser, groupWithJid),
-    can_manage_members: canManageGroupMembers(authUser, groupWithJid),
     activation_mode: group.activation_mode ?? 'auto',
     conversation_source: group.conversation_source ?? 'manual',
     conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
+    agent_profile_id: publishedAgentProfile.id,
+    agent_profile_name: publishedAgentProfile.name,
+    agent_profile_version: publishedAgentProfile.version,
+    agent_profile_avatar_emoji: publishedAgentProfile.avatar_emoji,
+    agent_profile_avatar_color: publishedAgentProfile.avatar_color,
+    agent_profile_avatar_url: publishedAgentProfile.avatar_url,
   };
 
   return c.json({
@@ -743,12 +866,240 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           : existing.activation_mode,
     };
 
-    setRegisteredGroup(jid, updated);
-    if (name) updateChatName(jid, name);
-    deps.getRegisteredGroups()[jid] = updated;
+    const commitUpdate = () => {
+      setRegisteredGroup(jid, updated);
+      if (name) updateChatName(jid, name);
+      deps.getRegisteredGroups()[jid] = updated;
+      if (
+        execution_mode !== undefined &&
+        execution_mode !== (existing.executionMode || 'container')
+      ) {
+        // SDK resume state is environment-bound. Never carry a host session
+        // into a container (or vice versa) after the old runner is stopped.
+        deleteWorkspaceSessions(existing.folder);
+        delete deps.sessions[existing.folder];
+      }
+    };
+
+    const executionModeChanged =
+      execution_mode !== undefined &&
+      execution_mode !== (existing.executionMode || 'container');
+    const runtimeWasSafetyBlocked =
+      execution_mode !== undefined &&
+      (deps.queue?.isGroupRuntimeSafetyBlocked?.(jid) ?? false);
+    if (
+      executionModeChanged ||
+      (execution_mode !== undefined && runtimeWasSafetyBlocked)
+    ) {
+      const runtimeJids = getWorkspaceRuntimeJids(deps, existing.folder, jid);
+      try {
+        await quiesceWorkspaceRunnersAroundCommit(
+          deps,
+          [{ folder: existing.folder, primaryJid: jid }],
+          {
+            reason: `Workspace ${jid} execution mode changed`,
+            onPostCommitFailure: (failedRuntimeJids) =>
+              deps.queue?.blockGroupsForRuntimeSafety?.(
+                failedRuntimeJids,
+                `Workspace ${jid} runtime cleanup failed after execution mode commit`,
+              ),
+          },
+          commitUpdate,
+        );
+        deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
+      } catch (err) {
+        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+        if (err.persisted) {
+          deps.queue?.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `Workspace ${jid} runtime cleanup failed after execution mode commit`,
+          );
+        }
+        return c.json(
+          {
+            error: err.persisted
+              ? 'Execution mode changed, but runtime cleanup failed; retry the request'
+              : 'Failed to stop the active workspace; execution mode was not changed',
+            persisted: err.persisted,
+            retryable: true,
+          },
+          503,
+        );
+      }
+    } else {
+      commitUpdate();
+    }
   }
 
   return c.json({ success: true, pinned_at });
+});
+
+// PATCH /api/groups/:jid/agent-profile - 切换 workspace 归属的顶层 AgentProfile
+groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const jid = c.req.param('jid');
+  const existing = getRegisteredGroup(jid);
+  if (!existing) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (
+    !canModifyGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...existing, jid },
+    )
+  ) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!jid.startsWith('web:')) {
+    return c.json(
+      { error: 'Only web workspaces can switch AgentProfile' },
+      403,
+    );
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const validation = GroupAgentProfilePatchSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json({ error: 'Invalid request body' }, 400);
+  }
+
+  const profile = getAgentProfileForUser(
+    validation.data.agent_profile_id,
+    authUser.id,
+  );
+  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+
+  let invalidatedRuntimeJids = 0;
+  let committedProfile = profile;
+  for (;;) {
+    const observedOldProfileId =
+      getWorkspaceAgentProfileId(existing.folder) ??
+      getOrCreateDefaultAgentProfile(authUser.id).id;
+    try {
+      const outcome = await withAgentProfileLocks(
+        [observedOldProfileId, profile.id],
+        async () => {
+          // DELETE may have archived the target while this request waited for
+          // the locks. Never publish a mapping to a no-longer-active Agent.
+          const lockedTarget = getAgentProfileForUser(profile.id, authUser.id);
+          if (!lockedTarget) return { kind: 'target_missing' as const };
+
+          // This route does not share a lock with workspace DELETE. Re-read the
+          // workspace after acquiring the profile locks so a request that was
+          // deleted or reassigned while we waited cannot be migrated from a
+          // stale entry snapshot.
+          const lockedWorkspace = getRegisteredGroup(jid);
+          if (
+            !lockedWorkspace ||
+            lockedWorkspace.folder !== existing.folder ||
+            !canModifyGroup(
+              { id: authUser.id, role: authUser.role },
+              { ...lockedWorkspace, jid },
+            )
+          ) {
+            return { kind: 'workspace_missing' as const };
+          }
+
+          const lockedOldProfileId =
+            getWorkspaceAgentProfileId(lockedWorkspace.folder) ??
+            getOrCreateDefaultAgentProfile(authUser.id).id;
+          if (lockedOldProfileId !== observedOldProfileId) {
+            return { kind: 'retry' as const };
+          }
+
+          const result = await quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            [{ folder: lockedWorkspace.folder, primaryJid: jid }],
+            {
+              reason: `Workspace ${jid} switched to Agent profile ${lockedTarget.id}`,
+            },
+            () => {
+              // DELETE can finish while the pre-commit stop awaits. Keep this
+              // final check and assignment synchronous so either migration
+              // publishes first or deletion wins without an orphan mapping.
+              const commitWorkspace = getRegisteredGroup(jid);
+              if (
+                !commitWorkspace ||
+                commitWorkspace.folder !== existing.folder ||
+                !canModifyGroup(
+                  { id: authUser.id, role: authUser.role },
+                  { ...commitWorkspace, jid },
+                )
+              ) {
+                // Throw before any assignment. A false return would be
+                // indistinguishable from a successful commit to the generic
+                // quiesce helper, causing it to run post-stop and potentially
+                // report persisted:true even though nothing was written.
+                throw new WorkspaceMissingDuringMigrationError();
+              }
+              assignWorkspaceAgentProfile(
+                commitWorkspace.folder,
+                lockedTarget.id,
+              );
+            },
+          );
+          return { kind: 'success' as const, result, profile: lockedTarget };
+        },
+      );
+      if (outcome.kind === 'retry') continue;
+      if (outcome.kind === 'target_missing') {
+        return c.json({ error: 'Agent profile is no longer active' }, 409);
+      }
+      if (outcome.kind === 'workspace_missing') {
+        return c.json(
+          { error: 'Workspace no longer exists or changed during migration' },
+          409,
+        );
+      }
+      invalidatedRuntimeJids = outcome.result.runtimeJids.length;
+      committedProfile = outcome.profile;
+      break;
+    } catch (err) {
+      if (err instanceof WorkspaceMissingDuringMigrationError) {
+        return c.json(
+          {
+            error: err.message,
+            persisted: false,
+          },
+          409,
+        );
+      }
+      if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+      logger.error(
+        {
+          err,
+          jid,
+          folder: existing.folder,
+          agentProfileId: profile.id,
+          persisted: err.persisted,
+        },
+        err.persisted
+          ? 'Workspace Agent profile persisted but post-commit runtime cleanup failed'
+          : 'Workspace Agent profile switch aborted before persistence',
+      );
+      return c.json(
+        {
+          error: err.persisted
+            ? 'Workspace Agent profile was updated, but runtime cleanup failed; retry the same request'
+            : 'Failed to quiesce active runtime; Workspace Agent profile was not updated',
+          persisted: err.persisted,
+          retryable: true,
+          agent_profile_id: err.persisted ? profile.id : undefined,
+        },
+        503,
+      );
+    }
+  }
+
+  return c.json({
+    success: true,
+    agent_profile_id: committedProfile.id,
+    agent_profile_name: committedProfile.name,
+    agent_profile_version: committedProfile.version,
+    invalidated_runtime_jids: invalidatedRuntimeJids,
+  });
 });
 
 // POST /api/groups/:jid/reset-owner — admin break-glass for a stuck IM owner.
@@ -763,7 +1114,10 @@ groupRoutes.post('/:jid/reset-owner', authMiddleware, async (c) => {
 
   const authUser = c.get('user') as AuthUser;
   if (authUser.role !== 'admin') {
-    return c.json({ error: 'Only an admin can reset the workspace owner' }, 403);
+    return c.json(
+      { error: 'Only an admin can reset the workspace owner' },
+      403,
+    );
   }
 
   const jid = c.req.param('jid');
@@ -800,8 +1154,8 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
 
   // IM-prefixed groups (feishu:, telegram:, qq:, etc.) follow a separate
   // cleanup path. They share their folder with the owner's home workspace,
-  // so we must NOT touch folder-scoped data (sessions, scheduled_tasks,
-  // group_members) or the workspace directory.
+  // so we must NOT touch folder-scoped data (sessions, scheduled_tasks) or
+  // the workspace directory.
   if (!jid.startsWith('web:')) {
     if (!getChannelType(jid)) {
       return c.json({ error: 'This group cannot be deleted' }, 403);
@@ -826,22 +1180,50 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  // Block deletion if any IM binding exists (agent or main conversation)
+  // Block deletion if any IM channel is mounted to this workspace or one of its sessions.
   const agents = listAgentsByJid(jid);
-  const boundAgents: Array<{
-    agentId: string;
-    agentName: string;
+  const sessionNameById = new Map(
+    agents
+      .filter((a) => a.kind === 'conversation')
+      .map((a) => [a.id, a.name] as const),
+  );
+  const boundSessions: Array<{
+    sessionId: string;
+    sessionName: string;
     imGroups: Array<{ jid: string; name: string }>;
   }> = [];
+  const sessionBindings = new Map<
+    string,
+    Array<{ jid: string; name: string }>
+  >();
+  const mainBindings = new Map<string, { jid: string; name: string }>();
+
+  for (const mount of listChannelMountsByWorkspace(jid)) {
+    const imGroup = getRegisteredGroup(mount.channel_jid);
+    const item = {
+      jid: mount.channel_jid,
+      name: imGroup?.name ?? mount.channel_jid,
+    };
+    if (mount.session_id) {
+      const items = sessionBindings.get(mount.session_id) ?? [];
+      items.push(item);
+      sessionBindings.set(mount.session_id, items);
+    } else {
+      mainBindings.set(mount.channel_jid, item);
+    }
+  }
+
   for (const a of agents) {
     if (a.kind === 'conversation') {
       const linked = getGroupsByTargetAgent(a.id);
-      if (linked.length > 0) {
-        boundAgents.push({
-          agentId: a.id,
-          agentName: a.name,
-          imGroups: linked.map((l) => ({ jid: l.jid, name: l.group.name })),
-        });
+      const items = sessionBindings.get(a.id) ?? [];
+      for (const l of linked) {
+        if (!items.some((item) => item.jid === l.jid)) {
+          items.push({ jid: l.jid, name: l.group.name });
+        }
+      }
+      if (items.length > 0) {
+        sessionBindings.set(a.id, items);
       }
     }
   }
@@ -855,16 +1237,45 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     ...mainBoundByJid,
     ...mainBoundByFolder.filter((l) => !mainBoundJids.has(l.jid)),
   ];
-  if (boundAgents.length > 0 || mainBound.length > 0) {
-    const mainImGroups = mainBound.map((l) => ({
-      jid: l.jid,
-      name: l.group.name,
-    }));
+  for (const l of mainBound) {
+    mainBindings.set(l.jid, { jid: l.jid, name: l.group.name });
+  }
+
+  for (const [sessionId, imGroups] of sessionBindings.entries()) {
+    boundSessions.push({
+      sessionId,
+      sessionName: sessionNameById.get(sessionId) ?? sessionId,
+      imGroups,
+    });
+  }
+
+  const threadContextBindings = listImContextBindingsByWorkspace(jid).map(
+    (binding) => {
+      const imGroup = getRegisteredGroup(binding.source_jid);
+      return {
+        jid: binding.source_jid,
+        name: imGroup?.name ?? binding.source_jid,
+        context_id: binding.context_id,
+      };
+    },
+  );
+  const mainImGroups = Array.from(mainBindings.values());
+  if (
+    boundSessions.length > 0 ||
+    mainImGroups.length > 0 ||
+    threadContextBindings.length > 0
+  ) {
     return c.json(
       {
         error: '该工作区绑定了 IM 群组，请先解绑后再删除。',
-        bound_agents: boundAgents,
+        bound_sessions: boundSessions,
+        bound_agents: boundSessions.map((s) => ({
+          agentId: s.sessionId,
+          agentName: s.sessionName,
+          imGroups: s.imGroups,
+        })),
         bound_main_im_groups: mainImGroups,
+        bound_thread_contexts: threadContextBindings,
       },
       409,
     );
@@ -877,35 +1288,57 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   // cwd/session dirs deleted out from under them (container/process leak + ENOENT).
   const deleteSiblingJids = getJidsByFolder(existing.folder);
   const deleteDescendantJids = Array.from(
-    new Set(
-      deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
-    ),
+    new Set(deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j))),
   );
   const deleteStopJids = Array.from(
     new Set([jid, ...deleteSiblingJids, ...deleteDescendantJids]),
   );
+  // Unlike an Agent identity mutation, deletion is destructive: work accepted
+  // after this point must be parked across the entire serialization family and
+  // then discarded after the DB/filesystem commit, never resumed against the
+  // deleted workspace. The batch pause is intentionally acquired before the
+  // first await so new sibling and virtual-descendant work cannot slip between
+  // individual stopGroup calls.
+  const deletePauseToken = deps.queue.pauseGroupsForMutation(deleteStopJids);
+  let deleteCommitted = false;
   try {
-    await Promise.all(
-      deleteStopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
-    );
-  } catch (err) {
-    logger.error(
-      { jid, stopJids: deleteStopJids, err },
-      'Failed to stop container before deleting group',
-    );
-    return c.json(
-      { error: 'Failed to stop container, group not deleted' },
-      500,
-    );
+    try {
+      // Do not preserve queued work for permanent deletion. stopGroup clears
+      // work that was already known; discardGroupsAfterMutation below clears
+      // anything newly parked while these asynchronous stops were in flight.
+      await Promise.all(
+        deleteStopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+      );
+    } catch (err) {
+      logger.error(
+        { jid, stopJids: deleteStopJids, err },
+        'Failed to stop container before deleting group',
+      );
+      return c.json(
+        { error: 'Failed to stop container, group not deleted' },
+        500,
+      );
+    }
+
+    deleteGroupData(jid, existing.folder);
+    deleteCommitted = true;
+
+    delete deps.getRegisteredGroups()[jid];
+    delete deps.getSessions()[existing.folder];
+    deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
+
+    removeFlowArtifacts(existing.folder);
+
+    return c.json({ success: true });
+  } finally {
+    if (deleteCommitted) {
+      deps.queue.discardGroupsAfterMutation(deletePauseToken);
+    } else {
+      // Stop/DB failure leaves the workspace valid, so accepted work remains
+      // legitimate and must drain once the failed delete releases its gate.
+      deps.queue.resumeGroupsAfterMutation(deletePauseToken);
+    }
   }
-  deleteGroupData(jid, existing.folder);
-  removeFlowArtifacts(existing.folder);
-
-  delete deps.getRegisteredGroups()[jid];
-  delete deps.getSessions()[existing.folder];
-  deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
-
-  return c.json({ success: true });
 });
 
 // POST /api/groups/:jid/stop - 停止当前运行的容器/进程
@@ -920,17 +1353,10 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  // Resource-level ACL: the owner (canModifyGroup) can always stop; a shared
-  // member may stop only a run they started themselves (the queue's current-run
-  // initiator), not the owner's. Mirrors the delete-message owner-or-sender model.
   if (
-    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid }) &&
-    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })
   ) {
-    return c.json(
-      { error: 'Only the workspace owner or the run initiator can stop it' },
-      403,
-    );
+    return c.json({ error: 'Only the workspace owner can stop it' }, 403);
   }
 
   try {
@@ -958,23 +1384,13 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  // Resource-level ACL (see /stop): owner OR the run's initiator. Uses the full
-  // (possibly virtual #agent:) jid so an agent-conversation run resolves to its
-  // own runner. Agent/task runs carry no message initiator (getActiveRunInitiator
-  // excludes activeRunnerIsTask) → owner-only. Known safe-direction limitation:
-  // a member who started their own agent/task run can't interrupt it — only the
-  // owner can; revisit if member-initiated agent interrupt is wanted (see PR notes).
   if (
     !canModifyGroup(
       { id: authUser.id, role: authUser.role },
       { ...group, jid: baseJid },
-    ) &&
-    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+    )
   ) {
-    return c.json(
-      { error: 'Only the workspace owner or the run initiator can interrupt it' },
-      403,
-    );
+    return c.json({ error: 'Only the workspace owner can interrupt it' }, 403);
   }
 
   const interrupted = deps.queue.interruptQuery(jid);
@@ -1201,9 +1617,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   //    with their cwd/session dirs pulled out from under them (ENOENT / undefined
   //    behavior in container mode).
   const descendantJids = Array.from(
-    new Set(
-      siblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
-    ),
+    new Set(siblingJids.flatMap((j) => deps.queue.listDescendantJids(j))),
   );
   const stopJids = [...siblingJids, ...descendantJids];
   try {
@@ -1355,9 +1769,7 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     return c.json({ messages, hasMore });
   }
 
-  // is_home 群组合并查询：将同 folder 下所有 JID（web + feishu/telegram IM 通道）的消息合并展示
-  // - admin: merge all siblings in the folder (shared admin home)
-  // - member: merge only siblings with same owner to prevent cross-user leakage
+  // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
   const queryJids = [jid];
   if (group.is_home) {
     const siblingJids = getJidsByFolder(group.folder);
@@ -1365,12 +1777,9 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       if (siblingJid === jid) continue;
       const siblingGroup = getRegisteredGroup(siblingJid);
       if (!siblingGroup) continue;
-      // Merge siblings by ownership: same creator, or admin's own IM channels
       const ownerMatch =
         group.created_by && siblingGroup.created_by === group.created_by;
-      const adminSelfMatch =
-        authUser.role === 'admin' && siblingGroup.created_by === authUser.id;
-      if (ownerMatch || adminSelfMatch) {
+      if (ownerMatch) {
         queryJids.push(siblingJid);
       }
     }
@@ -1459,7 +1868,10 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
     user.role !== 'admin' &&
     !canModifyGroup({ id: user.id, role: user.role }, { ...group, jid })
   ) {
-    return c.json({ error: 'Forbidden: only the workspace owner can read env' }, 403);
+    return c.json(
+      { error: 'Forbidden: only the workspace owner can read env' },
+      403,
+    );
   }
   if (
     user.role !== 'admin' &&
@@ -1496,7 +1908,10 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     envUser.role !== 'admin' &&
     !canModifyGroup({ id: envUser.id, role: envUser.role }, { ...group, jid })
   ) {
-    return c.json({ error: 'Forbidden: only the workspace owner can modify env' }, 403);
+    return c.json(
+      { error: 'Forbidden: only the workspace owner can modify env' },
+      403,
+    );
   }
   if (
     envUser.role !== 'admin' &&
@@ -1573,150 +1988,6 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
   }
 });
 
-// --- Member Management Routes ---
-
-// GET /api/groups/:jid/members - 列出成员
-groupRoutes.get('/:jid/members', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  const members = getGroupMembers(group.folder);
-  return c.json({ members });
-});
-
-// GET /api/groups/:jid/members/search?q=... - 搜索可添加的用户（owner/admin 权限）
-groupRoutes.get('/:jid/members/search', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (
-    !canManageGroupMembers(
-      { id: authUser.id, role: authUser.role },
-      { ...group, jid },
-    )
-  ) {
-    return c.json({ error: 'Forbidden' }, 403);
-  }
-
-  const q = c.req.query('q') || '';
-  if (!q.trim()) return c.json({ users: [] });
-
-  const result = listUsers({ query: q.trim(), status: 'active', pageSize: 10 });
-  const existingIds = new Set(
-    getGroupMembers(group.folder).map((m) => m.user_id),
-  );
-  const users = result.users
-    .filter((u) => !existingIds.has(u.id))
-    .map((u) => ({
-      id: u.id,
-      username: u.username,
-      display_name: u.display_name,
-    }));
-
-  return c.json({ users });
-});
-
-// POST /api/groups/:jid/members - 添加成员
-groupRoutes.post('/:jid/members', authMiddleware, async (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Insufficient permissions' }, 403);
-  }
-
-  if (group.is_home) {
-    return c.json({ error: 'Cannot add members to home groups' }, 400);
-  }
-
-  const body = await c.req.json().catch(() => ({}));
-  const validation = GroupMemberAddSchema.safeParse(body);
-  if (!validation.success) {
-    return c.json({ error: 'Invalid request body' }, 400);
-  }
-
-  const { user_id: targetUserId } = validation.data;
-
-  // Check target user exists and is active
-  const targetUser = getUserById(targetUserId);
-  if (!targetUser || targetUser.status !== 'active') {
-    return c.json({ error: 'User not found or inactive' }, 404);
-  }
-
-  // Check if already a member
-  const existingRole = getGroupMemberRole(group.folder, targetUserId);
-  if (existingRole !== null) {
-    return c.json({ error: 'User is already a member' }, 409);
-  }
-
-  addGroupMember(group.folder, targetUserId, 'member', authUser.id);
-  invalidateAllowedUserCache(jid);
-  logger.info(
-    { jid, folder: group.folder, targetUserId, addedBy: authUser.id },
-    'Group member added',
-  );
-
-  const members = getGroupMembers(group.folder);
-  return c.json({ success: true, members });
-});
-
-// DELETE /api/groups/:jid/members/:userId - 移除成员
-groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const targetUserId = c.req.param('userId');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-
-  // Self-removal: any member can leave
-  const isSelfRemoval = targetUserId === authUser.id;
-  if (!isSelfRemoval) {
-    if (
-      !canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)
-    ) {
-      return c.json({ error: 'Insufficient permissions' }, 403);
-    }
-  }
-
-  // Check target is actually a member
-  const targetRole = getGroupMemberRole(group.folder, targetUserId);
-  if (targetRole === null) {
-    return c.json({ error: 'User is not a member' }, 404);
-  }
-
-  // Owner cannot be removed
-  if (targetRole === 'owner') {
-    return c.json({ error: 'Cannot remove the owner' }, 400);
-  }
-
-  removeGroupMember(group.folder, targetUserId);
-  invalidateAllowedUserCache(jid);
-  logger.info(
-    {
-      jid,
-      folder: group.folder,
-      targetUserId,
-      removedBy: authUser.id,
-      isSelfRemoval,
-    },
-    'Group member removed',
-  );
-
-  const members = getGroupMembers(group.folder);
-  return c.json({ success: true, members });
-});
-
 // --- MCP Configuration Routes ---
 
 // GET /api/groups/:jid/mcp - 获取工作区 MCP 配置
@@ -1752,7 +2023,11 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   const selected_mcps = body.selected_mcps;
 
   // Validate mcp_mode
-  if (mcp_mode !== undefined && mcp_mode !== 'inherit' && mcp_mode !== 'custom') {
+  if (
+    mcp_mode !== undefined &&
+    mcp_mode !== 'inherit' &&
+    mcp_mode !== 'custom'
+  ) {
     return c.json({ error: 'Invalid mcp_mode' }, 400);
   }
 
@@ -1772,7 +2047,8 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   const updatedGroup: RegisteredGroup = {
     ...group,
     mcp_mode: mcp_mode ?? group.mcp_mode ?? 'inherit',
-    selected_mcps: selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
+    selected_mcps:
+      selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
   };
 
   setRegisteredGroup(jid, updatedGroup);

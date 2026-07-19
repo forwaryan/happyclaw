@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Users } from 'lucide-react';
+import { Bot, ChevronDown, ChevronUp } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { GroupInfo } from '../../stores/groups';
 import { GroupDetail } from './GroupDetail';
@@ -36,12 +36,6 @@ export function GroupCard({ group }: GroupCardProps) {
               <h3 className="text-lg font-semibold text-foreground truncate">
                 {group.name}
               </h3>
-              {group.is_shared && (
-                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-brand-100 text-primary text-[10px] font-medium flex-shrink-0">
-                  <Users className="w-3 h-3" />
-                  {group.member_count ?? 0}
-                </span>
-              )}
             </div>
 
             {/* JID */}
@@ -57,6 +51,15 @@ export function GroupCard({ group }: GroupCardProps) {
                   {group.folder}
                 </span>
               </div>
+              {group.agent_profile_name && (
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">Agent:</span>
+                  <span className="inline-flex min-w-0 items-center gap-1 text-foreground font-medium">
+                    <Bot className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="truncate">{group.agent_profile_name}</span>
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 

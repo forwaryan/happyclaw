@@ -79,7 +79,7 @@ export interface EnvRow {
 }
 
 export interface SessionInfo {
-  id: string;
+  shortId: string;
   ip_address: string | null;
   user_agent: string | null;
   created_at: string;
@@ -97,17 +97,15 @@ export interface SystemSettings {
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
   scriptTimeout: number;
-  billingEnabled: boolean;
-  billingMode: 'wallet_first';
-  billingMinStartBalanceUsd: number;
-  billingCurrency: string;
-  billingCurrencyRate: number;
-  externalClaudeDir: string;
-  autoCompactWindow: number;
-  subagentModel: string;
-  disableMemoryLayerForAdminHost: boolean;
-  pluginAutoScan: boolean;
   taskBackfillGraceMs: number;
+}
+
+export interface HostIntegrationSettings {
+  mainAgentContextSource: 'managed' | 'host_claude';
+  mainAgentAutoCompactWindow: number;
+  mainAgentAutoCompactPercentage: number;
+  externalClaudeDir: string;
+  pluginAutoScan: boolean;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────
@@ -130,7 +128,30 @@ export interface CachedOAuthUsage {
   error?: string;
 }
 
-export type SettingsTab = 'claude' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'plugins' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
+export type SettingsTab =
+  | 'claude'
+  | 'registration'
+  | 'appearance'
+  | 'system'
+  | 'automation'
+  | 'main-agent'
+  | 'host-integration'
+  | 'billing'
+  | 'profile'
+  | 'preferences'
+  | 'my-channels'
+  | 'security'
+  | 'groups'
+  | 'agent-profiles'
+  | 'memory'
+  | 'skills'
+  | 'mcp-servers'
+  | 'plugins'
+  | 'users'
+  | 'about'
+  | 'bindings'
+  | 'usage'
+  | 'monitor';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

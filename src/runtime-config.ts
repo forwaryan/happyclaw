@@ -42,7 +42,11 @@ function writeSecretFile(targetPath: string, data: string): void {
   try {
     fs.writeFileSync(fd, data);
   } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
   }
   fs.renameSync(tmp, targetPath);
   try {
@@ -78,6 +82,31 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
 ]);
+
+const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
+  // These values receive provider-level defaults below, but remain editable
+  // through the provider's advanced settings. Workspace overrides stay
+  // blocked so one workspace cannot silently change provider behavior.
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_NO_FLICKER',
+  'API_TIMEOUT_MS',
+]);
+
+const THIRD_PARTY_RUNTIME_DEFAULTS = {
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  CLAUDE_CODE_EFFORT_LEVEL: 'max',
+  CLAUDE_CODE_NO_FLICKER: '1',
+  API_TIMEOUT_MS: '3000000',
+} as const;
+
+function isOneMillionContextModel(model: string): boolean {
+  return /\[1m\]$/i.test(model.trim());
+}
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
   'LD_PRELOAD',
@@ -1816,7 +1845,10 @@ export function saveTelegramProviderConfig(
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  writeSecretFile(TELEGRAM_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
+  writeSecretFile(
+    TELEGRAM_CONFIG_FILE,
+    JSON.stringify(payload, null, 2) + '\n',
+  );
   return normalized;
 }
 
@@ -2394,10 +2426,48 @@ export function buildClaudeEnvLines(
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
   }
 
-  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile
+  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile.
   const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
+
+  // Anthropic-compatible third-party endpoints need a predictable Claude Code
+  // runtime. Prefill the implementation-level environment from the model and
+  // [1m] suffix, while allowing provider-level advanced settings to replace
+  // any default explicitly.
+  if (config.anthropicBaseUrl) {
+    const configuredValue = (key: string, fallback: string): string =>
+      Object.hasOwn(customEnv, key)
+        ? sanitizeCustomEnvValue(key, customEnv[key])
+        : fallback;
+
+    if (config.anthropicModel) {
+      const model = sanitizeEnvValue(config.anthropicModel);
+      lines.push(
+        `ANTHROPIC_DEFAULT_OPUS_MODEL=${configuredValue('ANTHROPIC_DEFAULT_OPUS_MODEL', model)}`,
+      );
+      lines.push(
+        `ANTHROPIC_DEFAULT_SONNET_MODEL=${configuredValue('ANTHROPIC_DEFAULT_SONNET_MODEL', model)}`,
+      );
+      lines.push(
+        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${configuredValue('ANTHROPIC_DEFAULT_HAIKU_MODEL', model)}`,
+      );
+    }
+
+    lines.push(
+      `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${configuredValue(
+        'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        isOneMillionContextModel(config.anthropicModel) ? '1000000' : '200000',
+      )}`,
+    );
+    for (const [key, value] of Object.entries(THIRD_PARTY_RUNTIME_DEFAULTS)) {
+      lines.push(`${key}=${configuredValue(key, value)}`);
+    }
+  }
+
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
+    if (config.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key)) {
+      continue;
+    }
     lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
@@ -2534,12 +2604,17 @@ export function appendClaudeConfigAudit(
   // 首次落盘 mode = 0o666 & ~umask（实测 0o644），同主机其他本地账号能读
   // 管理员审计轨迹（用户名 / OAuth 登录时点 / IM 凭据轮换时间窗 = 暴力破解
   // 窗口枚举素材）。和 writeSecretFile 同形态强 0o600。
-  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND;
+  const flags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND;
   const fd = fs.openSync(CLAUDE_CONFIG_AUDIT_FILE, flags, 0o600);
   try {
     fs.writeSync(fd, `${JSON.stringify(entry)}\n`);
   } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
   }
   // 自愈历史 0o644 文件：appendFileSync 在升级前已经创建过，单纯切到 fd 路径
   // 只对新文件生效；显式 chmod 保证存量也收紧。
@@ -2667,7 +2742,10 @@ export function saveContainerEnvConfig(
   }
 
   fs.mkdirSync(CONTAINER_ENV_DIR, { recursive: true });
-  writeSecretFile(containerEnvPath(folder), JSON.stringify(sanitized, null, 2) + '\n');
+  writeSecretFile(
+    containerEnvPath(folder),
+    JSON.stringify(sanitized, null, 2) + '\n',
+  );
 }
 
 export function deleteContainerEnvConfig(folder: string): void {
@@ -2816,6 +2894,16 @@ export function buildContainerEnvLines(
         logger.warn(
           { key },
           'Blocked dangerous env variable in buildContainerEnvLines',
+        );
+        continue;
+      }
+      if (
+        RESERVED_CLAUDE_ENV_KEYS.has(key) ||
+        (merged.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key))
+      ) {
+        logger.warn(
+          { key },
+          'Skipping managed Claude environment variable in workspace override',
         );
         continue;
       }
@@ -3045,6 +3133,8 @@ export interface AppearanceConfig {
   aiName: string;
   aiAvatarEmoji: string;
   aiAvatarColor: string;
+  aiAvatarUrl: string | null;
+  aiAvatarMode: 'brand' | 'emoji';
 }
 
 const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
@@ -3052,6 +3142,8 @@ const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
   aiName: ASSISTANT_NAME,
   aiAvatarEmoji: '\u{1F431}',
   aiAvatarColor: '#0d9488',
+  aiAvatarUrl: null,
+  aiAvatarMode: 'brand',
 };
 
 export function getAppearanceConfig(): AppearanceConfig {
@@ -3079,6 +3171,11 @@ export function getAppearanceConfig(): AppearanceConfig {
         typeof raw.aiAvatarColor === 'string' && raw.aiAvatarColor
           ? raw.aiAvatarColor
           : DEFAULT_APPEARANCE_CONFIG.aiAvatarColor,
+      aiAvatarUrl:
+        typeof raw.aiAvatarUrl === 'string' && raw.aiAvatarUrl
+          ? raw.aiAvatarUrl
+          : null,
+      aiAvatarMode: raw.aiAvatarMode === 'emoji' ? 'emoji' : 'brand',
     };
   } catch (err) {
     logger.warn(
@@ -3090,15 +3187,17 @@ export function getAppearanceConfig(): AppearanceConfig {
 }
 
 export function saveAppearanceConfig(
-  next: Partial<Pick<AppearanceConfig, 'appName'>> &
-    Omit<AppearanceConfig, 'appName'>,
+  next: Partial<AppearanceConfig>,
 ): AppearanceConfig {
   const existing = getAppearanceConfig();
   const config = {
     appName: next.appName || existing.appName,
-    aiName: next.aiName,
-    aiAvatarEmoji: next.aiAvatarEmoji,
-    aiAvatarColor: next.aiAvatarColor,
+    aiName: next.aiName || existing.aiName,
+    aiAvatarEmoji: next.aiAvatarEmoji || existing.aiAvatarEmoji,
+    aiAvatarColor: next.aiAvatarColor || existing.aiAvatarColor,
+    aiAvatarUrl:
+      next.aiAvatarUrl === undefined ? existing.aiAvatarUrl : next.aiAvatarUrl,
+    aiAvatarMode: next.aiAvatarMode ?? existing.aiAvatarMode,
     updatedAt: new Date().toISOString(),
   };
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
@@ -3110,6 +3209,8 @@ export function saveAppearanceConfig(
     aiName: config.aiName,
     aiAvatarEmoji: config.aiAvatarEmoji,
     aiAvatarColor: config.aiAvatarColor,
+    aiAvatarUrl: config.aiAvatarUrl,
+    aiAvatarMode: config.aiAvatarMode,
   };
 }
 
@@ -3600,9 +3701,7 @@ export function saveUserDingTalkConfig(
 
 // ========== Discord User IM Config ==========
 
-export function getUserDiscordConfig(
-  userId: string,
-): UserDiscordConfig | null {
+export function getUserDiscordConfig(userId: string): UserDiscordConfig | null {
   const filePath = path.join(userImDir(userId), 'discord.json');
   try {
     if (!fs.existsSync(filePath)) return null;
@@ -3677,14 +3776,12 @@ export interface SystemSettings {
   billingCurrencyRate: number;
   // External Claude directory (admin only)
   externalClaudeDir: string;
-  // Claude Agent SDK 自动对话压缩触发点（tokens）。0 = 保留 SDK 默认（约 1M）
-  autoCompactWindow: number;
-  // 预定义 SubAgent（code-reviewer / web-researcher）使用的模型别名或完整 ID。
-  // 经 SUBAGENT_MODEL 注入容器；默认 inherit（继承主会话模型，不擅自改变），可在设置页改。
-  subagentModel: string;
-  // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
-  // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
-  disableMemoryLayerForAdminHost: boolean;
+  // 默认主 Agent 是否继承宿主机 Claude 配置（仅 admin 生效）。
+  mainAgentContextSource: 'managed' | 'host_claude';
+  // 兼容旧版固定 token 阈值；新配置使用模型感知的百分比策略。
+  mainAgentAutoCompactWindow: number;
+  // 0 = 交给 SDK；50-90 = 按当前模型上下文窗口的百分比压缩。
+  mainAgentAutoCompactPercentage: number;
   // Plugin catalog 自动扫描：true（默认）= 启动 5s 后扫一次 + 每小时一次；
   // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
   // 适用于不希望本机私有 plugin 自动入共享 catalog 的环境。
@@ -3720,34 +3817,249 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   billingCurrency: 'USD',
   billingCurrencyRate: 1,
   externalClaudeDir: '',
-  autoCompactWindow: 0,
-  subagentModel: 'inherit',
-  disableMemoryLayerForAdminHost: false,
+  mainAgentContextSource: 'host_claude',
+  mainAgentAutoCompactWindow: 0,
+  mainAgentAutoCompactPercentage: 0,
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
 };
 
-function parseIntEnv(envVar: string | undefined, fallback: number): number {
-  if (!envVar) return fallback;
-  const parsed = parseInt(envVar, 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
+type SystemSettingsSource = 'file' | 'env' | 'api';
 
-/**
- * autoCompactWindow 区间收紧：0 = 禁用（用 SDK 默认 ~1M）；>0 收紧到 [100000, 1000000]。
- * SDK 侧 schema 为 assistant.mjs 的 `.min(1e5).max(1e6).catch(void 0)`——越界值会被静默剥离
- * 回退默认。在读（file/env）与写（save）两端统一调用，避免存量/手填的越界值在下游静默失效。
- */
-function clampAutoCompactWindow(v: unknown): number {
-  const n = typeof v === 'number' ? v : NaN;
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.min(1_000_000, Math.max(100_000, Math.floor(n)));
-}
+function normalizeSystemSettings(
+  raw: Record<string, unknown>,
+  source: SystemSettingsSource,
+): SystemSettings {
+  const invalidFields = new Set<string>();
+  const allowStringNumbers = source === 'env';
 
-function parseFloatEnv(envVar: string | undefined, fallback: number): number {
-  if (!envVar) return fallback;
-  const parsed = parseFloat(envVar);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  const numberField = (
+    key: keyof SystemSettings,
+    fallback: number,
+    min: number,
+    max: number,
+    integer = true,
+  ): number => {
+    const value = raw[key];
+    if (value === undefined) return fallback;
+    const parsed =
+      typeof value === 'number'
+        ? value
+        : allowStringNumbers && typeof value === 'string' && value.trim()
+          ? Number(value)
+          : NaN;
+    if (!Number.isFinite(parsed)) {
+      invalidFields.add(String(key));
+      return fallback;
+    }
+    const normalized = integer ? Math.floor(parsed) : parsed;
+    const clamped = Math.min(max, Math.max(min, normalized));
+    if (clamped !== parsed) invalidFields.add(String(key));
+    return clamped;
+  };
+
+  const booleanField = (
+    key: keyof SystemSettings,
+    fallback: boolean,
+  ): boolean => {
+    const value = raw[key];
+    if (value === undefined) return fallback;
+    if (typeof value === 'boolean') return value;
+    if (source === 'env' && value === 'true') return true;
+    if (source === 'env' && value === 'false') return false;
+    invalidFields.add(String(key));
+    return fallback;
+  };
+
+  const taskBackfillRaw = numberField(
+    'taskBackfillGraceMs',
+    DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
+    0,
+    86_400_000,
+  );
+  const taskBackfillGraceMs =
+    taskBackfillRaw === 0 ? 0 : Math.max(1_000, taskBackfillRaw);
+  if (taskBackfillGraceMs !== taskBackfillRaw) {
+    invalidFields.add('taskBackfillGraceMs');
+  }
+
+  // Accept the former system-wide key as the main Agent default during upgrade.
+  if (
+    raw.mainAgentAutoCompactWindow === undefined &&
+    raw.autoCompactWindow !== undefined
+  ) {
+    raw.mainAgentAutoCompactWindow = raw.autoCompactWindow;
+  }
+  const mainAgentAutoCompactRaw = numberField(
+    'mainAgentAutoCompactWindow',
+    DEFAULT_SYSTEM_SETTINGS.mainAgentAutoCompactWindow,
+    0,
+    1_000_000,
+  );
+  const mainAgentAutoCompactWindow =
+    mainAgentAutoCompactRaw === 0
+      ? 0
+      : Math.max(100_000, mainAgentAutoCompactRaw);
+  if (mainAgentAutoCompactWindow !== mainAgentAutoCompactRaw) {
+    invalidFields.add('mainAgentAutoCompactWindow');
+  }
+  const mainAgentAutoCompactPercentageRaw = numberField(
+    'mainAgentAutoCompactPercentage',
+    DEFAULT_SYSTEM_SETTINGS.mainAgentAutoCompactPercentage,
+    0,
+    90,
+  );
+  const mainAgentAutoCompactPercentage =
+    mainAgentAutoCompactPercentageRaw === 0
+      ? 0
+      : Math.max(50, mainAgentAutoCompactPercentageRaw);
+  if (mainAgentAutoCompactPercentage !== mainAgentAutoCompactPercentageRaw) {
+    invalidFields.add('mainAgentAutoCompactPercentage');
+  }
+
+  let billingCurrency = DEFAULT_SYSTEM_SETTINGS.billingCurrency;
+  if (raw.billingCurrency !== undefined) {
+    if (
+      typeof raw.billingCurrency === 'string' &&
+      raw.billingCurrency.trim().length >= 1 &&
+      raw.billingCurrency.trim().length <= 10
+    ) {
+      billingCurrency = raw.billingCurrency.trim();
+    } else {
+      invalidFields.add('billingCurrency');
+    }
+  }
+
+  let externalClaudeDir = DEFAULT_SYSTEM_SETTINGS.externalClaudeDir;
+  if (raw.externalClaudeDir !== undefined) {
+    if (typeof raw.externalClaudeDir !== 'string') {
+      invalidFields.add('externalClaudeDir');
+    } else {
+      const candidate = raw.externalClaudeDir.trim();
+      if (candidate) {
+        try {
+          const resolved = fs.realpathSync(candidate);
+          if (
+            !path.isAbsolute(candidate) ||
+            !fs.statSync(resolved).isDirectory()
+          ) {
+            invalidFields.add('externalClaudeDir');
+          } else {
+            externalClaudeDir = resolved;
+          }
+        } catch {
+          invalidFields.add('externalClaudeDir');
+        }
+      }
+    }
+  }
+
+  let mainAgentContextSource = DEFAULT_SYSTEM_SETTINGS.mainAgentContextSource;
+  if (raw.mainAgentContextSource !== undefined) {
+    if (
+      raw.mainAgentContextSource === 'managed' ||
+      raw.mainAgentContextSource === 'host_claude'
+    ) {
+      mainAgentContextSource = raw.mainAgentContextSource;
+    } else {
+      invalidFields.add('mainAgentContextSource');
+    }
+  }
+
+  const normalized: SystemSettings = {
+    containerTimeout: numberField(
+      'containerTimeout',
+      DEFAULT_SYSTEM_SETTINGS.containerTimeout,
+      60_000,
+      86_400_000,
+    ),
+    idleTimeout: numberField(
+      'idleTimeout',
+      DEFAULT_SYSTEM_SETTINGS.idleTimeout,
+      60_000,
+      86_400_000,
+    ),
+    containerMaxOutputSize: numberField(
+      'containerMaxOutputSize',
+      DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize,
+      1_048_576,
+      104_857_600,
+    ),
+    maxConcurrentContainers: numberField(
+      'maxConcurrentContainers',
+      DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers,
+      1,
+      100,
+    ),
+    maxConcurrentHostProcesses: numberField(
+      'maxConcurrentHostProcesses',
+      DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
+      1,
+      50,
+    ),
+    maxLoginAttempts: numberField(
+      'maxLoginAttempts',
+      DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
+      1,
+      100,
+    ),
+    loginLockoutMinutes: numberField(
+      'loginLockoutMinutes',
+      DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+      1,
+      MAX_LOGIN_LOCKOUT_MINUTES,
+    ),
+    maxConcurrentScripts: numberField(
+      'maxConcurrentScripts',
+      DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
+      1,
+      50,
+    ),
+    scriptTimeout: numberField(
+      'scriptTimeout',
+      DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
+      5_000,
+      600_000,
+    ),
+    billingEnabled: booleanField(
+      'billingEnabled',
+      DEFAULT_SYSTEM_SETTINGS.billingEnabled,
+    ),
+    billingMode: 'wallet_first',
+    billingMinStartBalanceUsd: numberField(
+      'billingMinStartBalanceUsd',
+      DEFAULT_SYSTEM_SETTINGS.billingMinStartBalanceUsd,
+      0,
+      1_000_000,
+      false,
+    ),
+    billingCurrency,
+    billingCurrencyRate: numberField(
+      'billingCurrencyRate',
+      DEFAULT_SYSTEM_SETTINGS.billingCurrencyRate,
+      0.0001,
+      1_000_000,
+      false,
+    ),
+    externalClaudeDir,
+    mainAgentContextSource,
+    mainAgentAutoCompactWindow:
+      mainAgentAutoCompactPercentage > 0 ? 0 : mainAgentAutoCompactWindow,
+    mainAgentAutoCompactPercentage,
+    pluginAutoScan: booleanField(
+      'pluginAutoScan',
+      DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
+    ),
+    taskBackfillGraceMs,
+  };
+
+  if (invalidFields.size > 0) {
+    logger.warn(
+      { source, invalidFields: Array.from(invalidFields).sort() },
+      'Normalized invalid system settings',
+    );
+  }
+  return normalized;
 }
 
 // In-memory cache: avoid synchronous file I/O on hot paths (stdout data handler, queue capacity check)
@@ -3759,164 +4071,38 @@ function readSystemSettingsFromFile(): SystemSettings | null {
   const raw = JSON.parse(
     fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
   ) as Record<string, unknown>;
-  return {
-    containerTimeout:
-      typeof raw.containerTimeout === 'number' && raw.containerTimeout > 0
-        ? raw.containerTimeout
-        : DEFAULT_SYSTEM_SETTINGS.containerTimeout,
-    idleTimeout:
-      typeof raw.idleTimeout === 'number' && raw.idleTimeout > 0
-        ? raw.idleTimeout
-        : DEFAULT_SYSTEM_SETTINGS.idleTimeout,
-    containerMaxOutputSize:
-      typeof raw.containerMaxOutputSize === 'number' &&
-      raw.containerMaxOutputSize > 0
-        ? raw.containerMaxOutputSize
-        : DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize,
-    maxConcurrentContainers:
-      typeof raw.maxConcurrentContainers === 'number' &&
-      raw.maxConcurrentContainers > 0
-        ? raw.maxConcurrentContainers
-        : DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers,
-    maxConcurrentHostProcesses:
-      typeof raw.maxConcurrentHostProcesses === 'number' &&
-      raw.maxConcurrentHostProcesses > 0
-        ? raw.maxConcurrentHostProcesses
-        : DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
-    maxLoginAttempts:
-      typeof raw.maxLoginAttempts === 'number' && raw.maxLoginAttempts > 0
-        ? raw.maxLoginAttempts
-        : DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
-    loginLockoutMinutes:
-      typeof raw.loginLockoutMinutes === 'number' && raw.loginLockoutMinutes > 0
-        ? Math.min(raw.loginLockoutMinutes, MAX_LOGIN_LOCKOUT_MINUTES)
-        : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
-    maxConcurrentScripts:
-      typeof raw.maxConcurrentScripts === 'number' &&
-      raw.maxConcurrentScripts > 0
-        ? raw.maxConcurrentScripts
-        : DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
-    scriptTimeout:
-      typeof raw.scriptTimeout === 'number' && raw.scriptTimeout > 0
-        ? raw.scriptTimeout
-        : DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
-    billingEnabled:
-      typeof raw.billingEnabled === 'boolean'
-        ? raw.billingEnabled
-        : DEFAULT_SYSTEM_SETTINGS.billingEnabled,
-    billingMode: 'wallet_first',
-    billingMinStartBalanceUsd:
-      typeof raw.billingMinStartBalanceUsd === 'number' &&
-      raw.billingMinStartBalanceUsd >= 0
-        ? raw.billingMinStartBalanceUsd
-        : DEFAULT_SYSTEM_SETTINGS.billingMinStartBalanceUsd,
-    billingCurrency:
-      typeof raw.billingCurrency === 'string' && raw.billingCurrency
-        ? raw.billingCurrency
-        : DEFAULT_SYSTEM_SETTINGS.billingCurrency,
-    billingCurrencyRate:
-      typeof raw.billingCurrencyRate === 'number' && raw.billingCurrencyRate > 0
-        ? raw.billingCurrencyRate
-        : DEFAULT_SYSTEM_SETTINGS.billingCurrencyRate,
-    externalClaudeDir:
-      typeof raw.externalClaudeDir === 'string'
-        ? raw.externalClaudeDir.trim()
-        : DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
-    autoCompactWindow: clampAutoCompactWindow(raw.autoCompactWindow),
-    subagentModel:
-      typeof raw.subagentModel === 'string' && raw.subagentModel.trim()
-        ? raw.subagentModel.trim()
-        : DEFAULT_SYSTEM_SETTINGS.subagentModel,
-    disableMemoryLayerForAdminHost:
-      typeof raw.disableMemoryLayerForAdminHost === 'boolean'
-        ? raw.disableMemoryLayerForAdminHost
-        : DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
-    pluginAutoScan:
-      typeof raw.pluginAutoScan === 'boolean'
-        ? raw.pluginAutoScan
-        : DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
-    taskBackfillGraceMs:
-      typeof raw.taskBackfillGraceMs === 'number' &&
-      raw.taskBackfillGraceMs >= 0
-        ? raw.taskBackfillGraceMs
-        : DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
-  };
+  return normalizeSystemSettings(raw, 'file');
 }
 
 function buildEnvFallbackSettings(): SystemSettings {
-  return {
-    containerTimeout: parseIntEnv(
-      process.env.CONTAINER_TIMEOUT,
-      DEFAULT_SYSTEM_SETTINGS.containerTimeout,
-    ),
-    idleTimeout: parseIntEnv(
-      process.env.IDLE_TIMEOUT,
-      DEFAULT_SYSTEM_SETTINGS.idleTimeout,
-    ),
-    containerMaxOutputSize: parseIntEnv(
-      process.env.CONTAINER_MAX_OUTPUT_SIZE,
-      DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize,
-    ),
-    maxConcurrentContainers: parseIntEnv(
-      process.env.MAX_CONCURRENT_CONTAINERS,
-      DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers,
-    ),
-    maxConcurrentHostProcesses: parseIntEnv(
-      process.env.MAX_CONCURRENT_HOST_PROCESSES,
-      DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
-    ),
-    maxLoginAttempts: parseIntEnv(
-      process.env.MAX_LOGIN_ATTEMPTS,
-      DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
-    ),
-    loginLockoutMinutes: Math.min(
-      parseIntEnv(
-        process.env.LOGIN_LOCKOUT_MINUTES,
-        DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
-      ),
-      MAX_LOGIN_LOCKOUT_MINUTES,
-    ),
-    maxConcurrentScripts: parseIntEnv(
-      process.env.MAX_CONCURRENT_SCRIPTS,
-      DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
-    ),
-    scriptTimeout: parseIntEnv(
-      process.env.SCRIPT_TIMEOUT,
-      DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
-    ),
-    billingEnabled:
-      process.env.BILLING_ENABLED === 'true' ||
-      DEFAULT_SYSTEM_SETTINGS.billingEnabled,
-    billingMode: 'wallet_first',
-    billingMinStartBalanceUsd: parseFloatEnv(
-      process.env.BILLING_MIN_START_BALANCE_USD,
-      DEFAULT_SYSTEM_SETTINGS.billingMinStartBalanceUsd,
-    ),
-    billingCurrency:
-      process.env.BILLING_CURRENCY || DEFAULT_SYSTEM_SETTINGS.billingCurrency,
-    billingCurrencyRate: parseFloatEnv(
-      process.env.BILLING_CURRENCY_RATE,
-      DEFAULT_SYSTEM_SETTINGS.billingCurrencyRate,
-    ),
-    externalClaudeDir:
-      process.env.EXTERNAL_CLAUDE_DIR || DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
-    autoCompactWindow: clampAutoCompactWindow(
-      parseIntEnv(process.env.AUTO_COMPACT_WINDOW, DEFAULT_SYSTEM_SETTINGS.autoCompactWindow),
-    ),
-    subagentModel:
-      process.env.SUBAGENT_MODEL || DEFAULT_SYSTEM_SETTINGS.subagentModel,
-    disableMemoryLayerForAdminHost:
-      process.env.DISABLE_MEMORY_LAYER_FOR_ADMIN_HOST === 'true' ||
-      DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
-    pluginAutoScan:
-      process.env.PLUGIN_AUTO_SCAN === 'false'
-        ? false
-        : DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
-    taskBackfillGraceMs: parseIntEnv(
-      process.env.TASK_BACKFILL_GRACE_MS,
-      DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
-    ),
-  };
+  return normalizeSystemSettings(
+    {
+      containerTimeout: process.env.CONTAINER_TIMEOUT,
+      idleTimeout: process.env.IDLE_TIMEOUT,
+      containerMaxOutputSize: process.env.CONTAINER_MAX_OUTPUT_SIZE,
+      maxConcurrentContainers: process.env.MAX_CONCURRENT_CONTAINERS,
+      maxConcurrentHostProcesses: process.env.MAX_CONCURRENT_HOST_PROCESSES,
+      maxLoginAttempts: process.env.MAX_LOGIN_ATTEMPTS,
+      loginLockoutMinutes: process.env.LOGIN_LOCKOUT_MINUTES,
+      maxConcurrentScripts: process.env.MAX_CONCURRENT_SCRIPTS,
+      scriptTimeout: process.env.SCRIPT_TIMEOUT,
+      billingEnabled: process.env.BILLING_ENABLED,
+      billingMinStartBalanceUsd: process.env.BILLING_MIN_START_BALANCE_USD,
+      billingCurrency: process.env.BILLING_CURRENCY,
+      billingCurrencyRate: process.env.BILLING_CURRENCY_RATE,
+      externalClaudeDir: process.env.EXTERNAL_CLAUDE_DIR,
+      mainAgentContextSource: process.env.MAIN_AGENT_CONTEXT_SOURCE,
+      mainAgentAutoCompactWindow:
+        process.env.MAIN_AGENT_AUTO_COMPACT_WINDOW ??
+        process.env.AUTO_COMPACT_WINDOW,
+      mainAgentAutoCompactPercentage:
+        process.env.MAIN_AGENT_AUTO_COMPACT_PERCENTAGE ??
+        process.env.AUTO_COMPACT_PERCENTAGE,
+      pluginAutoScan: process.env.PLUGIN_AUTO_SCAN,
+      taskBackfillGraceMs: process.env.TASK_BACKFILL_GRACE_MS,
+    },
+    'env',
+  );
 }
 
 export function getSystemSettings(): SystemSettings {
@@ -3958,6 +4144,32 @@ export function getSystemSettings(): SystemSettings {
   return settings;
 }
 
+/**
+ * One-time compatibility input for migrating the former system-wide compact
+ * threshold into Agent profiles. New runtime reads must use Agent policy.
+ */
+export function getLegacySystemAutoCompactWindow(): number | undefined {
+  let value: unknown = process.env.AUTO_COMPACT_WINDOW;
+  try {
+    if (fs.existsSync(SYSTEM_SETTINGS_FILE)) {
+      const raw = JSON.parse(
+        fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
+      ) as Record<string, unknown>;
+      if (raw.autoCompactWindow !== undefined) value = raw.autoCompactWindow;
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to read legacy auto compact setting');
+  }
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && value.trim()
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.min(1_000_000, Math.max(100_000, Math.floor(parsed)));
+}
+
 /** 获取生效的外部 Claude 目录（externalClaudeDir 空时 fallback 到 ~/.claude） */
 export function getEffectiveExternalDir(): string {
   const settings = getSystemSettings();
@@ -3968,77 +4180,7 @@ export function saveSystemSettings(
   partial: Partial<SystemSettings>,
 ): SystemSettings {
   const existing = getSystemSettings();
-  const merged: SystemSettings = { ...existing, ...partial };
-
-  // Range validation
-  if (merged.containerTimeout < 60000) merged.containerTimeout = 60000; // min 1 min
-  if (merged.containerTimeout > 86400000) merged.containerTimeout = 86400000; // max 24 hours
-  if (merged.idleTimeout < 60000) merged.idleTimeout = 60000;
-  if (merged.idleTimeout > 86400000) merged.idleTimeout = 86400000;
-  if (merged.containerMaxOutputSize < 1048576)
-    merged.containerMaxOutputSize = 1048576; // min 1MB
-  if (merged.containerMaxOutputSize > 104857600)
-    merged.containerMaxOutputSize = 104857600; // max 100MB
-  if (merged.maxConcurrentContainers < 1) merged.maxConcurrentContainers = 1;
-  if (merged.maxConcurrentContainers > 100)
-    merged.maxConcurrentContainers = 100;
-  if (merged.maxConcurrentHostProcesses < 1)
-    merged.maxConcurrentHostProcesses = 1;
-  if (merged.maxConcurrentHostProcesses > 50)
-    merged.maxConcurrentHostProcesses = 50;
-  if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
-  if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
-  if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
-  if (merged.loginLockoutMinutes > MAX_LOGIN_LOCKOUT_MINUTES)
-    merged.loginLockoutMinutes = MAX_LOGIN_LOCKOUT_MINUTES; // max 24 hours, see auth.ts reclaim TTL
-  if (merged.maxConcurrentScripts < 1) merged.maxConcurrentScripts = 1;
-  if (merged.maxConcurrentScripts > 50) merged.maxConcurrentScripts = 50;
-  if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000; // min 5s
-  if (merged.scriptTimeout > 600000) merged.scriptTimeout = 600000; // max 10 min
-  merged.billingMode = 'wallet_first';
-  if (merged.billingMinStartBalanceUsd < 0)
-    merged.billingMinStartBalanceUsd =
-      DEFAULT_SYSTEM_SETTINGS.billingMinStartBalanceUsd;
-  if (merged.billingMinStartBalanceUsd > 1000000)
-    merged.billingMinStartBalanceUsd = 1000000;
-
-  // autoCompactWindow 在读/写两端统一用 clampAutoCompactWindow 收紧（见函数注释）。
-  merged.autoCompactWindow = clampAutoCompactWindow(merged.autoCompactWindow);
-
-  // subagentModel: 非空字符串（别名或完整 model ID），去空白并限长；空则回退默认。
-  if (typeof merged.subagentModel !== 'string' || !merged.subagentModel.trim()) {
-    merged.subagentModel = DEFAULT_SYSTEM_SETTINGS.subagentModel;
-  } else {
-    merged.subagentModel = merged.subagentModel.trim().slice(0, 64);
-  }
-
-  // taskBackfillGraceMs: 0 = 关闭（旧行为：无视逾期全 backfill）；
-  // >0 限制在 [1s, 24h]，避免误配置成几毫秒导致正常任务也被跳过。
-  if (
-    merged.taskBackfillGraceMs < 0 ||
-    !Number.isFinite(merged.taskBackfillGraceMs)
-  ) {
-    merged.taskBackfillGraceMs = 0;
-  } else if (merged.taskBackfillGraceMs > 0) {
-    if (merged.taskBackfillGraceMs < 1000) merged.taskBackfillGraceMs = 1000;
-    if (merged.taskBackfillGraceMs > 86400000)
-      merged.taskBackfillGraceMs = 86400000;
-  }
-
-  // Validate externalClaudeDir: must be empty or an absolute directory path
-  if (merged.externalClaudeDir) {
-    const trimmed = merged.externalClaudeDir.trim();
-    if (trimmed) {
-      try {
-        const resolved = fs.realpathSync(trimmed);
-        merged.externalClaudeDir = fs.statSync(resolved).isDirectory() ? resolved : '';
-      } catch {
-        merged.externalClaudeDir = '';
-      }
-    } else {
-      merged.externalClaudeDir = '';
-    }
-  }
+  const merged = normalizeSystemSettings({ ...existing, ...partial }, 'api');
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
   const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;

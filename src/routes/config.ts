@@ -1,26 +1,45 @@
 // Configuration management routes
 
 import { randomBytes, createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
 import { Hono } from 'hono';
-import { updateWeChatNoProxy } from '../config.js';
+import { DATA_DIR, updateWeChatNoProxy } from '../config.js';
+import {
+  avatarUploadBodyLimit,
+  AVATAR_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
 import type { Variables } from '../web-context.js';
 import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
-import { getChannelType } from '../im-channel.js';
+import { extractChatId, getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
+  deleteAgent,
   getRegisteredGroup,
+  getAllRegisteredGroups,
   setRegisteredGroup,
   updateChatName,
   getAgent,
+  getAgentProfileForWorkspace,
+  getUserById,
+  logAuthEvent,
   clearSenderAllowlist,
+  deleteWorkspaceSessions,
   deleteSessionsByProviderId,
   VALID_ACTIVATION_MODES,
+  getDefaultChannelAccount,
+  getLegacyChannelAccount,
 } from '../db.js';
-import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
+import { parseChannelAddress } from '../channel-address.js';
+import {
+  adminRoleMiddleware,
+  authMiddleware,
+  systemConfigMiddleware,
+} from '../middleware/auth.js';
 import {
   ClaudeCustomEnvSchema,
   FeishuConfigSchema,
@@ -32,6 +51,7 @@ import {
   WhatsAppConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
+  HostIntegrationSettingsSchema,
   SystemSettingsSchema,
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
@@ -97,14 +117,26 @@ import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
-  checkImChannelLimit,
-  isBillingEnabled,
-  clearBillingEnabledCache,
-} from '../billing.js';
+  buildSessionMountUpdate,
+  buildDetachedWorkspaceUpdate,
+  buildWorkspaceMountUpdate,
+  commitChannelMountUpdate,
+  hasRemainingThreadMapMount,
+  hasSessionMountConflict,
+  hasWorkspaceMountConflict,
+  isNativeContextContainer,
+  restoreDefaultChannelMount,
+  type NativeContextMetadata,
+} from '../channel-mount-service.js';
+import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
-import fs from 'fs';
-import path from 'path';
-
+import { getClientIp } from '../utils.js';
+import {
+  quiesceWorkspaceRunnersAroundCommit,
+  resolveEffectiveAgentProfile,
+  withAgentProfileLocks,
+  WorkspaceRuntimeQuiesceError,
+} from '../agent-profile-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 /**
@@ -460,9 +492,7 @@ configRoutes.patch(
             providerId: id,
             protocolFieldChanged,
           },
-          protocolFieldChanged
-            ? { clearSessionsForProviderId: id }
-            : undefined,
+          protocolFieldChanged ? { clearSessionsForProviderId: id } : undefined,
         );
       }
 
@@ -929,13 +959,99 @@ function resolveProxyInfo(
 
 /** Persist a RegisteredGroup update and sync to the in-memory cache. */
 function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
-  setRegisteredGroup(imJid, updated);
+  commitChannelMountUpdate(imJid, updated);
+}
+
+function applyRegisteredGroupUpdate(
+  jid: string,
+  updated: RegisteredGroup,
+): void {
+  setRegisteredGroup(jid, updated);
   const webDeps = getWebDeps();
   if (webDeps) {
     const groups = webDeps.getRegisteredGroups();
-    if (groups[imJid]) groups[imJid] = updated;
-    webDeps.clearImFailCounts?.(imJid);
+    if (groups[jid]) groups[jid] = updated;
   }
+}
+
+type ChannelChatInfo = NativeContextMetadata & {
+  avatar?: string;
+  name?: string;
+  user_count?: string;
+};
+
+// Only fetches live chat metadata — does NOT compute threadCapable. That
+// decision must be (re-)computed by the caller against a freshly re-read
+// imGroup taken AFTER this await, never against the pre-await snapshot —
+// see the identical helper's doc comment in routes/agents.ts for why.
+async function fetchLiveChatInfo(
+  userId: string,
+  imJid: string,
+): Promise<{ chatInfo?: ChannelChatInfo | null }> {
+  const channelType = getChannelType(imJid);
+  if (!channelType) return {};
+  const webDeps = getWebDeps();
+  const chatInfo = webDeps?.getChannelChatInfo
+    ? ((await webDeps.getChannelChatInfo(imJid)) as ChannelChatInfo | null)
+    : channelType === 'feishu' && webDeps?.getFeishuChatInfo
+      ? await webDeps.getFeishuChatInfo(userId, extractChatId(imJid))
+      : null;
+  return { chatInfo };
+}
+
+function resolveWorkspaceForBinding(
+  targetMainJid: string,
+): { jid: string; group: RegisteredGroup } | null {
+  const direct = getRegisteredGroup(targetMainJid);
+  if (direct) return { jid: targetMainJid, group: direct };
+  if (!targetMainJid.startsWith('web:')) return null;
+
+  const folder = targetMainJid.slice(4);
+  for (const [jid, group] of Object.entries(getAllRegisteredGroups())) {
+    if (jid.startsWith('web:') && group.folder === folder) {
+      return { jid, group };
+    }
+  }
+  return null;
+}
+
+function detachThreadMapWorkspaceIfLast(
+  targetMainJid: string | undefined,
+  excludingImJid: string,
+  nextWorkspaceJid?: string,
+  nextRoutingMode?: 'single_session' | 'thread_map',
+): void {
+  if (!targetMainJid) return;
+  const workspace = resolveWorkspaceForBinding(targetMainJid);
+  if (!workspace) return;
+  const nextWorkspace =
+    nextRoutingMode === 'thread_map' && nextWorkspaceJid
+      ? resolveWorkspaceForBinding(nextWorkspaceJid)
+      : null;
+  if (nextWorkspace?.jid === workspace.jid) return;
+  if (hasRemainingThreadMapMount(workspace.jid, excludingImJid)) return;
+
+  applyRegisteredGroupUpdate(
+    workspace.jid,
+    buildDetachedWorkspaceUpdate(workspace.group),
+  );
+}
+
+function markNativeContextWorkspace(targetMainJid: string): void {
+  const workspace = resolveWorkspaceForBinding(targetMainJid);
+  if (!workspace) return;
+  applyRegisteredGroupUpdate(workspace.jid, {
+    ...workspace.group,
+    conversation_source: 'native_thread',
+    conversation_nav_mode: 'vertical_threads',
+  });
+}
+
+function restoreDefaultChannelError(restored: { reason: string }): string {
+  if (restored.reason === 'account_mismatch') {
+    return 'Channel account does not match this chat or owner';
+  }
+  return 'Channel account has no default or owner home workspace';
 }
 
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
@@ -1199,6 +1315,24 @@ configRoutes.put(
 
 // ─── Appearance config ────────────────────────────────────────────
 
+const SYSTEM_AGENT_AVATARS_DIR = path.join(DATA_DIR, 'avatars');
+const SYSTEM_AGENT_AVATAR_PREFIX = 'system-agent-';
+const SYSTEM_AGENT_AVATAR_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+
+function removeStaleSystemAgentAvatars(keep?: string): void {
+  if (!fs.existsSync(SYSTEM_AGENT_AVATARS_DIR)) return;
+  for (const filename of fs.readdirSync(SYSTEM_AGENT_AVATARS_DIR)) {
+    if (!filename.startsWith(SYSTEM_AGENT_AVATAR_PREFIX) || filename === keep)
+      continue;
+    fs.rmSync(path.join(SYSTEM_AGENT_AVATARS_DIR, filename), { force: true });
+  }
+}
+
 configRoutes.get('/appearance', authMiddleware, systemConfigMiddleware, (c) => {
   try {
     return c.json(getAppearanceConfig());
@@ -1236,6 +1370,58 @@ configRoutes.put(
   },
 );
 
+configRoutes.post(
+  '/appearance/avatar',
+  authMiddleware,
+  adminRoleMiddleware,
+  avatarUploadBodyLimit,
+  async (c) => {
+    if (!(c.req.header('content-type') || '').includes('multipart/form-data')) {
+      return c.json({ error: 'Expected multipart/form-data' }, 400);
+    }
+    const formData = await c.req.formData();
+    const file = formData.get('avatar');
+    if (!file || !(file instanceof File)) {
+      return c.json({ error: 'No avatar file provided' }, 400);
+    }
+    if (file.size > AVATAR_MAX_FILE_BYTES) {
+      return c.json({ error: 'File too large (max 3MB)' }, 413);
+    }
+    const extension = SYSTEM_AGENT_AVATAR_EXTENSIONS[file.type];
+    if (!extension) {
+      return c.json(
+        { error: 'Unsupported image type. Use jpg, png, gif or webp' },
+        400,
+      );
+    }
+
+    fs.mkdirSync(SYSTEM_AGENT_AVATARS_DIR, { recursive: true });
+    const filename = `${SYSTEM_AGENT_AVATAR_PREFIX}${randomBytes(4).toString('hex')}${extension}`;
+    const destination = path.join(SYSTEM_AGENT_AVATARS_DIR, filename);
+    const temporary = `${destination}.tmp`;
+    fs.writeFileSync(temporary, Buffer.from(await file.arrayBuffer()));
+    fs.renameSync(temporary, destination);
+    const aiAvatarUrl = `/api/auth/avatars/${filename}`;
+    const appearance = saveAppearanceConfig({ aiAvatarUrl });
+    removeStaleSystemAgentAvatars(filename);
+    return c.json({ appearance, avatarUrl: aiAvatarUrl });
+  },
+);
+
+configRoutes.delete(
+  '/appearance/avatar',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    const appearance = saveAppearanceConfig({
+      aiAvatarUrl: null,
+      aiAvatarMode: 'emoji',
+    });
+    removeStaleSystemAgentAvatars();
+    return c.json({ appearance });
+  },
+);
+
 // Public endpoint — no auth required (like /api/auth/status)
 configRoutes.get('/appearance/public', (c) => {
   try {
@@ -1245,6 +1431,8 @@ configRoutes.get('/appearance/public', (c) => {
       aiName: config.aiName,
       aiAvatarEmoji: config.aiAvatarEmoji,
       aiAvatarColor: config.aiAvatarColor,
+      aiAvatarUrl: config.aiAvatarUrl,
+      aiAvatarMode: config.aiAvatarMode,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');
@@ -1254,9 +1442,36 @@ configRoutes.get('/appearance/public', (c) => {
 
 // ─── System settings ───────────────────────────────────────────────
 
+function toSystemSettingsResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  return {
+    containerTimeout: settings.containerTimeout,
+    idleTimeout: settings.idleTimeout,
+    containerMaxOutputSize: settings.containerMaxOutputSize,
+    maxConcurrentContainers: settings.maxConcurrentContainers,
+    maxConcurrentHostProcesses: settings.maxConcurrentHostProcesses,
+    maxLoginAttempts: settings.maxLoginAttempts,
+    loginLockoutMinutes: settings.loginLockoutMinutes,
+    maxConcurrentScripts: settings.maxConcurrentScripts,
+    scriptTimeout: settings.scriptTimeout,
+    taskBackfillGraceMs: settings.taskBackfillGraceMs,
+  };
+}
+
+function changedSettingFields(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  submitted: Record<string, unknown>,
+): string[] {
+  return Object.keys(submitted)
+    .filter((key) => !Object.is(before[key], after[key]))
+    .sort();
+}
+
 configRoutes.get('/system', authMiddleware, systemConfigMiddleware, (c) => {
   try {
-    return c.json(getSystemSettings());
+    return c.json(toSystemSettingsResponse(getSystemSettings()));
   } catch (err) {
     logger.error({ err }, 'Failed to load system settings');
     return c.json({ error: 'Failed to load system settings' }, 500);
@@ -1277,26 +1492,27 @@ configRoutes.put(
       );
     }
 
-    // 启用「禁用 HappyClaw 记忆层」开关前必须给 admin 主容器配 customCwd，
-    // 否则 CLAUDE_CONFIG_DIR 仍指向 data/sessions/main/.claude，SDK 读不到 ~/.claude/
-    // 又没有 HappyClaw 记忆层注入，agent 会变成空白沙箱。
-    if (validation.data.disableMemoryLayerForAdminHost === true) {
-      const adminMain = getRegisteredGroup('web:main');
-      if (!adminMain || !adminMain.customCwd) {
-        return c.json(
-          {
-            error:
-              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则 SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，会是空白沙箱。',
-          },
-          400,
-        );
-      }
-    }
-
     try {
+      const before = toSystemSettingsResponse(getSystemSettings());
       const saved = saveSystemSettings(validation.data);
-      clearBillingEnabledCache();
-      return c.json(saved);
+      const response = toSystemSettingsResponse(saved);
+      const changedFields = changedSettingFields(
+        before,
+        response,
+        validation.data,
+      );
+      if (changedFields.length > 0) {
+        const actor = c.get('user') as AuthUser;
+        logAuthEvent({
+          event_type: 'system_settings_updated',
+          username: actor.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          user_agent: c.req.header('user-agent') ?? null,
+          details: { changed_fields: changedFields },
+        });
+      }
+      return c.json(response);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid system settings payload';
@@ -1306,72 +1522,263 @@ configRoutes.put(
   },
 );
 
-// ─── External Claude resources (admin only) ─────────────────────────
+// ─── Host integration settings (admin role only) ───────────────────
 
-configRoutes.get('/external-resources', authMiddleware, systemConfigMiddleware, (c) => {
-  // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.json({ dir: '', rules: [], claudeMd: null });
-  }
-  const effectiveDir = getEffectiveExternalDir();
+function toHostIntegrationResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  return {
+    externalClaudeDir: settings.externalClaudeDir,
+    pluginAutoScan: settings.pluginAutoScan,
+    mainAgentContextSource: settings.mainAgentContextSource,
+    mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
+    mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
+  };
+}
 
-  const result: {
-    dir: string;
-    rules: Array<{ name: string; size: number }>;
-    claudeMd: string | null;
-  } = { dir: effectiveDir, rules: [], claudeMd: null };
+configRoutes.get(
+  '/host-integration',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => c.json(toHostIntegrationResponse(getSystemSettings())),
+);
 
-  // Rules
-  const rulesDir = path.join(effectiveDir, 'rules');
-  try {
-    if (fs.existsSync(rulesDir)) {
-      for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
-        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-        try {
-          const st = fs.statSync(path.join(rulesDir, entry.name));
-          result.rules.push({ name: entry.name, size: st.size });
-        } catch { /* skip */ }
+configRoutes.put(
+  '/host-integration',
+  authMiddleware,
+  adminRoleMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = HostIntegrationSettingsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const requestedDir = validation.data.externalClaudeDir?.trim();
+    if (requestedDir) {
+      try {
+        const resolved = fs.realpathSync(requestedDir);
+        if (
+          !path.isAbsolute(requestedDir) ||
+          !fs.statSync(resolved).isDirectory()
+        ) {
+          throw new Error('not an absolute directory');
+        }
+      } catch {
+        return c.json(
+          { error: 'externalClaudeDir must be an existing absolute directory' },
+          400,
+        );
       }
     }
-  } catch { /* ignore */ }
 
-  // CLAUDE.md
-  const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
-  try {
-    if (fs.existsSync(claudeMdPath)) {
-      const content = fs.readFileSync(claudeMdPath, 'utf-8');
-      result.claudeMd = content.length > 10000 ? content.slice(0, 10000) + '\n...(截断)' : content;
+    const before = toHostIntegrationResponse(getSystemSettings());
+    const mainContextSourceChanged =
+      validation.data.mainAgentContextSource !== undefined &&
+      validation.data.mainAgentContextSource !== before.mainAgentContextSource;
+    const externalClaudeDirChanged =
+      validation.data.externalClaudeDir !== undefined &&
+      validation.data.externalClaudeDir !== before.externalClaudeDir;
+    const hostContextChanged =
+      mainContextSourceChanged || externalClaudeDirChanged;
+    const defaultCompactChanged =
+      (validation.data.mainAgentAutoCompactWindow !== undefined &&
+        validation.data.mainAgentAutoCompactWindow !==
+          before.mainAgentAutoCompactWindow) ||
+      (validation.data.mainAgentAutoCompactPercentage !== undefined &&
+        validation.data.mainAgentAutoCompactPercentage !==
+          before.mainAgentAutoCompactPercentage);
+    const contextMutationRequested =
+      hostContextChanged || defaultCompactChanged;
+    const workspaces = contextMutationRequested
+      ? Object.entries(getAllRegisteredGroups())
+          .map(([jid, group]) => ({
+            jid,
+            group,
+            profile: group.created_by
+              ? getAgentProfileForWorkspace(group.folder, group.created_by)
+              : undefined,
+          }))
+          .filter(({ group, profile }) => {
+            if (!group.created_by || !profile) return false;
+            const isActiveAdmin =
+              getUserById(group.created_by)?.role === 'admin';
+            const currentContextSource =
+              resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+                .source ?? 'managed';
+            const nextContextSource = profile.is_default
+              ? (validation.data.mainAgentContextSource ??
+                before.mainAgentContextSource)
+              : profile.runtime_policy.context.source;
+            return (
+              (defaultCompactChanged && profile.is_default) ||
+              (mainContextSourceChanged &&
+                profile.is_default &&
+                isActiveAdmin) ||
+              (externalClaudeDirChanged &&
+                isActiveAdmin &&
+                (currentContextSource === 'host_claude' ||
+                  nextContextSource === 'host_claude'))
+            );
+          })
+      : [];
+    const sessionResetFolders = Array.from(
+      new Set(workspaces.map(({ group }) => group.folder)),
+    );
+    const commit = () => {
+      const value = saveSystemSettings(validation.data);
+      for (const folder of sessionResetFolders) deleteWorkspaceSessions(folder);
+      return value;
+    };
+    let saved: ReturnType<typeof saveSystemSettings>;
+    if (contextMutationRequested && deps) {
+      const profileIds = Array.from(
+        new Set(
+          workspaces
+            .map(({ profile }) => profile)
+            .filter((profile) => !!profile)
+            .map((profile) => profile.id),
+        ),
+      );
+      try {
+        const result = await withAgentProfileLocks(profileIds, () =>
+          quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            workspaces.map(({ jid, group }) => ({
+              folder: group.folder,
+              primaryJid: jid,
+            })),
+            { reason: 'Host integration context updated' },
+            commit,
+          ),
+        );
+        saved = result.value;
+      } catch (err) {
+        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+        return c.json(
+          {
+            error: err.persisted
+              ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
+              : 'Failed to quiesce active workspaces; host integration was not updated',
+            persisted: err.persisted,
+            retryable: true,
+          },
+          503,
+        );
+      }
+    } else {
+      saved = commit();
     }
-  } catch { /* ignore */ }
+    const response = toHostIntegrationResponse(saved);
+    const changedFields = changedSettingFields(
+      before,
+      response,
+      validation.data,
+    );
+    const actor = c.get('user') as AuthUser;
+    if (changedFields.length > 0) {
+      logAuthEvent({
+        event_type: 'host_integration_updated',
+        username: actor.username,
+        actor_username: actor.username,
+        ip_address: getClientIp(c),
+        user_agent: c.req.header('user-agent') ?? null,
+        // Only names and a boolean are recorded; the host path is never logged.
+        details: {
+          changed_fields: changedFields,
+          external_claude_dir_configured: Boolean(response.externalClaudeDir),
+        },
+      });
+    }
 
-  return c.json(result);
-});
+    return c.json(response);
+  },
+);
+
+// ─── External Claude resources (admin only) ─────────────────────────
+
+configRoutes.get(
+  '/external-resources',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    const effectiveDir = getEffectiveExternalDir();
+
+    const result: {
+      dir: string;
+      rules: Array<{ name: string; size: number }>;
+      claudeMd: string | null;
+    } = { dir: effectiveDir, rules: [], claudeMd: null };
+
+    // Rules
+    const rulesDir = path.join(effectiveDir, 'rules');
+    try {
+      if (fs.existsSync(rulesDir)) {
+        for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+          if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+          try {
+            const st = fs.statSync(path.join(rulesDir, entry.name));
+            result.rules.push({ name: entry.name, size: st.size });
+          } catch {
+            /* skip */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // CLAUDE.md
+    const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
+    try {
+      if (fs.existsSync(claudeMdPath)) {
+        const content = fs.readFileSync(claudeMdPath, 'utf-8');
+        result.claudeMd =
+          content.length > 10000
+            ? content.slice(0, 10000) + '\n...(截断)'
+            : content;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return c.json(result);
+  },
+);
 
 // Read a single rule file content (admin only)
-configRoutes.get('/external-resources/rule', authMiddleware, systemConfigMiddleware, (c) => {
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.text('Forbidden', 403);
-  }
-  const name = c.req.query('name');
-  if (!name || name.includes('/') || name.includes('..')) {
-    return c.text('Invalid name', 400);
-  }
-  const effectiveDir = getEffectiveExternalDir();
-  const filePath = path.join(effectiveDir, 'rules', name);
-  try {
-    const resolved = fs.realpathSync(filePath);
-    // 确保解析后的路径仍在 rules 目录内
-    if (!resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))) {
+configRoutes.get(
+  '/external-resources/rule',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const user = c.get('user') as AuthUser;
+    if (user.role !== 'admin') {
       return c.text('Forbidden', 403);
     }
-    const content = fs.readFileSync(resolved, 'utf-8');
-    return c.text(content);
-  } catch {
-    return c.text('Not found', 404);
-  }
-});
+    const name = c.req.query('name');
+    if (!name || name.includes('/') || name.includes('..')) {
+      return c.text('Invalid name', 400);
+    }
+    const effectiveDir = getEffectiveExternalDir();
+    const filePath = path.join(effectiveDir, 'rules', name);
+    try {
+      const resolved = fs.realpathSync(filePath);
+      // 确保解析后的路径仍在 rules 目录内
+      if (
+        !resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))
+      ) {
+        return c.text('Forbidden', 403);
+      }
+      const content = fs.readFileSync(resolved, 'utf-8');
+      return c.text(content);
+    } catch {
+      return c.text('Not found', 404);
+    }
+  },
+);
 
 // ─── Per-user IM connection status ──────────────────────────────────
 
@@ -1384,6 +1791,7 @@ configRoutes.get('/user-im/status', authMiddleware, (c) => {
     wechat: deps?.isUserWeChatConnected?.(user.id) ?? false,
     dingtalk: deps?.isUserDingTalkConnected?.(user.id) ?? false,
     discord: deps?.isUserDiscordConnected?.(user.id) ?? false,
+    whatsapp: deps?.isUserWhatsAppConnected?.(user.id) ?? false,
   });
 });
 
@@ -1530,9 +1938,15 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       autoIsolateContext: next.autoIsolateContext as boolean | undefined,
       ownerOpenId: next.ownerOpenId as string | undefined,
     });
-    appendImConfigAudit(user.username, 'feishu', 'update', Object.keys(validation.data), {
-      userId: user.id,
-    });
+    appendImConfigAudit(
+      user.username,
+      'feishu',
+      'update',
+      Object.keys(validation.data),
+      {
+        userId: user.id,
+      },
+    );
 
     // Migrate existing Feishu chats when autoIsolateContext toggle changes
     const oldAutoIsolate = current?.autoIsolateContext ?? false;
@@ -1660,7 +2074,13 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'telegram', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'telegram',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Telegram channel
     if (deps?.reloadUserIMConfig) {
@@ -1756,11 +2176,22 @@ configRoutes.get('/user-im/telegram/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
     string,
-    { name: string; added_at: string; created_by?: string }
+    {
+      name: string;
+      added_at: string;
+      created_by?: string;
+      channel_account_id?: string | null;
+    }
   >;
+  const legacy = getLegacyChannelAccount(user.id, 'telegram');
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
-    if (jid.startsWith('telegram:') && group.created_by === user.id) {
+    const address = parseChannelAddress(jid);
+    if (
+      address?.provider === 'telegram' &&
+      group.created_by === user.id &&
+      (address.legacy || group.channel_account_id === legacy?.id)
+    ) {
       chats.push({ jid, name: group.name, addedAt: group.added_at });
     }
   }
@@ -1785,6 +2216,11 @@ configRoutes.delete(
       return c.json({ error: 'Chat not found' }, 404);
     }
     if (group.created_by !== user.id) {
+      return c.json({ error: 'Not authorized to remove this chat' }, 403);
+    }
+    const legacy = getLegacyChannelAccount(user.id, 'telegram');
+    const address = parseChannelAddress(jid);
+    if (!address?.legacy && group.channel_account_id !== legacy?.id) {
       return c.json({ error: 'Not authorized to remove this chat' }, 403);
     }
 
@@ -1886,7 +2322,13 @@ configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
       appSecret: next.appSecret,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'qq', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'qq',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's QQ channel
     if (deps?.reloadUserIMConfig) {
@@ -2015,11 +2457,22 @@ configRoutes.get('/user-im/qq/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
     string,
-    { name: string; added_at: string; created_by?: string }
+    {
+      name: string;
+      added_at: string;
+      created_by?: string;
+      channel_account_id?: string | null;
+    }
   >;
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
-    if (jid.startsWith('qq:') && group.created_by === user.id) {
+    const address = parseChannelAddress(jid);
+    if (
+      address?.provider === 'qq' &&
+      group.created_by === user.id &&
+      (address.legacy || group.channel_account_id === legacy?.id)
+    ) {
       chats.push({ jid, name: group.name, addedAt: group.added_at });
     }
   }
@@ -2043,10 +2496,15 @@ configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
   if (group.created_by !== user.id) {
     return c.json({ error: 'Not authorized to rename this chat' }, 403);
   }
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
+  const address = parseChannelAddress(jid);
+  if (!address?.legacy && group.channel_account_id !== legacy?.id) {
+    return c.json({ error: 'Not authorized to rename this chat' }, 403);
+  }
 
   const body = await c.req
     .json<{ name?: unknown }>()
-    .catch(() => ({} as { name?: unknown }));
+    .catch(() => ({}) as { name?: unknown });
   const rawName = typeof body.name === 'string' ? body.name : '';
   const name = rawName.trim();
   if (!name) {
@@ -2078,6 +2536,11 @@ configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
     return c.json({ error: 'Chat not found' }, 404);
   }
   if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to remove this chat' }, 403);
+  }
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
+  const address = parseChannelAddress(jid);
+  if (!address?.legacy && group.channel_account_id !== legacy?.id) {
     return c.json({ error: 'Not authorized to remove this chat' }, 403);
   }
 
@@ -2179,7 +2642,13 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDingTalkConfig(user.id, next);
-    appendImConfigAudit(user.username, 'dingtalk', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'dingtalk',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's DingTalk channel
     if (deps?.reloadUserIMConfig) {
@@ -2325,7 +2794,13 @@ configRoutes.put('/user-im/discord', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDiscordConfig(user.id, next);
-    appendImConfigAudit(user.username, 'discord', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'discord',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Discord channel
     if (deps?.reloadUserIMConfig) {
@@ -2505,7 +2980,13 @@ configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWeChatConfig(user.id, next);
-    appendImConfigAudit(user.username, 'wechat', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'wechat',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Update NO_PROXY based on bypassProxy setting
     updateWeChatNoProxy(saved.bypassProxy ?? true);
@@ -2636,7 +3117,13 @@ configRoutes.get('/user-im/wechat/qrcode-status', authMiddleware, async (c) => {
         baseUrl: data.baseurl || undefined,
         enabled: true,
       });
-    appendImConfigAudit(user.username, 'wechat', 'oauth_qr_confirmed', ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'], { userId: user.id });
+      appendImConfigAudit(
+        user.username,
+        'wechat',
+        'oauth_qr_confirmed',
+        ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'],
+        { userId: user.id },
+      );
 
       // Note: ilink_user_id (the QR scanner) is NOT auto-paired here.
       // The scanner needs to send a message to the bot and use /pair <code>
@@ -2788,7 +3275,13 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWhatsAppConfig(user.id, next);
-    appendImConfigAudit(user.username, 'whatsapp', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's WhatsApp channel (skeleton always returns false)
     if (deps?.reloadUserIMConfig) {
@@ -2833,16 +3326,19 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const current = getUserWhatsAppConfig(user.id);
-  const accountId = current?.accountId || 'default';
+  // Compatibility facade: the first-class default account owns the actual
+  // Baileys connection/authDir. Never use the user-editable legacy label as
+  // an auth directory key.
+  const accountId =
+    getDefaultChannelAccount(user.id, 'whatsapp')?.id ??
+    current?.accountId ??
+    'default';
 
   if (deps?.logoutUserWhatsApp) {
     try {
       await deps.logoutUserWhatsApp(user.id, accountId);
     } catch (err) {
-      logger.warn(
-        { err, userId: user.id },
-        'WhatsApp logout deps call failed',
-      );
+      logger.warn({ err, userId: user.id }, 'WhatsApp logout deps call failed');
     }
   }
 
@@ -2853,7 +3349,13 @@ configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
       enabled: false,
       paired: false,
     });
-    appendImConfigAudit(user.username, 'whatsapp', 'logout', ['enabled', 'paired'], { userId: user.id, accountId });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'logout',
+      ['enabled', 'paired'],
+      { userId: user.id, accountId },
+    );
     const state = deps?.getUserWhatsAppState?.(user.id) ?? {
       status: 'logged_out' as const,
     };
@@ -2891,7 +3393,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   // IM-binding 改的是 imGroup 行（target_agent_id / target_main_jid /
   // activation_mode 等），与 agents.ts 的 4 个 IM-binding 路由对齐：
   // 非成员用 access 检查隐藏存在性（404），成员但非 owner 拒绝写（403）。
-  // 否则共享工作区里的 member 可以劫持 owner 的 IM 路由到自己 agent。
+  // IM 路由变更必须由对应工作区所有者执行。
   if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'IM group not found' }, 404);
   }
@@ -2903,58 +3405,144 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
 
   // Unbind mode
   if (body.unbind === true) {
-    const updated: RegisteredGroup = {
-      ...imGroup,
-      target_main_jid: undefined,
-      target_agent_id: undefined,
-    };
-    applyBindingUpdate(imJid, updated);
-    logger.info({ imJid, userId: user.id }, 'IM group unbound (bindings page)');
-    return c.json({ success: true });
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read + re-authorize after the await — fetchLiveChatInfo
+    // yields the event loop on a live network call, during which ownership
+    // or binding state may have changed. restoreDefaultChannelMount commits
+    // whatever `group` it's given, so building it from the stale pre-await
+    // snapshot would silently clobber a concurrent write and could cross
+    // the original authorization boundary.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    const previousTargetMainJid = freshImGroup.target_main_jid;
+    const wasThreadMap = freshImGroup.binding_mode === 'thread_map';
+    const restored = restoreDefaultChannelMount(
+      imJid,
+      freshImGroup,
+      user.id,
+      chatInfo ?? {},
+    );
+    if (restored.status !== 'resolved') {
+      return c.json({ error: restoreDefaultChannelError(restored) }, 409);
+    }
+    if (wasThreadMap) {
+      detachThreadMapWorkspaceIfLast(
+        previousTargetMainJid,
+        imJid,
+        restored.workspaceJid,
+        restored.routingMode,
+      );
+    }
+    if (restored.routingMode === 'thread_map') {
+      markNativeContextWorkspace(restored.workspaceJid);
+    }
+    logger.info(
+      {
+        imJid,
+        defaultWorkspaceJid: restored.workspaceJid,
+        userId: user.id,
+      },
+      'IM group restored to channel account default workspace (bindings page)',
+    );
+    return c.json({ success: true, target_main_jid: restored.workspaceJid });
   }
 
-  // Bind to agent
-  if (typeof body.target_agent_id === 'string' && body.target_agent_id.trim()) {
-    const agentId = body.target_agent_id.trim();
-    const agent = getAgent(agentId);
+  const targetSessionId =
+    typeof body.target_session_id === 'string' && body.target_session_id.trim()
+      ? body.target_session_id.trim()
+      : typeof body.target_agent_id === 'string' && body.target_agent_id.trim()
+        ? body.target_agent_id.trim()
+        : '';
+
+  // Bind to workspace session. Stored in target_agent_id for backward compatibility.
+  if (targetSessionId) {
+    const sessionId = targetSessionId;
+    const agent = getAgent(sessionId);
     if (!agent) {
-      return c.json({ error: 'Agent not found' }, 404);
+      return c.json({ error: 'Session not found' }, 404);
     }
     if (agent.kind !== 'conversation') {
       return c.json(
-        { error: 'Only conversation agents can bind IM groups' },
+        { error: 'Only workspace sessions can bind IM groups' },
         400,
       );
     }
-    // Check user can access the workspace that owns this agent
+    if (!agent.chat_jid.startsWith('web:')) {
+      return c.json(
+        { error: 'Session target must belong to a workspace' },
+        400,
+      );
+    }
+    // Check user can access the workspace that owns this session.
     const ownerGroup = getRegisteredGroup(agent.chat_jid);
     if (
       !ownerGroup ||
-      !canAccessGroup(user, { ...ownerGroup, jid: agent.chat_jid })
+      !canModifyGroup(user, { ...ownerGroup, jid: agent.chat_jid })
     ) {
       return c.json({ error: 'Forbidden' }, 403);
+    }
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read after the await: fetchLiveChatInfo makes a live network call
+    // that yields the event loop, during which a concurrent bind request or
+    // the message router's owner-learning path can commit a new mount for
+    // this exact imJid, or upgrade native_context_type from 'none' to
+    // 'thread'. Building the update, or computing threadCapable, from the
+    // pre-await snapshot would silently clobber that write or bind a
+    // now-thread-capable container as a fixed single session.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    // Re-run authorization against the fresh row — the handler's top-level
+    // checks only proved it against the stale imGroup read before the await.
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
+      return c.json(
+        {
+          error:
+            'Native thread containers can only bind to a workspace, not a single session',
+        },
+        400,
+      );
     }
 
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-    const hasConflict =
-      (imGroup.target_agent_id && imGroup.target_agent_id !== agentId) ||
-      !!imGroup.target_main_jid;
+    const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
 
-    const updated: RegisteredGroup = {
-      ...imGroup,
-      target_agent_id: agentId,
-      target_main_jid: undefined,
-      reply_policy: replyPolicy,
-    };
+    const updated: RegisteredGroup = buildSessionMountUpdate(
+      freshImGroup,
+      sessionId,
+      {
+        replyPolicy,
+      },
+    );
     applyBindingUpdate(imJid, updated);
+    if (freshImGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(freshImGroup.target_main_jid, imJid);
+    }
     logger.info(
-      { imJid, agentId, userId: user.id },
-      'IM group bound to agent (bindings page)',
+      { imJid, sessionId, userId: user.id },
+      'IM group bound to workspace session (bindings page)',
     );
     return c.json({ success: true });
   }
@@ -2964,8 +3552,12 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   const activationMode =
     typeof rawActivationMode === 'string' &&
     VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as typeof rawActivationMode &
-          'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled')
+      ? (rawActivationMode as
+          | (typeof rawActivationMode & 'auto')
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled')
       : undefined;
 
   // Parse owner_im_id for owner_mentioned mode
@@ -2977,44 +3569,75 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   // Bind to workspace main conversation
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
+    if (!targetMainJid.startsWith('web:')) {
+      return c.json({ error: 'Target must be a workspace' }, 400);
+    }
     const targetGroup = getRegisteredGroup(targetMainJid);
     if (!targetGroup) {
       return c.json({ error: 'Target workspace not found' }, 404);
     }
-    if (!canAccessGroup(user, { ...targetGroup, jid: targetMainJid })) {
+    if (!canModifyGroup(user, { ...targetGroup, jid: targetMainJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
-    if (targetGroup.is_home) {
-      return c.json(
-        { error: 'Home workspace main conversation uses default IM routing' },
-        400,
-      );
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read + re-authorize after the await — see the analogous comment
+    // in the session-bind branch above.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
     }
-
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    const threadCapable = isNativeContextContainer(
+      imJid,
+      freshImGroup,
+      chatInfo ?? {},
+    );
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
     const legacyMainJid = `web:${targetGroup.folder}`;
-    const hasConflict =
-      !!imGroup.target_agent_id ||
-      (imGroup.target_main_jid &&
-        imGroup.target_main_jid !== targetMainJid &&
-        imGroup.target_main_jid !== legacyMainJid);
+    const hasConflict = hasWorkspaceMountConflict(
+      freshImGroup,
+      targetMainJid,
+      legacyMainJid,
+    );
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
-
     const updated: RegisteredGroup = {
-      ...imGroup,
-      target_main_jid: targetMainJid,
-      target_agent_id: undefined,
-      reply_policy: replyPolicy,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
-      ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
+      ...buildWorkspaceMountUpdate(
+        freshImGroup,
+        targetMainJid,
+        threadCapable ? 'thread_map' : 'single_session',
+        {
+          replyPolicy,
+          ...(activationMode !== undefined ? { activationMode } : {}),
+          ...(ownerImId !== undefined ? { ownerImId } : {}),
+        },
+      ),
+      feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+      feishu_group_message_type:
+        chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
     };
     applyBindingUpdate(imJid, updated);
+    if (freshImGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(
+        freshImGroup.target_main_jid,
+        imJid,
+        targetMainJid,
+        threadCapable ? 'thread_map' : 'single_session',
+      );
+    }
+    if (threadCapable) markNativeContextWorkspace(targetMainJid);
     logger.info(
-      { imJid, targetMainJid, userId: user.id },
+      { imJid, targetMainJid, threadCapable, userId: user.id },
       'IM group bound to workspace (bindings page)',
     );
     return c.json({ success: true });
@@ -3024,7 +3647,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   if (activationMode !== undefined || ownerImId !== undefined) {
     const updated: RegisteredGroup = {
       ...imGroup,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(activationMode !== undefined
+        ? { activation_mode: activationMode }
+        : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
     };
     applyBindingUpdate(imJid, updated);
@@ -3036,7 +3661,10 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   }
 
   return c.json(
-    { error: 'Must provide target_main_jid, target_agent_id, activation_mode, or unbind' },
+    {
+      error:
+        'Must provide target_main_jid, target_session_id, target_agent_id, activation_mode, or unbind',
+    },
     400,
   );
 });

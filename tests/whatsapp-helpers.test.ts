@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import type { proto } from '@whiskeysockets/baileys';
+import type { proto } from 'baileys';
 
 import {
   extractMessageText,
@@ -12,9 +12,9 @@ import {
 
 describe('extractMessageText', () => {
   test('plain conversation', () => {
-    expect(
-      extractMessageText({ conversation: 'hi' } as proto.IMessage),
-    ).toBe('hi');
+    expect(extractMessageText({ conversation: 'hi' } as proto.IMessage)).toBe(
+      'hi',
+    );
   });
 
   test('extendedTextMessage', () => {
@@ -134,7 +134,10 @@ describe('isMentioningBot', () => {
 
   test('returns false when mentions empty', () => {
     expect(
-      isMentioningBot({ extendedTextMessage: { text: 'hi' } } as proto.IMessage, SELF),
+      isMentioningBot(
+        { extendedTextMessage: { text: 'hi' } } as proto.IMessage,
+        SELF,
+      ),
     ).toBe(false);
   });
 

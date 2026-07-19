@@ -24,6 +24,7 @@ import {
   createWeChatConnection,
   type WeChatConnection,
   type WeChatConnectionConfig,
+  type WeChatConnectionState,
 } from './wechat.js';
 import {
   createDingTalkConnection,
@@ -46,7 +47,7 @@ import {
   type WhatsAppConnectionState,
 } from './whatsapp.js';
 import { logger } from './logger.js';
-import type { FeishuMessageMeta } from './types.js';
+import type { ChannelMessageMeta } from './types.js';
 import {
   StreamingCardController,
   type StreamingCardOptions,
@@ -76,6 +77,10 @@ export interface IMChannelConnectOpts {
     chatName: string,
     code: string,
   ) => Promise<boolean>;
+  onNativeContextDetected?: (
+    chatJid: string,
+    contextType: 'thread',
+  ) => boolean | void | Promise<boolean | void>;
   /** Slash command callback (e.g. /clear). Returns reply text or null.
    *  senderImId is the channel-specific user ID (e.g. Discord user.id, Telegram from.id);
    *  channels that don't have a stable per-user ID may pass undefined. */
@@ -89,8 +94,12 @@ export interface IMChannelConnectOpts {
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
   resolveEffectiveChatJid?: (
     chatJid: string,
-    messageMeta?: FeishuMessageMeta,
-  ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
+    messageMeta?: ChannelMessageMeta,
+  ) => {
+    effectiveJid: string;
+    agentId: string | null;
+    sourceJid?: string;
+  } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   /** Bot 被添加到群聊时调用 */
@@ -104,17 +113,25 @@ export interface IMChannelConnectOpts {
   /** 发言者白名单：返回 false 则丢弃（命令处理后、mention 门控前调用） */
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** Resolve registered group for a jid */
-  resolveRegisteredGroup?: (jid: string) => { activation_mode?: string } | undefined;
+  resolveRegisteredGroup?: (
+    jid: string,
+  ) => { activation_mode?: string } | undefined;
   /** 飞书流式卡片按钮中断回调 */
   onCardInterrupt?: (chatJid: string) => void;
   /** P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书） */
   onP2pSender?: (senderOpenId: string) => void;
+  /** Canonicalize an inbound provider JID before persistence/callbacks. */
+  normalizeIncomingJid?: (jid: string) => string;
+  /** WeChat iLink authorization/transport lifecycle. */
+  onWeChatConnectionStateChange?: (state: WeChatConnectionState) => void;
 }
 
 export interface IMChannel {
   readonly channelType: string;
   connect(opts: IMChannelConnectOpts): Promise<boolean>;
   disconnect(): Promise<void>;
+  /** Provider-level authorization revoke (supported by QR/session channels). */
+  logout?(): Promise<void>;
   sendMessage(
     chatId: string,
     text: string,
@@ -206,10 +223,8 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
         onCardInterrupt: opts.onCardInterrupt,
         onP2pSender: opts.onP2pSender,
+        normalizeIncomingJid: opts.normalizeIncomingJid,
       });
-      if (!connected) {
-        inner = null;
-      }
       return connected;
     },
 
@@ -348,6 +363,7 @@ export function createTelegramChannel(
           onNewChat: opts.onNewChat,
           isChatAuthorized: opts.isChatAuthorized ?? (() => true),
           onPairAttempt: opts.onPairAttempt,
+          onNativeContextDetected: opts.onNativeContextDetected,
           onCommand: opts.onCommand,
           ignoreMessagesBefore: opts.ignoreMessagesBefore,
           resolveGroupFolder: opts.resolveGroupFolder,
@@ -355,11 +371,11 @@ export function createTelegramChannel(
           onAgentMessage: opts.onAgentMessage,
           onBotAddedToGroup: opts.onBotAddedToGroup,
           onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         return inner.isConnected();
       } catch (err) {
         logger.error({ err }, 'Telegram channel connect failed');
-        inner = null;
         return false;
       }
     },
@@ -465,11 +481,11 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         return inner.isConnected();
       } catch (err) {
         logger.error({ err }, 'QQ channel connect failed');
-        inner = null;
         return false;
       }
     },
@@ -504,10 +520,7 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'QQ channel not connected, skip sending image',
-        );
+        logger.warn({ chatId }, 'QQ channel not connected, skip sending image');
         return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
@@ -519,10 +532,7 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'QQ channel not connected, skip sending file',
-        );
+        logger.warn({ chatId }, 'QQ channel not connected, skip sending file');
         return;
       }
       await inner.sendFile(chatId, filePath, fileName);
@@ -576,7 +586,10 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
 
 // ─── WeChat Adapter ─────────────────────────────────────────────
 
-export function createWeChatChannel(config: WeChatConnectionConfig): IMChannel {
+export function createWeChatChannel(
+  config: WeChatConnectionConfig,
+  onUpdatesBuf?: (cursor: string) => void | Promise<void>,
+): IMChannel {
   let inner: WeChatConnection | null = null;
 
   const channel: IMChannel = {
@@ -593,19 +606,25 @@ export function createWeChatChannel(config: WeChatConnectionConfig): IMChannel {
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
+          onConnectionStateChange: opts.onWeChatConnectionStateChange,
+          onUpdatesBuf,
         });
         return inner.isConnected();
       } catch (err) {
         logger.error({ err }, 'WeChat channel connect failed');
-        inner = null;
         return false;
       }
     },
 
     async disconnect(): Promise<void> {
       if (inner) {
+        const cursor = inner.getUpdatesBuf();
         await inner.disconnect();
         inner = null;
+        await onUpdatesBuf?.(cursor);
       }
     },
 
@@ -693,11 +712,11 @@ export function createDingTalkChannel(
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
           isGroupOwnerMessage: opts.isGroupOwnerMessage,
           resolveRegisteredGroup: opts.resolveRegisteredGroup,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         return inner.isConnected();
       } catch (err) {
         logger.error({ err }, 'DingTalk channel connect failed');
-        inner = null;
         return false;
       }
     },
@@ -821,6 +840,7 @@ export function createDiscordChannel(
           onReady: opts.onReady,
           onNewChat: opts.onNewChat,
           isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
           ignoreMessagesBefore: opts.ignoreMessagesBefore,
           onCommand: opts.onCommand,
           resolveGroupFolder: opts.resolveGroupFolder,
@@ -830,11 +850,11 @@ export function createDiscordChannel(
           onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
           shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
           isGroupOwnerMessage: opts.isGroupOwnerMessage,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         return ok;
       } catch (err) {
         logger.warn({ err }, 'Discord channel connect failed');
-        inner = null;
         return false;
       }
     },
@@ -871,7 +891,9 @@ export function createDiscordChannel(
         if (!typingIntervals.has(chatId)) {
           await inner.setTyping(chatId, true);
           const interval = setInterval(async () => {
-            try { if (inner) await inner.setTyping(chatId, true); } catch {}
+            try {
+              if (inner) await inner.setTyping(chatId, true);
+            } catch {}
           }, 9000);
           typingIntervals.set(chatId, interval);
         }
@@ -941,6 +963,8 @@ export function createWhatsAppChannel(
         await inner.connect({
           onReady: opts.onReady,
           onNewChat: opts.onNewChat,
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
           onCommand: opts.onCommand,
           ignoreMessagesBefore: opts.ignoreMessagesBefore,
           resolveGroupFolder: opts.resolveGroupFolder,
@@ -952,6 +976,7 @@ export function createWhatsAppChannel(
           isGroupOwnerMessage: opts.isGroupOwnerMessage,
           isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
           onConnectionUpdate,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
         });
         // Baileys connect 是 async fire-and-forget：socket 建好后立刻返回，
         // 真实的 connected 状态要等 connection.update -> 'open' 才到。
@@ -959,7 +984,6 @@ export function createWhatsAppChannel(
         return true;
       } catch (err) {
         logger.warn({ err }, 'WhatsApp channel connect failed');
-        inner = null;
         return false;
       }
     },
@@ -971,17 +995,20 @@ export function createWhatsAppChannel(
       }
     },
 
+    async logout(): Promise<void> {
+      if (inner) {
+        await inner.logout();
+        inner = null;
+      }
+    },
+
     async sendMessage(
       chatId: string,
       text: string,
       localImagePaths?: string[],
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'WhatsApp channel not connected, skip sending message',
-        );
-        return;
+        throw new Error('WhatsApp channel not connected');
       }
       await inner.sendMessage(chatId, text, localImagePaths);
     },
@@ -994,11 +1021,7 @@ export function createWhatsAppChannel(
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'WhatsApp channel not connected, skip sending image',
-        );
-        return;
+        throw new Error('WhatsApp channel not connected');
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
@@ -1009,11 +1032,7 @@ export function createWhatsAppChannel(
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'WhatsApp channel not connected, skip sending file',
-        );
-        return;
+        throw new Error('WhatsApp channel not connected');
       }
       await inner.sendFile(chatId, filePath, fileName);
     },

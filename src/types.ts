@@ -34,18 +34,45 @@ export interface ContainerConfig {
 }
 
 export type ExecutionMode = 'container' | 'host';
-export type ConversationSource = 'manual' | 'feishu_thread';
+export type ConversationSource = 'manual' | 'native_thread' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
+export type ChannelRoutingMode = 'single_session' | 'thread_map';
 
-/** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
-export interface FeishuMessageMeta {
+export interface ChannelMount {
+  channel_jid: string;
+  channel_account_id?: string | null;
+  channel_type: string;
+  workspace_jid: string;
+  session_id?: string | null;
+  routing_mode: ChannelRoutingMode;
+  reply_policy: 'source_only' | 'mirror';
+  activation_mode:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
+  owner_im_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Provider-native topic/thread metadata used by workspace thread_map routing. */
+export interface ChannelMessageMeta {
+  provider?: string;
+  nativeContextType?: 'thread';
+  contextId?: string;
   threadId?: string;
   rootId?: string;
   parentId?: string;
   messageId?: string;
   text?: string;
+  title?: string;
 }
+
+/** @deprecated Use ChannelMessageMeta. Kept for connector compatibility. */
+export type FeishuMessageMeta = ChannelMessageMeta;
 
 export interface RegisteredGroup {
   name: string;
@@ -57,12 +84,19 @@ export interface RegisteredGroup {
   initSourcePath?: string; // 容器模式下复制来源的宿主机绝对路径
   initGitUrl?: string; // 容器模式下 clone 来源的 Git URL
   created_by?: string;
+  /** Channel account that owns this external chat. Null means legacy/default. */
+  channel_account_id?: string;
   is_home?: boolean; // 用户主容器标记
-  target_agent_id?: string; // IM 消息路由到指定 conversation agent
-  target_main_jid?: string; // IM 消息路由到指定工作区的主对话（web:{folder}）
+  target_agent_id?: string; // 兼容旧字段：IM 消息路由到指定工作区会话（conversation session）
+  target_main_jid?: string; // IM 消息路由到指定工作区的主会话（web:{folder}）
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
   owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
   sender_allowlist?: string[] | null; // null/undefined = 不限制，[] = 仅 owner 可触发（未 /claim 时无人可触发），[ids] = 白名单
   mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
@@ -70,17 +104,138 @@ export interface RegisteredGroup {
   conversation_source?: ConversationSource; // 工作区会话来源（默认 manual）
   conversation_nav_mode?: ConversationNavMode; // 工作区会话导航模式（默认 horizontal）
   binding_mode?: ImBindingMode; // IM 绑定模式（默认 single_context）
+  native_context_type?: 'none' | 'thread'; // 渠道原生上下文能力（如飞书话题、Telegram Forum）
   feishu_chat_mode?: string; // 飞书群模式：group/topic/p2p 等
   feishu_group_message_type?: string; // 飞书群消息形式：chat/thread
 }
 
-export interface GroupMember {
-  user_id: string;
-  role: 'owner' | 'member';
-  added_at: string;
-  added_by?: string;
-  username: string;
-  display_name: string;
+export type ChannelProvider =
+  | 'feishu'
+  | 'telegram'
+  | 'qq'
+  | 'wechat'
+  | 'dingtalk'
+  | 'discord'
+  | 'whatsapp';
+
+export type ChannelAuthMode = 'credentials' | 'bot_token' | 'qr_session';
+export type ChannelAuthStatus =
+  | 'draft'
+  | 'awaiting_scan'
+  | 'authorized'
+  | 'revoked'
+  | 'error';
+export type ChannelTransportStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'error';
+
+/** Public metadata only. Credentials live behind secret_ref and are never serialized. */
+export interface ChannelAccount {
+  id: string;
+  owner_user_id: string;
+  provider: ChannelProvider;
+  name: string;
+  secret_ref: string;
+  enabled: boolean;
+  is_default: boolean;
+  /** Legacy singleton keeps unscoped JIDs so existing history/bindings survive. */
+  is_legacy_default: boolean;
+  /** How this provider authorizes an account. Derived at creation and immutable. */
+  auth_mode: ChannelAuthMode;
+  /** Authorization lifecycle; separate from the live transport connection. */
+  auth_status: ChannelAuthStatus;
+  /** Live socket/stream lifecycle. */
+  transport_status: ChannelTransportStatus;
+  /** @deprecated Compatibility projection of transport_status. */
+  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  default_agent_profile_id: string | null;
+  default_workspace_jid: string | null;
+  last_error: string | null;
+  connected_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelAccountPublic extends Omit<
+  ChannelAccount,
+  'secret_ref' | 'default_agent_profile_id'
+> {
+  has_credentials: boolean;
+  options?: {
+    bypassProxy?: boolean;
+    streamingMode?: 'card' | 'text' | 'edit' | 'off';
+    phoneNumber?: string;
+  };
+}
+
+export interface AgentProfile {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  /** IDENTITY: concise role and public identity. */
+  identity_prompt: string;
+  /** SOUL: values, temperament, and durable judgment principles. */
+  soul_prompt: string;
+  /** AGENTS: operating rules, workflows, and collaboration behavior. */
+  agents_prompt: string;
+  /** TOOLS: tool-selection and tool-usage guidance. */
+  tools_prompt: string;
+  /** Append to or replace the Claude Code preset. HappyClaw safety always remains. */
+  prompt_mode: AgentProfilePromptMode;
+  /** @deprecated Compatibility alias for prompt_mode === 'append'. */
+  include_claude_preset: boolean;
+  avatar_emoji: string | null;
+  avatar_color: string | null;
+  avatar_url: string | null;
+  runtime_policy: AgentProfileRuntimePolicy;
+  identity_hash: string;
+  version: number;
+  is_default: boolean;
+  status: 'active' | 'archived';
+  created_at: string;
+  updated_at: string;
+}
+
+export type AgentProfilePromptMode = 'append' | 'replace';
+
+export interface AgentProfilePrompts {
+  identity_prompt: string;
+  soul_prompt: string;
+  agents_prompt: string;
+  tools_prompt: string;
+  prompt_mode: AgentProfilePromptMode;
+}
+
+export interface AgentProfilePromptVersion extends AgentProfilePrompts {
+  id: string;
+  agent_profile_id: string;
+  version: number;
+  name: string;
+  identity_hash: string;
+  change_source: 'create' | 'update' | 'restore' | 'migration';
+  restored_from_version: number | null;
+  created_at: string;
+}
+
+export interface AgentProfileRuntimePolicy {
+  context: {
+    source: 'managed' | 'host_claude';
+    auto_compact_window: number;
+    auto_compact_percentage: number;
+  };
+  skills: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+  mcp: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+  tools: {
+    mode: 'inherit' | 'readonly' | 'restricted';
+  };
 }
 
 export interface NewMessage {
@@ -144,6 +299,8 @@ export interface ScheduledTask {
   execution_mode?: 'host' | 'container' | null;
   workspace_jid?: string | null;
   workspace_folder?: string | null;
+  running_until?: string | null;
+  runner_id?: string | null;
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
@@ -151,13 +308,104 @@ export interface ScheduledTask {
   created_at: string;
   created_by?: string;
   notify_channels?: string[] | null;
+  /** Optimistic-concurrency revision for edits made through REST/MCP/UI. */
+  revision: number;
+  updated_at: string;
+  /** Soft deletion keeps task history queryable while removing future fires. */
+  deleted_at: string | null;
+}
+
+export type TaskRunTrigger = 'scheduled' | 'manual' | 'backfill';
+
+export type TaskRunStatus =
+  | 'queued'
+  | 'running'
+  | 'retry_wait'
+  | 'success'
+  | 'failed'
+  | 'cancelled'
+  | 'missed'
+  | 'delivered';
+
+export type TaskRunNotificationStatus =
+  | 'pending'
+  | 'success'
+  | 'partial_failed'
+  | 'failed'
+  | 'skipped';
+
+export interface TaskRunNotificationSummary {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  failed_channels: string[];
+}
+
+export interface TaskRunNotificationReceipt {
+  status: Exclude<TaskRunNotificationStatus, 'pending'>;
+  summary: TaskRunNotificationSummary;
+  error?: string | null;
+}
+
+/**
+ * Immutable, non-secret definition used by one occurrence. A queued/retried run
+ * must never silently switch to a newer task definition.
+ */
+export interface TaskRunDefinitionSnapshot {
+  prompt: string;
+  group_folder: string;
+  chat_jid: string;
+  context_mode: 'group' | 'isolated';
+  execution_type: 'agent' | 'script';
+  execution_mode: 'host' | 'container' | null;
+  script_command: string | null;
+  notify_channels: string[] | null;
+}
+
+/** Durable state for one scheduled/manual occurrence. */
+export interface TaskRun {
+  id: string;
+  task_id: string;
+  trigger_type: TaskRunTrigger;
+  idempotency_key: string | null;
+  scheduled_for: string;
+  definition_revision: number;
+  definition_snapshot: TaskRunDefinitionSnapshot;
+  status: TaskRunStatus;
+  attempt: number;
+  available_at: string;
+  lease_owner: string | null;
+  lease_token: number;
+  lease_expires_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  duration_ms: number;
+  result: string | null;
+  error: string | null;
+  notification_status: TaskRunNotificationStatus;
+  notification_error: string | null;
+  notification_summary: TaskRunNotificationSummary | null;
+  notification_attempt: number;
+  notification_available_at: string | null;
+}
+
+export interface ClaimedTaskRun extends TaskRun {
+  status: 'running';
+  lease_owner: string;
+  lease_expires_at: string;
 }
 
 export interface TaskRunLog {
+  id?: number;
+  run_id?: string;
   task_id: string;
   run_at: string;
   duration_ms: number;
-  status: 'running' | 'success' | 'error';
+  /** `queued` means a group-mode prompt was delivered to the workspace queue;
+   * it does not claim that the Agent has finished executing it. */
+  status: 'running' | 'queued' | 'success' | 'error';
   result: string | null;
   error: string | null;
 }
@@ -300,7 +548,9 @@ export type AuthEventType =
   | 'invite_deleted'
   | 'invite_used'
   | 'recovery_reset'
-  | 'register_success';
+  | 'register_success'
+  | 'system_settings_updated'
+  | 'host_integration_updated';
 
 export interface AuthAuditLog {
   id: number;
@@ -333,10 +583,16 @@ export interface SubAgent {
   last_im_jid: string | null;
   /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
   spawned_from_jid: string | null;
-  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
+  source_kind?: 'manual' | 'native_thread' | 'feishu_thread' | 'auto_im' | null;
   thread_id?: string | null;
   root_message_id?: string | null;
-  title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
+  title_source?:
+    | 'manual'
+    | 'native_root'
+    | 'feishu_root'
+    | 'auto'
+    | 'auto_pending'
+    | null;
   last_active_at?: string | null;
 }
 
@@ -419,12 +675,8 @@ export type WsMessageOut =
   | {
       type: 'whatsapp_status';
       userId: string;
-      status:
-        | 'connecting'
-        | 'qr'
-        | 'connected'
-        | 'disconnected'
-        | 'logged_out';
+      accountId?: string;
+      status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
       qr?: string;
       qrDataUrl?: string;
       error?: string;
@@ -454,12 +706,30 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          kind:
+            | 'tool'
+            | 'skill'
+            | 'hook'
+            | 'status'
+            | 'task'
+            | 'memory'
+            | 'debug'
+            | 'context'
+            | 'permission';
         }>;
         traceEvents?: Array<{
           id: string;
           timestamp: number;
-          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          kind:
+            | 'tool'
+            | 'skill'
+            | 'hook'
+            | 'status'
+            | 'task'
+            | 'memory'
+            | 'debug'
+            | 'context'
+            | 'permission';
           scope?: StreamEvent['agentScope'];
           title: string;
           summary?: string;
@@ -568,6 +838,7 @@ export type BalanceTransactionSource =
 export type BalanceOperatorType = 'system' | 'admin' | 'user';
 export type BalanceReferenceType =
   | 'message'
+  | 'usage_event'
   | 'task'
   | 'subscription'
   | 'redeem_code'
@@ -640,7 +911,8 @@ export type BillingAuditEventType =
   | 'code_deleted'
   | 'wallet_blocked'
   | 'wallet_unblocked'
-  | 'quota_exceeded';
+  | 'quota_exceeded'
+  | 'billing_settings_updated';
 
 export interface BillingAuditLog {
   id: number;

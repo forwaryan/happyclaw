@@ -27,13 +27,14 @@ export interface McpContext {
    * Cleared between turns by the agent-runner main loop so that regular
    * follow-up messages aren't misattributed to the prior task. */
   currentTaskId?: string | null;
+  /** Mutable correlation id for the user input currently being answered.
+   * Cold starts use the triggering message id; IPC turns use the host-issued
+   * delivery id from their receipt. */
+  currentInputTurnId?: string | null;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
   workspaceMemory: string;
-  // 禁用 HappyClaw 的 memory MCP 工具（memory_append/search/get），
-  // 让 Agent 完全按用户本机 ~/.claude/ 下的 Playbook 约定管理记忆
-  disableMemoryLayer?: boolean;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -47,8 +48,14 @@ function writeIpcFile(dir: string, data: object): string {
     fs.renameSync(tempPath, filepath);
   } catch (err) {
     // Clean up temp file on failure
-    try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
-    throw new Error(`IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
   return filename;
 }
@@ -63,10 +70,12 @@ async function pollIpcResult(
   data: Record<string, unknown> & { requestId: string },
   resultFilePrefix: string,
   timeoutMs: number = 30_000,
+  resultDir: string = dir,
 ): Promise<Record<string, unknown>> {
   const resultFileName = `${resultFilePrefix}_${data.requestId}.json`;
-  const resultFilePath = path.join(dir, resultFileName);
+  const resultFilePath = path.join(resultDir, resultFileName);
 
+  fs.mkdirSync(resultDir, { recursive: true });
   writeIpcFile(dir, data);
 
   const pollInterval = 500;
@@ -189,6 +198,9 @@ export function buildSendMessageData(
   if (ctx.currentTaskId) {
     data.taskId = ctx.currentTaskId;
   }
+  if (ctx.currentInputTurnId) {
+    data.inputTurnId = ctx.currentInputTurnId;
+  }
   return data;
 }
 
@@ -197,6 +209,7 @@ export function buildSendMessageData(
  */
 export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   const MESSAGES_DIR = path.join(ctx.workspaceIpc, 'messages');
+  const MESSAGE_RESULTS_DIR = path.join(ctx.workspaceIpc, 'message-results');
   const TASKS_DIR = path.join(ctx.workspaceIpc, 'tasks');
   const hasCrossGroupAccess = ctx.isAdminHome;
   const toRelativePath = createToRelativePath(ctx);
@@ -211,8 +224,22 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         const data = buildSendMessageData(ctx, {
           type: 'message',
           text: args.text,
+          requestId: newRequestId(),
         });
-        writeIpcFile(MESSAGES_DIR, data);
+        const result = await pollIpcResult(
+          MESSAGES_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_message_result',
+          120_000,
+          MESSAGE_RESULTS_DIR,
+        );
+        if (!result.success) {
+          throw new Error(
+            typeof result.error === 'string'
+              ? result.error
+              : 'Message delivery failed.',
+          );
+        }
         return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
       },
     ),
@@ -318,11 +345,26 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         const data = buildSendMessageData(ctx, {
           type: 'image',
           imageBase64: base64,
+          filePath: path.relative(ctx.workspaceGroup, resolved),
           mimeType,
           caption: args.caption || undefined,
           fileName: path.basename(resolved),
+          requestId: newRequestId(),
         });
-        writeIpcFile(MESSAGES_DIR, data);
+        const delivery = await pollIpcResult(
+          MESSAGES_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_message_result',
+          120_000,
+          MESSAGE_RESULTS_DIR,
+        );
+        if (!delivery.success) {
+          throw new Error(
+            typeof delivery.error === 'string'
+              ? delivery.error
+              : 'Image delivery failed.',
+          );
+        }
         return {
           content: [
             {
@@ -417,14 +459,25 @@ Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
           };
         }
 
-        const data = {
+        const data = buildSendMessageData(ctx, {
           type: 'send_file',
-          chatJid: ctx.chatJid,
           filePath: relativePath,
           fileName: args.fileName,
-          timestamp: new Date().toISOString(),
-        };
-        writeIpcFile(TASKS_DIR, data);
+          requestId: newRequestId(),
+        });
+        const delivery = await pollIpcResult(
+          TASKS_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_file_result',
+          120_000,
+        );
+        if (!delivery.success) {
+          throw new Error(
+            typeof delivery.error === 'string'
+              ? delivery.error
+              : 'File delivery failed.',
+          );
+        }
         return {
           content: [
             {
@@ -448,11 +501,11 @@ EXECUTION TYPE:
 EXECUTION MODE:
 \u2022 "host": Task runs directly on the host machine. Admin only.
 \u2022 "container" (default for non-admin): Task runs in a Docker container.
-Each agent task automatically gets its own dedicated workspace.
+Each agent task runs in its source workspace (same files, mounts, skills, and Agent profile).
 
 CONTEXT MODE (agent mode only) - Choose based on task type:
 \u2022 "group": Task runs in the group's conversation context, with access to chat history.
-\u2022 "isolated": Task runs in a fresh session with no conversation history.
+\u2022 "isolated": Each trigger gets a fresh, independent session inside the source workspace. The session and virtual task chat are removed after that run.
 
 MESSAGING BEHAVIOR - The task output is sent to the user or group.
 \u2022 Agent mode: output is sent via MCP tool or stdout. Use <internal> tags to suppress.
@@ -501,9 +554,9 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           ),
         context_mode: z
           .enum(['group', 'isolated'])
-          .default('group')
+          .default('isolated')
           .describe(
-            '(agent mode only) group=runs with persistent workspace context (recommended), isolated=fresh session each time',
+            '(agent mode only) isolated=fresh session each time (default), group=runs with persistent workspace context',
           ),
         target_group_jid: z
           .string()
@@ -553,7 +606,12 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         // Validate schedule_value before writing IPC
         if (args.schedule_type === 'cron') {
           try {
-            CronExpressionParser.parse(args.schedule_value, { tz: process.env.TZ || 'Asia/Shanghai' });
+            const interval = CronExpressionParser.parse(args.schedule_value, {
+              tz: process.env.TZ || 'Asia/Shanghai',
+            });
+            if (interval.fields.second.values.length !== 1) {
+              throw new Error('Cron frequency must be at least 60 seconds');
+            }
           } catch {
             return {
               content: [
@@ -566,13 +624,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             };
           }
         } else if (args.schedule_type === 'interval') {
-          const ms = parseInt(args.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
+          const ms = Number(args.schedule_value);
+          if (!Number.isFinite(ms) || ms < 60_000) {
             return {
               content: [
                 {
                   type: 'text' as const,
-                  text: `Invalid interval: "${args.schedule_value}". Must be positive milliseconds (e.g., "300000" for 5 min).`,
+                  text: `Invalid interval: "${args.schedule_value}". Must be at least 60000 milliseconds (e.g., "300000" for 5 min).`,
                 },
               ],
               isError: true,
@@ -604,7 +662,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           prompt: args.prompt || '',
           schedule_type: args.schedule_type,
           schedule_value: args.schedule_value,
-          context_mode: args.context_mode || 'group',
+          context_mode: args.context_mode || 'isolated',
           execution_type: execType,
           targetJid,
           createdBy: ctx.groupFolder,
@@ -619,7 +677,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         const modeLabel = execType === 'script' ? 'script' : 'agent';
         // 改为阻塞确认：等主进程真正落库后回执，避免 fire-and-forget 的“报成功但没建成”。
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'schedule_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'schedule_task_result',
+          );
           if (!result.success) {
             return {
               content: [
@@ -663,8 +725,15 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     tool(
       'list_tasks',
       "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks.",
-      {},
-      async () => {
+      {
+        include_deleted: z
+          .boolean()
+          .default(false)
+          .describe(
+            'Include soft-deleted tasks so they can be inspected/restored',
+          ),
+      },
+      async (args) => {
         const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
@@ -674,6 +743,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
               requestId,
               groupFolder: ctx.groupFolder,
               isAdminHome: hasCrossGroupAccess,
+              includeDeleted: args.include_deleted,
               timestamp: new Date().toISOString(),
             },
             'list_tasks_result',
@@ -695,7 +765,10 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             schedule_type: string;
             schedule_value: string;
             status: string;
-            next_run: string;
+            next_run: string | null;
+            revision: number;
+            current_run?: { id: string; status: string } | null;
+            deleted_at?: string | null;
           }>;
           if (tasks.length === 0) {
             return {
@@ -707,7 +780,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           const formatted = tasks
             .map(
               (t) =>
-                `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${formatIsoLocal(t.next_run)}`,
+                `- [${t.id}] rev=${t.revision}${t.deleted_at ? ' [deleted]' : ''} ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.current_run?.status || t.status}, next: ${t.next_run ? formatIsoLocal(t.next_run) : '-'}`,
             )
             .join('\n');
           return {
@@ -732,29 +805,55 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- pause_task ---
     tool(
       'pause_task',
-      'Pause a scheduled task. It will not run until resumed.',
-      { task_id: z.string().describe('The task ID to pause') },
+      'Pause future scheduled occurrences. A currently running occurrence continues; use stop_task_run to stop it.',
+      {
+        task_id: z.string().describe('The task ID to pause'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'pause_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'pause_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'pause_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} paused.` }] };
+          return {
+            content: [
+              { type: 'text' as const, text: `Task ${args.task_id} paused.` },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for pause confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for pause confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -765,28 +864,54 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     tool(
       'resume_task',
       'Resume a paused task.',
-      { task_id: z.string().describe('The task ID to resume') },
+      {
+        task_id: z.string().describe('The task ID to resume'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'resume_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'resume_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'resume_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} resumed.` }] };
+          return {
+            content: [
+              { type: 'text' as const, text: `Task ${args.task_id} resumed.` },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for resume confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for resume confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -796,29 +921,58 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- cancel_task ---
     tool(
       'cancel_task',
-      'Cancel and delete a scheduled task.',
-      { task_id: z.string().describe('The task ID to cancel') },
+      'Soft-delete a scheduled task. Future runs stop, but run history is retained.',
+      {
+        task_id: z.string().describe('The task ID to delete'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'cancel_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'cancel_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'cancel_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} cancelled and deleted.` }] };
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task ${args.task_id} deleted. Its run history is retained.`,
+              },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for cancel confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for cancel confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -831,22 +985,57 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       `Update an existing scheduled task IN PLACE. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
       {
         task_id: z.string().describe('The task ID to update'),
-        prompt: z.string().optional().describe('New action/instructions for the task (agent mode)'),
-        schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type. If you change this you MUST also pass schedule_value.'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            'Revision returned by list_tasks. The update is rejected if the task changed since it was listed.',
+          ),
+        prompt: z
+          .string()
+          .optional()
+          .describe('New action/instructions for the task (agent mode)'),
+        schedule_type: z
+          .enum(['cron', 'interval', 'once'])
+          .optional()
+          .describe(
+            'New schedule type. If you change this you MUST also pass schedule_value.',
+          ),
         schedule_value: z
           .string()
           .optional()
-          .describe('New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).'),
-        context_mode: z.enum(['group', 'isolated']).optional().describe('New context mode (agent mode)'),
-        execution_type: z.enum(['agent', 'script']).optional().describe('New execution type (script is admin only)'),
-        script_command: z.string().max(4096).optional().describe('New shell command (script mode)'),
-        execution_mode: z.enum(['host', 'container']).optional().describe('New execution mode (host is admin only)'),
+          .describe(
+            'New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).',
+          ),
+        context_mode: z
+          .enum(['group', 'isolated'])
+          .optional()
+          .describe('New context mode (agent mode)'),
+        execution_type: z
+          .enum(['agent', 'script'])
+          .optional()
+          .describe('New execution type (script is admin only)'),
+        script_command: z
+          .string()
+          .max(4096)
+          .optional()
+          .describe('New shell command (script mode)'),
+        execution_mode: z
+          .enum(['host', 'container'])
+          .optional()
+          .describe('New execution mode (host is admin only)'),
       },
       async (args) => {
         // 改 schedule_type 必须同时给 schedule_value，否则主进程无法据新类型重算 next_run。
         if (args.schedule_type && !args.schedule_value) {
           return {
-            content: [{ type: 'text' as const, text: 'When changing schedule_type you must also provide a matching schedule_value.' }],
+            content: [
+              {
+                type: 'text' as const,
+                text: 'When changing schedule_type you must also provide a matching schedule_value.',
+              },
+            ],
             isError: true,
           };
         }
@@ -854,26 +1043,308 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           type: 'update_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
-        for (const k of ['prompt', 'schedule_type', 'schedule_value', 'context_mode', 'execution_type', 'script_command', 'execution_mode'] as const) {
+        for (const k of [
+          'prompt',
+          'schedule_type',
+          'schedule_value',
+          'context_mode',
+          'execution_type',
+          'script_command',
+          'execution_mode',
+        ] as const) {
           if (args[k] !== undefined) data[k] = args[k];
         }
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'update_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'update_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          const nextRun = result.nextRun ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}` : '';
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} updated.${nextRun}` }] };
+          const nextRun = result.nextRun
+            ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}`
+            : '';
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task ${args.task_id} updated.${nextRun}`,
+              },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for update confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for update confirmation for task ${args.task_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- run_task_now ---
+    tool(
+      'run_task_now',
+      'Run a scheduled task once now without changing its future schedule. A paused task stays paused.',
+      {
+        task_id: z.string().describe('The task ID to run'),
+        idempotency_key: z
+          .string()
+          .optional()
+          .describe(
+            'Stable retry key; reuse it when retrying an uncertain request',
+          ),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        const idempotencyKey = args.idempotency_key || requestId;
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'run_task_now',
+              requestId,
+              taskId: args.task_id,
+              idempotencyKey,
+              timestamp: new Date().toISOString(),
+            },
+            'run_task_now_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to run task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              structuredContent: {
+                success: false,
+                task_id: args.task_id,
+                error: result.error || 'Unknown error',
+                existing_run_id: result.runId ?? null,
+                idempotency_key: idempotencyKey,
+              },
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task queued. run_id=${result.runId ?? '?'}. This one-time run does not change the future schedule.`,
+              },
+            ],
+            structuredContent: {
+              success: true,
+              task_id: args.task_id,
+              run_id: result.runId ?? null,
+              status: 'queued',
+              idempotency_key: idempotencyKey,
+            },
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout while starting task ${args.task_id}. Retry with idempotency_key=${idempotencyKey} or inspect task runs first.`,
+              },
+            ],
+            structuredContent: {
+              success: false,
+              task_id: args.task_id,
+              uncertain: true,
+              idempotency_key: idempotencyKey,
+            },
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- stop_task_run ---
+    tool(
+      'stop_task_run',
+      'Stop one queued or running occurrence. This does not pause future scheduled runs.',
+      {
+        run_id: z
+          .string()
+          .describe('Run ID returned by run_task_now/list_task_runs'),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'stop_task_run',
+              requestId,
+              runId: args.run_id,
+              timestamp: new Date().toISOString(),
+            },
+            'stop_task_run_result',
+          );
+          return result.success
+            ? {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Run ${args.run_id} stopped. Future task schedules are unchanged.`,
+                  },
+                ],
+              }
+            : {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to stop run ${args.run_id}: ${result.error || 'Unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for stop confirmation for run ${args.run_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- restore_task ---
+    tool(
+      'restore_task',
+      'Restore a soft-deleted task as paused. It will not run until explicitly resumed.',
+      {
+        task_id: z.string(),
+        expected_revision: z.number().int().positive(),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'restore_task',
+              requestId,
+              taskId: args.task_id,
+              expectedRevision: args.expected_revision,
+              timestamp: new Date().toISOString(),
+            },
+            'restore_task_result',
+          );
+          return result.success
+            ? {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Task ${args.task_id} restored as paused (revision ${result.revision ?? '?'}).`,
+                  },
+                ],
+              }
+            : {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to restore task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for restore confirmation for task ${args.task_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- list_task_runs ---
+    tool(
+      'list_task_runs',
+      'List recent occurrences for a scheduled task, including attempts and notification state.',
+      {
+        task_id: z.string(),
+        limit: z.number().int().min(1).max(50).default(20),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'list_task_runs',
+              requestId,
+              taskId: args.task_id,
+              limit: args.limit,
+              timestamp: new Date().toISOString(),
+            },
+            'list_task_runs_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to list runs: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const runs = (result.runs || []) as Array<Record<string, unknown>>;
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  runs.length === 0
+                    ? 'No task runs found.'
+                    : runs
+                        .map(
+                          (run) =>
+                            `- [${String(run.id)}] ${String(run.status)} trigger=${String(run.trigger_type)} attempt=${String(run.attempt)} scheduled=${formatIsoLocal(String(run.scheduled_for))} notification=${String(run.notification_status)}`,
+                        )
+                        .join('\n'),
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              { type: 'text' as const, text: 'Timeout listing task runs.' },
+            ],
             isError: true,
           };
         }
@@ -1012,7 +1483,10 @@ Returns up to 100 messages per call (default 50), ordered oldest-first. Use "bef
           if (messages.length === 0) {
             return {
               content: [
-                { type: 'text' as const, text: 'No messages found in this channel.' },
+                {
+                  type: 'text' as const,
+                  text: 'No messages found in this channel.',
+                },
               ],
             };
           }
@@ -1344,8 +1818,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers, skipped in native Claude mode)
-  if (ctx.isHome && !ctx.disableMemoryLayer) {
+  // --- memory_append --- (only available for home containers)
+  if (ctx.isHome) {
     tools.push(
       tool(
         'memory_append',
@@ -1465,215 +1939,215 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_search + memory_get --- (skipped in native Claude mode)
-  if (!ctx.disableMemoryLayer) {
+  // --- memory_search + memory_get ---
+  {
     tools.push(
-    tool(
-      'memory_search',
-      `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
+      tool(
+        'memory_search',
+        `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
 \u8fd4\u56de\u6587\u4ef6\u8def\u5f84\u3001\u884c\u53f7\u548c\u4e0a\u4e0b\u6587\u7247\u6bb5\u3002\u8d85\u8fc7 512KB \u7684\u6587\u4ef6\u4f1a\u88ab\u8df3\u8fc7\u3002
 \u7528\u4e8e\u56de\u5fc6\u8fc7\u53bb\u7684\u51b3\u7b56\u3001\u504f\u597d\u3001\u9879\u76ee\u4e0a\u4e0b\u6587\u6216\u5bf9\u8bdd\u5386\u53f2\u3002`,
-      {
-        query: z
-          .string()
-          .describe(
-            '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
-          ),
-        max_results: z
-          .number()
-          .optional()
-          .default(20)
-          .describe(
-            '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
-          ),
-      },
-      async (args) => {
-        if (!args.query.trim()) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
-              },
-            ],
-            isError: true,
-          };
-        }
-        const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
-        const queryLower = args.query.toLowerCase();
-        const files: string[] = [];
-        collectMemoryFiles(ctx.workspaceMemory, files, 4);
-        collectMemoryFiles(ctx.workspaceGroup, files, 4);
-        collectMemoryFiles(ctx.workspaceGlobal, files, 4);
-        const uniqueFiles = Array.from(new Set(files));
-        if (uniqueFiles.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
-              },
-            ],
-          };
-        }
-        const results: string[] = [];
-        let skippedLarge = 0;
-        for (const filePath of uniqueFiles) {
-          if (results.length >= maxResults) break;
-          try {
-            const stat = fs.statSync(filePath);
-            if (stat.size > MAX_MEMORY_FILE_SIZE) {
-              skippedLarge++;
-              continue;
-            }
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const lines = content.split('\n');
-            let lastEnd = -1;
-            for (let i = 0; i < lines.length; i++) {
-              if (results.length >= maxResults) break;
-              if (lines[i].toLowerCase().includes(queryLower)) {
-                const start = Math.max(0, i - 1);
-                if (start <= lastEnd) continue;
-                const end = Math.min(lines.length, i + 2);
-                lastEnd = end;
-                const snippet = lines.slice(start, end).join('\n');
-                results.push(
-                  `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
-                );
-              }
-            }
-          } catch {
-            /* skip unreadable */
+        {
+          query: z
+            .string()
+            .describe(
+              '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
+            ),
+          max_results: z
+            .number()
+            .optional()
+            .default(20)
+            .describe(
+              '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
+            ),
+        },
+        async (args) => {
+          if (!args.query.trim()) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
+                },
+              ],
+              isError: true,
+            };
           }
-        }
-        const skippedNote =
-          skippedLarge > 0
-            ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
-            : '';
-        if (results.length === 0) {
+          const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
+          const queryLower = args.query.toLowerCase();
+          const files: string[] = [];
+          collectMemoryFiles(ctx.workspaceMemory, files, 4);
+          collectMemoryFiles(ctx.workspaceGroup, files, 4);
+          collectMemoryFiles(ctx.workspaceGlobal, files, 4);
+          const uniqueFiles = Array.from(new Set(files));
+          if (uniqueFiles.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
+                },
+              ],
+            };
+          }
+          const results: string[] = [];
+          let skippedLarge = 0;
+          for (const filePath of uniqueFiles) {
+            if (results.length >= maxResults) break;
+            try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > MAX_MEMORY_FILE_SIZE) {
+                skippedLarge++;
+                continue;
+              }
+              const content = fs.readFileSync(filePath, 'utf-8');
+              const lines = content.split('\n');
+              let lastEnd = -1;
+              for (let i = 0; i < lines.length; i++) {
+                if (results.length >= maxResults) break;
+                if (lines[i].toLowerCase().includes(queryLower)) {
+                  const start = Math.max(0, i - 1);
+                  if (start <= lastEnd) continue;
+                  const end = Math.min(lines.length, i + 2);
+                  lastEnd = end;
+                  const snippet = lines.slice(start, end).join('\n');
+                  results.push(
+                    `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
+                  );
+                }
+              }
+            } catch {
+              /* skip unreadable */
+            }
+          }
+          const skippedNote =
+            skippedLarge > 0
+              ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
+              : '';
+          if (results.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
+                },
+              ],
+            };
+          }
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
+                text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
               },
             ],
           };
-        }
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
-            },
-          ],
-        };
-      },
-    ),
+        },
+      ),
 
-    // --- memory_get ---
-    tool(
-      'memory_get',
-      `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
-      {
-        file: z
-          .string()
-          .describe(
-            '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
-          ),
-        from_line: z
-          .number()
-          .optional()
-          .describe(
-            '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
-          ),
-        lines: z
-          .number()
-          .optional()
-          .describe(
-            '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
-          ),
-      },
-      async (args) => {
-        const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
-        let resolvedPath: string;
-        if (pathRef.startsWith('[global] ')) {
-          resolvedPath = path.join(
-            ctx.workspaceGlobal,
-            pathRef.slice('[global] '.length),
-          );
-        } else if (pathRef.startsWith('[memory] ')) {
-          resolvedPath = path.join(
-            ctx.workspaceMemory,
-            pathRef.slice('[memory] '.length),
-          );
-        } else {
-          resolvedPath = path.join(ctx.workspaceGroup, pathRef);
-        }
-        resolvedPath = path.normalize(resolvedPath);
-        const inGroup =
-          resolvedPath === ctx.workspaceGroup ||
-          resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
-        const inGlobal =
-          resolvedPath === ctx.workspaceGlobal ||
-          resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
-        const inMemory =
-          resolvedPath === ctx.workspaceMemory ||
-          resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
-        if (!inGroup && !inGlobal && !inMemory) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (!fs.existsSync(resolvedPath)) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        try {
-          const content = fs.readFileSync(resolvedPath, 'utf-8');
-          const allLines = content.split('\n');
-          const fromLine = Math.max(
-            (args.from_line ?? lineFromRef ?? 1) - 1,
-            0,
-          );
-          const maxLines = Math.min(args.lines ?? allLines.length, 200);
-          const slice = allLines.slice(fromLine, fromLine + maxLines);
-          const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `${header}\n\n${slice.join('\n')}`,
-              },
-            ],
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      },
-    ),
-  );
+      // --- memory_get ---
+      tool(
+        'memory_get',
+        `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
+        {
+          file: z
+            .string()
+            .describe(
+              '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
+            ),
+          from_line: z
+            .number()
+            .optional()
+            .describe(
+              '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
+            ),
+          lines: z
+            .number()
+            .optional()
+            .describe(
+              '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
+            ),
+        },
+        async (args) => {
+          const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
+          let resolvedPath: string;
+          if (pathRef.startsWith('[global] ')) {
+            resolvedPath = path.join(
+              ctx.workspaceGlobal,
+              pathRef.slice('[global] '.length),
+            );
+          } else if (pathRef.startsWith('[memory] ')) {
+            resolvedPath = path.join(
+              ctx.workspaceMemory,
+              pathRef.slice('[memory] '.length),
+            );
+          } else {
+            resolvedPath = path.join(ctx.workspaceGroup, pathRef);
+          }
+          resolvedPath = path.normalize(resolvedPath);
+          const inGroup =
+            resolvedPath === ctx.workspaceGroup ||
+            resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
+          const inGlobal =
+            resolvedPath === ctx.workspaceGlobal ||
+            resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
+          const inMemory =
+            resolvedPath === ctx.workspaceMemory ||
+            resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
+          if (!inGroup && !inGlobal && !inMemory) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
+                },
+              ],
+              isError: true,
+            };
+          }
+          if (!fs.existsSync(resolvedPath)) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          try {
+            const content = fs.readFileSync(resolvedPath, 'utf-8');
+            const allLines = content.split('\n');
+            const fromLine = Math.max(
+              (args.from_line ?? lineFromRef ?? 1) - 1,
+              0,
+            );
+            const maxLines = Math.min(args.lines ?? allLines.length, 200);
+            const slice = allLines.slice(fromLine, fromLine + maxLines);
+            const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `${header}\n\n${slice.join('\n')}`,
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
   }
 
   return tools;

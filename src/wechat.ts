@@ -13,21 +13,20 @@
  */
 import crypto from 'crypto';
 import fs from 'fs';
-import {
-  storeChatMetadata,
-  storeMessageDirect,
-  updateChatName,
-} from './db.js';
+import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
+import { downloadAndDecryptMedia, uploadMediaBuffer } from './wechat-crypto.js';
 import {
-  downloadAndDecryptMedia,
-  uploadMediaBuffer,
-} from './wechat-crypto.js';
-import { markdownToPlainText, splitTextChunks, createDedupCache } from './im-utils.js';
+  markdownToPlainText,
+  splitTextChunks,
+  createDedupCache,
+} from './im-utils.js';
+import { weChatIlinkHeaders } from './wechat-onboarding.js';
+import { resolveAdmittedChannelRoute } from './channel-admission.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -44,7 +43,7 @@ const RECONNECT_MAX_DELAY_MS = 60000;
 
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024; // 5 MB for inline base64
 
-const CHANNEL_VERSION = '0.1.0';
+const CHANNEL_VERSION = '1.0.0';
 
 // iLink message types
 // const MESSAGE_TYPE_USER = 1;
@@ -75,6 +74,11 @@ export interface WeChatConnectionConfig {
   getUpdatesBuf?: string;
 }
 
+export interface WeChatConnectionState {
+  status: 'connected' | 'expired' | 'disconnected';
+  error?: string;
+}
+
 export interface WeChatConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
@@ -89,6 +93,18 @@ export interface WeChatConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  normalizeIncomingJid?: (jid: string) => string;
+  /** No inbound message may register or download media before this passes. */
+  isChatAuthorized?: (jid: string) => boolean;
+  onPairAttempt?: (
+    jid: string,
+    chatName: string,
+    code: string,
+  ) => Promise<boolean>;
+  /** Publish authorization/transport loss (notably iLink errcode -14). */
+  onConnectionStateChange?: (state: WeChatConnectionState) => void;
+  /** Persist a fully processed getUpdates cursor before the next poll. */
+  onUpdatesBuf?: (cursor: string) => void | Promise<void>;
 }
 
 export interface WeChatConnection {
@@ -106,11 +122,7 @@ export interface WeChatConnection {
     caption?: string,
     fileName?: string,
   ): Promise<void>;
-  sendFile(
-    chatId: string,
-    filePath: string,
-    fileName: string,
-  ): Promise<void>;
+  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendTyping(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   getUpdatesBuf(): string;
@@ -145,11 +157,97 @@ interface CDNMedia {
   aes_key?: string;
 }
 
+type WeChatApiEnvelope = {
+  ret?: unknown;
+  errcode?: unknown;
+  error_code?: unknown;
+  errno?: unknown;
+  code?: unknown;
+  errmsg?: unknown;
+  error_msg?: unknown;
+  message?: unknown;
+  base_resp?: { ret?: unknown; errcode?: unknown; errmsg?: unknown };
+};
+
+function nonZeroApiCode(value: unknown): boolean {
+  if (value === undefined || value === null || value === '') return false;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric !== 0 : true;
+}
+
+/** Reject transport-success responses that encode a WeChat API failure. */
+export function assertWeChatApiSuccess(
+  response: WeChatApiEnvelope,
+  operation: string,
+): void {
+  const codes: Array<[string, unknown]> = [
+    ['ret', response.ret],
+    ['errcode', response.errcode],
+    ['error_code', response.error_code],
+    ['errno', response.errno],
+    ['code', response.code],
+    ['base_resp.ret', response.base_resp?.ret],
+    ['base_resp.errcode', response.base_resp?.errcode],
+  ];
+  const failure = codes.find(([, value]) => nonZeroApiCode(value));
+  if (!failure) return;
+  const message =
+    response.errmsg ??
+    response.error_msg ??
+    response.message ??
+    response.base_resp?.errmsg ??
+    '';
+  throw new Error(
+    `${operation} failed: ${failure[0]}=${String(failure[1])}${message ? ` message=${String(message)}` : ''}`,
+  );
+}
+
+export async function parseWeChatApiResponse<T>(
+  response: Response,
+  endpoint: string,
+): Promise<T> {
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `WeChat API ${endpoint} HTTP ${response.status}: ${text.slice(0, 200)}`,
+    );
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(
+      `WeChat API ${endpoint} invalid JSON: ${text.slice(0, 200)}`,
+    );
+  }
+}
+
 interface GetUpdatesResponse {
   ret?: number;
   msgs?: WeixinMessage[];
   get_updates_buf?: string;
   longpolling_timeout_ms?: number;
+}
+
+/**
+ * Process one long-poll batch before acknowledging its cursor. If processing
+ * or persistence fails, the caller keeps the previous cursor so the batch is
+ * replayed after retry/restart instead of being acknowledged early.
+ */
+export async function processWeChatUpdateBatch<T>(input: {
+  messages?: T[];
+  nextCursor?: string;
+  currentCursor: string;
+  processMessage: (message: T) => Promise<void>;
+  persistCursor?: (cursor: string) => void | Promise<void>;
+}): Promise<string> {
+  for (const message of input.messages ?? []) {
+    await input.processMessage(message);
+  }
+  if (!input.nextCursor || input.nextCursor === input.currentCursor) {
+    return input.currentCursor;
+  }
+  await input.persistCursor?.(input.nextCursor);
+  return input.nextCursor;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -162,7 +260,6 @@ function randomWechatUin(): string {
   const uint32 = crypto.randomBytes(4).readUInt32BE(0);
   return Buffer.from(String(uint32), 'utf-8').toString('base64');
 }
-
 
 /**
  * Extract text content from message item_list.
@@ -226,6 +323,7 @@ export function createWeChatConnection(
   let stopping = false;
   let connected = false;
   let cancelSleep: (() => void) | null = null;
+  let activeOpts: WeChatConnectOpts | null = null;
 
   // context_token cache: from_user_id -> latest context_token
   const contextTokenCache = new Map<string, string>();
@@ -233,13 +331,15 @@ export function createWeChatConnection(
   // Known JIDs — skip redundant storeChatMetadata/onNewChat for repeat messages
   const knownJids = new Set<string>();
 
+  // Avoid turning an unauthorized sender into a reply-amplification source.
+  const rejectTimestamps = new Map<string, number>();
+  const REJECT_COOLDOWN_MS = 5 * 60 * 1000;
+
   // Message deduplication: key -> timestamp
   // LRU deduplication cache（共享 helper）
   const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
 
   // ─── Deduplication ────────────────────────────────────────
-
-
 
   // ─── HTTP Helpers ─────────────────────────────────────────
 
@@ -249,11 +349,15 @@ export function createWeChatConnection(
       AuthorizationType: 'ilink_bot_token',
       Authorization: `Bearer ${config.botToken}`,
       'X-WECHAT-UIN': wechatUin,
+      ...weChatIlinkHeaders(),
     };
   }
 
   function baseInfo(): Record<string, string> {
-    return { channel_version: CHANNEL_VERSION };
+    return {
+      channel_version: CHANNEL_VERSION,
+      bot_agent: `HappyClaw/${CHANNEL_VERSION}`,
+    };
   }
 
   /**
@@ -284,14 +388,7 @@ export function createWeChatConnection(
         signal: controller.signal,
       });
 
-      const text = await res.text();
-      try {
-        return JSON.parse(text) as T;
-      } catch {
-        throw new Error(
-          `WeChat API ${endpoint} invalid JSON: ${text.slice(0, 200)}`,
-        );
-      }
+      return await parseWeChatApiResponse<T>(res, endpoint);
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
         throw new Error(`WeChat API ${endpoint} timed out`);
@@ -321,35 +418,30 @@ export function createWeChatConnection(
     contextToken: string,
     text: string,
   ): Promise<void> {
-    const clientId = String(
-      crypto.randomBytes(4).readUInt32BE(0),
-    );
+    const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
 
-    const resp = await apiPost<{ ret?: number; errcode?: number; errmsg?: string }>(
-      'ilink/bot/sendmessage',
-      {
-        msg: {
-          to_user_id: toUserId,
-          context_token: contextToken,
-          item_list: [
-            {
-              type: MESSAGE_ITEM_TYPE_TEXT,
-              text_item: { text },
-            },
-          ],
-          message_type: MESSAGE_TYPE_BOT,
-          message_state: MESSAGE_STATE_FINISH,
-          client_id: clientId,
-        },
-        base_info: baseInfo(),
+    const resp = await apiPost<{
+      ret?: number;
+      errcode?: number;
+      errmsg?: string;
+    }>('ilink/bot/sendmessage', {
+      msg: {
+        to_user_id: toUserId,
+        context_token: contextToken,
+        item_list: [
+          {
+            type: MESSAGE_ITEM_TYPE_TEXT,
+            text_item: { text },
+          },
+        ],
+        message_type: MESSAGE_TYPE_BOT,
+        message_state: MESSAGE_STATE_FINISH,
+        client_id: clientId,
       },
-    );
+      base_info: baseInfo(),
+    });
 
-    if (resp.ret !== undefined && resp.ret !== 0) {
-      throw new Error(
-        `sendMessage failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`,
-      );
-    }
+    assertWeChatApiSuccess(resp, 'sendMessage');
   }
 
   async function getTypingTicket(
@@ -531,22 +623,86 @@ export function createWeChatConnection(
 
       // Skip stale messages — if no timestamp available, skip as well (can't verify freshness)
       if (opts.ignoreMessagesBefore) {
-        if (!msg.create_time_ms || msg.create_time_ms < opts.ignoreMessagesBefore) return;
+        if (
+          !msg.create_time_ms ||
+          msg.create_time_ms < opts.ignoreMessagesBefore
+        )
+          return;
       }
 
-      // Cache context_token for replies
-      if (msg.context_token) {
-        contextTokenCache.set(fromUserId, msg.context_token);
-      }
-
-      const jid = `wechat:${fromUserId}`;
+      const jid =
+        opts.normalizeIncomingJid?.(`wechat:${fromUserId}`) ??
+        `wechat:${fromUserId}`;
       const senderName = fromUserId.split('@')[0] || 'WeChat用户';
       const chatName = senderName;
 
       // Extract text content
       let content = msg.item_list ? extractTextContent(msg.item_list) : '';
 
-      // ── Auto-register chat (WeChat is 1:1 bound, no pairing needed) ──
+      // Pairing and admission must run before registration, workspace lookup,
+      // file downloads, or message persistence. QR authorization authenticates
+      // the bot account; it does not authorize every person who can message it.
+      const pairMatch = content.match(/^\/pair\s+(\S+)/i);
+      if (pairMatch && opts.onPairAttempt) {
+        try {
+          const success = await opts.onPairAttempt(jid, chatName, pairMatch[1]);
+          if (msg.context_token) {
+            await sendMessageApi(
+              fromUserId,
+              msg.context_token,
+              success
+                ? '配对成功，此微信会话已连接。'
+                : '配对码无效或已过期，请在网页设置中重新生成。',
+            );
+          }
+        } catch (err) {
+          logger.error({ err, jid }, 'WeChat pair attempt failed');
+          if (msg.context_token) {
+            await sendMessageApi(
+              fromUserId,
+              msg.context_token,
+              '配对失败，请稍后重试。',
+            );
+          }
+        }
+        return;
+      }
+
+      if (!(opts.isChatAuthorized?.(jid) ?? false)) {
+        const now = Date.now();
+        const lastReject = rejectTimestamps.get(jid) ?? 0;
+        if (msg.context_token && now - lastReject >= REJECT_COOLDOWN_MS) {
+          rejectTimestamps.set(jid, now);
+          await sendMessageApi(
+            fromUserId,
+            msg.context_token,
+            '此微信会话尚未配对。请在网页设置中生成配对码，然后发送 /pair <配对码>。',
+          );
+        }
+        logger.debug({ jid }, 'Unauthorized WeChat chat, message ignored');
+        return;
+      }
+
+      const resolvedRoute = resolveAdmittedChannelRoute(
+        jid,
+        opts.resolveEffectiveChatJid,
+      );
+      if (!resolvedRoute) {
+        logger.warn(
+          { jid },
+          'WeChat message dropped: binding resolver rejected route',
+        );
+        return;
+      }
+      const { targetJid, routing: agentRouting } = resolvedRoute;
+
+      // Cache a reply token only after authorization, preventing arbitrary
+      // senders from growing the long-lived per-connection cache.
+      if (msg.context_token) {
+        contextTokenCache.set(fromUserId, msg.context_token);
+      }
+
+      // ── Register the authorized base chat ──
       const nowIso = new Date().toISOString();
       if (!knownJids.has(jid)) {
         knownJids.add(jid);
@@ -566,11 +722,7 @@ export function createWeChatConnection(
           if (reply) {
             const ct = contextTokenCache.get(fromUserId);
             if (ct) {
-              await sendMessageApi(
-                fromUserId,
-                ct,
-                markdownToPlainText(reply),
-              );
+              await sendMessageApi(fromUserId, ct, markdownToPlainText(reply));
             }
             return;
           }
@@ -642,10 +794,7 @@ export function createWeChatConnection(
 
       if (!content) return; // No usable content
 
-      // Route and store message
-      const agentRouting = opts.resolveEffectiveChatJid?.(jid);
-      const targetJid = agentRouting?.effectiveJid ?? jid;
-
+      // Route was resolved before registration and media download.
       const id = crypto.randomUUID();
       const timestamp = msg.create_time_ms
         ? new Date(msg.create_time_ms).toISOString()
@@ -653,10 +802,19 @@ export function createWeChatConnection(
       const senderId = `wechat:${fromUserId}`;
 
       if (targetJid !== jid) storeChatMetadata(targetJid, timestamp);
-      storeMessageDirect(id, targetJid, senderId, senderName, content, timestamp, false, {
-        attachments: attachmentsJson,
-        sourceJid: jid,
-      });
+      storeMessageDirect(
+        id,
+        targetJid,
+        senderId,
+        senderName,
+        content,
+        timestamp,
+        false,
+        {
+          attachments: attachmentsJson,
+          sourceJid: jid,
+        },
+      );
 
       broadcastNewMessage(
         targetJid,
@@ -688,7 +846,10 @@ export function createWeChatConnection(
         );
       }
     } catch (err) {
-      logger.error({ err, msgId: msg.message_id }, 'Error handling WeChat message');
+      logger.error(
+        { err, msgId: msg.message_id },
+        'Error handling WeChat message',
+      );
     }
   }
 
@@ -708,8 +869,12 @@ export function createWeChatConnection(
 
         // Check for session expiry
         if (response.ret === ERRCODE_SESSION_EXPIRED) {
-          logger.warn('WeChat session expired (errcode -14), stopping poll loop');
+          const error = 'WeChat authorization expired (errcode -14)';
+          logger.warn(
+            'WeChat session expired (errcode -14), stopping poll loop',
+          );
           connected = false;
+          opts.onConnectionStateChange?.({ status: 'expired', error });
           break;
         }
 
@@ -727,22 +892,21 @@ export function createWeChatConnection(
         // Reset backoff on success
         reconnectDelay = RECONNECT_MIN_DELAY_MS;
 
-        // Update cursor
-        if (response.get_updates_buf) {
-          currentGetUpdatesBuf = response.get_updates_buf;
-        }
-
-        // Process messages
-        if (response.msgs && response.msgs.length > 0) {
-          for (const msg of response.msgs) {
-            await processMessage(msg, opts);
-          }
-        }
+        // Cursor acknowledgement is deliberately last. A crash or processing
+        // failure replays the whole batch from the previous durable cursor.
+        currentGetUpdatesBuf = await processWeChatUpdateBatch({
+          messages: response.msgs,
+          nextCursor: response.get_updates_buf,
+          currentCursor: currentGetUpdatesBuf,
+          processMessage: (msg) => processMessage(msg, opts),
+          persistCursor: opts.onUpdatesBuf,
+        });
       } catch (err) {
         if (stopping) break;
 
         // Long-poll timeout is expected when no new messages arrive — just retry immediately.
-        const isTimeout = err instanceof Error && err.message.includes('timed out');
+        const isTimeout =
+          err instanceof Error && err.message.includes('timed out');
         if (isTimeout) {
           logger.debug({ err }, 'WeChat poll timeout (normal, retrying)');
           continue;
@@ -776,6 +940,7 @@ export function createWeChatConnection(
 
       stopping = false;
       connected = true;
+      activeOpts = opts;
       dedup.clear();
       contextTokenCache.clear();
       knownJids.clear();
@@ -787,6 +952,7 @@ export function createWeChatConnection(
 
       // Fire onReady immediately since there's no handshake
       opts.onReady?.();
+      opts.onConnectionStateChange?.({ status: 'connected' });
 
       // Start poll loop in background (non-blocking)
       pollLoop(opts).catch((err) => {
@@ -798,6 +964,8 @@ export function createWeChatConnection(
     async disconnect(): Promise<void> {
       stopping = true;
       connected = false;
+      activeOpts?.onConnectionStateChange?.({ status: 'disconnected' });
+      activeOpts = null;
 
       // Abort any pending sleep
       cancelSleep?.();
@@ -806,6 +974,7 @@ export function createWeChatConnection(
       dedup.clear();
       contextTokenCache.clear();
       knownJids.clear();
+      rejectTimestamps.clear();
       logger.info('WeChat iLink bot disconnected');
     },
 
@@ -823,7 +992,7 @@ export function createWeChatConnection(
           { chatId },
           'No context_token available for WeChat user, cannot send message',
         );
-        return;
+        throw new Error(`No context_token available for WeChat chat ${chatId}`);
       }
 
       try {
@@ -856,7 +1025,7 @@ export function createWeChatConnection(
           { chatId },
           'No context_token for WeChat user, cannot send image',
         );
-        return;
+        throw new Error(`No context_token available for WeChat chat ${chatId}`);
       }
 
       if (imageBuffer.length > MAX_FILE_SIZE) {
@@ -924,11 +1093,7 @@ export function createWeChatConnection(
           base_info: baseInfo(),
         });
 
-        if (resp.ret !== undefined && resp.ret !== 0) {
-          throw new Error(
-            `sendImage failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`,
-          );
-        }
+        assertWeChatApiSuccess(resp, 'sendImage');
 
         logger.info(
           { chatId, size: imageBuffer.length, fileName: resolvedFileName },
@@ -953,7 +1118,7 @@ export function createWeChatConnection(
           { chatId },
           'No context_token for WeChat user, cannot send file',
         );
-        return;
+        throw new Error(`No context_token available for WeChat chat ${chatId}`);
       }
 
       // Single readFile + size check, then pass buffer to uploadMediaBuffer —
@@ -1009,16 +1174,9 @@ export function createWeChatConnection(
           base_info: baseInfo(),
         });
 
-        if (resp.ret !== undefined && resp.ret !== 0) {
-          throw new Error(
-            `sendFile failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`,
-          );
-        }
+        assertWeChatApiSuccess(resp, 'sendFile');
 
-        logger.info(
-          { chatId, size: buf.length, fileName },
-          'WeChat file sent',
-        );
+        logger.info({ chatId, size: buf.length, fileName }, 'WeChat file sent');
       } catch (err) {
         logger.error({ err, chatId, fileName }, 'Failed to send WeChat file');
         throw err;

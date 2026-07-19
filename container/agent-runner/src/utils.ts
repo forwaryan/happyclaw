@@ -19,7 +19,11 @@ export function shorten(input: string, maxLen = 180): string {
 export function redactSensitive(input: unknown, depth = 0): unknown {
   if (depth > 3) return '[truncated]';
   if (input == null) return input;
-  if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+  if (
+    typeof input === 'string' ||
+    typeof input === 'number' ||
+    typeof input === 'boolean'
+  ) {
     return input;
   }
   if (Array.isArray(input)) {
@@ -29,7 +33,9 @@ export function redactSensitive(input: unknown, depth = 0): unknown {
     const obj = input as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (/(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)) {
+      if (
+        /(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)
+      ) {
         out[k] = '[REDACTED]';
       } else {
         out[k] = redactSensitive(v, depth + 1);
@@ -66,8 +72,10 @@ export function redactInlineSecrets(value: string): string {
       // to cover postgres / mongodb / redis / mysql / ftp / ssh / git etc.
       // The DSN form `<scheme>://user:pass@host/...` is universal; restrict
       // the scheme to a reasonable identifier shape to avoid colon-rich text.
-      .replace(/(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
-        '$1[REDACTED]$2')
+      .replace(
+        /(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
+        '$1[REDACTED]$2',
+      )
       // key=value / key:value with explicit secret-shaped key. Anchor 不再
       // 用 lazy `[A-Za-z0-9_]*?` 兜底（O(n^2) ReDoS 源头），改成显式枚举
       // 常见前缀 + 限定长度。截止字符增加 ; , 拦多 cookie 行。
@@ -95,7 +103,10 @@ export function redactInlineSecrets(value: string): string {
       .replace(/\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}/g, '[REDACTED]')
       .replace(/\bnpm_[A-Za-z0-9]{30,}/g, '[REDACTED]')
       // private key / pem 头标识，整段一路擦到 END 标记
-      .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]')
+      .replace(
+        /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+        '[REDACTED PRIVATE KEY]',
+      )
   );
 }
 
@@ -112,7 +123,15 @@ export function summarizeToolInput(input: unknown): string | undefined {
 
   if (typeof input === 'object') {
     const obj = input as Record<string, unknown>;
-    const keyCandidates = ['command', 'query', 'path', 'pattern', 'prompt', 'url', 'name'];
+    const keyCandidates = [
+      'command',
+      'query',
+      'path',
+      'pattern',
+      'prompt',
+      'url',
+      'name',
+    ];
     for (const key of keyCandidates) {
       const value = obj[key];
       if (typeof value === 'string' && value.trim()) {
@@ -140,7 +159,10 @@ export function summarizeToolInput(input: unknown): string | undefined {
  * and clamp the length so the trace stays readable without dumping a 10K-line
  * bash output into the card. Returns undefined for empty / non-textual results.
  */
-export function summarizeToolResult(content: unknown, maxLen = 400): string | undefined {
+export function summarizeToolResult(
+  content: unknown,
+  maxLen = 400,
+): string | undefined {
   let text: string | undefined;
   if (typeof content === 'string') {
     text = content;
@@ -167,7 +189,10 @@ export function summarizeToolResult(content: unknown, maxLen = 400): string | un
  * Extract a skill name from Skill tool input.
  * Tries skillName, skill, name, command fields, then regex-matches leading slashes.
  */
-export function extractSkillName(toolName: unknown, input: unknown): string | undefined {
+export function extractSkillName(
+  toolName: unknown,
+  input: unknown,
+): string | undefined {
   if (toolName !== 'Skill') return undefined;
   if (!input || typeof input !== 'object') return undefined;
   const obj = input as Record<string, unknown>;
@@ -225,6 +250,57 @@ export function isSuspectTruncatedStreamResult(
   return (usage.input_tokens ?? 0) === 0 && (usage.output_tokens ?? 0) === 0;
 }
 
+const STALE_BACKGROUND_WAIT_PATTERNS = [
+  /等待其余\s*\d+\s*个\s*(?:Agent|agent|任务|后台任务)/u,
+  /\d+\s*\/\s*\d+\s*完成[\s\S]{0,80}等待/u,
+  /后台\s*(?:Agent|agent|任务)[\s\S]{0,80}(?:完成后|结束后)[\s\S]{0,80}(?:继续汇总|自动唤醒|继续)/u,
+  /(?:任务|Agent|agent)[\s\S]{0,80}(?:运行中|还在跑|尚未完成)[\s\S]{0,80}(?:继续汇总|等待)/u,
+  /(?:I'll|I will)\s+wait\s+for\s+the\s+(?:other|remaining)\s+\d+\s+(?:agents|tasks)/iu,
+  /(?:waiting|wait)\s+for\s+(?:the\s+)?(?:other|remaining)\s+\d+\s+(?:agents|tasks)/iu,
+];
+
+/**
+ * Background task completion can race with model text generation. The SDK may
+ * deliver all task notifications, but the model can still finish with a stale
+ * progress update ("1/6 done, waiting for the rest"). Only use this predicate
+ * after this query has already emitted a result with pending background tasks.
+ */
+export function isStaleBackgroundWaitReply(
+  text: string | null | undefined,
+): boolean {
+  const trimmed = text?.trim();
+  if (!trimmed) return false;
+  return STALE_BACKGROUND_WAIT_PATTERNS.some((pattern) =>
+    pattern.test(trimmed),
+  );
+}
+
+export function shouldForceBackgroundTaskSummary(params: {
+  emitOutput: boolean;
+  sawPendingBackgroundTasks: boolean;
+  pendingBgTasks: number;
+  finalText: string | null | undefined;
+  attempts: number;
+  maxAttempts: number;
+}): boolean {
+  if (!params.emitOutput) return false;
+  if (!params.sawPendingBackgroundTasks) return false;
+  if (params.pendingBgTasks !== 0) return false;
+  if (params.attempts >= params.maxAttempts) return false;
+  return isStaleBackgroundWaitReply(params.finalText);
+}
+
+export function buildBackgroundTaskSummaryPrompt(): string {
+  return [
+    '<system-reminder>',
+    'All background Task agents for the previous user request have now completed.',
+    'Your previous draft still said you were waiting for remaining agents, so it was stale.',
+    'Do not send another progress update. Use the task-notification results already present in this conversation and produce the final user-facing synthesis now.',
+    'If you wrote scratch files for any cluster, read them only if needed. Otherwise summarize directly from the completed task notifications.',
+    '</system-reminder>',
+  ].join('\n');
+}
+
 /** AssistantTextTracker 处理的 content block 最小形状（SDK assistant 消息的 content 数组元素）。 */
 export interface AssistantContentBlock {
   type: string;
@@ -254,7 +330,11 @@ export class AssistantTextTracker {
   addContentBlocks(blocks: AssistantContentBlock[]): boolean {
     let sawText = false;
     for (const block of blocks) {
-      if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+      if (
+        block.type === 'text' &&
+        typeof block.text === 'string' &&
+        block.text
+      ) {
         this.currentSegment += block.text;
         sawText = true;
       } else if (block.type === 'tool_use') {

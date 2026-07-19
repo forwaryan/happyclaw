@@ -12,8 +12,13 @@ export interface ClaudeContextPlanArgs {
   projectRoot: string;
   dataDir: string;
   groupSessionsDir?: string;
+  /**
+   * Explicit Agent policy opt-in for the administrator's native ~/.claude
+   * context. Managed HappyClaw skills are resolved independently below.
+   */
+  includeHostClaudeContext?: boolean;
   mountUserSkills?: boolean;
-  // host 模式下 HappyClaw 记忆层是否启用（即 !disableMemoryLayerForAdminHost）。
+  userSkillsDirOverride?: string;
   // true 且 admin 原生 ~/.claude/CLAUDE.md 存在时，两套全局记忆并存，触发 audit 告警。
   happyclawMemoryActive?: boolean;
 }
@@ -36,8 +41,6 @@ export interface HostClaudeContextSyncResult {
   warnings: string[];
 }
 
-const ADMIN_HOME_FOLDER = 'main';
-
 function exists(p: string | undefined): p is string {
   return !!p && fs.existsSync(p);
 }
@@ -55,9 +58,9 @@ function lexists(p: string): boolean {
 function countChildDirs(dir: string | undefined): number {
   if (!exists(dir)) return 0;
   try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-      .length;
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink()).length;
   } catch {
     return 0;
   }
@@ -66,9 +69,12 @@ function countChildDirs(dir: string | undefined): number {
 function countRuleFiles(dir: string | undefined): number {
   if (!exists(dir)) return 0;
   try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() || entry.isDirectory() || entry.isSymbolicLink())
-      .length;
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter(
+        (entry) =>
+          entry.isFile() || entry.isDirectory() || entry.isSymbolicLink(),
+      ).length;
   } catch {
     return 0;
   }
@@ -113,14 +119,25 @@ function linkEntries(
   }
 }
 
-export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeContextPlan {
+export function buildClaudeContextPlan(
+  args: ClaudeContextPlanArgs,
+): ClaudeContextPlan {
   const ownerId = args.group.created_by;
-  const isAdminOwned =
-    args.ownerHomeFolder === ADMIN_HOME_FOLDER ||
-    (!!args.group.is_home && args.group.folder === ADMIN_HOME_FOLDER);
-  const claudeMdSource = isAdminOwned ? path.join(args.externalClaudeDir, 'CLAUDE.md') : undefined;
-  const rulesSourceDir = isAdminOwned ? path.join(args.externalClaudeDir, 'rules') : undefined;
-  const externalSkillsDir = isAdminOwned ? path.join(args.externalClaudeDir, 'skills') : undefined;
+  // `host_claude` is authorized when the Agent policy is written: only an
+  // admin can persist it, and workspaces can only bind an Agent owned by the
+  // same user. Do not infer the role from folder === "main" here: additional
+  // admins have owner-specific home folders and must receive the same policy.
+  const includeHostClaudeContext = args.includeHostClaudeContext === true;
+  const isAdminOwned = includeHostClaudeContext;
+  const claudeMdSource = includeHostClaudeContext
+    ? path.join(args.externalClaudeDir, 'CLAUDE.md')
+    : undefined;
+  const rulesSourceDir = includeHostClaudeContext
+    ? path.join(args.externalClaudeDir, 'rules')
+    : undefined;
+  const externalSkillsDir = includeHostClaudeContext
+    ? path.join(args.externalClaudeDir, 'skills')
+    : undefined;
   const builtinSkillsDir =
     args.executionMode === 'container'
       ? '/opt/builtin-skills'
@@ -128,7 +145,8 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
   const projectSkillsDir = path.join(args.projectRoot, 'container', 'skills');
   const userSkillsDir =
     args.mountUserSkills !== false && ownerId
-      ? path.join(args.dataDir, 'skills', ownerId)
+      ? (args.userSkillsDirOverride ??
+        path.join(args.dataDir, 'skills', ownerId))
       : undefined;
 
   const hostClaudeRuntime = args.groupSessionsDir
@@ -142,39 +160,54 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
     : undefined;
 
   const warnings: string[] = [];
-  if (isAdminOwned && !exists(claudeMdSource)) warnings.push('CLAUDE.md missing');
-  if (isAdminOwned && !exists(rulesSourceDir)) warnings.push('rules missing');
-  if (isAdminOwned && !exists(externalSkillsDir)) warnings.push('external skills missing');
+  if (includeHostClaudeContext && !exists(claudeMdSource))
+    warnings.push('CLAUDE.md missing');
+  if (includeHostClaudeContext && !exists(rulesSourceDir))
+    warnings.push('rules missing');
+  if (includeHostClaudeContext && !exists(externalSkillsDir))
+    warnings.push('external skills missing');
   // 记忆层未禁用 + 原生 ~/.claude/CLAUDE.md 存在 → 两套全局记忆并存，提醒 admin。
-  if (isAdminOwned && args.happyclawMemoryActive && exists(claudeMdSource)) {
+  if (
+    includeHostClaudeContext &&
+    args.happyclawMemoryActive &&
+    exists(claudeMdSource)
+  ) {
     warnings.push(
-      '两套全局记忆同时生效：~/.claude/CLAUDE.md（原生 Playbook）+ HappyClaw 记忆层；如需纯原生体验可开启 disableMemoryLayerForAdminHost',
+      '两套全局记忆同时生效：~/.claude/CLAUDE.md（原生 Playbook）+ HappyClaw 记忆层',
     );
   }
 
   const audit: ClaudeContextAudit = {
     executionMode: args.executionMode,
-    externalClaudeDir: isAdminOwned ? args.externalClaudeDir : undefined,
+    externalClaudeDir: includeHostClaudeContext
+      ? args.externalClaudeDir
+      : undefined,
     claudeMd: {
       sourcePath: claudeMdSource,
-      runtimePath: args.executionMode === 'container' ? '/workspace/CLAUDE.md' : hostClaudeRuntime,
+      runtimePath:
+        args.executionMode === 'container'
+          ? '/workspace/CLAUDE.md'
+          : hostClaudeRuntime,
       status: exists(claudeMdSource)
         ? args.executionMode === 'container'
           ? 'mounted'
           : 'linked'
-        : isAdminOwned
+        : includeHostClaudeContext
           ? 'missing'
           : 'unavailable',
       tokens: fileTokenEstimate(claudeMdSource),
     },
     rules: {
       sourcePath: rulesSourceDir,
-      runtimePath: args.executionMode === 'container' ? '/workspace/.claude/rules' : hostRulesRuntime,
+      runtimePath:
+        args.executionMode === 'container'
+          ? '/workspace/.claude/rules'
+          : hostRulesRuntime,
       status: exists(rulesSourceDir)
         ? args.executionMode === 'container'
           ? 'mounted'
           : 'linked'
-        : isAdminOwned
+        : includeHostClaudeContext
           ? 'missing'
           : 'unavailable',
       fileCount: countRuleFiles(rulesSourceDir),
@@ -184,35 +217,49 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
         {
           name: 'builtin',
           sourcePath: builtinSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/home/node/.claude/skills'
-            : hostSkillsRuntime,
-          count: countChildDirs(args.executionMode === 'container' ? undefined : builtinSkillsDir),
+          runtimePath:
+            args.executionMode === 'container'
+              ? '/home/node/.claude/skills'
+              : hostSkillsRuntime,
+          count: countChildDirs(
+            args.executionMode === 'container' ? undefined : builtinSkillsDir,
+          ),
         },
-        ...(externalSkillsDir ? [{
-          name: 'external' as const,
-          sourcePath: externalSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/workspace/external-skills'
-            : hostSkillsRuntime,
-          count: countChildDirs(externalSkillsDir),
-        }] : []),
+        ...(externalSkillsDir
+          ? [
+              {
+                name: 'external' as const,
+                sourcePath: externalSkillsDir,
+                runtimePath:
+                  args.executionMode === 'container'
+                    ? '/workspace/external-skills'
+                    : hostSkillsRuntime,
+                count: countChildDirs(externalSkillsDir),
+              },
+            ]
+          : []),
         {
           name: 'project',
           sourcePath: projectSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/workspace/project-skills'
-            : hostSkillsRuntime,
+          runtimePath:
+            args.executionMode === 'container'
+              ? '/workspace/project-skills'
+              : hostSkillsRuntime,
           count: countChildDirs(projectSkillsDir),
         },
-        ...(userSkillsDir ? [{
-          name: 'user' as const,
-          sourcePath: userSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/workspace/user-skills'
-            : hostSkillsRuntime,
-          count: countChildDirs(userSkillsDir),
-        }] : []),
+        ...(userSkillsDir
+          ? [
+              {
+                name: 'user' as const,
+                sourcePath: userSkillsDir,
+                runtimePath:
+                  args.executionMode === 'container'
+                    ? '/workspace/user-skills'
+                    : hostSkillsRuntime,
+                count: countChildDirs(userSkillsDir),
+              },
+            ]
+          : []),
       ],
     },
     happyclawPrompt: { totalBytes: 0, files: [] },
@@ -245,7 +292,8 @@ export function syncHostClaudeContext(
       removePath(path.join(skillsDir, entry.name));
     }
   }
-  const includeSkill = (entry: fs.Dirent) => entry.isDirectory() || entry.isSymbolicLink();
+  const includeSkill = (entry: fs.Dirent) =>
+    entry.isDirectory() || entry.isSymbolicLink();
   // skill 四来源（builtin→external→project→user）合并进同一目录，后序覆盖前序。
   // 收集同名冲突并写入 warnings，避免静默覆盖（前端 AgentContextPanel 会展示）。
   const skillConflicts = new Set<string>();
@@ -274,6 +322,16 @@ export function syncHostClaudeContext(
   let claudeMdStatus = plan.audit.claudeMd.status;
   const sessionClaudeMd = path.join(groupSessionsDir, 'CLAUDE.md');
   if (!plan.claudeMdSource || !fs.existsSync(plan.claudeMdSource)) {
+    // A previous host_claude Agent may have linked the native playbook into
+    // this shared workspace session. Remove only resolver-owned symlinks when
+    // the next Agent does not opt in; preserve real session-authored files.
+    try {
+      if (fs.lstatSync(sessionClaudeMd).isSymbolicLink()) {
+        fs.unlinkSync(sessionClaudeMd);
+      }
+    } catch {
+      /* absent is already the desired state */
+    }
     return { claudeMdStatus, warnings };
   }
 

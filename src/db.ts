@@ -6,6 +6,11 @@ import path from 'path';
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { logger } from './logger.js';
 import {
+  AgentProfile,
+  AgentProfilePromptMode,
+  AgentProfilePrompts,
+  AgentProfilePromptVersion,
+  AgentProfileRuntimePolicy,
   AgentKind,
   AgentStatus,
   AuthAuditLog,
@@ -18,9 +23,11 @@ import {
   BillingAuditEventType,
   BillingAuditLog,
   BillingPlan,
+  ChannelMount,
+  ChannelAccount,
+  ChannelProvider,
   DailyUsage,
   ExecutionMode,
-  GroupMember,
   InviteCode,
   InviteCodeWithCreator,
   MessageFinalizationReason,
@@ -33,6 +40,13 @@ import {
   RegisteredGroup,
   ScheduledTask,
   SubAgent,
+  ClaimedTaskRun,
+  TaskRun,
+  TaskRunDefinitionSnapshot,
+  TaskRunNotificationStatus,
+  TaskRunNotificationSummary,
+  TaskRunStatus,
+  TaskRunTrigger,
   TaskRunLog,
   User,
   UserBalance,
@@ -46,8 +60,20 @@ import {
   PermissionTemplateKey,
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
+import { channelConversationJid } from './channel-address.js';
+import { getChannelFromJid } from './channel-prefixes.js';
+import {
+  includeClaudePresetForMode,
+  normalizeAgentProfilePrompts,
+  promptModeFromLegacyPreset,
+} from './agent-profile-prompts.js';
 
 let db: InstanceType<typeof Database>;
+const CURRENT_SCHEMA_VERSION = 54;
+
+export function isDatabaseInitialized(): boolean {
+  return Boolean(db?.open);
+}
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
 let _stmts: {
@@ -81,10 +107,11 @@ function stmts() {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
-        `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
+        `INSERT INTO usage_records (id, event_id, user_id, group_folder, agent_id, message_id, model,
           input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
-          cost_usd, duration_ms, num_turns, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          cost_usd, provider_estimated_cost_usd, billed_cost_usd,
+          duration_ms, num_turns, source, usage_date, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageUpsert: db.prepare(
         `INSERT INTO usage_daily_summary (user_id, model, date,
@@ -230,15 +257,175 @@ function getRouterStateInternal(key: string): string | undefined {
   }
 }
 
+function tableExists(tableName: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(tableName);
+  return !!row;
+}
+
+function reportKnownForeignKeyOrphans(): void {
+  if (!tableExists('users')) return;
+  const specs: Array<{
+    childTable: string;
+    childColumn: string;
+    parentTable: string;
+    parentColumn: string;
+  }> = [
+    {
+      childTable: 'user_balances',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+    {
+      childTable: 'user_sessions',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+    {
+      childTable: 'user_subscriptions',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+    {
+      childTable: 'balance_transactions',
+      childColumn: 'user_id',
+      parentTable: 'users',
+      parentColumn: 'id',
+    },
+  ];
+
+  for (const spec of specs) {
+    if (!tableExists(spec.childTable) || !tableExists(spec.parentTable)) {
+      continue;
+    }
+    const result = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM ${spec.childTable}
+         WHERE ${spec.childColumn} IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM ${spec.parentTable}
+             WHERE ${spec.parentTable}.${spec.parentColumn} = ${spec.childTable}.${spec.childColumn}
+           )`,
+      )
+      .get() as { count: number };
+    if (result.count > 0) {
+      logger.warn(
+        {
+          table: spec.childTable,
+          parentTable: spec.parentTable,
+          rows: result.count,
+        },
+        'Preserving orphaned rows for operator review before foreign-key enforcement',
+      );
+    }
+  }
+}
+
+function sqliteStringLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+/**
+ * Create a self-contained, consistent snapshot before upgrading an existing
+ * database. VACUUM INTO reads through SQLite's transaction layer, so committed
+ * WAL pages are included. This function intentionally runs before any schema
+ * or data-reconciliation write; a backup failure aborts startup.
+ */
+function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
+  const configuredDir = process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR;
+  const backupDir = configuredDir
+    ? path.resolve(configuredDir)
+    : path.join(path.dirname(dbPath), 'migration-backups');
+  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
+  const backupPath = path.join(
+    backupDir,
+    `messages-v${schemaVersion}-to-v${CURRENT_SCHEMA_VERSION}-${timestamp}-${process.pid}.db`,
+  );
+
+  let probe: InstanceType<typeof Database> | undefined;
+  try {
+    fs.mkdirSync(backupDir, { recursive: true });
+    db.exec(`VACUUM INTO ${sqliteStringLiteral(backupPath)}`);
+    probe = new Database(backupPath);
+    const result = probe.pragma('quick_check', { simple: true });
+    if (result !== 'ok') {
+      throw new Error(`quick_check returned ${String(result)}`);
+    }
+    probe.close();
+    probe = undefined;
+    fs.chmodSync(backupPath, 0o600);
+    logger.info(
+      {
+        backupPath,
+        fromVersion: schemaVersion,
+        toVersion: CURRENT_SCHEMA_VERSION,
+      },
+      'Created pre-migration SQLite backup',
+    );
+  } catch (error) {
+    try {
+      probe?.close();
+    } catch {
+      // Preserve the original backup/validation error.
+    }
+    for (const candidate of [
+      backupPath,
+      `${backupPath}-wal`,
+      `${backupPath}-shm`,
+    ]) {
+      try {
+        fs.rmSync(candidate, { force: true });
+      } catch {
+        // Cleanup must not hide the backup failure that blocks migration.
+      }
+    }
+    throw new Error(
+      `Refusing database migration v${schemaVersion}→v${CURRENT_SCHEMA_VERSION}: pre-migration backup failed`,
+      { cause: error },
+    );
+  }
+}
+
+function enforcePreMigrationBackup(dbPath: string): void {
+  const rawVersion = getRouterStateInternal('schema_version');
+  if (rawVersion === undefined) return;
+
+  const schemaVersion = Number(rawVersion);
+  if (!Number.isInteger(schemaVersion) || schemaVersion < 0) {
+    throw new Error(`Invalid database schema version: ${rawVersion}`);
+  }
+  if (schemaVersion > CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `Database schema v${schemaVersion} is newer than supported v${CURRENT_SCHEMA_VERSION}; refusing downgrade`,
+    );
+  }
+  if (schemaVersion >= 39 && schemaVersion < CURRENT_SCHEMA_VERSION) {
+    createPreMigrationBackup(dbPath, schemaVersion);
+  }
+}
+
 export function initDatabase(): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
 
-  // Enable WAL mode for better concurrency and performance
-  db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
+  try {
+    enforcePreMigrationBackup(dbPath);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+
+  // Enable WAL mode for better concurrency and performance only after the
+  // upgrade backup gate has completed without mutating the source schema.
+  db.exec('PRAGMA journal_mode = WAL');
+  reportKnownForeignKeyOrphans();
   // Enable foreign-key enforcement. SQLite defaults to OFF for backward
   // compatibility, so all FK declarations on existing schemas are silent
   // no-ops without this PRAGMA. We log existing orphans (if any) but only
@@ -311,7 +498,12 @@ export function initDatabase(): void {
       status TEXT DEFAULT 'active',
       created_at TEXT NOT NULL,
       created_by TEXT,
-      notify_channels TEXT
+      notify_channels TEXT,
+      running_until TEXT,
+      runner_id TEXT,
+      revision INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL DEFAULT '',
+      deleted_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -327,6 +519,52 @@ export function initDatabase(): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+    CREATE TABLE IF NOT EXISTS task_runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      occurrence_key TEXT NOT NULL UNIQUE,
+      trigger_type TEXT NOT NULL,
+      idempotency_key TEXT,
+      scheduled_for TEXT NOT NULL,
+      definition_revision INTEGER NOT NULL,
+      definition_snapshot TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      available_at TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_token INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      result TEXT,
+      error TEXT,
+      notification_status TEXT NOT NULL DEFAULT 'pending',
+      notification_error TEXT,
+      notification_summary TEXT,
+      notification_payload TEXT,
+      notification_attempt INTEGER NOT NULL DEFAULT 0,
+      notification_available_at TEXT,
+      notification_lease_owner TEXT,
+      notification_lease_token INTEGER NOT NULL DEFAULT 0,
+      notification_lease_expires_at TEXT,
+      notification_lease_payload TEXT,
+      notification_generation INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_manual_idempotency
+      ON task_runs(task_id, idempotency_key)
+      WHERE idempotency_key IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_one_nonterminal
+      ON task_runs(task_id)
+      WHERE status IN ('queued', 'running', 'retry_wait');
+    CREATE INDEX IF NOT EXISTS idx_task_runs_due
+      ON task_runs(status, available_at, lease_expires_at);
+    CREATE INDEX IF NOT EXISTS idx_task_runs_task_created
+      ON task_runs(task_id, created_at DESC);
   `);
 
   // State tables (replacing JSON files)
@@ -350,6 +588,31 @@ export function initDatabase(): void {
       created_by TEXT,
       is_home INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS channel_accounts (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      name TEXT NOT NULL,
+      secret_ref TEXT NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      is_legacy_default INTEGER NOT NULL DEFAULT 0,
+      auth_mode TEXT NOT NULL DEFAULT 'credentials',
+      auth_status TEXT NOT NULL DEFAULT 'draft',
+      transport_status TEXT NOT NULL DEFAULT 'disconnected',
+      status TEXT NOT NULL DEFAULT 'disconnected',
+      default_agent_profile_id TEXT,
+      default_workspace_jid TEXT,
+      last_error TEXT,
+      connected_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(owner_user_id, provider, name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_channel_accounts_owner_provider
+      ON channel_accounts(owner_user_id, provider, updated_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_accounts_one_default
+      ON channel_accounts(owner_user_id, provider) WHERE is_default = 1;
     CREATE TABLE IF NOT EXISTS im_context_bindings (
       source_jid TEXT NOT NULL,
       context_type TEXT NOT NULL,
@@ -365,6 +628,69 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_icb_workspace ON im_context_bindings(workspace_jid);
     CREATE INDEX IF NOT EXISTS idx_icb_agent ON im_context_bindings(agent_id);
+    CREATE TABLE IF NOT EXISTS channel_mounts (
+      channel_jid TEXT PRIMARY KEY,
+      channel_type TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      session_id TEXT,
+      routing_mode TEXT NOT NULL DEFAULT 'single_session',
+      reply_policy TEXT NOT NULL DEFAULT 'source_only',
+      activation_mode TEXT NOT NULL DEFAULT 'auto',
+      owner_im_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_workspace ON channel_mounts(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_session ON channel_mounts(session_id);
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_type ON channel_mounts(channel_type);
+    CREATE TABLE IF NOT EXISTS workspaces (
+      jid TEXT PRIMARY KEY,
+      folder TEXT NOT NULL,
+      owner_user_id TEXT,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      is_home INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspaces_folder ON workspaces(folder);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id, status);
+    -- Runtime resume state projected from the legacy sessions table. This is
+    -- deliberately not named sessions: product conversation Sessions live in
+    -- agents, while these rows only track SDK/provider resume metadata.
+    CREATE TABLE IF NOT EXISTS workspace_runtime_sessions (
+      group_folder TEXT NOT NULL,
+      runtime_agent_id TEXT NOT NULL DEFAULT '',
+      workspace_jid TEXT NOT NULL,
+      sdk_session_id TEXT NOT NULL DEFAULT '',
+      provider_id TEXT,
+      agent_profile_id TEXT,
+      agent_profile_version INTEGER,
+      identity_hash TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (group_folder, runtime_agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_workspace ON workspace_runtime_sessions(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_profile ON workspace_runtime_sessions(agent_profile_id);
+    CREATE TABLE IF NOT EXISTS agent_channel_mounts (
+      channel_jid TEXT PRIMARY KEY,
+      agent_profile_id TEXT,
+      owner_user_id TEXT,
+      channel_type TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      workspace_folder TEXT,
+      session_id TEXT,
+      routing_mode TEXT NOT NULL DEFAULT 'single_session',
+      reply_policy TEXT NOT NULL DEFAULT 'source_only',
+      activation_mode TEXT NOT NULL DEFAULT 'auto',
+      owner_im_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_profile ON agent_channel_mounts(agent_profile_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_workspace ON agent_channel_mounts(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_session ON agent_channel_mounts(session_id);
   `);
 
   // Auth tables
@@ -435,19 +761,6 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_invites_created_at ON invite_codes(created_at);
   `);
 
-  // Group members table for shared workspaces
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS group_members (
-      group_folder TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'member',
-      added_at TEXT NOT NULL,
-      added_by TEXT,
-      PRIMARY KEY (group_folder, user_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
-  `);
-
   // User pinned groups (per-user workspace pinning)
   db.exec(`
     CREATE TABLE IF NOT EXISTS user_pinned_groups (
@@ -482,6 +795,66 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
     CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
     CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+  `);
+
+  // Top-level Agent Profiles: runtime identities/personas that own workspaces.
+  // Do not confuse this with the legacy `agents` table above, which stores
+  // workspace-scoped conversation/task/spawn agents.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_profiles (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      include_claude_preset INTEGER NOT NULL DEFAULT 1,
+      avatar_emoji TEXT,
+      avatar_color TEXT,
+      avatar_url TEXT,
+      runtime_policy TEXT NOT NULL DEFAULT '{}',
+      identity_hash TEXT NOT NULL DEFAULT '',
+      version INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_default
+      ON agent_profiles(owner_user_id)
+      WHERE is_default = 1 AND status = 'active';
+    CREATE INDEX IF NOT EXISTS idx_agent_profiles_owner
+      ON agent_profiles(owner_user_id, status);
+
+    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
+      id TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      identity_hash TEXT NOT NULL,
+      change_source TEXT NOT NULL DEFAULT 'update',
+      restored_from_version INTEGER,
+      created_at TEXT NOT NULL,
+      UNIQUE(agent_profile_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
+      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
+
+    CREATE TABLE IF NOT EXISTS workspace_agent_profiles (
+      group_folder TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
+      ON workspace_agent_profiles(agent_profile_id);
   `);
 
   // Billing tables
@@ -624,6 +997,7 @@ export function initDatabase(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS usage_records (
       id TEXT PRIMARY KEY,
+      event_id TEXT,
       user_id TEXT NOT NULL,
       group_folder TEXT NOT NULL,
       agent_id TEXT,
@@ -634,14 +1008,40 @@ export function initDatabase(): void {
       cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL NOT NULL DEFAULT 0,
+      provider_estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      billed_cost_usd REAL NOT NULL DEFAULT 0,
       duration_ms INTEGER DEFAULT 0,
       num_turns INTEGER DEFAULT 0,
       source TEXT NOT NULL DEFAULT 'agent',
+      usage_date TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_usage_user_date ON usage_records(user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_group_date ON usage_records(group_folder, created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_model_date ON usage_records(model, created_at);
+    CREATE TABLE IF NOT EXISTS usage_events (
+      event_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      agent_id TEXT,
+      message_id TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+      provider_estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      billed_cost_usd REAL NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      num_turns INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'agent',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_events_user_date
+      ON usage_events(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_group_date
+      ON usage_events(group_folder, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_agent_date
+      ON usage_events(agent_id, created_at);
 
     CREATE TABLE IF NOT EXISTS usage_daily_summary (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -671,6 +1071,25 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+  `);
+
+  // v51 usage event ledger columns. These must be added before creating the
+  // event/model uniqueness index because existing databases already have the
+  // usage_records table.
+  ensureColumn('usage_records', 'event_id', 'TEXT');
+  ensureColumn(
+    'usage_records',
+    'provider_estimated_cost_usd',
+    'REAL NOT NULL DEFAULT 0',
+  );
+  ensureColumn('usage_records', 'billed_cost_usd', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('usage_records', 'usage_date', 'TEXT');
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_event_model
+      ON usage_records(event_id, model) WHERE event_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_usage_date ON usage_records(usage_date);
+    CREATE INDEX IF NOT EXISTS idx_usage_user_usage_date
+      ON usage_records(user_id, usage_date);
   `);
 
   // Lightweight migrations for existing DBs
@@ -712,6 +1131,36 @@ export function initDatabase(): void {
   ensureColumn('scheduled_tasks', 'execution_mode', 'TEXT');
   ensureColumn('scheduled_tasks', 'workspace_jid', 'TEXT');
   ensureColumn('scheduled_tasks', 'workspace_folder', 'TEXT');
+  ensureColumn('scheduled_tasks', 'running_until', 'TEXT');
+  ensureColumn('scheduled_tasks', 'runner_id', 'TEXT');
+  ensureColumn('scheduled_tasks', 'revision', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('scheduled_tasks', 'updated_at', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('scheduled_tasks', 'deleted_at', 'TEXT');
+  ensureColumn('task_runs', 'notification_summary', 'TEXT');
+  ensureColumn('task_runs', 'notification_payload', 'TEXT');
+  ensureColumn(
+    'task_runs',
+    'notification_attempt',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  ensureColumn('task_runs', 'notification_available_at', 'TEXT');
+  ensureColumn('task_runs', 'notification_lease_owner', 'TEXT');
+  ensureColumn(
+    'task_runs',
+    'notification_lease_token',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  ensureColumn('task_runs', 'notification_lease_expires_at', 'TEXT');
+  ensureColumn('task_runs', 'notification_lease_payload', 'TEXT');
+  ensureColumn(
+    'task_runs',
+    'notification_generation',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  // Old rows predate updated_at; created_at is the least-surprising baseline.
+  db.prepare(
+    "UPDATE scheduled_tasks SET updated_at = created_at WHERE updated_at = '' OR updated_at IS NULL",
+  ).run();
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
   ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
@@ -741,6 +1190,11 @@ export function initDatabase(): void {
     'registered_groups',
     'binding_mode',
     "TEXT DEFAULT 'single_context'",
+  );
+  ensureColumn(
+    'registered_groups',
+    'native_context_type',
+    "TEXT DEFAULT 'none'",
   );
   ensureColumn('registered_groups', 'feishu_chat_mode', 'TEXT');
   ensureColumn('registered_groups', 'feishu_group_message_type', 'TEXT');
@@ -831,6 +1285,9 @@ export function initDatabase(): void {
     'status',
     'created_at',
     'created_by',
+    'revision',
+    'updated_at',
+    'deleted_at',
   ]);
   assertSchema(
     'registered_groups',
@@ -925,8 +1382,8 @@ export function initDatabase(): void {
   `);
 
   // Backfill created_by for feishu/telegram groups by matching sibling groups in the same folder.
-  // Only backfill when the folder has exactly one distinct owner; otherwise keep NULL
-  // to avoid misrouting in ambiguous folders (e.g., shared admin main).
+  // Only backfill when the folder has exactly one distinct owner; otherwise
+  // keep NULL to avoid misrouting ambiguous legacy data.
   db.exec(`
     UPDATE registered_groups
     SET created_by = (
@@ -950,25 +1407,6 @@ export function initDatabase(): void {
     UPDATE registered_groups SET is_home = 1
     WHERE jid = 'web:main' AND folder = 'main' AND is_home = 0
   `);
-
-  // v15 migration: backfill group_members for existing web groups
-  const currentVersion = getRouterStateInternal('schema_version');
-  if (!currentVersion || parseInt(currentVersion, 10) < 15) {
-    db.transaction(() => {
-      // Backfill owner records for all web groups with created_by set
-      const webGroups = db
-        .prepare(
-          "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
-        )
-        .all() as Array<{ folder: string; created_by: string }>;
-      for (const g of webGroups) {
-        db.prepare(
-          `INSERT OR IGNORE INTO group_members (group_folder, user_id, role, added_at, added_by)
-           VALUES (?, ?, 'owner', ?, ?)`,
-        ).run(g.folder, g.created_by, new Date().toISOString(), g.created_by);
-      }
-    })();
-  }
 
   // v16→v17 migration: rebuild sessions table with composite primary key
   // Old PK was (group_folder), which cannot store multiple agent sessions per folder.
@@ -1047,19 +1485,7 @@ export function initDatabase(): void {
         db.prepare(
           `INSERT OR IGNORE INTO billing_plans (id, name, description, tier, monthly_cost_usd, allow_overage, features, is_default, is_active, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          'free',
-          '免费版',
-          '基础免费套餐',
-          0,
-          0,
-          0,
-          '[]',
-          1,
-          1,
-          now,
-          now,
-        );
+        ).run('free', '免费版', '基础免费套餐', 0, 0, 0, '[]', 1, 1, now, now);
       }
 
       // Initialize balances for all existing users
@@ -1127,7 +1553,9 @@ export function initDatabase(): void {
   );
   ensureColumn('balance_transactions', 'notes', 'TEXT');
   // Create unique index only if it doesn't exist
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_bal_tx_idempotency ON balance_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_bal_tx_idempotency ON balance_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL`,
+  );
 
   // v26→v27 migration: wallet-first commercialization baseline
   const v27Ver = getRouterStateInternal('schema_version');
@@ -1199,7 +1627,8 @@ export function initDatabase(): void {
           COALESCE(jme.key, 'unknown'),
           COALESCE(json_extract(jme.value, '$.inputTokens'), 0),
           COALESCE(json_extract(jme.value, '$.outputTokens'), 0),
-          0, 0,
+          COALESCE(json_extract(jme.value, '$.cacheReadInputTokens'), 0),
+          COALESCE(json_extract(jme.value, '$.cacheCreationInputTokens'), 0),
           COALESCE(json_extract(jme.value, '$.costUSD'), 0),
           COALESCE(json_extract(m.token_usage, '$.durationMs'), 0),
           COALESCE(json_extract(m.token_usage, '$.numTurns'), 0),
@@ -1298,6 +1727,200 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT');
   }
 
+  // v39 → v40: Track the top-level AgentProfile identity used by each Claude
+  // session. When a profile prompt changes, callers can detect the hash mismatch
+  // and start a fresh SDK session without losing HappyClaw message history.
+  ensureColumn('sessions', 'agent_profile_id', 'TEXT');
+  ensureColumn('sessions', 'identity_hash', 'TEXT');
+  ensureColumn('sessions', 'agent_profile_version', 'INTEGER');
+
+  // v40 → v41: Allow each AgentProfile to opt out of the Claude Code
+  // built-in system prompt preset and use only HappyClaw/Agent prompts.
+  ensureColumn(
+    'agent_profiles',
+    'include_claude_preset',
+    'INTEGER NOT NULL DEFAULT 1',
+  );
+
+  // v43 → v44: AgentProfile runtime policy moves provider/tool/skill/MCP
+  // intent from workspace-level compatibility fields into the top-level Agent.
+  ensureColumn(
+    'agent_profiles',
+    'runtime_policy',
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
+  // v46 → v47: profile-level avatar overrides. Null means inherit the
+  // globally configured main HappyClaw avatar.
+  ensureColumn('agent_profiles', 'avatar_emoji', 'TEXT');
+  ensureColumn('agent_profiles', 'avatar_color', 'TEXT');
+  ensureColumn('agent_profiles', 'avatar_url', 'TEXT');
+
+  // v47 → v48: split the legacy all-in-one Agent prompt into the four
+  // IDENTITY / SOUL / AGENTS / TOOLS sections. The legacy prompt represented
+  // general operating instructions, so migrate it losslessly into AGENTS.
+  const promptSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  ensureColumn('agent_profiles', 'soul_prompt', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('agent_profiles', 'agents_prompt', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('agent_profiles', 'tools_prompt', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(
+    'agent_profiles',
+    'prompt_mode',
+    "TEXT NOT NULL DEFAULT 'append'",
+  );
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
+      id TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      identity_hash TEXT NOT NULL,
+      change_source TEXT NOT NULL DEFAULT 'update',
+      restored_from_version INTEGER,
+      created_at TEXT NOT NULL,
+      UNIQUE(agent_profile_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
+      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
+  `);
+  if (promptSchemaVersion < 48) {
+    const legacyRows = db
+      .prepare('SELECT * FROM agent_profiles')
+      .all() as Array<Record<string, unknown>>;
+    db.transaction(() => {
+      for (const row of legacyRows) {
+        const legacyPrompt = String(row.identity_prompt ?? '');
+        const includePreset = Number(row.include_claude_preset ?? 1) === 1;
+        const prompts = normalizeAgentProfilePrompts({
+          identity_prompt: '',
+          soul_prompt: String(row.soul_prompt ?? ''),
+          agents_prompt: String(row.agents_prompt ?? '') || legacyPrompt,
+          tools_prompt: String(row.tools_prompt ?? ''),
+          prompt_mode: promptModeFromLegacyPreset(includePreset),
+        });
+        const runtimePolicy = parseAgentProfileRuntimePolicy(
+          row.runtime_policy,
+        );
+        const identityHash = computeAgentProfileIdentityHash(
+          prompts,
+          runtimePolicy,
+          String(row.name ?? ''),
+        );
+        db.prepare(
+          `UPDATE agent_profiles
+           SET identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
+               prompt_mode = ?, include_claude_preset = ?, identity_hash = ?
+           WHERE id = ?`,
+        ).run(
+          prompts.identity_prompt,
+          prompts.soul_prompt,
+          prompts.agents_prompt,
+          prompts.tools_prompt,
+          prompts.prompt_mode,
+          includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+          identityHash,
+          String(row.id),
+        );
+        insertAgentProfilePromptVersionSnapshot({
+          profileId: String(row.id),
+          version: Number(row.version ?? 1),
+          name: String(row.name ?? ''),
+          prompts,
+          identityHash,
+          changeSource: 'migration',
+          createdAt: String(
+            row.updated_at ?? row.created_at ?? new Date().toISOString(),
+          ),
+        });
+      }
+    })();
+  }
+
+  // v48 → v49: first-class channel accounts. Credentials are stored outside
+  // SQLite behind secret_ref; routing projections retain the account ID so
+  // two bots in the same external chat cannot share a JID/mount accidentally.
+  ensureColumn('registered_groups', 'channel_account_id', 'TEXT');
+  ensureColumn('channel_mounts', 'channel_account_id', 'TEXT');
+  ensureColumn('agent_channel_mounts', 'channel_account_id', 'TEXT');
+  ensureColumn(
+    'channel_accounts',
+    'is_legacy_default',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  // v49 → v50: model authorization separately from the live transport.
+  // QR protocols may have a socket running while still waiting for a scan;
+  // that must never be published as a connected account.
+  ensureColumn(
+    'channel_accounts',
+    'auth_mode',
+    "TEXT NOT NULL DEFAULT 'credentials'",
+  );
+  ensureColumn(
+    'channel_accounts',
+    'auth_status',
+    "TEXT NOT NULL DEFAULT 'draft'",
+  );
+  ensureColumn(
+    'channel_accounts',
+    'transport_status',
+    "TEXT NOT NULL DEFAULT 'disconnected'",
+  );
+  db.exec(`
+    UPDATE channel_accounts SET auth_mode = CASE
+      WHEN provider IN ('wechat', 'whatsapp') THEN 'qr_session'
+      WHEN provider IN ('telegram', 'discord') THEN 'bot_token'
+      ELSE 'credentials'
+    END
+    WHERE auth_mode IS NULL OR auth_mode = '' OR auth_mode = 'credentials';
+    UPDATE channel_accounts SET auth_status = CASE
+      WHEN status = 'connected' THEN 'authorized'
+      WHEN status = 'error' THEN 'error'
+      ELSE auth_status
+    END;
+    UPDATE channel_accounts SET transport_status = status
+      WHERE transport_status = 'disconnected' AND status != 'disconnected';
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_rg_channel_account
+      ON registered_groups(channel_account_id);
+    CREATE INDEX IF NOT EXISTS idx_channel_mounts_account
+      ON channel_mounts(channel_account_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_account
+      ON agent_channel_mounts(channel_account_id);
+  `);
+
+  // v44 → v45: make the SDK resume-state projection explicit. The former
+  // `workspace_sessions` name looked like a product conversation model even
+  // though it only mirrored `sessions` provider/SDK metadata.
+  if (tableExists('workspace_sessions')) {
+    db.transaction(() => {
+      db.exec(`
+        INSERT OR REPLACE INTO workspace_runtime_sessions (
+          group_folder, runtime_agent_id, workspace_jid, sdk_session_id,
+          provider_id, agent_profile_id, agent_profile_version, identity_hash,
+          created_at, updated_at
+        )
+        SELECT group_folder, session_agent_id, workspace_jid, claude_session_id,
+          provider_id, agent_profile_id, agent_profile_version, identity_hash,
+          created_at, updated_at
+        FROM workspace_sessions
+      `);
+      db.exec('DROP TABLE workspace_sessions');
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_workspace
+          ON workspace_runtime_sessions(workspace_jid);
+        CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_profile
+          ON workspace_runtime_sessions(agent_profile_id);
+      `);
+    })();
+  }
+
   // v37 → v38: Added users.default_require_mention column (per-user default
   // for require_mention on auto-registered IM group chats). The actual
   // ensureColumn migration runs above with the other users.* additions —
@@ -1323,7 +1946,7 @@ export function initDatabase(): void {
         .prepare(
           // ORDER BY 让多次 dry-run 结果稳定 + 让"早创建的真账号"优先被
           // lowercase 化，避免后注册的混淆账号顶替原账号。
-          "SELECT id, username FROM users WHERE username != lower(username) ORDER BY created_at ASC, id ASC",
+          'SELECT id, username FROM users WHERE username != lower(username) ORDER BY created_at ASC, id ASC',
         )
         .all() as Array<{ id: string; username: string }>;
       if (mixedCaseRows.length > 0) {
@@ -1359,10 +1982,68 @@ export function initDatabase(): void {
     }
   }
 
-  const SCHEMA_VERSION = '39';
+  // v42 → v43: top-level Agent ownership and canonical workspace/channel
+  // projections. Tables are created with CREATE IF NOT EXISTS above; this
+  // pass backfills sources and removes any projection-only ghosts.
+  // v45 → v46: workspace sharing was removed. Drop the legacy membership
+  // table so stale grants cannot survive an upgrade.
+  db.exec('DROP TABLE IF EXISTS group_members');
+  backfillAgentProfileDefaultsAndWorkspaceMappings();
+  reconcileCanonicalRuntimeProjections();
+
+  // v50 -> v51: make usage a first-class, idempotent event ledger. Historical
+  // rows predate event IDs, so each row becomes one explicitly marked legacy
+  // event; we do not guess which old model rows belonged to the same run.
+  const v51Check = getRouterStateInternal('schema_version');
+  if (!v51Check || parseInt(v51Check, 10) < 51) {
+    db.transaction(() => {
+      db.exec(`
+        UPDATE usage_records
+        SET provider_estimated_cost_usd = cost_usd
+        WHERE provider_estimated_cost_usd = 0 AND cost_usd != 0;
+
+        UPDATE usage_records
+        SET usage_date = date(created_at, 'localtime')
+        WHERE usage_date IS NULL OR usage_date = '';
+
+        UPDATE usage_records
+        SET user_id = COALESCE((
+          SELECT rg.created_by FROM registered_groups rg
+          WHERE rg.folder = usage_records.group_folder
+            AND rg.created_by IS NOT NULL
+          LIMIT 1
+        ), user_id)
+        WHERE user_id = 'system';
+
+        UPDATE usage_records
+        SET event_id = 'legacy:' || id
+        WHERE event_id IS NULL OR event_id = '';
+
+        INSERT OR IGNORE INTO usage_events (
+          event_id, user_id, group_folder, agent_id, message_id,
+          input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd, duration_ms, num_turns, source, created_at
+        )
+        SELECT event_id, user_id, group_folder, agent_id, message_id,
+          input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd, duration_ms, num_turns, source, created_at
+        FROM usage_records;
+      `);
+    })();
+  }
+  // Idempotent repair for installations that briefly ran an early v51 build
+  // before usage_date was added to the finalized migration.
+  db.exec(`
+    UPDATE usage_records
+    SET usage_date = date(created_at, 'localtime')
+    WHERE usage_date IS NULL OR usage_date = '';
+  `);
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
-  ).run('schema_version', SCHEMA_VERSION);
+  ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
 }
 
 /**
@@ -1470,7 +2151,11 @@ function toUtf8String(value: unknown, warnField?: string): string {
     const decoded = Buffer.from(value as Uint8Array).toString('utf8');
     if (warnField) {
       logger.warn(
-        { field: warnField, byteLen: (value as Uint8Array).byteLength, sample: decoded.slice(0, 80) },
+        {
+          field: warnField,
+          byteLen: (value as Uint8Array).byteLength,
+          sample: decoded.slice(0, 80),
+        },
         'toUtf8String: Buffer on TEXT column, decoded as UTF-8',
       );
     }
@@ -1499,7 +2184,9 @@ function normalizeMessageRow(
   row: NewMessage & { is_from_me: number },
 ): NewMessage & { is_from_me: boolean };
 function normalizeMessageRow(row: NewMessage): NewMessage;
-function normalizeMessageRow(row: NewMessage & { is_from_me?: number }): NewMessage & { is_from_me?: boolean } {
+function normalizeMessageRow(
+  row: NewMessage & { is_from_me?: number },
+): NewMessage & { is_from_me?: boolean } {
   const { is_from_me, content, ...rest } = row;
   const out: NewMessage & { is_from_me?: boolean } = {
     ...rest,
@@ -1543,9 +2230,12 @@ export function storeMessageDirect(
   // truncation_continue 与 sdk_final 同属"最终回复"：截断自动续写的后续 turn
   // 复用挂起序列的 turnId 时必须命中同一行（全渠道一条回复的 DB 合并基础）。
   const existingFinalRow =
-    (meta?.sourceKind === 'sdk_final' || meta?.sourceKind === 'truncation_continue') &&
+    (meta?.sourceKind === 'sdk_final' ||
+      meta?.sourceKind === 'truncation_continue') &&
     meta.turnId
-      ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as { id: string } | undefined)
+      ? (stmts().storeMessageSelect.get(chatJid, meta.turnId) as
+          | { id: string }
+          | undefined)
       : undefined;
   const effectiveMsgId = existingFinalRow?.id || msgId;
   stmts().storeMessageInsert.run(
@@ -1617,10 +2307,78 @@ export function updateLatestMessageTokenUsage(
   costUsd?: number,
 ): void {
   if (msgId) {
-    stmts().updateTokenUsageById.run(tokenUsage, costUsd ?? null, msgId, chatJid);
+    stmts().updateTokenUsageById.run(
+      tokenUsage,
+      costUsd ?? null,
+      msgId,
+      chatJid,
+    );
   } else {
     stmts().updateTokenUsageLatest.run(tokenUsage, costUsd ?? null, chatJid);
   }
+}
+
+/**
+ * Rebuild a message's cumulative usage snapshot from the immutable event
+ * ledger. This keeps legacy message consumers accurate when one visible reply
+ * receives multiple incremental SDK usage events.
+ */
+export function rebuildMessageTokenUsageFromLedger(
+  chatJid: string,
+  groupFolder: string,
+  messageId: string,
+): void {
+  const total = db
+    .prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
+        COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(provider_estimated_cost_usd), 0) AS costUSD,
+        COALESCE(SUM(duration_ms), 0) AS durationMs,
+        COALESCE(SUM(num_turns), 0) AS numTurns
+       FROM usage_events WHERE group_folder = ? AND message_id = ?`,
+    )
+    .get(groupFolder, messageId) as Record<string, number>;
+  const modelRows = db
+    .prepare(
+      `SELECT model, COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_input_tokens), 0) AS cacheReadInputTokens,
+        COALESCE(SUM(cache_creation_input_tokens), 0) AS cacheCreationInputTokens,
+        COALESCE(SUM(provider_estimated_cost_usd), 0) AS costUSD
+       FROM usage_records WHERE group_folder = ? AND message_id = ?
+       GROUP BY model ORDER BY model`,
+    )
+    .all(groupFolder, messageId) as Array<Record<string, unknown>>;
+  const modelUsage = Object.fromEntries(
+    modelRows.map((row) => [
+      String(row.model),
+      {
+        inputTokens: Number(row.inputTokens) || 0,
+        outputTokens: Number(row.outputTokens) || 0,
+        cacheReadInputTokens: Number(row.cacheReadInputTokens) || 0,
+        cacheCreationInputTokens: Number(row.cacheCreationInputTokens) || 0,
+        costUSD: Number(row.costUSD) || 0,
+      },
+    ]),
+  );
+  const tokenUsage = {
+    inputTokens: Number(total.inputTokens) || 0,
+    outputTokens: Number(total.outputTokens) || 0,
+    cacheReadInputTokens: Number(total.cacheReadInputTokens) || 0,
+    cacheCreationInputTokens: Number(total.cacheCreationInputTokens) || 0,
+    costUSD: Number(total.costUSD) || 0,
+    durationMs: Number(total.durationMs) || 0,
+    numTurns: Number(total.numTurns) || 0,
+    modelUsage,
+  };
+  updateLatestMessageTokenUsage(
+    chatJid,
+    JSON.stringify(tokenUsage),
+    messageId,
+    tokenUsage.costUSD,
+  );
 }
 
 /**
@@ -1725,7 +2483,13 @@ export function getTokenUsageStats(
       try {
         const modelUsage = JSON.parse(row.model_usage_json) as Record<
           string,
-          { inputTokens: number; outputTokens: number; costUSD: number }
+          {
+            inputTokens: number;
+            outputTokens: number;
+            cacheReadInputTokens?: number;
+            cacheCreationInputTokens?: number;
+            costUSD: number;
+          }
         >;
         for (const [model, usage] of Object.entries(modelUsage)) {
           addToAggregated(
@@ -1733,8 +2497,8 @@ export function getTokenUsageStats(
             model,
             usage.inputTokens || 0,
             usage.outputTokens || 0,
-            0,
-            0,
+            usage.cacheReadInputTokens || 0,
+            usage.cacheCreationInputTokens || 0,
             usage.costUSD || 0,
           );
         }
@@ -1843,6 +2607,23 @@ function toLocalDateString(date?: Date | string): string {
   return `${year}-${month}-${day}`;
 }
 
+export function getUsageDateWindow(
+  days: number,
+  now: Date = new Date(),
+): { from: string; to: string; days: number; timezone: string } {
+  const normalizedDays = Math.min(Math.max(Math.trunc(days) || 1, 1), 365);
+  const to = new Date(now);
+  const from = new Date(now);
+  from.setHours(12, 0, 0, 0);
+  from.setDate(from.getDate() - (normalizedDays - 1));
+  return {
+    from: toLocalDateString(from),
+    to: toLocalDateString(to),
+    days: normalizedDays,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  };
+}
+
 /**
  * Insert a usage record and update daily summary.
  */
@@ -1861,38 +2642,204 @@ export function insertUsageRecord(record: {
   numTurns?: number;
   source?: string;
 }): void {
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const localDate = toLocalDateString();
+  recordUsageEventBatch({
+    eventId: crypto.randomUUID(),
+    userId: record.userId,
+    groupFolder: record.groupFolder,
+    agentId: record.agentId,
+    messageId: record.messageId,
+    inputTokens: record.inputTokens,
+    outputTokens: record.outputTokens,
+    cacheReadInputTokens: record.cacheReadInputTokens,
+    cacheCreationInputTokens: record.cacheCreationInputTokens,
+    providerEstimatedCostUSD: record.costUSD,
+    billedCostUSD: 0,
+    durationMs: record.durationMs,
+    numTurns: record.numTurns,
+    source: record.source,
+    models: [
+      {
+        model: record.model,
+        inputTokens: record.inputTokens,
+        outputTokens: record.outputTokens,
+        cacheReadInputTokens: record.cacheReadInputTokens,
+        cacheCreationInputTokens: record.cacheCreationInputTokens,
+        providerEstimatedCostUSD: record.costUSD,
+        billedCostUSD: 0,
+      },
+    ],
+    trackBillingUsage: false,
+  });
+}
 
-  db.transaction(() => {
-    stmts().insertUsageInsert.run(
-      id,
-      record.userId,
-      record.groupFolder,
-      record.agentId ?? null,
-      record.messageId ?? null,
-      record.model,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheReadInputTokens,
-      record.cacheCreationInputTokens,
-      record.costUSD,
-      record.durationMs ?? 0,
-      record.numTurns ?? 0,
-      record.source ?? 'agent',
-      now,
-    );
-    stmts().insertUsageUpsert.run(
-      record.userId,
-      record.model,
-      localDate,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheReadInputTokens,
-      record.cacheCreationInputTokens,
-      record.costUSD,
-    );
+export interface UsageModelRecordInput {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  providerEstimatedCostUSD: number;
+  billedCostUSD: number;
+}
+
+export interface UsageEventRecordInput {
+  eventId: string;
+  userId: string;
+  groupFolder: string;
+  agentId?: string | null;
+  messageId?: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  providerEstimatedCostUSD: number;
+  billedCostUSD: number;
+  durationMs?: number;
+  numTurns?: number;
+  source?: string;
+  createdAt?: string;
+  models: UsageModelRecordInput[];
+  /** Update the quota/billing period ledgers in the same transaction. */
+  trackBillingUsage?: boolean;
+  /** Atomically deduct the already-rated billedCostUSD from the user wallet. */
+  chargeBalance?: boolean;
+}
+
+/**
+ * Persist one logical Agent run and all of its per-model calls atomically.
+ * Replaying the same eventId is a no-op, including quota counters.
+ */
+export function recordUsageEventBatch(input: UsageEventRecordInput): {
+  inserted: boolean;
+} {
+  if (!input.eventId.trim()) throw new Error('usage eventId is required');
+  if (!input.userId.trim()) throw new Error('usage userId is required');
+  if (!input.groupFolder.trim())
+    throw new Error('usage groupFolder is required');
+
+  const nonNegative = (value: number) =>
+    Number.isFinite(value) ? Math.max(0, value) : 0;
+  const createdAt = input.createdAt || new Date().toISOString();
+  const localDate = toLocalDateString(createdAt);
+  const source = input.source?.trim() || 'agent';
+  const models = input.models.length
+    ? input.models
+    : [
+        {
+          model: 'unknown',
+          inputTokens: input.inputTokens,
+          outputTokens: input.outputTokens,
+          cacheReadInputTokens: input.cacheReadInputTokens,
+          cacheCreationInputTokens: input.cacheCreationInputTokens,
+          providerEstimatedCostUSD: input.providerEstimatedCostUSD,
+          billedCostUSD: input.billedCostUSD,
+        },
+      ];
+
+  return db.transaction(() => {
+    const eventInsert = db
+      .prepare(
+        `INSERT OR IGNORE INTO usage_events (
+          event_id, user_id, group_folder, agent_id, message_id,
+          input_tokens, output_tokens, cache_read_input_tokens,
+          cache_creation_input_tokens, provider_estimated_cost_usd,
+          billed_cost_usd, duration_ms, num_turns, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.eventId,
+        input.userId,
+        input.groupFolder,
+        input.agentId ?? null,
+        input.messageId ?? null,
+        nonNegative(input.inputTokens),
+        nonNegative(input.outputTokens),
+        nonNegative(input.cacheReadInputTokens),
+        nonNegative(input.cacheCreationInputTokens),
+        nonNegative(input.providerEstimatedCostUSD),
+        nonNegative(input.billedCostUSD),
+        nonNegative(input.durationMs ?? 0),
+        nonNegative(input.numTurns ?? 0),
+        source,
+        createdAt,
+      );
+
+    if (eventInsert.changes === 0) return { inserted: false };
+
+    for (const modelUsage of models) {
+      const model = modelUsage.model.trim() || 'unknown';
+      const estimated = nonNegative(modelUsage.providerEstimatedCostUSD);
+      const billed = nonNegative(modelUsage.billedCostUSD);
+      stmts().insertUsageInsert.run(
+        crypto.randomUUID(),
+        input.eventId,
+        input.userId,
+        input.groupFolder,
+        input.agentId ?? null,
+        input.messageId ?? null,
+        model,
+        nonNegative(modelUsage.inputTokens),
+        nonNegative(modelUsage.outputTokens),
+        nonNegative(modelUsage.cacheReadInputTokens),
+        nonNegative(modelUsage.cacheCreationInputTokens),
+        estimated,
+        estimated,
+        billed,
+        nonNegative(input.durationMs ?? 0),
+        nonNegative(input.numTurns ?? 0),
+        source,
+        localDate,
+        createdAt,
+      );
+      stmts().insertUsageUpsert.run(
+        input.userId,
+        model,
+        localDate,
+        nonNegative(modelUsage.inputTokens),
+        nonNegative(modelUsage.outputTokens),
+        nonNegative(modelUsage.cacheReadInputTokens),
+        nonNegative(modelUsage.cacheCreationInputTokens),
+        estimated,
+      );
+    }
+
+    if (input.trackBillingUsage) {
+      const d = new Date(createdAt);
+      const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const billableInput =
+        nonNegative(input.inputTokens) +
+        nonNegative(input.cacheReadInputTokens) +
+        nonNegative(input.cacheCreationInputTokens);
+      incrementUsageBoth(
+        input.userId,
+        month,
+        localDate,
+        billableInput,
+        nonNegative(input.outputTokens),
+        nonNegative(input.billedCostUSD),
+      );
+    }
+
+    if (input.chargeBalance && nonNegative(input.billedCostUSD) > 0) {
+      adjustUserBalance(
+        input.userId,
+        -nonNegative(input.billedCostUSD),
+        'deduction',
+        'AI 调用消费扣费',
+        'usage_event',
+        input.eventId,
+        null,
+        `usage_event_${input.eventId}`,
+        {
+          source: 'usage_charge',
+          operatorType: 'system',
+          notes: `用量事件消费扣费: ${input.eventId}`,
+          allowNegative: true,
+        },
+      );
+    }
+
+    return { inserted: true };
   })();
 }
 
@@ -1914,9 +2861,9 @@ export function getUsageDailyStats(
   cost_usd: number;
   request_count: number;
 }> {
-  const sinceDate = toLocalDateString(new Date(Date.now() - days * 86400000));
-  const conditions: string[] = ['date >= ?'];
-  const params: unknown[] = [sinceDate];
+  const window = getUsageDateWindow(days);
+  const conditions: string[] = ['date >= ?', 'date <= ?'];
+  const params: unknown[] = [window.from, window.to];
 
   if (userId) {
     conditions.push('user_id = ?');
@@ -1972,9 +2919,9 @@ export function getUsageDailySummary(
   totalMessages: number;
   totalActiveDays: number;
 } {
-  const sinceDate = toLocalDateString(new Date(Date.now() - days * 86400000));
-  const conditions: string[] = ['date >= ?'];
-  const params: unknown[] = [sinceDate];
+  const window = getUsageDateWindow(days);
+  const conditions: string[] = ['date >= ?', 'date <= ?'];
+  const params: unknown[] = [window.from, window.to];
 
   if (userId) {
     conditions.push('user_id = ?');
@@ -2032,6 +2979,303 @@ export function getUsageModels(): string[] {
   return rows.map((r) => r.model);
 }
 
+export interface UsageQueryFilters {
+  from: string;
+  to: string;
+  userId?: string;
+  model?: string;
+  agentId?: string;
+  groupFolder?: string;
+  source?: string;
+}
+
+function buildUsageWhere(filters: UsageQueryFilters): {
+  sql: string;
+  params: unknown[];
+} {
+  const conditions = ['r.usage_date >= ?', 'r.usage_date <= ?'];
+  const params: unknown[] = [filters.from, filters.to];
+  const add = (column: string, value?: string) => {
+    if (!value) return;
+    conditions.push(`${column} = ?`);
+    params.push(value);
+  };
+  add('r.user_id', filters.userId);
+  add('r.model', filters.model);
+  if (filters.agentId === '__main__') {
+    conditions.push('r.agent_id IS NULL');
+  } else {
+    add('r.agent_id', filters.agentId);
+  }
+  add('r.group_folder', filters.groupFolder);
+  add('r.source', filters.source);
+  return { sql: conditions.join(' AND '), params };
+}
+
+export interface UsageAttributionItem {
+  key: string;
+  name: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  providerEstimatedCostUSD: number;
+  billedCostUSD: number;
+  runCount: number;
+  modelCallCount: number;
+}
+
+export function getUsageAnalytics(filters: UsageQueryFilters): {
+  summary: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    totalTokens: number;
+    providerEstimatedCostUSD: number;
+    billedCostUSD: number;
+    runCount: number;
+    modelCallCount: number;
+    activeDays: number;
+  };
+  breakdown: Array<{
+    date: string;
+    model: string;
+    user_id: string;
+    agent_id: string | null;
+    group_folder: string;
+    source: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    provider_estimated_cost_usd: number;
+    cost_usd: number;
+    billed_cost_usd: number;
+    run_count: number;
+    model_call_count: number;
+  }>;
+  daily: Array<{
+    date: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    provider_estimated_cost_usd: number;
+    cost_usd: number;
+    billed_cost_usd: number;
+    run_count: number;
+    model_call_count: number;
+  }>;
+  attributions: {
+    models: UsageAttributionItem[];
+    agents: UsageAttributionItem[];
+    workspaces: UsageAttributionItem[];
+    sources: UsageAttributionItem[];
+  };
+} {
+  const where = buildUsageWhere(filters);
+  const aggregateSelect = `
+    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(r.cache_read_input_tokens), 0) AS cache_read_tokens,
+    COALESCE(SUM(r.cache_creation_input_tokens), 0) AS cache_creation_tokens,
+    COALESCE(SUM(r.provider_estimated_cost_usd), 0) AS provider_cost,
+    COALESCE(SUM(r.billed_cost_usd), 0) AS billed_cost,
+    COUNT(DISTINCT r.event_id) AS run_count,
+    COUNT(*) AS model_call_count`;
+  const summaryRow = db
+    .prepare(
+      `SELECT ${aggregateSelect},
+        COUNT(DISTINCT r.usage_date) AS active_days
+       FROM usage_records r WHERE ${where.sql}`,
+    )
+    .get(...where.params) as Record<string, number>;
+
+  const breakdown = db
+    .prepare(
+      `SELECT r.usage_date AS date, r.model, r.user_id,
+        r.agent_id, r.group_folder, r.source, ${aggregateSelect}
+       FROM usage_records r WHERE ${where.sql}
+       GROUP BY r.usage_date, r.model, r.user_id,
+         r.agent_id, r.group_folder, r.source
+       ORDER BY date ASC, r.model ASC`,
+    )
+    .all(...where.params)
+    .map((row: any) => ({
+      date: String(row.date),
+      model: String(row.model),
+      user_id: String(row.user_id),
+      agent_id: row.agent_id == null ? null : String(row.agent_id),
+      group_folder: String(row.group_folder),
+      source: String(row.source),
+      input_tokens: Number(row.input_tokens) || 0,
+      output_tokens: Number(row.output_tokens) || 0,
+      cache_read_tokens: Number(row.cache_read_tokens) || 0,
+      cache_creation_tokens: Number(row.cache_creation_tokens) || 0,
+      provider_estimated_cost_usd: Number(row.provider_cost) || 0,
+      cost_usd: Number(row.provider_cost) || 0,
+      billed_cost_usd: Number(row.billed_cost) || 0,
+      run_count: Number(row.run_count) || 0,
+      model_call_count: Number(row.model_call_count) || 0,
+    }));
+
+  const daily = db
+    .prepare(
+      `SELECT r.usage_date AS date, ${aggregateSelect}
+       FROM usage_records r WHERE ${where.sql}
+       GROUP BY r.usage_date
+       ORDER BY date ASC`,
+    )
+    .all(...where.params)
+    .map((row: any) => ({
+      date: String(row.date),
+      input_tokens: Number(row.input_tokens) || 0,
+      output_tokens: Number(row.output_tokens) || 0,
+      cache_read_tokens: Number(row.cache_read_tokens) || 0,
+      cache_creation_tokens: Number(row.cache_creation_tokens) || 0,
+      provider_estimated_cost_usd: Number(row.provider_cost) || 0,
+      cost_usd: Number(row.provider_cost) || 0,
+      billed_cost_usd: Number(row.billed_cost) || 0,
+      run_count: Number(row.run_count) || 0,
+      model_call_count: Number(row.model_call_count) || 0,
+    }));
+
+  const attribution = (
+    column: 'model' | 'agent_id' | 'group_folder' | 'source',
+  ): UsageAttributionItem[] => {
+    const keyExpression =
+      column === 'agent_id'
+        ? `COALESCE(CAST(r.agent_id AS TEXT), '__main__')`
+        : `COALESCE(CAST(r.${column} AS TEXT), 'unassigned')`;
+    const nameExpression =
+      column === 'agent_id'
+        ? `COALESCE(
+            (SELECT a.name FROM agents a WHERE a.id = r.agent_id LIMIT 1),
+            (SELECT ap.name FROM agent_profiles ap WHERE ap.id = r.agent_id LIMIT 1),
+            CAST(r.agent_id AS TEXT), 'HappyClaw')`
+        : column === 'group_folder'
+          ? `COALESCE(
+              (SELECT rg.name FROM registered_groups rg
+               WHERE rg.folder = r.group_folder LIMIT 1),
+              CAST(r.group_folder AS TEXT), 'unassigned')`
+          : `COALESCE(CAST(r.${column} AS TEXT), 'unassigned')`;
+    const rows = db
+      .prepare(
+        `SELECT ${keyExpression} AS key,
+          ${nameExpression} AS name,
+          ${aggregateSelect}
+         FROM usage_records r WHERE ${where.sql}
+         GROUP BY r.${column}
+         ORDER BY provider_cost DESC, key ASC`,
+      )
+      .all(...where.params) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const input = Number(row.input_tokens) || 0;
+      const output = Number(row.output_tokens) || 0;
+      const cacheRead = Number(row.cache_read_tokens) || 0;
+      const cacheCreation = Number(row.cache_creation_tokens) || 0;
+      const key = String(row.key);
+      return {
+        key,
+        name: String(row.name || key),
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: cacheRead,
+        cacheCreationTokens: cacheCreation,
+        totalTokens: input + output + cacheRead + cacheCreation,
+        providerEstimatedCostUSD: Number(row.provider_cost) || 0,
+        billedCostUSD: Number(row.billed_cost) || 0,
+        runCount: Number(row.run_count) || 0,
+        modelCallCount: Number(row.model_call_count) || 0,
+      };
+    });
+  };
+
+  const inputTokens = Number(summaryRow.input_tokens) || 0;
+  const outputTokens = Number(summaryRow.output_tokens) || 0;
+  const cacheReadTokens = Number(summaryRow.cache_read_tokens) || 0;
+  const cacheCreationTokens = Number(summaryRow.cache_creation_tokens) || 0;
+  return {
+    summary: {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      totalTokens:
+        inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
+      providerEstimatedCostUSD: Number(summaryRow.provider_cost) || 0,
+      billedCostUSD: Number(summaryRow.billed_cost) || 0,
+      runCount: Number(summaryRow.run_count) || 0,
+      modelCallCount: Number(summaryRow.model_call_count) || 0,
+      activeDays: Number(summaryRow.active_days) || 0,
+    },
+    breakdown,
+    daily,
+    attributions: {
+      models: attribution('model'),
+      agents: attribution('agent_id'),
+      workspaces: attribution('group_folder'),
+      sources: attribution('source'),
+    },
+  };
+}
+
+export function getUsageModelsForFilters(filters: UsageQueryFilters): string[] {
+  const where = buildUsageWhere({ ...filters, model: undefined });
+  return (
+    db
+      .prepare(
+        `SELECT DISTINCT r.model FROM usage_records r
+         WHERE ${where.sql} ORDER BY r.model`,
+      )
+      .all(...where.params) as Array<{ model: string }>
+  ).map((row) => row.model);
+}
+
+export function getUsageRecordsPage(
+  filters: UsageQueryFilters,
+  page: number,
+  pageSize: number,
+): { records: Array<Record<string, unknown>>; total: number } {
+  const where = buildUsageWhere(filters);
+  const safePage = Math.max(1, Math.trunc(page) || 1);
+  // Public JSON routes cap this at 500. The higher internal ceiling is used by
+  // the authenticated CSV export to avoid silently truncating downloads.
+  const safePageSize = Math.min(
+    Math.max(1, Math.trunc(pageSize) || 50),
+    100_000,
+  );
+  const total = Number(
+    (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM usage_records r WHERE ${where.sql}`,
+        )
+        .get(...where.params) as { count: number }
+    ).count,
+  );
+  const records = db
+    .prepare(
+      `SELECT r.event_id AS eventId, r.user_id AS userId,
+        r.group_folder AS groupFolder, r.agent_id AS agentId,
+        r.message_id AS messageId, r.model,
+        r.input_tokens AS inputTokens, r.output_tokens AS outputTokens,
+        r.cache_read_input_tokens AS cacheReadTokens,
+        r.cache_creation_input_tokens AS cacheCreationTokens,
+        r.provider_estimated_cost_usd AS providerEstimatedCostUSD,
+        r.billed_cost_usd AS billedCostUSD, r.duration_ms AS durationMs,
+        r.num_turns AS numTurns, r.source, r.created_at AS createdAt
+       FROM usage_records r WHERE ${where.sql}
+       ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...where.params, safePageSize, (safePage - 1) * safePageSize) as Array<
+    Record<string, unknown>
+  >;
+  return { records, total };
+}
+
 /**
  * Get list of users that have usage data.
  */
@@ -2039,9 +3283,9 @@ export function getUsageUsers(): Array<{ id: string; username: string }> {
   const rows = db
     .prepare(
       `
-    SELECT DISTINCT uds.user_id as id, COALESCE(u.username, uds.user_id) as username
-    FROM usage_daily_summary uds
-    LEFT JOIN users u ON u.id = uds.user_id
+    SELECT DISTINCT r.user_id as id, COALESCE(u.username, r.user_id) as username
+    FROM usage_records r
+    LEFT JOIN users u ON u.id = r.user_id
     ORDER BY u.username
   `,
     )
@@ -2083,12 +3327,17 @@ export function getMessagesSince(
 }
 
 export function createTask(
-  task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
+  task: Omit<
+    ScheduledTask,
+    'last_run' | 'last_result' | 'revision' | 'updated_at' | 'deleted_at'
+  > &
+    Partial<Pick<ScheduledTask, 'revision' | 'updated_at' | 'deleted_at'>>,
 ): void {
+  const updatedAt = task.updated_at ?? task.created_at;
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels, revision, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -2097,7 +3346,7 @@ export function createTask(
     toUtf8String(task.prompt, 'scheduled_tasks.prompt'),
     task.schedule_type,
     task.schedule_value,
-    task.context_mode || 'group',
+    task.context_mode || 'isolated',
     task.execution_type || 'agent',
     task.script_command == null
       ? null
@@ -2108,6 +3357,9 @@ export function createTask(
     task.created_at,
     task.created_by ?? null,
     task.notify_channels != null ? JSON.stringify(task.notify_channels) : null,
+    task.revision ?? 1,
+    updatedAt,
+    task.deleted_at ?? null,
   );
 }
 
@@ -2127,9 +3379,13 @@ function mapTaskRow(row: unknown): ScheduledTask {
   if (r.execution_mode === undefined) r.execution_mode = null;
   if (r.workspace_jid === undefined) r.workspace_jid = null;
   if (r.workspace_folder === undefined) r.workspace_folder = null;
+  if (!Number.isInteger(r.revision) || r.revision < 1) r.revision = 1;
+  if (!r.updated_at) r.updated_at = r.created_at;
+  if (r.deleted_at === undefined) r.deleted_at = null;
   // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
   r.prompt = toUtf8String(r.prompt);
-  if (r.script_command !== undefined) r.script_command = toUtf8StringOrNull(r.script_command);
+  if (r.script_command !== undefined)
+    r.script_command = toUtf8StringOrNull(r.script_command);
   return r as ScheduledTask;
 }
 
@@ -2141,7 +3397,7 @@ export function getTaskById(id: string): ScheduledTask | undefined {
 export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
   return db
     .prepare(
-      'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC',
+      'SELECT * FROM scheduled_tasks WHERE group_folder = ? AND deleted_at IS NULL ORDER BY created_at DESC',
     )
     .all(groupFolder)
     .map(mapTaskRow);
@@ -2149,7 +3405,18 @@ export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
 
 export function getAllTasks(): ScheduledTask[] {
   return db
-    .prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC')
+    .prepare(
+      'SELECT * FROM scheduled_tasks WHERE deleted_at IS NULL ORDER BY created_at DESC',
+    )
+    .all()
+    .map(mapTaskRow);
+}
+
+export function getDeletedTasks(): ScheduledTask[] {
+  return db
+    .prepare(
+      'SELECT * FROM scheduled_tasks WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC',
+    )
     .all()
     .map(mapTaskRow);
 }
@@ -2206,7 +3473,10 @@ export function updateTask(
     values.push(
       updates.script_command == null
         ? null
-        : toUtf8String(updates.script_command, 'scheduled_tasks.script_command'),
+        : toUtf8String(
+            updates.script_command,
+            'scheduled_tasks.script_command',
+          ),
     );
   }
   if (updates.next_run !== undefined) {
@@ -2219,7 +3489,11 @@ export function updateTask(
   }
   if (updates.notify_channels !== undefined) {
     fields.push('notify_channels = ?');
-    values.push(updates.notify_channels != null ? JSON.stringify(updates.notify_channels) : null);
+    values.push(
+      updates.notify_channels != null
+        ? JSON.stringify(updates.notify_channels)
+        : null,
+    );
   }
   if (updates.chat_jid !== undefined) {
     fields.push('chat_jid = ?');
@@ -2232,10 +3506,167 @@ export function updateTask(
 
   if (fields.length === 0) return;
 
+  fields.push('revision = revision + 1');
+  fields.push('updated_at = ?');
+  values.push(new Date().toISOString());
+
   values.push(id);
   db.prepare(
-    `UPDATE scheduled_tasks SET ${fields.join(', ')} WHERE id = ?`,
+    `UPDATE scheduled_tasks SET ${fields.join(', ')} WHERE id = ? AND deleted_at IS NULL`,
   ).run(...values);
+}
+
+export type TaskRevisionMutationResult =
+  | { status: 'updated'; task: ScheduledTask }
+  | { status: 'conflict'; task: ScheduledTask }
+  | { status: 'not_found' };
+
+export type TaskSoftDeleteMutationResult =
+  | TaskRevisionMutationResult
+  | { status: 'active_run'; task: ScheduledTask; run: TaskRun };
+
+/**
+ * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
+ * available while all in-process clients migrate to this contract.
+ */
+export function updateTaskWithRevision(
+  id: string,
+  expectedRevision: number,
+  updates: Parameters<typeof updateTask>[1],
+): TaskRevisionMutationResult {
+  const current = getTaskById(id);
+  if (!current || current.deleted_at) return { status: 'not_found' };
+  if (current.revision !== expectedRevision) {
+    return { status: 'conflict', task: current };
+  }
+
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  const pushText = (field: string, value: unknown) => {
+    fields.push(`${field} = ?`);
+    values.push(value);
+  };
+  if (updates.prompt !== undefined)
+    pushText('prompt', toUtf8String(updates.prompt, 'scheduled_tasks.prompt'));
+  if (updates.schedule_type !== undefined)
+    pushText('schedule_type', updates.schedule_type);
+  if (updates.schedule_value !== undefined)
+    pushText('schedule_value', updates.schedule_value);
+  if (updates.context_mode !== undefined)
+    pushText('context_mode', updates.context_mode);
+  if (updates.execution_type !== undefined)
+    pushText('execution_type', updates.execution_type);
+  if (updates.execution_mode !== undefined)
+    pushText('execution_mode', updates.execution_mode);
+  if (updates.script_command !== undefined) {
+    pushText(
+      'script_command',
+      updates.script_command == null
+        ? null
+        : toUtf8String(
+            updates.script_command,
+            'scheduled_tasks.script_command',
+          ),
+    );
+  }
+  if (updates.next_run !== undefined) pushText('next_run', updates.next_run);
+  if (updates.status !== undefined) pushText('status', updates.status);
+  if (updates.notify_channels !== undefined) {
+    pushText(
+      'notify_channels',
+      updates.notify_channels == null
+        ? null
+        : JSON.stringify(updates.notify_channels),
+    );
+  }
+  if (updates.chat_jid !== undefined) pushText('chat_jid', updates.chat_jid);
+  if (updates.group_folder !== undefined)
+    pushText('group_folder', updates.group_folder);
+
+  if (fields.length === 0) return { status: 'updated', task: current };
+  fields.push('revision = revision + 1', 'updated_at = ?');
+  values.push(new Date().toISOString(), id, expectedRevision);
+  const result = db
+    .prepare(
+      `UPDATE scheduled_tasks SET ${fields.join(', ')}
+       WHERE id = ? AND revision = ? AND deleted_at IS NULL`,
+    )
+    .run(...values);
+  const latest = getTaskById(id);
+  if (result.changes === 1 && latest)
+    return { status: 'updated', task: latest };
+  if (!latest || latest.deleted_at) return { status: 'not_found' };
+  return { status: 'conflict', task: latest };
+}
+
+export function softDeleteTaskWithRevision(
+  id: string,
+  expectedRevision: number,
+): TaskSoftDeleteMutationResult {
+  return db
+    .transaction((): TaskSoftDeleteMutationResult => {
+      const current = getTaskById(id);
+      if (!current || current.deleted_at) return { status: 'not_found' };
+      if (current.revision !== expectedRevision) {
+        return { status: 'conflict', task: current };
+      }
+      const activeRun = getActiveTaskRunForTask(id);
+      if (activeRun) {
+        return { status: 'active_run', task: current, run: activeRun };
+      }
+      const now = new Date().toISOString();
+      const result = db
+        .prepare(
+          `UPDATE scheduled_tasks
+           SET deleted_at = ?, status = 'paused', next_run = NULL,
+               revision = revision + 1, updated_at = ?
+           WHERE id = ? AND revision = ? AND deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM task_runs
+               WHERE task_id = scheduled_tasks.id
+                 AND status IN ('queued','running','retry_wait')
+             )`,
+        )
+        .run(now, now, id, expectedRevision);
+      const latest = getTaskById(id);
+      if (result.changes === 1 && latest) {
+        return { status: 'updated', task: latest };
+      }
+      if (!latest || latest.deleted_at) return { status: 'not_found' };
+      const racedRun = getActiveTaskRunForTask(id);
+      if (racedRun) {
+        return { status: 'active_run', task: latest, run: racedRun };
+      }
+      return { status: 'conflict', task: latest };
+    })
+    .immediate();
+}
+
+/** Restore only the definition/history; the user must explicitly resume it. */
+export function restoreTaskWithRevision(
+  id: string,
+  expectedRevision: number,
+): TaskRevisionMutationResult {
+  const current = getTaskById(id);
+  if (!current) return { status: 'not_found' };
+  if (current.revision !== expectedRevision) {
+    return { status: 'conflict', task: current };
+  }
+  if (!current.deleted_at) return { status: 'updated', task: current };
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE scheduled_tasks
+       SET deleted_at = NULL, status = 'paused', next_run = NULL,
+           revision = revision + 1, updated_at = ?
+       WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL`,
+    )
+    .run(now, id, expectedRevision);
+  const latest = getTaskById(id);
+  if (result.changes === 1 && latest)
+    return { status: 'updated', task: latest };
+  if (!latest) return { status: 'not_found' };
+  return { status: 'conflict', task: latest };
 }
 
 export function updateTaskWorkspace(
@@ -2250,12 +3681,17 @@ export function updateTaskWorkspace(
 
 export function deleteTask(id: string): void {
   // Delete child records first (FK constraint)
+  db.prepare('DELETE FROM task_runs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
 }
 
 export function deleteTasksForGroup(groupFolder: string): void {
   const tx = db.transaction((folder: string) => {
+    db.prepare(
+      `DELETE FROM task_runs
+       WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)`,
+    ).run(folder);
     db.prepare(
       `
       DELETE FROM task_run_logs
@@ -2276,13 +3712,77 @@ export function getDueTasks(): ScheduledTask[] {
   return db
     .prepare(
       `
-    SELECT * FROM scheduled_tasks
-    WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?
-    ORDER BY next_run
+	    SELECT * FROM scheduled_tasks
+	    WHERE status = 'active'
+	      AND deleted_at IS NULL
+	      AND next_run IS NOT NULL
+	      AND next_run <= ?
+	      AND (running_until IS NULL OR running_until <= ?)
+	    ORDER BY next_run
+	  `,
+    )
+    .all(now, now)
+    .map(mapTaskRow);
+}
+
+/** V2 ignores the legacy definition-level lease; ownership lives on task_runs. */
+export function getDueTaskDefinitionsV2(limit = 100): ScheduledTask[] {
+  const now = new Date().toISOString();
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_tasks
+       WHERE status = 'active' AND deleted_at IS NULL
+         AND next_run IS NOT NULL AND next_run <= ?
+       ORDER BY next_run LIMIT ?`,
+    )
+    .all(now, limit)
+    .map(mapTaskRow);
+}
+
+// Clear every task's run lease (running_until/runner_id) unconditionally.
+// Must be called once at scheduler process startup, before the first
+// getDueTasks() poll: a lease held in the DB can only have been acquired by
+// a runner process that no longer exists (this process just started, and
+// its own in-memory runningTaskIds is freshly cleared too), so any lease
+// still on disk is stale by definition — leaving it in place would hide a
+// crash-interrupted task from getDueTasks() until the lease's absolute
+// expiry, and if that expiry lands past the backfill grace window the
+// interrupted run is silently skipped forever instead of retried.
+export function clearStaleTaskLeases(): number {
+  const result = db
+    .prepare(
+      `
+    UPDATE scheduled_tasks
+    SET running_until = NULL, runner_id = NULL
+    WHERE running_until IS NOT NULL OR runner_id IS NOT NULL
   `,
     )
-    .all(now)
-    .map(mapTaskRow);
+    .run();
+  return result.changes;
+}
+
+export function claimTaskForRun(
+  id: string,
+  runnerId: string,
+  leaseMs: number,
+): boolean {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+  const result = db
+    .prepare(
+      `
+    UPDATE scheduled_tasks
+    SET runner_id = ?, running_until = ?
+    WHERE id = ?
+      AND status = 'active'
+      AND next_run IS NOT NULL
+      AND next_run <= ?
+      AND (running_until IS NULL OR running_until <= ?)
+  `,
+    )
+    .run(runnerId, leaseUntil, id, nowIso, nowIso);
+  return result.changes === 1;
 }
 
 export function updateTaskAfterRun(
@@ -2294,7 +3794,8 @@ export function updateTaskAfterRun(
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+	    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
+	        running_until = NULL, runner_id = NULL
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
@@ -2307,7 +3808,8 @@ export function advanceSkippedTask(id: string, nextRun: string | null): void {
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+	    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
+	        running_until = NULL, runner_id = NULL
     WHERE id = ?
   `,
   ).run(nextRun, nextRun, id);
@@ -2323,10 +3825,1752 @@ export function pauseTaskAfterRun(id: string, lastResult: string): void {
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused'
+	    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused',
+	        running_until = NULL, runner_id = NULL
     WHERE id = ?
   `,
   ).run(now, lastResult, id);
+}
+
+interface TaskRunRow {
+  id: string;
+  task_id: string;
+  occurrence_key: string;
+  trigger_type: TaskRunTrigger;
+  idempotency_key: string | null;
+  scheduled_for: string;
+  definition_revision: number;
+  definition_snapshot: string;
+  status: TaskRunStatus;
+  attempt: number;
+  available_at: string;
+  lease_owner: string | null;
+  lease_token: number;
+  lease_expires_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  duration_ms: number;
+  result: string | null;
+  error: string | null;
+  notification_status: TaskRunNotificationStatus;
+  notification_error: string | null;
+  notification_summary: string | null;
+  notification_payload: string | null;
+  notification_attempt: number;
+  notification_available_at: string | null;
+  notification_lease_owner: string | null;
+  notification_lease_token: number;
+  notification_lease_expires_at: string | null;
+  notification_lease_payload: string | null;
+  notification_generation: number;
+}
+
+function taskDefinitionSnapshot(
+  task: ScheduledTask,
+): TaskRunDefinitionSnapshot {
+  return {
+    prompt: task.prompt,
+    group_folder: task.group_folder,
+    chat_jid: task.chat_jid,
+    context_mode: task.context_mode,
+    execution_type: task.execution_type,
+    execution_mode: task.execution_mode ?? null,
+    script_command: task.script_command,
+    notify_channels: task.notify_channels ?? null,
+  };
+}
+
+function mapTaskRunRow(row: TaskRunRow): TaskRun {
+  let snapshot: TaskRunDefinitionSnapshot;
+  try {
+    snapshot = JSON.parse(row.definition_snapshot) as TaskRunDefinitionSnapshot;
+  } catch {
+    snapshot = {
+      prompt: '',
+      group_folder: '',
+      chat_jid: '',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: null,
+      script_command: null,
+      notify_channels: null,
+    };
+  }
+  let notificationSummary: TaskRunNotificationSummary | null = null;
+  if (row.notification_summary) {
+    try {
+      notificationSummary = JSON.parse(
+        row.notification_summary,
+      ) as TaskRunNotificationSummary;
+    } catch {
+      notificationSummary = null;
+    }
+  }
+  return {
+    ...row,
+    definition_snapshot: snapshot,
+    notification_summary: notificationSummary,
+  };
+}
+
+function insertTaskRunRow(
+  task: ScheduledTask,
+  input: {
+    id: string;
+    occurrenceKey: string;
+    triggerType: TaskRunTrigger;
+    idempotencyKey: string | null;
+    scheduledFor: string;
+    status: 'queued' | 'missed';
+    availableAt: string;
+    result?: string | null;
+    error?: string | null;
+  },
+): void {
+  const now = new Date().toISOString();
+  const terminal = input.status === 'missed' ? now : null;
+  db.prepare(
+    `INSERT INTO task_runs (
+       id, task_id, occurrence_key, trigger_type, idempotency_key,
+       scheduled_for, definition_revision, definition_snapshot, status,
+       attempt, available_at, lease_owner, lease_token, lease_expires_at,
+       started_at, completed_at, created_at, updated_at, duration_ms,
+       result, error, notification_status, notification_error,
+       notification_summary, notification_payload, notification_attempt,
+       notification_available_at, notification_lease_owner,
+       notification_lease_token, notification_lease_expires_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, 0, NULL,
+               NULL, ?, ?, ?, 0, ?, ?, ?, NULL,
+               NULL, NULL, 0, NULL, NULL, 0, NULL)`,
+  ).run(
+    input.id,
+    task.id,
+    input.occurrenceKey,
+    input.triggerType,
+    input.idempotencyKey,
+    input.scheduledFor,
+    task.revision,
+    JSON.stringify(taskDefinitionSnapshot(task)),
+    input.status,
+    input.availableAt,
+    terminal,
+    now,
+    now,
+    input.result ?? null,
+    input.error ?? null,
+    input.status === 'missed' ? 'skipped' : 'pending',
+  );
+}
+
+export interface CreateTaskRunInput {
+  task: ScheduledTask;
+  triggerType: TaskRunTrigger;
+  scheduledFor?: string;
+  idempotencyKey?: string | null;
+  availableAt?: string;
+}
+
+export interface CreateTaskRunResult {
+  created: boolean;
+  reason?: 'duplicate' | 'active_conflict';
+  run: TaskRun;
+}
+
+/**
+ * Create a manual occurrence. Scheduled/backfill occurrences should normally
+ * use materializeTaskOccurrence so cursor advancement is atomic with creation.
+ */
+export function createTaskRun(input: CreateTaskRunInput): CreateTaskRunResult {
+  const task = input.task;
+  if (task.deleted_at)
+    throw new Error('Cannot create a run for a deleted task');
+  const scheduledFor = input.scheduledFor ?? new Date().toISOString();
+  const idempotencyKey = input.idempotencyKey?.trim() || null;
+  const id = crypto.randomUUID();
+  const occurrenceKey =
+    input.triggerType === 'manual'
+      ? `${task.id}:manual:${idempotencyKey ?? id}`
+      : `${task.id}:${scheduledFor}`;
+  const availableAt = input.availableAt ?? new Date().toISOString();
+
+  return db.transaction(() => {
+    const existing = db
+      .prepare('SELECT * FROM task_runs WHERE occurrence_key = ?')
+      .get(occurrenceKey) as TaskRunRow | undefined;
+    if (existing) {
+      return {
+        created: false,
+        reason: 'duplicate' as const,
+        run: mapTaskRunRow(existing),
+      };
+    }
+    if (idempotencyKey) {
+      const idempotent = db
+        .prepare(
+          'SELECT * FROM task_runs WHERE task_id = ? AND idempotency_key = ?',
+        )
+        .get(task.id, idempotencyKey) as TaskRunRow | undefined;
+      if (idempotent) {
+        return {
+          created: false,
+          reason: 'duplicate' as const,
+          run: mapTaskRunRow(idempotent),
+        };
+      }
+    }
+    const active = db
+      .prepare(
+        `SELECT * FROM task_runs
+         WHERE task_id = ? AND status IN ('queued','running','retry_wait')
+         ORDER BY created_at LIMIT 1`,
+      )
+      .get(task.id) as TaskRunRow | undefined;
+    if (active) {
+      return {
+        created: false,
+        reason: 'active_conflict' as const,
+        run: mapTaskRunRow(active),
+      };
+    }
+    insertTaskRunRow(task, {
+      id,
+      occurrenceKey,
+      triggerType: input.triggerType,
+      idempotencyKey,
+      scheduledFor,
+      status: 'queued',
+      availableAt,
+    });
+    return {
+      created: true,
+      run: getTaskRunById(id)!,
+    };
+  })();
+}
+
+export interface MaterializeTaskOccurrenceInput {
+  taskId: string;
+  scheduledFor: string;
+  nextRun: string | null;
+  triggerType: 'scheduled' | 'backfill';
+  /** Recurring occurrences beyond grace are persisted as terminal missed rows. */
+  missedReason?: string;
+}
+
+/**
+ * Atomically materialize one due occurrence and advance its definition cursor.
+ * A still-active previous occurrence never overlaps: this occurrence is
+ * recorded as missed and the schedule continues.
+ */
+export function materializeTaskOccurrence(
+  input: MaterializeTaskOccurrenceInput,
+): CreateTaskRunResult | undefined {
+  return db.transaction(() => {
+    const row = db
+      .prepare(
+        `SELECT * FROM scheduled_tasks
+         WHERE id = ? AND deleted_at IS NULL AND status = 'active'
+           AND next_run = ?`,
+      )
+      .get(input.taskId, input.scheduledFor);
+    if (!row) return undefined;
+    const task = mapTaskRow(row);
+    const occurrenceKey = `${task.id}:${input.scheduledFor}`;
+    const existing = db
+      .prepare('SELECT * FROM task_runs WHERE occurrence_key = ?')
+      .get(occurrenceKey) as TaskRunRow | undefined;
+    if (existing) {
+      return {
+        created: false,
+        reason: 'duplicate' as const,
+        run: mapTaskRunRow(existing),
+      };
+    }
+    const active = db
+      .prepare(
+        `SELECT * FROM task_runs
+         WHERE task_id = ? AND status IN ('queued','running','retry_wait')
+         ORDER BY created_at LIMIT 1`,
+      )
+      .get(task.id) as TaskRunRow | undefined;
+    const missedReason =
+      input.missedReason ??
+      (active
+        ? `Skipped: previous occurrence ${active.id} is still active`
+        : null);
+    const status = missedReason ? 'missed' : 'queued';
+    const runId = crypto.randomUUID();
+    insertTaskRunRow(task, {
+      id: runId,
+      occurrenceKey,
+      triggerType: input.triggerType,
+      idempotencyKey: null,
+      scheduledFor: input.scheduledFor,
+      status,
+      availableAt: new Date().toISOString(),
+      error: missedReason,
+    });
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE scheduled_tasks
+       SET next_run = ?, updated_at = ?
+       WHERE id = ? AND next_run = ? AND deleted_at IS NULL`,
+    ).run(input.nextRun, now, task.id, input.scheduledFor);
+    if (
+      status === 'missed' &&
+      task.schedule_type === 'once' &&
+      input.nextRun === null
+    ) {
+      db.prepare(
+        `UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
+         WHERE id = ? AND status = 'active' AND next_run IS NULL`,
+      ).run(now, task.id);
+    }
+    return { created: true, run: getTaskRunById(runId)! };
+  })();
+}
+
+export function getTaskRunById(id: string): TaskRun | undefined {
+  const row = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(id) as
+    | TaskRunRow
+    | undefined;
+  return row ? mapTaskRunRow(row) : undefined;
+}
+
+export function getActiveTaskRunForTask(taskId: string): TaskRun | undefined {
+  const row = db
+    .prepare(
+      `SELECT * FROM task_runs
+       WHERE task_id = ? AND status IN ('queued','running','retry_wait')
+       ORDER BY created_at LIMIT 1`,
+    )
+    .get(taskId) as TaskRunRow | undefined;
+  return row ? mapTaskRunRow(row) : undefined;
+}
+
+export function getTaskRunsForTask(taskId: string, limit = 20): TaskRun[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM task_runs WHERE task_id = ?
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(taskId, limit) as TaskRunRow[]
+  ).map(mapTaskRunRow);
+}
+
+export function getTaskRunsByStatus(
+  statuses: TaskRunStatus[],
+  limit = 100,
+): TaskRun[] {
+  if (statuses.length === 0) return [];
+  const placeholders = statuses.map(() => '?').join(',');
+  return (
+    db
+      .prepare(
+        `SELECT * FROM task_runs WHERE status IN (${placeholders})
+         ORDER BY available_at, created_at LIMIT ?`,
+      )
+      .all(...statuses, limit) as TaskRunRow[]
+  ).map(mapTaskRunRow);
+}
+
+export function claimNextTaskRun(
+  owner: string,
+  leaseMs: number,
+): ClaimedTaskRun | undefined {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  return db.transaction(() => {
+    const candidate = db
+      .prepare(
+        `SELECT * FROM task_runs
+         WHERE (
+           status IN ('queued','retry_wait') AND available_at <= ?
+         ) OR (
+           status = 'running' AND lease_expires_at IS NOT NULL
+             AND lease_expires_at <= ? AND started_at IS NULL
+         )
+         ORDER BY available_at, scheduled_for, created_at LIMIT 1`,
+      )
+      .get(nowIso, nowIso) as TaskRunRow | undefined;
+    if (!candidate) return undefined;
+    const nextToken = candidate.lease_token + 1;
+    const result = db
+      .prepare(
+        `UPDATE task_runs
+         SET status = 'running', lease_owner = ?, lease_token = ?,
+             lease_expires_at = ?, attempt = attempt + 1,
+             updated_at = ?
+         WHERE id = ? AND (
+           (status IN ('queued','retry_wait') AND available_at <= ?)
+           OR (status = 'running' AND lease_expires_at IS NOT NULL
+               AND lease_expires_at <= ? AND started_at IS NULL)
+         )`,
+      )
+      .run(owner, nextToken, expiresAt, nowIso, candidate.id, nowIso, nowIso);
+    if (result.changes !== 1) return undefined;
+    return getTaskRunById(candidate.id) as ClaimedTaskRun;
+  })();
+}
+
+/** Mark the irreversible execution boundary before invoking Agent/script/group. */
+export function markTaskRunExecutionStarted(
+  id: string,
+  owner: string,
+  token: number,
+): boolean {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE task_runs SET started_at = COALESCE(started_at, ?), updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?
+         AND EXISTS (
+           SELECT 1 FROM scheduled_tasks
+           WHERE scheduled_tasks.id = task_runs.task_id
+             AND scheduled_tasks.deleted_at IS NULL
+             AND scheduled_tasks.status IN ('active','paused')
+         )`,
+    )
+    .run(now, now, id, owner, token, now);
+  return result.changes === 1;
+}
+
+/**
+ * A process crash after execution started is not known-safe to replay. Record
+ * it as interrupted instead of blindly repeating possible external effects.
+ */
+export function failExpiredStartedTaskRuns(): number {
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const expired = db
+      .prepare(
+        `SELECT id, task_id FROM task_runs
+         WHERE status = 'running' AND started_at IS NOT NULL
+           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
+      )
+      .all(now) as Array<{ id: string; task_id: string }>;
+    if (expired.length === 0) return 0;
+    const failOne = db.prepare(
+      `UPDATE task_runs
+       SET status = 'failed', completed_at = ?, updated_at = ?,
+           error = COALESCE(error, 'Process stopped after execution began; not retried to avoid duplicate side effects'),
+           notification_status = CASE
+             WHEN notification_status = 'pending'
+                  AND notification_payload IS NULL THEN 'skipped'
+             ELSE notification_status
+           END,
+           notification_lease_owner = NULL,
+           notification_lease_expires_at = NULL,
+           notification_lease_payload = NULL,
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1
+       WHERE id = ? AND status = 'running' AND started_at IS NOT NULL
+         AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
+    );
+    let changed = 0;
+    const taskIdSet = new Set<string>();
+    for (const run of expired) {
+      const result = failOne.run(now, now, run.id, now);
+      if (result.changes === 1) {
+        changed++;
+        taskIdSet.add(run.task_id);
+      }
+    }
+    const taskIds = [...taskIdSet];
+    if (taskIds.length === 0) return 0;
+    const taskPlaceholders = taskIds.map(() => '?').join(',');
+    db.prepare(
+      `UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
+       WHERE id IN (${taskPlaceholders}) AND schedule_type = 'once'
+         AND next_run IS NULL AND status IN ('active','paused')`,
+    ).run(now, ...taskIds);
+    return changed;
+  })();
+}
+
+export function renewTaskRunLease(
+  id: string,
+  owner: string,
+  token: number,
+  leaseMs: number,
+): boolean {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  const result = db
+    .prepare(
+      `UPDATE task_runs SET lease_expires_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?`,
+    )
+    .run(expiresAt, nowIso, id, owner, token, nowIso);
+  return result.changes === 1;
+}
+
+export function releaseTaskRunForRetry(
+  id: string,
+  owner: string,
+  token: number,
+  availableAt: string,
+  error: string,
+): boolean {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE task_runs
+       SET status = 'retry_wait', available_at = ?, error = ?,
+           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?`,
+    )
+    .run(availableAt, error, now, id, owner, token, now);
+  return result.changes === 1;
+}
+
+export interface CompleteTaskRunInput {
+  status: Extract<
+    TaskRunStatus,
+    'success' | 'failed' | 'cancelled' | 'delivered'
+  >;
+  result?: string | null;
+  error?: string | null;
+  notificationStatus?: TaskRunNotificationStatus;
+  notificationError?: string | null;
+}
+
+export function completeTaskRun(
+  id: string,
+  owner: string,
+  token: number,
+  input: CompleteTaskRunInput,
+): boolean {
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const current = db
+      .prepare('SELECT * FROM task_runs WHERE id = ?')
+      .get(id) as TaskRunRow | undefined;
+    if (
+      !current ||
+      current.status !== 'running' ||
+      current.lease_owner !== owner ||
+      current.lease_token !== token ||
+      !current.lease_expires_at ||
+      current.lease_expires_at <= now
+    ) {
+      return false;
+    }
+    const startedAt = current.started_at
+      ? new Date(current.started_at).getTime()
+      : new Date(current.created_at).getTime();
+    const durationMs = Math.max(0, Date.now() - startedAt);
+    // IPC delivery can finish before the Agent process exits. Do not replace a
+    // real receipt with the isolated-run fallback `pending` value.
+    const requestedNotificationStatus =
+      input.notificationStatus ?? current.notification_status;
+    const effectiveNotificationStatus = current.notification_payload
+      ? requestedNotificationStatus === 'success' ||
+        requestedNotificationStatus === 'skipped'
+        ? current.notification_status === 'pending'
+          ? 'failed'
+          : current.notification_status
+        : requestedNotificationStatus === 'pending' &&
+            current.notification_status !== 'pending'
+          ? current.notification_status
+          : requestedNotificationStatus
+      : requestedNotificationStatus === 'pending' &&
+          current.notification_status !== 'pending'
+        ? current.notification_status
+        : requestedNotificationStatus;
+    const effectiveNotificationError =
+      effectiveNotificationStatus === current.notification_status &&
+      current.notification_status !== 'pending'
+        ? current.notification_error
+        : (input.notificationError ?? null);
+    const changed = db
+      .prepare(
+        `UPDATE task_runs
+         SET status = ?, result = ?, error = ?, notification_status = ?,
+             notification_error = ?, duration_ms = ?, completed_at = ?,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND status = 'running' AND lease_owner = ?
+           AND lease_token = ? AND lease_expires_at > ?`,
+      )
+      .run(
+        input.status,
+        input.result ?? null,
+        input.error ?? null,
+        effectiveNotificationStatus,
+        effectiveNotificationError,
+        durationMs,
+        now,
+        now,
+        id,
+        owner,
+        token,
+        now,
+      );
+    if (changed.changes !== 1) return false;
+    const summary = input.error
+      ? `Error: ${input.error}`
+      : input.result?.slice(0, 200) ||
+        (input.status === 'delivered' ? 'Delivered' : 'Completed');
+    db.prepare(
+      `UPDATE scheduled_tasks
+       SET last_run = ?, last_result = ?,
+           status = CASE
+             WHEN schedule_type = 'once' AND next_run IS NULL THEN 'completed'
+             ELSE status
+           END,
+           updated_at = ?
+       WHERE id = ?`,
+    ).run(now, summary, now, current.task_id);
+    return true;
+  })();
+}
+
+/** Cancellation increments the fencing token so a late worker cannot commit. */
+export function cancelTaskRun(
+  id: string,
+  reason = 'Cancelled by user',
+): boolean {
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const current = db
+      .prepare(
+        `SELECT task_id FROM task_runs
+         WHERE id = ? AND status IN ('queued','running','retry_wait')`,
+      )
+      .get(id) as { task_id: string } | undefined;
+    if (!current) return false;
+    const result = db
+      .prepare(
+        `UPDATE task_runs
+         SET status = 'cancelled', error = ?, completed_at = ?, updated_at = ?,
+             notification_status = 'skipped', notification_error = NULL,
+             notification_payload = NULL, notification_available_at = NULL,
+             notification_lease_owner = NULL,
+             notification_lease_expires_at = NULL,
+             notification_lease_payload = NULL,
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE id = ? AND status IN ('queued','running','retry_wait')`,
+      )
+      .run(reason, now, now, id);
+    if (result.changes !== 1) return false;
+    db.prepare(
+      `UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
+       WHERE id = ? AND schedule_type = 'once' AND next_run IS NULL
+         AND status IN ('active','paused')`,
+    ).run(now, current.task_id);
+    return true;
+  })();
+}
+
+export function updateTaskRunNotification(
+  id: string,
+  status: TaskRunNotificationStatus,
+  error: string | null = null,
+  summary: TaskRunNotificationSummary | null = null,
+): boolean {
+  return db.transaction(() => {
+    const current = db
+      .prepare(
+        `SELECT status, notification_status, notification_error,
+                notification_summary, notification_payload
+         FROM task_runs WHERE id = ?`,
+      )
+      .get(id) as
+      | Pick<
+          TaskRunRow,
+          | 'status'
+          | 'notification_status'
+          | 'notification_error'
+          | 'notification_summary'
+          | 'notification_payload'
+        >
+      | undefined;
+    if (
+      !current ||
+      current.status === 'cancelled' ||
+      current.status === 'missed'
+    ) {
+      return false;
+    }
+
+    // A queued retry is authoritative evidence that delivery is unfinished.
+    // Never let a late/coarse status-only write hide durable retry work.
+    const preserveRetryState =
+      current.notification_payload !== null &&
+      (status === 'success' || status === 'skipped');
+    const effectiveStatus = preserveRetryState
+      ? current.notification_status === 'success' ||
+        current.notification_status === 'skipped'
+        ? 'failed'
+        : current.notification_status
+      : status;
+    const effectiveError = preserveRetryState
+      ? current.notification_error
+      : error;
+    const effectiveSummary = preserveRetryState
+      ? current.notification_summary
+      : summary
+        ? JSON.stringify(summary)
+        : null;
+
+    const result = db
+      .prepare(
+        `UPDATE task_runs SET notification_status = ?, notification_error = ?,
+           notification_summary = ?,
+           notification_generation = notification_generation + 1,
+           updated_at = ? WHERE id = ? AND status NOT IN ('cancelled','missed')`,
+      )
+      .run(
+        effectiveStatus,
+        effectiveError,
+        effectiveSummary,
+        new Date().toISOString(),
+        id,
+      );
+    return result.changes === 1;
+  })();
+}
+
+export interface TaskRunTextNotificationPayload {
+  kind: 'store_result_and_notify' | 'send_message';
+  chatJid: string;
+  text: string;
+  options?: {
+    ownerId?: string;
+    notifyChannels?: string[] | null;
+    sourceKind?: string;
+    skipStore?: boolean;
+    workspaceFolder?: string;
+    /** The source IM received this exact message through a prior strict ACK. */
+    sourceAlreadyDelivered?: boolean;
+  };
+  sendOptions?: { source?: string };
+}
+
+export interface TaskRunImMessageNotificationPayload {
+  kind: 'im_message';
+  targetJid: string;
+  text: string;
+  localImagePaths: string[];
+}
+
+export interface TaskRunImImageNotificationPayload {
+  kind: 'im_image';
+  targetJid: string;
+  workspaceFolder: string;
+  filePath: string;
+  mimeType: string;
+  caption?: string;
+  fileName?: string;
+}
+
+export interface TaskRunImFileNotificationPayload {
+  kind: 'im_file';
+  targetJid: string;
+  workspaceFolder: string;
+  filePath: string;
+  fileName: string;
+}
+
+export type TaskRunAtomicNotificationPayload =
+  | TaskRunTextNotificationPayload
+  | TaskRunImMessageNotificationPayload
+  | TaskRunImImageNotificationPayload
+  | TaskRunImFileNotificationPayload;
+
+export type TaskRunNotificationPayload =
+  | TaskRunAtomicNotificationPayload
+  | { kind: 'batch'; items: TaskRunAtomicNotificationPayload[] };
+
+export interface TaskRunNotificationReceipt {
+  status: Exclude<TaskRunNotificationStatus, 'pending'>;
+  summary: TaskRunNotificationSummary;
+  error?: string | null;
+}
+
+export interface ClaimedTaskRunNotification {
+  runId: string;
+  payload: TaskRunNotificationPayload;
+  attempt: number;
+  owner: string;
+  token: number;
+  expiresAt: string;
+  generation: number;
+  notificationStatus: TaskRunNotificationStatus;
+  notificationSummary: TaskRunNotificationSummary | null;
+  notificationError: string | null;
+}
+
+const MAX_TASK_NOTIFICATION_ATTEMPTS = 5;
+const FINAL_NOTIFICATION_UNKNOWN_ERROR =
+  'Final notification attempt expired; delivery outcome is unknown';
+
+function mergeTaskRunNotificationPayloads(
+  current: TaskRunNotificationPayload | null,
+  next: TaskRunNotificationPayload | undefined,
+): TaskRunNotificationPayload | null {
+  if (!next) return current;
+  const currentItems = !current
+    ? []
+    : current.kind === 'batch'
+      ? current.items
+      : [current];
+  const nextItems = next.kind === 'batch' ? next.items : [next];
+  const items = [
+    ...new Map(
+      [...currentItems, ...nextItems].map((item) => [
+        JSON.stringify(item),
+        item,
+      ]),
+    ).values(),
+  ];
+  return items.length === 1 ? items[0] : { kind: 'batch', items };
+}
+
+function notificationPayloadAddsNewWork(
+  current: TaskRunNotificationPayload | null,
+  next: TaskRunNotificationPayload | undefined,
+): boolean {
+  if (!next) return false;
+  const existing = new Set(
+    taskRunNotificationPayloadItems(current).map((item) =>
+      JSON.stringify(item),
+    ),
+  );
+  return taskRunNotificationPayloadItems(next).some(
+    (item) => !existing.has(JSON.stringify(item)),
+  );
+}
+
+function taskRunNotificationPayloadItems(
+  payload: TaskRunNotificationPayload | null | undefined,
+): TaskRunAtomicNotificationPayload[] {
+  if (!payload) return [];
+  return payload.kind === 'batch' ? payload.items : [payload];
+}
+
+/** Remove exactly the atomic work owned by one claim from the latest queue. */
+function subtractTaskRunNotificationPayload(
+  current: TaskRunNotificationPayload | null,
+  claimed: TaskRunNotificationPayload,
+): TaskRunNotificationPayload | null {
+  const claimedCounts = new Map<string, number>();
+  for (const item of taskRunNotificationPayloadItems(claimed)) {
+    const key = JSON.stringify(item);
+    claimedCounts.set(key, (claimedCounts.get(key) ?? 0) + 1);
+  }
+  const remaining = taskRunNotificationPayloadItems(current).filter((item) => {
+    const key = JSON.stringify(item);
+    const count = claimedCounts.get(key) ?? 0;
+    if (count <= 0) return true;
+    claimedCounts.set(key, count - 1);
+    return false;
+  });
+  return remaining.length === 0
+    ? null
+    : remaining.length === 1
+      ? remaining[0]
+      : { kind: 'batch', items: remaining };
+}
+
+function notificationPayloadChannels(
+  payload: TaskRunNotificationPayload | null,
+): string[] {
+  return [
+    ...new Set(
+      taskRunNotificationPayloadItems(payload).map((item) =>
+        'targetJid' in item
+          ? item.targetJid.split(':', 1)[0] || item.targetJid
+          : (item.options?.notifyChannels?.[0] ?? item.chatJid),
+      ),
+    ),
+  ];
+}
+
+function subtractNotificationSummary(
+  current: TaskRunNotificationSummary | null,
+  baseline: TaskRunNotificationSummary | null,
+  remainingPayload: TaskRunNotificationPayload | null,
+): TaskRunNotificationSummary {
+  const attempted = Math.max(
+    0,
+    (current?.attempted ?? 0) - (baseline?.attempted ?? 0),
+  );
+  const succeeded = Math.max(
+    0,
+    (current?.succeeded ?? 0) - (baseline?.succeeded ?? 0),
+  );
+  const failed = Math.max(0, (current?.failed ?? 0) - (baseline?.failed ?? 0));
+  let failedChannels: string[] = [];
+  if (failed > 0) {
+    const baselineChannels = new Set(baseline?.failed_channels ?? []);
+    failedChannels = (current?.failed_channels ?? []).filter(
+      (channel) => !baselineChannels.has(channel),
+    );
+    if (failedChannels.length === 0) {
+      failedChannels = notificationPayloadChannels(remainingPayload);
+    }
+    if (failedChannels.length === 0) {
+      failedChannels = [...(current?.failed_channels ?? [])];
+    }
+  }
+  return { attempted, succeeded, failed, failed_channels: failedChannels };
+}
+
+function subtractNotificationError(
+  current: string | null,
+  baseline: string | null,
+): string | null {
+  if (!current || current === baseline) return null;
+  if (baseline && current.startsWith(`${baseline}; `)) {
+    return current.slice(baseline.length + 2) || null;
+  }
+  return current;
+}
+
+function removeNotificationError(
+  current: string | null,
+  removed: string | null | undefined,
+): string | null {
+  if (!current || !removed) return current;
+  if (current === removed) return null;
+  if (current.startsWith(`${removed}; `)) {
+    return current.slice(removed.length + 2) || null;
+  }
+  if (current.endsWith(`; ${removed}`)) {
+    return current.slice(0, -(removed.length + 2)) || null;
+  }
+  const marker = `; ${removed}; `;
+  const index = current.indexOf(marker);
+  if (index >= 0) {
+    return `${current.slice(0, index)}; ${current.slice(index + marker.length)}`;
+  }
+  return current;
+}
+
+function notificationStatusForSummary(
+  summary: TaskRunNotificationSummary,
+): TaskRunNotificationReceipt['status'] {
+  return summary.failed === 0
+    ? summary.attempted === 0
+      ? 'skipped'
+      : 'success'
+    : summary.succeeded > 0
+      ? 'partial_failed'
+      : 'failed';
+}
+
+function mergeTaskRunNotificationReceipts(
+  currentStatus: TaskRunNotificationStatus,
+  currentSummary: TaskRunNotificationSummary | null,
+  currentError: string | null,
+  next: TaskRunNotificationReceipt,
+): TaskRunNotificationReceipt {
+  if (!currentSummary || currentStatus === 'pending') return next;
+  const summary: TaskRunNotificationSummary = {
+    attempted: currentSummary.attempted + next.summary.attempted,
+    succeeded: currentSummary.succeeded + next.summary.succeeded,
+    failed: currentSummary.failed + next.summary.failed,
+    failed_channels: [
+      ...new Set([
+        ...currentSummary.failed_channels,
+        ...next.summary.failed_channels,
+      ]),
+    ],
+  };
+  return {
+    status:
+      summary.failed === 0
+        ? summary.attempted === 0
+          ? 'skipped'
+          : 'success'
+        : summary.succeeded > 0
+          ? 'partial_failed'
+          : 'failed',
+    summary,
+    error: [currentError, next.error].filter(Boolean).join('; ') || null,
+  };
+}
+
+function keepRetryWorkNonSuccessful(
+  receipt: TaskRunNotificationReceipt,
+  payload: TaskRunNotificationPayload | null,
+): TaskRunNotificationReceipt {
+  if (
+    !payload ||
+    (receipt.status !== 'success' && receipt.status !== 'skipped')
+  ) {
+    return receipt;
+  }
+  return {
+    ...receipt,
+    status: 'failed',
+    error: receipt.error || 'Notification retry work remains pending delivery',
+  };
+}
+
+/** Persist an immediate delivery receipt; failures become notification-only retry work. */
+export function recordTaskRunNotificationReceipt(
+  runId: string,
+  receipt: TaskRunNotificationReceipt,
+  retryPayload?: TaskRunNotificationPayload,
+): boolean {
+  const now = new Date();
+  return db.transaction(() => {
+    const row = db
+      .prepare(
+        `SELECT status, notification_status, notification_error,
+                notification_summary, notification_payload,
+                notification_generation
+         FROM task_runs WHERE id = ?`,
+      )
+      .get(runId) as
+      | Pick<
+          TaskRunRow,
+          | 'status'
+          | 'notification_status'
+          | 'notification_error'
+          | 'notification_summary'
+          | 'notification_payload'
+          | 'notification_generation'
+        >
+      | undefined;
+    // Cancellation/misfire is authoritative. Late IPC files must not notify
+    // the user or resurrect notification-only retry work.
+    if (!row || row.status === 'cancelled' || row.status === 'missed') {
+      return false;
+    }
+    let currentSummary: TaskRunNotificationSummary | null = null;
+    let currentPayload: TaskRunNotificationPayload | null = null;
+    try {
+      currentSummary = row.notification_summary
+        ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
+        : null;
+      currentPayload = row.notification_payload
+        ? (JSON.parse(row.notification_payload) as TaskRunNotificationPayload)
+        : null;
+    } catch {
+      // A new valid receipt repairs malformed legacy/internal JSON.
+    }
+    let mergedReceipt = mergeTaskRunNotificationReceipts(
+      row.notification_status,
+      currentSummary,
+      row.notification_error,
+      receipt,
+    );
+    const shouldRetry =
+      (receipt.status === 'failed' || receipt.status === 'partial_failed') &&
+      !!retryPayload;
+    const mergedPayload = mergeTaskRunNotificationPayloads(
+      currentPayload,
+      shouldRetry ? retryPayload : undefined,
+    );
+    mergedReceipt = keepRetryWorkNonSuccessful(mergedReceipt, mergedPayload);
+    const addedNewRetryWork = notificationPayloadAddsNewWork(
+      currentPayload,
+      shouldRetry ? retryPayload : undefined,
+    );
+    const availableAt = mergedPayload
+      ? new Date(now.getTime() + 1_000).toISOString()
+      : null;
+    const result = db
+      .prepare(
+        `UPDATE task_runs
+         SET notification_status = ?, notification_error = ?,
+             notification_summary = ?, notification_payload = ?,
+             notification_attempt = CASE WHEN ? AND notification_lease_owner IS NULL THEN 0
+                                         ELSE notification_attempt END,
+             notification_available_at = ?,
+             notification_generation = notification_generation + 1,
+             updated_at = ?
+         WHERE id = ? AND status NOT IN ('cancelled','missed')`,
+      )
+      .run(
+        mergedReceipt.status,
+        mergedReceipt.error ?? null,
+        JSON.stringify(mergedReceipt.summary),
+        mergedPayload ? JSON.stringify(mergedPayload) : null,
+        addedNewRetryWork ? 1 : 0,
+        availableAt,
+        now.toISOString(),
+        runId,
+      );
+    return result.changes === 1;
+  })();
+}
+
+/**
+ * Atomically supersede one provisional failure with its fallback outcome.
+ * The exact retry item is consumed, while unrelated IPC/channel failures stay
+ * durable. This is used when a strict source send fails but the normal owner
+ * notification fallback subsequently succeeds (or yields better retry work).
+ */
+export function replaceTaskRunNotificationReceipt(
+  runId: string,
+  previousReceipt: TaskRunNotificationReceipt,
+  previousPayload: TaskRunNotificationPayload,
+  nextReceipt: TaskRunNotificationReceipt,
+  nextRetryPayload?: TaskRunNotificationPayload,
+): boolean {
+  const now = new Date();
+  return db.transaction(() => {
+    const row = db
+      .prepare(
+        `SELECT status, notification_status, notification_error,
+                notification_summary, notification_payload,
+                notification_attempt, notification_available_at,
+                notification_generation
+         FROM task_runs WHERE id = ?`,
+      )
+      .get(runId) as
+      | Pick<
+          TaskRunRow,
+          | 'status'
+          | 'notification_status'
+          | 'notification_error'
+          | 'notification_summary'
+          | 'notification_payload'
+          | 'notification_attempt'
+          | 'notification_available_at'
+          | 'notification_generation'
+        >
+      | undefined;
+    if (
+      !row ||
+      row.status === 'cancelled' ||
+      row.status === 'missed' ||
+      !row.notification_payload ||
+      !row.notification_summary
+    ) {
+      return false;
+    }
+
+    let currentPayload: TaskRunNotificationPayload;
+    let currentSummary: TaskRunNotificationSummary;
+    try {
+      currentPayload = JSON.parse(
+        row.notification_payload,
+      ) as TaskRunNotificationPayload;
+      currentSummary = JSON.parse(
+        row.notification_summary,
+      ) as TaskRunNotificationSummary;
+    } catch {
+      return false;
+    }
+    const previousItems = taskRunNotificationPayloadItems(previousPayload);
+    const remainingPayload = subtractTaskRunNotificationPayload(
+      currentPayload,
+      previousPayload,
+    );
+    if (
+      taskRunNotificationPayloadItems(currentPayload).length -
+        taskRunNotificationPayloadItems(remainingPayload).length !==
+      previousItems.length
+    ) {
+      return false;
+    }
+
+    const baseSummary: TaskRunNotificationSummary = {
+      attempted: Math.max(
+        0,
+        currentSummary.attempted - previousReceipt.summary.attempted,
+      ),
+      succeeded: Math.max(
+        0,
+        currentSummary.succeeded - previousReceipt.summary.succeeded,
+      ),
+      failed: Math.max(
+        0,
+        currentSummary.failed - previousReceipt.summary.failed,
+      ),
+      failed_channels: [],
+    };
+    if (baseSummary.failed > 0) {
+      const removedChannels = new Set(previousReceipt.summary.failed_channels);
+      const remainingChannels = notificationPayloadChannels(remainingPayload);
+      baseSummary.failed_channels = [
+        ...new Set([
+          ...currentSummary.failed_channels.filter(
+            (channel) => !removedChannels.has(channel),
+          ),
+          ...remainingChannels,
+        ]),
+      ];
+      if (baseSummary.failed_channels.length === 0) {
+        baseSummary.failed_channels = [...currentSummary.failed_channels];
+      }
+    }
+    const baseError = removeNotificationError(
+      row.notification_error,
+      previousReceipt.error,
+    );
+    const baseReceipt: TaskRunNotificationReceipt = {
+      status: notificationStatusForSummary(baseSummary),
+      summary: baseSummary,
+      error: baseError,
+    };
+    let mergedReceipt =
+      baseSummary.attempted === 0
+        ? nextReceipt
+        : mergeTaskRunNotificationReceipts(
+            baseReceipt.status,
+            baseReceipt.summary,
+            baseReceipt.error ?? null,
+            nextReceipt,
+          );
+    const shouldRetryNext =
+      (nextReceipt.status === 'failed' ||
+        nextReceipt.status === 'partial_failed') &&
+      !!nextRetryPayload;
+    const mergedPayload = mergeTaskRunNotificationPayloads(
+      remainingPayload,
+      shouldRetryNext ? nextRetryPayload : undefined,
+    );
+    mergedReceipt = keepRetryWorkNonSuccessful(mergedReceipt, mergedPayload);
+    const addedNewRetryWork = notificationPayloadAddsNewWork(
+      remainingPayload,
+      shouldRetryNext ? nextRetryPayload : undefined,
+    );
+    const retryAt = new Date(now.getTime() + 1_000).toISOString();
+    const availableCandidates = [
+      remainingPayload ? row.notification_available_at : null,
+      shouldRetryNext ? retryAt : null,
+    ].filter((value): value is string => !!value);
+    const result = db
+      .prepare(
+        `UPDATE task_runs
+         SET notification_status = ?, notification_error = ?,
+             notification_summary = ?, notification_payload = ?,
+             notification_attempt = CASE WHEN ? THEN 0
+                                         ELSE notification_attempt END,
+             notification_available_at = ?,
+             notification_generation = notification_generation + 1,
+             updated_at = ?
+         WHERE id = ? AND notification_generation = ?
+           AND status NOT IN ('cancelled','missed')`,
+      )
+      .run(
+        mergedReceipt.status,
+        mergedReceipt.error ?? null,
+        JSON.stringify(mergedReceipt.summary),
+        mergedPayload ? JSON.stringify(mergedPayload) : null,
+        addedNewRetryWork ? 1 : 0,
+        mergedPayload ? (availableCandidates.sort()[0] ?? retryAt) : null,
+        now.toISOString(),
+        runId,
+        row.notification_generation,
+      );
+    return result.changes === 1;
+  })();
+}
+
+/** Mark a completed isolated run with no outbound IPC as intentionally skipped. */
+export function finalizeTaskRunNotificationIfPending(runId: string): boolean {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE task_runs
+       SET notification_status = 'skipped', notification_error = NULL,
+           notification_summary = ?,
+           notification_generation = notification_generation + 1,
+           updated_at = ?
+       WHERE id = ? AND notification_status = 'pending'
+         AND notification_payload IS NULL
+         AND status NOT IN ('cancelled','missed')`,
+    )
+    .run(
+      JSON.stringify({
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        failed_channels: [],
+      } satisfies TaskRunNotificationSummary),
+      now,
+      runId,
+    );
+  return result.changes === 1;
+}
+
+export function claimNextTaskRunNotification(
+  owner: string,
+  leaseMs: number,
+): ClaimedTaskRunNotification | undefined {
+  return claimTaskRunNotification(owner, leaseMs);
+}
+
+/** Claim notification work for one known run (used by targeted recovery/tests). */
+export function claimTaskRunNotificationById(
+  runId: string,
+  owner: string,
+  leaseMs: number,
+): ClaimedTaskRunNotification | undefined {
+  return claimTaskRunNotification(owner, leaseMs, runId);
+}
+
+function claimTaskRunNotification(
+  owner: string,
+  leaseMs: number,
+  runId?: string,
+): ClaimedTaskRunNotification | undefined {
+  finalizeExpiredTaskRunNotificationAttempts();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  return db.transaction(() => {
+    const row = db
+      .prepare(
+        `SELECT id, notification_payload, notification_attempt,
+                notification_lease_token, notification_generation,
+                notification_status, notification_summary,
+                notification_error
+         FROM task_runs
+         WHERE notification_payload IS NOT NULL
+           AND (? IS NULL OR id = ?)
+           AND status IN ('success','failed','delivered')
+           AND notification_attempt < ?
+           AND (
+             (notification_status IN ('failed','partial_failed','pending')
+               AND notification_available_at IS NOT NULL
+               AND notification_available_at <= ?
+               AND notification_lease_owner IS NULL)
+             OR (notification_lease_expires_at IS NOT NULL
+                 AND notification_lease_expires_at <= ?)
+           )
+         ORDER BY notification_available_at, completed_at, created_at LIMIT 1`,
+      )
+      .get(
+        runId ?? null,
+        runId ?? null,
+        MAX_TASK_NOTIFICATION_ATTEMPTS,
+        nowIso,
+        nowIso,
+      ) as
+      | {
+          id: string;
+          notification_payload: string;
+          notification_attempt: number;
+          notification_lease_token: number;
+          notification_generation: number;
+          notification_status: TaskRunNotificationStatus;
+          notification_summary: string | null;
+          notification_error: string | null;
+        }
+      | undefined;
+    if (!row) return undefined;
+    const token = row.notification_lease_token + 1;
+    const changed = db
+      .prepare(
+        `UPDATE task_runs
+         SET notification_lease_owner = ?, notification_lease_token = ?,
+             notification_lease_expires_at = ?,
+             notification_lease_payload = notification_payload,
+             notification_attempt = notification_attempt + 1,
+             updated_at = ?
+         WHERE id = ? AND notification_lease_token = ?`,
+      )
+      .run(
+        owner,
+        token,
+        expiresAt,
+        nowIso,
+        row.id,
+        row.notification_lease_token,
+      );
+    if (changed.changes !== 1) return undefined;
+    try {
+      return {
+        runId: row.id,
+        payload: JSON.parse(
+          row.notification_payload,
+        ) as TaskRunNotificationPayload,
+        attempt: row.notification_attempt + 1,
+        owner,
+        token,
+        expiresAt,
+        generation: row.notification_generation,
+        notificationStatus: row.notification_status,
+        notificationSummary: row.notification_summary
+          ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
+          : null,
+        notificationError: row.notification_error,
+      };
+    } catch {
+      db.prepare(
+        `UPDATE task_runs SET notification_status='failed',
+           notification_error='Invalid persisted notification payload',
+           notification_payload=NULL, notification_available_at=NULL,
+           notification_lease_owner=NULL, notification_lease_expires_at=NULL,
+           notification_lease_payload=NULL,
+           updated_at=? WHERE id=? AND notification_lease_owner=?
+             AND notification_lease_token=?`,
+      ).run(nowIso, row.id, owner, token);
+      return undefined;
+    }
+  })();
+}
+
+/** A crashed final notification attempt has an unknowable delivery outcome.
+ * Fence it terminally instead of replaying (duplicate risk) or busy-looping. */
+export function finalizeExpiredTaskRunNotificationAttempts(): number {
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const rows = db
+      .prepare(
+        `SELECT id, status, notification_error, notification_summary,
+                notification_payload, notification_attempt,
+                notification_available_at, notification_lease_owner,
+                notification_lease_token, notification_lease_expires_at,
+                notification_lease_payload, notification_generation
+         FROM task_runs
+         WHERE notification_payload IS NOT NULL
+           AND notification_attempt >= ?
+           AND notification_lease_owner IS NOT NULL
+           AND notification_lease_expires_at IS NOT NULL
+           AND notification_lease_expires_at <= ?`,
+      )
+      .all(MAX_TASK_NOTIFICATION_ATTEMPTS, now) as Array<
+      Pick<
+        TaskRunRow,
+        | 'id'
+        | 'status'
+        | 'notification_error'
+        | 'notification_summary'
+        | 'notification_payload'
+        | 'notification_attempt'
+        | 'notification_available_at'
+        | 'notification_lease_owner'
+        | 'notification_lease_token'
+        | 'notification_lease_expires_at'
+        | 'notification_lease_payload'
+        | 'notification_generation'
+      >
+    >;
+    let changed = 0;
+    for (const row of rows) {
+      let currentPayload: TaskRunNotificationPayload;
+      let claimedPayload: TaskRunNotificationPayload;
+      let currentSummary: TaskRunNotificationSummary | null = null;
+      try {
+        currentPayload = JSON.parse(
+          row.notification_payload!,
+        ) as TaskRunNotificationPayload;
+      } catch {
+        // Invalid work cannot be retried safely. Treat the whole opaque value as
+        // the expired claim so this row becomes terminal below.
+        currentPayload = { kind: 'batch', items: [] };
+      }
+      try {
+        // A v53 process may have crashed with a lease immediately before the
+        // v54 upgrade. With no snapshot, fail closed by treating all current
+        // work as the unknown final claim instead of replaying it.
+        claimedPayload = JSON.parse(
+          row.notification_lease_payload!,
+        ) as TaskRunNotificationPayload;
+      } catch {
+        claimedPayload = currentPayload;
+      }
+      try {
+        currentSummary = row.notification_summary
+          ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
+          : null;
+      } catch {
+        currentSummary = null;
+      }
+      const remainingPayload = subtractTaskRunNotificationPayload(
+        currentPayload,
+        claimedPayload,
+      );
+      const summary: TaskRunNotificationSummary = {
+        attempted: (currentSummary?.attempted ?? 0) + 1,
+        succeeded: currentSummary?.succeeded ?? 0,
+        failed: (currentSummary?.failed ?? 0) + 1,
+        failed_channels: [
+          ...new Set([
+            ...(currentSummary?.failed_channels ?? []),
+            ...notificationPayloadChannels(claimedPayload),
+          ]),
+        ],
+      };
+      const error = [row.notification_error, FINAL_NOTIFICATION_UNKNOWN_ERROR]
+        .filter(Boolean)
+        .join('; ');
+      const result = db
+        .prepare(
+          `UPDATE task_runs
+           SET notification_status = ?, notification_error = ?,
+               notification_summary = ?, notification_payload = ?,
+               notification_attempt = ?, notification_available_at = ?,
+               notification_lease_owner = NULL,
+               notification_lease_expires_at = NULL,
+               notification_lease_payload = NULL,
+               notification_generation = notification_generation + 1,
+               updated_at = ?
+           WHERE id = ? AND notification_lease_owner = ?
+             AND notification_lease_token = ?
+             AND notification_lease_expires_at <= ?
+             AND notification_generation = ?
+             AND status NOT IN ('cancelled','missed')`,
+        )
+        .run(
+          notificationStatusForSummary(summary),
+          error,
+          JSON.stringify(summary),
+          remainingPayload ? JSON.stringify(remainingPayload) : null,
+          remainingPayload ? 0 : row.notification_attempt,
+          remainingPayload
+            ? (row.notification_available_at ??
+                new Date(Date.now() + 1_000).toISOString())
+            : null,
+          now,
+          row.id,
+          row.notification_lease_owner,
+          row.notification_lease_token,
+          now,
+          row.notification_generation,
+        );
+      changed += result.changes;
+    }
+    return changed;
+  })();
+}
+
+/** Extend one notification delivery lease without changing its fencing token. */
+export function renewTaskRunNotificationLease(
+  claim: ClaimedTaskRunNotification,
+  leaseMs: number,
+): boolean {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  const result = db
+    .prepare(
+      `UPDATE task_runs SET notification_lease_expires_at = ?, updated_at = ?
+       WHERE id = ? AND notification_payload IS NOT NULL
+         AND notification_lease_owner = ? AND notification_lease_token = ?
+         AND notification_lease_expires_at > ?`,
+    )
+    .run(expiresAt, nowIso, claim.runId, claim.owner, claim.token, nowIso);
+  if (result.changes === 1) claim.expiresAt = expiresAt;
+  return result.changes === 1;
+}
+
+export function completeTaskRunNotificationAttempt(
+  claim: ClaimedTaskRunNotification,
+  receipt: TaskRunNotificationReceipt,
+  retryPayload?: TaskRunNotificationPayload,
+): boolean {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const workerRetryable =
+    (receipt.status === 'failed' || receipt.status === 'partial_failed') &&
+    claim.attempt < MAX_TASK_NOTIFICATION_ATTEMPTS &&
+    !!retryPayload;
+  const delayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, claim.attempt - 1));
+  const workerAvailableAt = workerRetryable
+    ? new Date(now.getTime() + delayMs).toISOString()
+    : null;
+  return db.transaction(() => {
+    const row = db
+      .prepare(
+        `SELECT status, notification_status, notification_error,
+                notification_summary, notification_payload,
+                notification_attempt, notification_available_at,
+                notification_lease_owner, notification_lease_token,
+                notification_lease_expires_at, notification_generation
+         FROM task_runs WHERE id = ?`,
+      )
+      .get(claim.runId) as
+      | Pick<
+          TaskRunRow,
+          | 'status'
+          | 'notification_status'
+          | 'notification_error'
+          | 'notification_summary'
+          | 'notification_payload'
+          | 'notification_attempt'
+          | 'notification_available_at'
+          | 'notification_lease_owner'
+          | 'notification_lease_token'
+          | 'notification_lease_expires_at'
+          | 'notification_generation'
+        >
+      | undefined;
+    if (
+      !row ||
+      row.status === 'cancelled' ||
+      row.status === 'missed' ||
+      row.notification_lease_owner !== claim.owner ||
+      row.notification_lease_token !== claim.token ||
+      !row.notification_lease_expires_at ||
+      row.notification_lease_expires_at <= nowIso
+    ) {
+      return false;
+    }
+
+    let currentPayload: TaskRunNotificationPayload | null = null;
+    let currentSummary: TaskRunNotificationSummary | null = null;
+    try {
+      currentPayload = row.notification_payload
+        ? (JSON.parse(row.notification_payload) as TaskRunNotificationPayload)
+        : null;
+      currentSummary = row.notification_summary
+        ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
+        : null;
+    } catch {
+      return false;
+    }
+
+    const concurrentWrite = row.notification_generation !== claim.generation;
+    const latePayload = concurrentWrite
+      ? subtractTaskRunNotificationPayload(currentPayload, claim.payload)
+      : null;
+    const nextPayload = mergeTaskRunNotificationPayloads(
+      latePayload,
+      workerRetryable ? retryPayload : undefined,
+    );
+
+    // A final-attempt crash is terminal historical evidence: later work may
+    // succeed, but it cannot retroactively prove that unknown delivery A did
+    // not happen. Preserve that audit receipt while settling fresh batch B.
+    let nextReceipt =
+      currentSummary &&
+      row.notification_error?.includes(FINAL_NOTIFICATION_UNKNOWN_ERROR)
+        ? mergeTaskRunNotificationReceipts(
+            row.notification_status,
+            currentSummary,
+            row.notification_error,
+            receipt,
+          )
+        : receipt;
+    if (concurrentWrite) {
+      const lateSummary = subtractNotificationSummary(
+        currentSummary,
+        claim.notificationSummary,
+        latePayload,
+      );
+      if (
+        lateSummary.attempted > 0 ||
+        lateSummary.succeeded > 0 ||
+        lateSummary.failed > 0
+      ) {
+        nextReceipt = mergeTaskRunNotificationReceipts(
+          receipt.status,
+          receipt.summary,
+          receipt.error ?? null,
+          {
+            status:
+              lateSummary.failed === 0
+                ? lateSummary.attempted === 0
+                  ? 'skipped'
+                  : 'success'
+                : lateSummary.succeeded > 0
+                  ? 'partial_failed'
+                  : 'failed',
+            summary: lateSummary,
+            error: subtractNotificationError(
+              row.notification_error,
+              claim.notificationError,
+            ),
+          },
+        );
+      }
+    }
+    nextReceipt = keepRetryWorkNonSuccessful(nextReceipt, nextPayload);
+
+    const availableCandidates = [
+      latePayload ? row.notification_available_at : null,
+      workerRetryable ? workerAvailableAt : null,
+    ].filter((value): value is string => !!value);
+    const nextAvailableAt = nextPayload
+      ? (availableCandidates.sort()[0] ??
+        new Date(now.getTime() + 1_000).toISOString())
+      : null;
+    // The late payload was appended after this claim began and has not itself
+    // consumed an attempt. Reset the shared batch counter so its next claim is
+    // attempt 1 (and the merged batch receives a complete retry budget).
+    const nextAttempt = latePayload ? 0 : row.notification_attempt;
+    const result = db
+      .prepare(
+        `UPDATE task_runs
+         SET notification_status = ?, notification_error = ?,
+             notification_summary = ?, notification_payload = ?,
+             notification_attempt = ?, notification_available_at = ?,
+             notification_lease_owner = NULL,
+             notification_lease_expires_at = NULL,
+             notification_lease_payload = NULL,
+             notification_generation = notification_generation + 1,
+             updated_at = ?
+         WHERE id = ? AND notification_lease_owner = ?
+           AND notification_lease_token = ?
+           AND notification_lease_expires_at > ?
+           AND notification_generation = ?
+           AND status NOT IN ('cancelled','missed')`,
+      )
+      .run(
+        nextReceipt.status,
+        nextReceipt.error ?? null,
+        JSON.stringify(nextReceipt.summary),
+        nextPayload ? JSON.stringify(nextPayload) : null,
+        nextAttempt,
+        nextAvailableAt,
+        nowIso,
+        claim.runId,
+        claim.owner,
+        claim.token,
+        nowIso,
+        row.notification_generation,
+      );
+    return result.changes === 1;
+  })();
+}
+
+/** Earliest retry/queued admission or expired running lease. */
+export function getNextTaskRunWakeAt(): string | null {
+  const now = new Date().toISOString();
+  const row = db
+    .prepare(
+      `SELECT MIN(wake_at) AS wake_at FROM (
+         SELECT available_at AS wake_at FROM task_runs
+           WHERE status IN ('queued','retry_wait')
+         UNION ALL
+         SELECT lease_expires_at AS wake_at FROM task_runs
+           WHERE status = 'running' AND lease_expires_at IS NOT NULL
+         UNION ALL
+         SELECT notification_available_at AS wake_at FROM task_runs
+           WHERE notification_payload IS NOT NULL
+             AND notification_attempt < 5
+             AND notification_available_at IS NOT NULL
+             AND notification_lease_owner IS NULL
+             AND status IN ('success','failed','delivered')
+             AND notification_status IN ('failed','partial_failed','pending')
+         UNION ALL
+         SELECT notification_lease_expires_at AS wake_at FROM task_runs
+           WHERE notification_lease_owner IS NOT NULL
+             AND notification_lease_expires_at IS NOT NULL
+             AND (notification_attempt < 5 OR notification_lease_expires_at > ?)
+       )`,
+    )
+    .get(now) as { wake_at: string | null };
+  return row.wake_at ?? null;
+}
+
+export function getNextScheduledTaskWakeAt(): string | null {
+  const row = db
+    .prepare(
+      `SELECT MIN(next_run) AS wake_at FROM scheduled_tasks
+       WHERE status = 'active' AND deleted_at IS NULL AND next_run IS NOT NULL`,
+    )
+    .get() as { wake_at: string | null };
+  return row.wake_at ?? null;
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -2359,7 +5603,12 @@ export function logTaskRunStart(taskId: string): number {
 
 export function updateTaskRunLog(
   id: number,
-  updates: { duration_ms: number; status: 'success' | 'error'; result: string | null; error: string | null },
+  updates: {
+    duration_ms: number;
+    status: 'success' | 'error';
+    result: string | null;
+    error: string | null;
+  },
 ): void {
   db.prepare(
     `
@@ -2388,13 +5637,20 @@ export function cleanupOldTaskRunLogs(retentionDays = 30): number {
   const result = db
     .prepare(`DELETE FROM task_run_logs WHERE run_at < ?`)
     .run(cutoff);
-  return result.changes;
+  const durable = db
+    .prepare(
+      `DELETE FROM task_runs
+       WHERE completed_at IS NOT NULL AND completed_at < ?
+         AND status IN ('success','failed','cancelled','missed','delivered')`,
+    )
+    .run(cutoff);
+  return result.changes + durable.changes;
 }
 
 export function cleanupOldDailyUsage(retentionDays = 90): number {
-  const cutoff = new Date(
-    Date.now() - retentionDays * 24 * 60 * 60 * 1000,
-  ).toISOString().slice(0, 10);
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
   const result = db
     .prepare('DELETE FROM daily_usage WHERE date < ?')
     .run(cutoff);
@@ -2457,12 +5713,33 @@ export function setSession(
   groupFolder: string,
   sessionId: string,
   agentId?: string | null,
+  agentIdentity?: {
+    agentProfileId?: string | null;
+    agentProfileVersion?: number | null;
+    identityHash?: string | null;
+  },
 ): void {
   const effectiveAgentId = agentId || '';
-  db.prepare(
-    `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
-     ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
-  ).run(groupFolder, sessionId, effectiveAgentId);
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
+       ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
+    ).run(groupFolder, sessionId, effectiveAgentId);
+    if (agentIdentity) {
+      db.prepare(
+        `UPDATE sessions
+         SET agent_profile_id = ?, agent_profile_version = ?, identity_hash = ?
+         WHERE group_folder = ? AND agent_id = ?`,
+      ).run(
+        agentIdentity.agentProfileId ?? null,
+        agentIdentity.agentProfileVersion ?? null,
+        agentIdentity.identityHash ?? null,
+        groupFolder,
+        effectiveAgentId,
+      );
+    }
+    syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
+  })();
 }
 
 export function deleteSession(
@@ -2470,9 +5747,24 @@ export function deleteSession(
   agentId?: string | null,
 ): void {
   const effectiveAgentId = agentId || '';
-  db.prepare(
-    'DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?',
-  ).run(groupFolder, effectiveAgentId);
+  db.transaction(() => {
+    db.prepare(
+      'DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+  })();
+}
+
+/** Invalidate every SDK resume token associated with a workspace. */
+export function deleteWorkspaceSessions(groupFolder: string): void {
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+    ).run(groupFolder);
+  })();
 }
 
 /**
@@ -2508,15 +5800,879 @@ export function setSessionProviderId(
   providerId: string | null,
 ): void {
   const effectiveAgentId = agentId || '';
-  db.prepare(
-    `INSERT INTO sessions (group_folder, session_id, agent_id, provider_id)
-     VALUES (?, '', ?, ?)
-     ON CONFLICT(group_folder, agent_id) DO UPDATE SET provider_id = excluded.provider_id`,
-  ).run(groupFolder, effectiveAgentId, providerId);
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO sessions (group_folder, session_id, agent_id, provider_id)
+       VALUES (?, '', ?, ?)
+       ON CONFLICT(group_folder, agent_id) DO UPDATE SET provider_id = excluded.provider_id`,
+    ).run(groupFolder, effectiveAgentId, providerId);
+    syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
+  })();
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
-  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+    ).run(groupFolder);
+  })();
+}
+
+export interface SessionAgentIdentity {
+  agent_profile_id: string | null;
+  agent_profile_version: number | null;
+  identity_hash: string | null;
+}
+
+export function getSessionAgentIdentity(
+  groupFolder: string,
+  agentId?: string | null,
+): SessionAgentIdentity | undefined {
+  const effectiveAgentId = agentId || '';
+  const row = db
+    .prepare(
+      `SELECT agent_profile_id, agent_profile_version, identity_hash
+       FROM sessions
+       WHERE group_folder = ? AND agent_id = ?`,
+    )
+    .get(groupFolder, effectiveAgentId) as SessionAgentIdentity | undefined;
+  return row;
+}
+
+const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
+  context: {
+    source: 'managed',
+    auto_compact_window: 0,
+    auto_compact_percentage: 0,
+  },
+  skills: { mode: 'inherit', ids: [] },
+  mcp: { mode: 'inherit', ids: [] },
+  tools: { mode: 'inherit' },
+};
+
+type RuntimePolicyInput = Partial<{
+  context: Partial<AgentProfileRuntimePolicy['context']> | null;
+  skills: Partial<AgentProfileRuntimePolicy['skills']> | null;
+  mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
+  tools: Partial<AgentProfileRuntimePolicy['tools']> | null;
+}>;
+
+function normalizeIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function normalizeMode<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+export function normalizeAgentProfileRuntimePolicy(
+  input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+): AgentProfileRuntimePolicy {
+  const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
+  const normalized: AgentProfileRuntimePolicy = {
+    context: {
+      source: normalizeMode(
+        raw.context?.source,
+        ['managed', 'host_claude'] as const,
+        'managed',
+      ),
+      auto_compact_window: (() => {
+        const value = raw.context?.auto_compact_window;
+        if (
+          typeof value !== 'number' ||
+          !Number.isFinite(value) ||
+          value <= 0
+        ) {
+          return 0;
+        }
+        return Math.min(1_000_000, Math.max(100_000, Math.floor(value)));
+      })(),
+      auto_compact_percentage: (() => {
+        const value = raw.context?.auto_compact_percentage;
+        if (
+          typeof value !== 'number' ||
+          !Number.isFinite(value) ||
+          value <= 0
+        ) {
+          return 0;
+        }
+        return Math.min(90, Math.max(50, Math.floor(value)));
+      })(),
+    },
+    skills: {
+      mode: normalizeMode(
+        raw.skills?.mode,
+        ['inherit', 'custom', 'disabled'] as const,
+        'inherit',
+      ),
+      ids: normalizeIdList(raw.skills?.ids),
+    },
+    mcp: {
+      mode: normalizeMode(
+        raw.mcp?.mode,
+        ['inherit', 'custom', 'disabled'] as const,
+        'inherit',
+      ),
+      ids: normalizeIdList(raw.mcp?.ids),
+    },
+    tools: {
+      mode: normalizeMode(
+        raw.tools?.mode,
+        ['inherit', 'readonly', 'restricted'] as const,
+        'inherit',
+      ),
+    },
+  };
+  if (normalized.context.auto_compact_percentage > 0) {
+    normalized.context.auto_compact_window = 0;
+  }
+  return normalized;
+}
+
+/** Merge a PATCH-shaped policy without resetting omitted sibling fields. */
+export function mergeAgentProfileRuntimePolicy(
+  current: AgentProfileRuntimePolicy,
+  patch: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+): AgentProfileRuntimePolicy {
+  if (patch === null) return normalizeAgentProfileRuntimePolicy();
+  const has = (key: keyof RuntimePolicyInput) =>
+    Object.prototype.hasOwnProperty.call(patch, key);
+  const mergeCapability = <T extends 'skills' | 'mcp'>(key: T) => {
+    const value = patch[key];
+    if (value === null) return DEFAULT_AGENT_PROFILE_RUNTIME_POLICY[key];
+    return {
+      mode: value?.mode ?? current[key].mode,
+      ids: value?.ids ?? current[key].ids,
+    };
+  };
+
+  return normalizeAgentProfileRuntimePolicy({
+    context: has('context')
+      ? patch.context === null
+        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context
+        : {
+            source: patch.context?.source ?? current.context.source,
+            auto_compact_window:
+              patch.context?.auto_compact_window ??
+              current.context.auto_compact_window,
+            auto_compact_percentage:
+              patch.context?.auto_compact_percentage ??
+              current.context.auto_compact_percentage,
+          }
+      : current.context,
+    skills: has('skills') ? mergeCapability('skills') : current.skills,
+    mcp: has('mcp') ? mergeCapability('mcp') : current.mcp,
+    tools: has('tools')
+      ? patch.tools === null
+        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.tools
+        : {
+            mode: patch.tools?.mode ?? current.tools.mode,
+          }
+      : current.tools,
+  });
+}
+
+export function serializeAgentProfileRuntimePolicy(
+  input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+): string {
+  return JSON.stringify(normalizeAgentProfileRuntimePolicy(input));
+}
+
+export function migrateAgentProfileAutoCompactWindow(
+  legacyValue: number | undefined,
+): number {
+  if (legacyValue === undefined) return 0;
+  const value = Math.min(1_000_000, Math.max(100_000, Math.floor(legacyValue)));
+  const rows = db
+    .prepare(
+      'SELECT id, runtime_policy FROM agent_profiles WHERE is_default = 0',
+    )
+    .all() as Array<{ id: string; runtime_policy: unknown }>;
+  const update = db.prepare(
+    'UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?',
+  );
+  let migrated = 0;
+  db.transaction(() => {
+    for (const row of rows) {
+      let raw: Record<string, unknown> = {};
+      try {
+        const parsed =
+          typeof row.runtime_policy === 'string'
+            ? JSON.parse(row.runtime_policy)
+            : row.runtime_policy;
+        if (parsed && typeof parsed === 'object') {
+          raw = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Invalid legacy policy is normalized below.
+      }
+      const rawContext =
+        raw.context && typeof raw.context === 'object'
+          ? (raw.context as Record<string, unknown>)
+          : {};
+      if (
+        Object.prototype.hasOwnProperty.call(rawContext, 'auto_compact_window')
+      ) {
+        continue;
+      }
+      const normalized = normalizeAgentProfileRuntimePolicy(
+        raw as RuntimePolicyInput,
+      );
+      normalized.context.auto_compact_window = value;
+      update.run(JSON.stringify(normalized), row.id);
+      migrated += 1;
+    }
+  })();
+  return migrated;
+}
+
+function parseAgentProfileRuntimePolicy(
+  raw: unknown,
+): AgentProfileRuntimePolicy {
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as RuntimePolicyInput;
+      return normalizeAgentProfileRuntimePolicy(parsed);
+    } catch {
+      return normalizeAgentProfileRuntimePolicy();
+    }
+  }
+  if (raw && typeof raw === 'object') {
+    return normalizeAgentProfileRuntimePolicy(raw as RuntimePolicyInput);
+  }
+  return normalizeAgentProfileRuntimePolicy();
+}
+
+export function computeAgentProfileIdentityHash(
+  identityPrompt: string,
+  includeClaudePreset?: boolean,
+  runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+  name?: string,
+): string;
+export function computeAgentProfileIdentityHash(
+  prompts: AgentProfilePrompts,
+  runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
+  name?: string,
+): string;
+export function computeAgentProfileIdentityHash(
+  promptsOrIdentity: string | AgentProfilePrompts,
+  includeOrRuntime:
+    | boolean
+    | RuntimePolicyInput
+    | AgentProfileRuntimePolicy
+    | null = true,
+  runtimeOrName?:
+    | RuntimePolicyInput
+    | AgentProfileRuntimePolicy
+    | null
+    | string,
+  legacyName = '',
+): string {
+  const legacyCall = typeof promptsOrIdentity === 'string';
+  const prompts = legacyCall
+    ? normalizeAgentProfilePrompts({
+        identity_prompt: promptsOrIdentity,
+        prompt_mode: promptModeFromLegacyPreset(
+          typeof includeOrRuntime === 'boolean' ? includeOrRuntime : true,
+        ),
+      })
+    : normalizeAgentProfilePrompts(promptsOrIdentity);
+  const runtimePolicy = legacyCall
+    ? (runtimeOrName as
+        | RuntimePolicyInput
+        | AgentProfileRuntimePolicy
+        | null
+        | undefined)
+    : (includeOrRuntime as
+        | RuntimePolicyInput
+        | AgentProfileRuntimePolicy
+        | null
+        | undefined);
+  const name = legacyCall
+    ? legacyName
+    : typeof runtimeOrName === 'string'
+      ? runtimeOrName
+      : '';
+  const normalizedPolicy = normalizeAgentProfileRuntimePolicy(runtimePolicy);
+  const payload: {
+    prompts: AgentProfilePrompts;
+    runtimePolicy?: Record<string, unknown>;
+    name?: string;
+  } = { prompts };
+  const identityPolicy = {
+    context: { source: normalizedPolicy.context.source },
+    skills: normalizedPolicy.skills,
+    mcp: normalizedPolicy.mcp,
+    tools: normalizedPolicy.tools,
+  };
+  const defaultIdentityPolicy = {
+    context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
+    skills: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.skills,
+    mcp: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.mcp,
+    tools: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.tools,
+  };
+  if (name) payload.name = name;
+  if (
+    JSON.stringify(identityPolicy) !== JSON.stringify(defaultIdentityPolicy)
+  ) {
+    payload.runtimePolicy = identityPolicy;
+  }
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(payload))
+    .digest('hex');
+}
+
+function mapAgentProfilePromptVersionRow(
+  row: Record<string, unknown>,
+): AgentProfilePromptVersion {
+  return {
+    id: String(row.id),
+    agent_profile_id: String(row.agent_profile_id),
+    version: Number(row.version),
+    name: String(row.name),
+    identity_prompt: String(row.identity_prompt ?? ''),
+    soul_prompt: String(row.soul_prompt ?? ''),
+    agents_prompt: String(row.agents_prompt ?? ''),
+    tools_prompt: String(row.tools_prompt ?? ''),
+    prompt_mode: row.prompt_mode === 'replace' ? 'replace' : 'append',
+    identity_hash: String(row.identity_hash),
+    change_source:
+      row.change_source === 'create' ||
+      row.change_source === 'restore' ||
+      row.change_source === 'migration'
+        ? row.change_source
+        : 'update',
+    restored_from_version:
+      row.restored_from_version == null
+        ? null
+        : Number(row.restored_from_version),
+    created_at: String(row.created_at),
+  };
+}
+
+function insertAgentProfilePromptVersionSnapshot(input: {
+  profileId: string;
+  version: number;
+  name: string;
+  prompts: AgentProfilePrompts;
+  identityHash: string;
+  changeSource: AgentProfilePromptVersion['change_source'];
+  restoredFromVersion?: number | null;
+  createdAt?: string;
+}): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO agent_profile_prompt_versions (
+      id, agent_profile_id, version, name,
+      identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+      identity_hash, change_source, restored_from_version, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    crypto.randomUUID(),
+    input.profileId,
+    input.version,
+    input.name,
+    input.prompts.identity_prompt,
+    input.prompts.soul_prompt,
+    input.prompts.agents_prompt,
+    input.prompts.tools_prompt,
+    input.prompts.prompt_mode,
+    input.identityHash,
+    input.changeSource,
+    input.restoredFromVersion ?? null,
+    input.createdAt ?? new Date().toISOString(),
+  );
+}
+
+export function listAgentProfilePromptVersions(
+  profileId: string,
+  ownerUserId: string,
+): AgentProfilePromptVersion[] {
+  const profile = getAgentProfileForUser(profileId, ownerUserId);
+  if (!profile) return [];
+  const rows = db
+    .prepare(
+      `SELECT * FROM agent_profile_prompt_versions
+       WHERE agent_profile_id = ? ORDER BY version DESC`,
+    )
+    .all(profileId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentProfilePromptVersionRow);
+}
+
+export function getAgentProfilePromptVersion(
+  profileId: string,
+  ownerUserId: string,
+  version: number,
+): AgentProfilePromptVersion | undefined {
+  const profile = getAgentProfileForUser(profileId, ownerUserId);
+  if (!profile) return undefined;
+  const row = db
+    .prepare(
+      `SELECT * FROM agent_profile_prompt_versions
+       WHERE agent_profile_id = ? AND version = ?`,
+    )
+    .get(profileId, version) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfilePromptVersionRow(row) : undefined;
+}
+
+function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
+  const name = String(row.name);
+  const persistedIncludeClaudePreset =
+    Number(row.include_claude_preset ?? 1) === 1;
+  const prompts = normalizeAgentProfilePrompts({
+    identity_prompt: String(row.identity_prompt ?? ''),
+    soul_prompt: String(row.soul_prompt ?? ''),
+    agents_prompt: String(row.agents_prompt ?? ''),
+    tools_prompt: String(row.tools_prompt ?? ''),
+    prompt_mode:
+      row.prompt_mode === 'replace' || row.prompt_mode === 'append'
+        ? row.prompt_mode
+        : promptModeFromLegacyPreset(persistedIncludeClaudePreset),
+  });
+  const includeClaudePreset = includeClaudePresetForMode(prompts.prompt_mode);
+  const runtimePolicy = parseAgentProfileRuntimePolicy(row.runtime_policy);
+  return {
+    id: String(row.id),
+    owner_user_id: String(row.owner_user_id),
+    name,
+    ...prompts,
+    include_claude_preset: includeClaudePreset,
+    avatar_emoji:
+      typeof row.avatar_emoji === 'string' ? row.avatar_emoji : null,
+    avatar_color:
+      typeof row.avatar_color === 'string' ? row.avatar_color : null,
+    avatar_url: typeof row.avatar_url === 'string' ? row.avatar_url : null,
+    runtime_policy: runtimePolicy,
+    identity_hash: String(
+      row.identity_hash ??
+        computeAgentProfileIdentityHash(prompts, runtimePolicy, name),
+    ),
+    version: Number(row.version ?? 1),
+    is_default: Number(row.is_default ?? 0) === 1,
+    status: row.status === 'archived' ? 'archived' : 'active',
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+export function getAgentProfile(profileId: string): AgentProfile | undefined {
+  const row = db
+    .prepare('SELECT * FROM agent_profiles WHERE id = ?')
+    .get(profileId) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfileRow(row) : undefined;
+}
+
+export function getAgentProfileForUser(
+  profileId: string,
+  userId: string,
+): AgentProfile | undefined {
+  const row = db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE id = ? AND owner_user_id = ? AND status = 'active'",
+    )
+    .get(profileId, userId) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfileRow(row) : undefined;
+}
+
+const DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
+const LEGACY_DEFAULT_AGENT_PROFILE_NAME = 'Default Agent';
+
+export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
+  const existing = db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active' LIMIT 1",
+    )
+    .get(userId) as Record<string, unknown> | undefined;
+  if (existing) {
+    const profile = mapAgentProfileRow(existing);
+    const migrateName = profile.name === LEGACY_DEFAULT_AGENT_PROFILE_NAME;
+    if (!migrateName) return profile;
+
+    const now = new Date().toISOString();
+    const name = migrateName ? DEFAULT_AGENT_PROFILE_NAME : profile.name;
+    const runtimePolicy = profile.runtime_policy;
+    const identityHash = computeAgentProfileIdentityHash(
+      profile,
+      runtimePolicy,
+      name,
+    );
+    const nextVersion = profile.version + 1;
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE agent_profiles
+         SET name = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        name,
+        serializeAgentProfileRuntimePolicy(runtimePolicy),
+        identityHash,
+        nextVersion,
+        now,
+        profile.id,
+      );
+    })();
+    return getAgentProfile(profile.id)!;
+  }
+
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const name = DEFAULT_AGENT_PROFILE_NAME;
+  const prompts = normalizeAgentProfilePrompts();
+  const runtimePolicy = normalizeAgentProfileRuntimePolicy();
+  const identityHash = computeAgentProfileIdentityHash(
+    prompts,
+    runtimePolicy,
+    name,
+  );
+  const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO agent_profiles (
+        id, owner_user_id, name,
+        identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+        include_claude_preset, runtime_policy, identity_hash, version,
+        is_default, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`,
+    ).run(
+      id,
+      userId,
+      name,
+      prompts.identity_prompt,
+      prompts.soul_prompt,
+      prompts.agents_prompt,
+      prompts.tools_prompt,
+      prompts.prompt_mode,
+      includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+      runtimePolicyJson,
+      identityHash,
+      now,
+      now,
+    );
+    insertAgentProfilePromptVersionSnapshot({
+      profileId: id,
+      version: 1,
+      name,
+      prompts,
+      identityHash,
+      changeSource: 'create',
+      createdAt: now,
+    });
+  })();
+  return getAgentProfile(id)!;
+}
+
+export function listAgentProfilesForUser(userId: string): AgentProfile[] {
+  getOrCreateDefaultAgentProfile(userId);
+  const rows = db
+    .prepare(
+      `SELECT * FROM agent_profiles
+       WHERE owner_user_id = ? AND status = 'active'
+       ORDER BY is_default DESC, updated_at DESC, created_at ASC`,
+    )
+    .all(userId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentProfileRow);
+}
+
+export function createAgentProfile(input: {
+  ownerUserId: string;
+  name: string;
+  identityPrompt?: string;
+  soulPrompt?: string;
+  agentsPrompt?: string;
+  toolsPrompt?: string;
+  promptMode?: AgentProfilePromptMode;
+  includeClaudePreset?: boolean;
+  avatarEmoji?: string | null;
+  avatarColor?: string | null;
+  runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
+}): AgentProfile {
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  const prompts = normalizeAgentProfilePrompts({
+    identity_prompt: input.identityPrompt ?? '',
+    soul_prompt: input.soulPrompt ?? '',
+    agents_prompt: input.agentsPrompt ?? '',
+    tools_prompt: input.toolsPrompt ?? '',
+    prompt_mode:
+      input.promptMode ??
+      promptModeFromLegacyPreset(input.includeClaudePreset ?? true),
+  });
+  const runtimePolicy = normalizeAgentProfileRuntimePolicy(input.runtimePolicy);
+  const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
+  const identityHash = computeAgentProfileIdentityHash(
+    prompts,
+    runtimePolicy,
+    input.name,
+  );
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO agent_profiles (
+        id, owner_user_id, name,
+        identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+        include_claude_preset, avatar_emoji, avatar_color, runtime_policy, identity_hash, version,
+        is_default, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+    ).run(
+      id,
+      input.ownerUserId,
+      input.name,
+      prompts.identity_prompt,
+      prompts.soul_prompt,
+      prompts.agents_prompt,
+      prompts.tools_prompt,
+      prompts.prompt_mode,
+      includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+      input.avatarEmoji ?? null,
+      input.avatarColor ?? null,
+      runtimePolicyJson,
+      identityHash,
+      now,
+      now,
+    );
+    insertAgentProfilePromptVersionSnapshot({
+      profileId: id,
+      version: 1,
+      name: input.name,
+      prompts,
+      identityHash,
+      changeSource: 'create',
+      createdAt: now,
+    });
+  })();
+  return getAgentProfile(id)!;
+}
+
+export function updateAgentProfile(
+  profileId: string,
+  ownerUserId: string,
+  updates: {
+    name?: string;
+    identityPrompt?: string;
+    soulPrompt?: string;
+    agentsPrompt?: string;
+    toolsPrompt?: string;
+    promptMode?: AgentProfilePromptMode;
+    includeClaudePreset?: boolean;
+    avatarEmoji?: string | null;
+    avatarColor?: string | null;
+    avatarUrl?: string | null;
+    runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
+    changeSource?: AgentProfilePromptVersion['change_source'];
+    restoredFromVersion?: number | null;
+  },
+): AgentProfile | undefined {
+  const existing = getAgentProfileForUser(profileId, ownerUserId);
+  if (!existing) return undefined;
+  const nextName = updates.name ?? existing.name;
+  const nextPromptMode =
+    updates.promptMode ??
+    (updates.includeClaudePreset === undefined
+      ? existing.prompt_mode
+      : promptModeFromLegacyPreset(updates.includeClaudePreset));
+  const nextPrompts = normalizeAgentProfilePrompts({
+    identity_prompt: updates.identityPrompt ?? existing.identity_prompt,
+    soul_prompt: updates.soulPrompt ?? existing.soul_prompt,
+    agents_prompt: updates.agentsPrompt ?? existing.agents_prompt,
+    tools_prompt: updates.toolsPrompt ?? existing.tools_prompt,
+    prompt_mode: nextPromptMode,
+  });
+  const nextRuntimePolicy =
+    updates.runtimePolicy !== undefined
+      ? mergeAgentProfileRuntimePolicy(
+          existing.runtime_policy,
+          updates.runtimePolicy,
+        )
+      : existing.runtime_policy;
+  const nextAvatarEmoji =
+    updates.avatarEmoji === undefined
+      ? existing.avatar_emoji
+      : updates.avatarEmoji;
+  const nextAvatarColor =
+    updates.avatarColor === undefined
+      ? existing.avatar_color
+      : updates.avatarColor;
+  const nextAvatarUrl =
+    updates.avatarUrl === undefined ? existing.avatar_url : updates.avatarUrl;
+  const nextHash = computeAgentProfileIdentityHash(
+    nextPrompts,
+    nextRuntimePolicy,
+    nextName,
+  );
+  const identityChanged = nextHash !== existing.identity_hash;
+  const promptChanged =
+    nextPrompts.identity_prompt !== existing.identity_prompt ||
+    nextPrompts.soul_prompt !== existing.soul_prompt ||
+    nextPrompts.agents_prompt !== existing.agents_prompt ||
+    nextPrompts.tools_prompt !== existing.tools_prompt ||
+    nextPrompts.prompt_mode !== existing.prompt_mode;
+  const nextVersion = identityChanged ? existing.version + 1 : existing.version;
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE agent_profiles
+       SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
+           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?,
+           runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+       WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
+    ).run(
+      nextName,
+      nextPrompts.identity_prompt,
+      nextPrompts.soul_prompt,
+      nextPrompts.agents_prompt,
+      nextPrompts.tools_prompt,
+      nextPrompts.prompt_mode,
+      includeClaudePresetForMode(nextPrompts.prompt_mode) ? 1 : 0,
+      nextAvatarEmoji,
+      nextAvatarColor,
+      nextAvatarUrl,
+      serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
+      nextHash,
+      nextVersion,
+      now,
+      profileId,
+      ownerUserId,
+    );
+    // Runtime identity versions intentionally also advance for name and
+    // capability-policy changes so existing SDK sessions are invalidated.
+    // Prompt history, however, is a history of the four prompt sections and
+    // prompt mode only; recording unrelated identity versions here would show
+    // duplicate prompt revisions in the editor.
+    if (promptChanged) {
+      insertAgentProfilePromptVersionSnapshot({
+        profileId,
+        version: nextVersion,
+        name: nextName,
+        prompts: nextPrompts,
+        identityHash: nextHash,
+        changeSource: updates.changeSource ?? 'update',
+        restoredFromVersion: updates.restoredFromVersion,
+        createdAt: now,
+      });
+    }
+  })();
+  return getAgentProfile(profileId);
+}
+
+export function archiveAgentProfile(
+  profileId: string,
+  ownerUserId: string,
+): 'ok' | 'not_found' | 'is_default' | 'has_workspaces' | 'has_mounts' {
+  const existing = getAgentProfileForUser(profileId, ownerUserId);
+  if (!existing) return 'not_found';
+  if (existing.is_default) return 'is_default';
+  const count = countWorkspaceAgentProfileMappings(profileId);
+  if (count > 0) return 'has_workspaces';
+  if (countAgentChannelMountsForProfile(profileId) > 0) return 'has_mounts';
+  db.prepare(
+    "UPDATE agent_profiles SET status = 'archived', updated_at = ? WHERE id = ? AND owner_user_id = ?",
+  ).run(new Date().toISOString(), profileId, ownerUserId);
+  return 'ok';
+}
+
+export function assignWorkspaceAgentProfile(
+  groupFolder: string,
+  profileId: string,
+): void {
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO workspace_agent_profiles (
+        group_folder, agent_profile_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(group_folder) DO UPDATE SET
+        agent_profile_id = excluded.agent_profile_id,
+        updated_at = excluded.updated_at`,
+    ).run(groupFolder, profileId, now, now);
+    syncAgentChannelMountsForWorkspaceFolder(groupFolder);
+  })();
+}
+
+export function getWorkspaceAgentProfileId(
+  groupFolder: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      'SELECT agent_profile_id FROM workspace_agent_profiles WHERE group_folder = ?',
+    )
+    .get(groupFolder) as { agent_profile_id: string } | undefined;
+  return row?.agent_profile_id;
+}
+
+export function deleteWorkspaceAgentProfile(groupFolder: string): void {
+  db.transaction(() => {
+    db.prepare(
+      'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+    ).run(groupFolder);
+    syncAgentChannelMountsForWorkspaceFolder(groupFolder);
+  })();
+}
+
+export function countWorkspaceAgentProfileMappings(profileId: string): number {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as count FROM workspace_agent_profiles WHERE agent_profile_id = ?',
+    )
+    .get(profileId) as { count: number };
+  return row.count;
+}
+
+export function getAgentProfileForWorkspace(
+  groupFolder: string,
+  ownerUserId?: string | null,
+): AgentProfile | undefined {
+  const mappedId = getWorkspaceAgentProfileId(groupFolder);
+  if (mappedId) {
+    const mapped = getAgentProfile(mappedId);
+    if (mapped?.status === 'active') return mapped;
+  }
+  if (!ownerUserId) return undefined;
+  const fallback = getOrCreateDefaultAgentProfile(ownerUserId);
+  // Runtime fallback may materialize a previously-unmapped default ownership,
+  // but Agent PATCH snapshots use the same default fallback before this write.
+  // Therefore the workspace is already included in the default profile lock's
+  // quiesce set; it cannot appear as a new membership outside that snapshot.
+  assignWorkspaceAgentProfile(groupFolder, fallback.id);
+  return fallback;
+}
+
+export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
+  // initDatabase invokes this before the web server publishes routes or starts
+  // runners, so no process-local profile membership lock is necessary here.
+  const tx = db.transaction(() => {
+    const users = db
+      .prepare("SELECT id FROM users WHERE status != 'deleted'")
+      .all() as Array<{ id: string }>;
+    for (const user of users) {
+      getOrCreateDefaultAgentProfile(user.id);
+    }
+
+    const webWorkspaces = db
+      .prepare(
+        "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
+      )
+      .all() as Array<{ folder: string; created_by: string }>;
+    for (const ws of webWorkspaces) {
+      if (getWorkspaceAgentProfileId(ws.folder)) continue;
+      const profile = getOrCreateDefaultAgentProfile(ws.created_by);
+      assignWorkspaceAgentProfile(ws.folder, profile.id);
+    }
+  });
+  tx();
 }
 
 /**
@@ -2544,6 +6700,9 @@ export function deleteSessionsByProviderId(providerId: string): {
       )
       .all(id) as Array<{ group_folder: string }>;
     const affectedFolders = rows.map((r) => r.group_folder);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE provider_id = ?',
+    ).run(id);
     const result = db
       .prepare('DELETE FROM sessions WHERE provider_id = ?')
       .run(id);
@@ -2595,6 +6754,7 @@ type RegisteredGroupRow = {
   init_source_path: string | null;
   init_git_url: string | null;
   created_by: string | null;
+  channel_account_id: string | null;
   is_home: number;
   selected_skills: string | null;
   target_agent_id: string | null;
@@ -2608,6 +6768,7 @@ type RegisteredGroupRow = {
   conversation_source: string | null;
   conversation_nav_mode: string | null;
   binding_mode: string | null;
+  native_context_type: string | null;
   feishu_chat_mode: string | null;
   feishu_group_message_type: string | null;
   sender_allowlist: string | null;
@@ -2667,6 +6828,7 @@ function parseGroupRow(
     initSourcePath: row.init_source_path ?? undefined,
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
+    channel_account_id: row.channel_account_id ?? undefined,
     is_home: row.is_home === 1,
     target_agent_id: row.target_agent_id ?? undefined,
     target_main_jid: row.target_main_jid ?? undefined,
@@ -2675,13 +6837,18 @@ function parseGroupRow(
     activation_mode: parseActivationMode(row.activation_mode),
     owner_im_id: row.owner_im_id ?? undefined,
     conversation_source:
-      row.conversation_source === 'feishu_thread' ? 'feishu_thread' : 'manual',
+      row.conversation_source === 'native_thread' ||
+      row.conversation_source === 'feishu_thread'
+        ? row.conversation_source
+        : 'manual',
     conversation_nav_mode:
       row.conversation_nav_mode === 'vertical_threads'
         ? 'vertical_threads'
         : 'horizontal',
     binding_mode:
       row.binding_mode === 'thread_map' ? 'thread_map' : 'single_context',
+    native_context_type:
+      row.native_context_type === 'thread' ? 'thread' : 'none',
     feishu_chat_mode: row.feishu_chat_mode ?? undefined,
     feishu_group_message_type: row.feishu_group_message_type ?? undefined,
     sender_allowlist: senderAllowlist,
@@ -2700,8 +6867,437 @@ function parseActivationMode(
   raw: string | null,
 ): 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled' {
   if (raw && VALID_ACTIVATION_MODES.has(raw))
-    return raw as 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+    return raw as
+      | 'auto'
+      | 'always'
+      | 'when_mentioned'
+      | 'owner_mentioned'
+      | 'disabled';
   return 'auto';
+}
+
+export interface WorkspaceRecord {
+  jid: string;
+  folder: string;
+  owner_user_id: string | null;
+  name: string;
+  status: 'active' | 'archived';
+  is_home: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** SDK/provider resume state. This is not a user-visible product Session. */
+export interface WorkspaceRuntimeSessionRecord {
+  group_folder: string;
+  runtime_agent_id: string;
+  workspace_jid: string;
+  sdk_session_id: string;
+  provider_id: string | null;
+  agent_profile_id: string | null;
+  agent_profile_version: number | null;
+  identity_hash: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentChannelMountRecord extends ChannelMount {
+  agent_profile_id: string | null;
+  owner_user_id: string | null;
+  workspace_folder: string | null;
+}
+
+function parseWorkspaceRecord(row: Record<string, unknown>): WorkspaceRecord {
+  return {
+    jid: String(row.jid),
+    folder: String(row.folder),
+    owner_user_id:
+      typeof row.owner_user_id === 'string' ? row.owner_user_id : null,
+    name: String(row.name),
+    status: row.status === 'archived' ? 'archived' : 'active',
+    is_home: Number(row.is_home ?? 0) === 1,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function parseWorkspaceRuntimeSessionRecord(
+  row: Record<string, unknown>,
+): WorkspaceRuntimeSessionRecord {
+  return {
+    group_folder: String(row.group_folder),
+    runtime_agent_id: String(row.runtime_agent_id ?? ''),
+    workspace_jid: String(row.workspace_jid),
+    sdk_session_id: String(row.sdk_session_id ?? ''),
+    provider_id: typeof row.provider_id === 'string' ? row.provider_id : null,
+    agent_profile_id:
+      typeof row.agent_profile_id === 'string' ? row.agent_profile_id : null,
+    agent_profile_version:
+      typeof row.agent_profile_version === 'number'
+        ? row.agent_profile_version
+        : row.agent_profile_version == null
+          ? null
+          : Number(row.agent_profile_version),
+    identity_hash:
+      typeof row.identity_hash === 'string' ? row.identity_hash : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function parseAgentChannelMountRecord(
+  row: ChannelMountRow & Record<string, unknown>,
+): AgentChannelMountRecord {
+  return {
+    ...parseChannelMountRow(row),
+    agent_profile_id:
+      typeof row.agent_profile_id === 'string' ? row.agent_profile_id : null,
+    owner_user_id:
+      typeof row.owner_user_id === 'string' ? row.owner_user_id : null,
+    workspace_folder:
+      typeof row.workspace_folder === 'string' ? row.workspace_folder : null,
+  };
+}
+
+function getWorkspaceJidForFolder(groupFolder: string): string | null {
+  const row = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%' ORDER BY is_home DESC, added_at ASC LIMIT 1",
+    )
+    .get(groupFolder) as { jid: string } | undefined;
+  return row?.jid ?? null;
+}
+
+function syncWorkspaceFromRegisteredGroup(
+  jid: string,
+  group: RegisteredGroup,
+): void {
+  if (!jid.startsWith('web:')) return;
+  const now = new Date().toISOString();
+  const existing = getWorkspaceRecord(jid);
+  db.prepare(
+    `INSERT INTO workspaces (
+      jid, folder, owner_user_id, name, status, is_home, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+    ON CONFLICT(jid) DO UPDATE SET
+      folder = excluded.folder,
+      owner_user_id = excluded.owner_user_id,
+      name = excluded.name,
+      status = 'active',
+      is_home = excluded.is_home,
+      updated_at = excluded.updated_at`,
+  ).run(
+    jid,
+    group.folder,
+    group.created_by ?? null,
+    group.name,
+    group.is_home ? 1 : 0,
+    existing?.created_at ?? group.added_at ?? now,
+    now,
+  );
+}
+
+function deleteWorkspaceMirror(jid: string, folder?: string): void {
+  db.prepare('DELETE FROM workspaces WHERE jid = ?').run(jid);
+  db.prepare(
+    'DELETE FROM workspace_runtime_sessions WHERE workspace_jid = ?',
+  ).run(jid);
+  db.prepare('DELETE FROM agent_channel_mounts WHERE workspace_jid = ?').run(
+    jid,
+  );
+  db.prepare('DELETE FROM channel_mounts WHERE workspace_jid = ?').run(jid);
+  if (folder) {
+    const replacementJid = getWorkspaceJidForFolder(folder);
+    if (replacementJid) {
+      const rows = db
+        .prepare('SELECT agent_id FROM sessions WHERE group_folder = ?')
+        .all(folder) as Array<{ agent_id: string | null }>;
+      for (const row of rows) {
+        syncWorkspaceRuntimeSessionProjection(folder, row.agent_id ?? '');
+      }
+    } else {
+      db.prepare(
+        'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+      ).run(folder);
+    }
+  }
+}
+
+function syncWorkspaceRuntimeSessionProjection(
+  groupFolder: string,
+  agentId?: string | null,
+): void {
+  const effectiveAgentId = agentId || '';
+  const row = db
+    .prepare(
+      `SELECT session_id, provider_id, agent_profile_id, agent_profile_version, identity_hash
+       FROM sessions
+       WHERE group_folder = ? AND agent_id = ?`,
+    )
+    .get(groupFolder, effectiveAgentId) as
+    | {
+        session_id: string;
+        provider_id: string | null;
+        agent_profile_id: string | null;
+        agent_profile_version: number | null;
+        identity_hash: string | null;
+      }
+    | undefined;
+  if (!row) {
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+    return;
+  }
+  const workspaceJid = getWorkspaceJidForFolder(groupFolder);
+  if (!workspaceJid) {
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    ).run(groupFolder, effectiveAgentId);
+    return;
+  }
+  const now = new Date().toISOString();
+  const existing = getWorkspaceRuntimeSession(groupFolder, effectiveAgentId);
+  db.prepare(
+    `INSERT INTO workspace_runtime_sessions (
+      group_folder, runtime_agent_id, workspace_jid, sdk_session_id,
+      provider_id, agent_profile_id, agent_profile_version, identity_hash,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(group_folder, runtime_agent_id) DO UPDATE SET
+      workspace_jid = excluded.workspace_jid,
+      sdk_session_id = excluded.sdk_session_id,
+      provider_id = excluded.provider_id,
+      agent_profile_id = excluded.agent_profile_id,
+      agent_profile_version = excluded.agent_profile_version,
+      identity_hash = excluded.identity_hash,
+      updated_at = excluded.updated_at`,
+  ).run(
+    groupFolder,
+    effectiveAgentId,
+    workspaceJid,
+    row.session_id,
+    row.provider_id ?? null,
+    row.agent_profile_id ?? null,
+    row.agent_profile_version ?? null,
+    row.identity_hash ?? null,
+    existing?.created_at ?? now,
+    now,
+  );
+}
+
+function syncWorkspaceRuntimeSessionsForFolder(groupFolder: string): void {
+  const rows = db
+    .prepare('SELECT agent_id FROM sessions WHERE group_folder = ?')
+    .all(groupFolder) as Array<{ agent_id: string | null }>;
+  for (const row of rows) {
+    syncWorkspaceRuntimeSessionProjection(groupFolder, row.agent_id ?? '');
+  }
+}
+
+function syncAgentChannelMountFromMount(mount: ChannelMount): void {
+  const workspace = getRegisteredGroup(mount.workspace_jid);
+  const agentProfileId = workspace
+    ? (getWorkspaceAgentProfileId(workspace.folder) ?? null)
+    : null;
+  db.prepare(
+    `INSERT INTO agent_channel_mounts (
+      channel_jid, channel_account_id, agent_profile_id, owner_user_id, channel_type,
+      workspace_jid, workspace_folder, session_id, routing_mode, reply_policy,
+      activation_mode, owner_im_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(channel_jid) DO UPDATE SET
+      channel_account_id = excluded.channel_account_id,
+      agent_profile_id = excluded.agent_profile_id,
+      owner_user_id = excluded.owner_user_id,
+      channel_type = excluded.channel_type,
+      workspace_jid = excluded.workspace_jid,
+      workspace_folder = excluded.workspace_folder,
+      session_id = excluded.session_id,
+      routing_mode = excluded.routing_mode,
+      reply_policy = excluded.reply_policy,
+      activation_mode = excluded.activation_mode,
+      owner_im_id = excluded.owner_im_id,
+      updated_at = excluded.updated_at`,
+  ).run(
+    mount.channel_jid,
+    mount.channel_account_id ?? null,
+    agentProfileId,
+    workspace?.created_by ?? null,
+    mount.channel_type,
+    mount.workspace_jid,
+    workspace?.folder ?? null,
+    mount.session_id ?? null,
+    mount.routing_mode,
+    mount.reply_policy,
+    mount.activation_mode,
+    mount.owner_im_id ?? null,
+    mount.created_at,
+    mount.updated_at,
+  );
+}
+
+function syncAgentChannelMountsForWorkspaceFolder(groupFolder: string): void {
+  const rows = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%'",
+    )
+    .all(groupFolder) as Array<{ jid: string }>;
+  for (const row of rows) {
+    const mounts = listChannelMountsByWorkspace(row.jid);
+    for (const mount of mounts) {
+      syncAgentChannelMountFromMount(mount);
+    }
+  }
+}
+
+function syncAgentChannelMountsForWorkspaceJid(workspaceJid: string): void {
+  for (const mount of listChannelMountsByWorkspace(workspaceJid)) {
+    syncAgentChannelMountFromMount(mount);
+  }
+}
+
+export function getWorkspaceRecord(jid: string): WorkspaceRecord | undefined {
+  const row = db.prepare('SELECT * FROM workspaces WHERE jid = ?').get(jid) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? parseWorkspaceRecord(row) : undefined;
+}
+
+export function listWorkspaceRecords(): WorkspaceRecord[] {
+  const rows = db
+    .prepare('SELECT * FROM workspaces ORDER BY updated_at DESC')
+    .all() as Array<Record<string, unknown>>;
+  return rows.map(parseWorkspaceRecord);
+}
+
+export function getWorkspaceRuntimeSession(
+  groupFolder: string,
+  agentId?: string | null,
+): WorkspaceRuntimeSessionRecord | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+    )
+    .get(groupFolder, agentId || '') as Record<string, unknown> | undefined;
+  return row ? parseWorkspaceRuntimeSessionRecord(row) : undefined;
+}
+
+export function listWorkspaceRuntimeSessionsByWorkspace(
+  workspaceJid: string,
+): WorkspaceRuntimeSessionRecord[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM workspace_runtime_sessions WHERE workspace_jid = ? ORDER BY updated_at DESC',
+    )
+    .all(workspaceJid) as Array<Record<string, unknown>>;
+  return rows.map(parseWorkspaceRuntimeSessionRecord);
+}
+
+export function getAgentChannelMount(
+  channelJid: string,
+): AgentChannelMountRecord | undefined {
+  const row = db
+    .prepare('SELECT * FROM agent_channel_mounts WHERE channel_jid = ?')
+    .get(channelJid) as (ChannelMountRow & Record<string, unknown>) | undefined;
+  return row ? parseAgentChannelMountRecord(row) : undefined;
+}
+
+export function listAgentChannelMountsForProfile(
+  agentProfileId: string,
+): AgentChannelMountRecord[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM agent_channel_mounts WHERE agent_profile_id = ? ORDER BY updated_at DESC',
+    )
+    .all(agentProfileId) as Array<ChannelMountRow & Record<string, unknown>>;
+  return rows.map(parseAgentChannelMountRecord);
+}
+
+export function listAgentChannelMountsByWorkspace(
+  workspaceJid: string,
+): AgentChannelMountRecord[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM agent_channel_mounts WHERE workspace_jid = ? ORDER BY updated_at DESC',
+    )
+    .all(workspaceJid) as Array<ChannelMountRow & Record<string, unknown>>;
+  return rows.map(parseAgentChannelMountRecord);
+}
+
+export function countAgentChannelMountsForProfile(
+  agentProfileId: string,
+): number {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as count FROM agent_channel_mounts WHERE agent_profile_id = ?',
+    )
+    .get(agentProfileId) as { count: number };
+  return row.count;
+}
+
+export function syncAllWorkspacesFromRegisteredGroups(): void {
+  const rows = db
+    .prepare("SELECT * FROM registered_groups WHERE jid LIKE 'web:%'")
+    .all() as RegisteredGroupRow[];
+  for (const row of rows) {
+    syncWorkspaceFromRegisteredGroup(row.jid, parseGroupRow(row));
+  }
+}
+
+export function syncAllWorkspaceRuntimeSessionsFromSessions(): void {
+  const rows = db
+    .prepare('SELECT group_folder, agent_id FROM sessions')
+    .all() as Array<{ group_folder: string; agent_id: string | null }>;
+  for (const row of rows) {
+    syncWorkspaceRuntimeSessionProjection(row.group_folder, row.agent_id ?? '');
+  }
+}
+
+/**
+ * Rebuild compatibility projections from their authoritative source tables.
+ * The whole pass is atomic and removes projection-only ghosts left by crashes
+ * or historical non-transactional dual writes.
+ */
+export function reconcileCanonicalRuntimeProjections(): void {
+  db.transaction(() => {
+    db.exec(`
+      DELETE FROM workspaces
+      WHERE NOT EXISTS (
+        SELECT 1 FROM registered_groups rg
+        WHERE rg.jid = workspaces.jid AND rg.jid LIKE 'web:%'
+      )
+    `);
+    syncAllWorkspacesFromRegisteredGroups();
+    db.exec(`
+      DELETE FROM workspace_agent_profiles
+      WHERE NOT EXISTS (
+        SELECT 1 FROM workspaces w
+        WHERE w.folder = workspace_agent_profiles.group_folder
+      )
+    `);
+
+    db.exec(`
+      DELETE FROM workspace_runtime_sessions
+      WHERE NOT EXISTS (
+        SELECT 1 FROM sessions s
+        WHERE s.group_folder = workspace_runtime_sessions.group_folder
+          AND s.agent_id = workspace_runtime_sessions.runtime_agent_id
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM registered_groups rg
+        WHERE rg.jid = workspace_runtime_sessions.workspace_jid
+          AND rg.jid LIKE 'web:%'
+          AND rg.folder = workspace_runtime_sessions.group_folder
+      )
+    `);
+    syncAllWorkspaceRuntimeSessionsFromSessions();
+
+    // Channel projections are cheap to rebuild and their source can change
+    // shape (workspace vs product Session target), so a full replace is safer
+    // than trying to infer every stale-target case.
+    syncAllChannelMountsFromRegisteredGroups();
+  })();
 }
 
 export function getRegisteredGroup(
@@ -2714,42 +7310,386 @@ export function getRegisteredGroup(
   return parseGroupRow(row);
 }
 
-export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+type ChannelAccountRow = {
+  id: string;
+  owner_user_id: string;
+  provider: string;
+  name: string;
+  secret_ref: string;
+  enabled: number;
+  is_default: number;
+  is_legacy_default: number;
+  auth_mode: string;
+  auth_status: string;
+  transport_status: string;
+  status: string;
+  default_agent_profile_id: string | null;
+  default_workspace_jid: string | null;
+  last_error: string | null;
+  connected_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function parseChannelAccountRow(row: ChannelAccountRow): ChannelAccount {
+  const transportStatus = ['connecting', 'connected', 'error'].includes(
+    row.transport_status || row.status,
+  )
+    ? ((row.transport_status ||
+        row.status) as ChannelAccount['transport_status'])
+    : 'disconnected';
+  const authMode = ['bot_token', 'qr_session'].includes(row.auth_mode)
+    ? (row.auth_mode as ChannelAccount['auth_mode'])
+    : 'credentials';
+  const authStatus = [
+    'awaiting_scan',
+    'authorized',
+    'revoked',
+    'error',
+  ].includes(row.auth_status)
+    ? (row.auth_status as ChannelAccount['auth_status'])
+    : 'draft';
+  return {
+    id: row.id,
+    owner_user_id: row.owner_user_id,
+    provider: row.provider as ChannelProvider,
+    name: row.name,
+    secret_ref: row.secret_ref,
+    enabled: row.enabled === 1,
+    is_default: row.is_default === 1,
+    is_legacy_default: row.is_legacy_default === 1,
+    auth_mode: authMode,
+    auth_status: authStatus,
+    transport_status: transportStatus,
+    status: transportStatus,
+    default_agent_profile_id: row.default_agent_profile_id,
+    default_workspace_jid: row.default_workspace_jid,
+    last_error: row.last_error,
+    connected_at: row.connected_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export function createChannelAccount(input: {
+  id?: string;
+  owner_user_id: string;
+  provider: ChannelProvider;
+  name: string;
+  secret_ref: string;
+  enabled?: boolean;
+  is_default?: boolean;
+  is_legacy_default?: boolean;
+  auth_mode?: ChannelAccount['auth_mode'];
+  auth_status?: ChannelAccount['auth_status'];
+  default_agent_profile_id?: string | null;
+  default_workspace_jid?: string | null;
+}): ChannelAccount {
+  return db.transaction(() => {
+    const id = input.id ?? crypto.randomUUID();
+    const now = new Date().toISOString();
+    const wantsDefault = input.is_default === true;
+    const existingCount = db
+      .prepare(
+        'SELECT COUNT(*) AS count FROM channel_accounts WHERE owner_user_id = ? AND provider = ?',
+      )
+      .get(input.owner_user_id, input.provider) as { count: number };
+    const isDefault = wantsDefault || existingCount.count === 0;
+    if (isDefault) {
+      db.prepare(
+        'UPDATE channel_accounts SET is_default = 0, updated_at = ? WHERE owner_user_id = ? AND provider = ?',
+      ).run(now, input.owner_user_id, input.provider);
+    }
+    db.prepare(
+      `INSERT INTO channel_accounts (
+        id, owner_user_id, provider, name, secret_ref, enabled, is_default, is_legacy_default,
+        auth_mode, auth_status, transport_status, status, default_agent_profile_id, default_workspace_jid,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'disconnected', 'disconnected', ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.owner_user_id,
+      input.provider,
+      input.name.trim(),
+      input.secret_ref,
+      input.enabled === false ? 0 : 1,
+      isDefault ? 1 : 0,
+      input.is_legacy_default === true ? 1 : 0,
+      input.auth_mode ?? 'credentials',
+      input.auth_status ?? 'draft',
+      input.default_agent_profile_id ?? null,
+      input.default_workspace_jid ?? null,
+      now,
+      now,
+    );
+    return getChannelAccount(id)!;
+  })();
+}
+
+export function getChannelAccount(id: string): ChannelAccount | undefined {
+  const row = db
+    .prepare('SELECT * FROM channel_accounts WHERE id = ?')
+    .get(id) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+export function getChannelAccountForUser(
+  id: string,
+  ownerUserId: string,
+): ChannelAccount | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
+    )
+    .get(id, ownerUserId) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+export function getDefaultChannelAccount(
+  ownerUserId: string,
+  provider: ChannelProvider,
+): ChannelAccount | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE owner_user_id = ? AND provider = ? ORDER BY is_default DESC, created_at ASC LIMIT 1',
+    )
+    .get(ownerUserId, provider) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+/** The account that owns historical unscoped JIDs, independent of UI default. */
+export function getLegacyChannelAccount(
+  ownerUserId: string,
+  provider: ChannelProvider,
+): ChannelAccount | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE owner_user_id = ? AND provider = ? AND is_legacy_default = 1 ORDER BY created_at ASC LIMIT 1',
+    )
+    .get(ownerUserId, provider) as ChannelAccountRow | undefined;
+  return row ? parseChannelAccountRow(row) : undefined;
+}
+
+export function listChannelAccountsForUser(
+  ownerUserId: string,
+): ChannelAccount[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM channel_accounts WHERE owner_user_id = ? ORDER BY provider, is_default DESC, created_at ASC',
+    )
+    .all(ownerUserId) as ChannelAccountRow[];
+  return rows.map(parseChannelAccountRow);
+}
+
+export function listEnabledChannelAccounts(): ChannelAccount[] {
+  return (
+    db
+      .prepare(
+        'SELECT * FROM channel_accounts WHERE enabled = 1 ORDER BY owner_user_id, provider, created_at',
+      )
+      .all() as ChannelAccountRow[]
+  ).map(parseChannelAccountRow);
+}
+
+export function updateChannelAccount(
+  id: string,
+  ownerUserId: string,
+  patch: Partial<
+    Pick<
+      ChannelAccount,
+      | 'name'
+      | 'enabled'
+      | 'is_default'
+      | 'default_agent_profile_id'
+      | 'default_workspace_jid'
+    >
+  >,
+): ChannelAccount | undefined {
+  return db.transaction(() => {
+    const current = getChannelAccountForUser(id, ownerUserId);
+    if (!current) return undefined;
+    const now = new Date().toISOString();
+    if (patch.is_default === true) {
+      db.prepare(
+        'UPDATE channel_accounts SET is_default = 0, updated_at = ? WHERE owner_user_id = ? AND provider = ? AND id != ?',
+      ).run(now, ownerUserId, current.provider, id);
+    }
+    db.prepare(
+      `UPDATE channel_accounts SET
+        name = ?, enabled = ?, is_default = ?, default_agent_profile_id = ?,
+        default_workspace_jid = ?, updated_at = ?
+       WHERE id = ? AND owner_user_id = ?`,
+    ).run(
+      patch.name?.trim() ?? current.name,
+      (patch.enabled ?? current.enabled) ? 1 : 0,
+      (patch.is_default ?? current.is_default) ? 1 : 0,
+      patch.default_agent_profile_id === undefined
+        ? current.default_agent_profile_id
+        : patch.default_agent_profile_id,
+      patch.default_workspace_jid === undefined
+        ? current.default_workspace_jid
+        : patch.default_workspace_jid,
+      now,
+      id,
+      ownerUserId,
+    );
+    if (current.is_default && patch.is_default === false) {
+      const replacement = db
+        .prepare(
+          'SELECT id FROM channel_accounts WHERE owner_user_id = ? AND provider = ? AND id != ? ORDER BY created_at ASC LIMIT 1',
+        )
+        .get(ownerUserId, current.provider, id) as { id: string } | undefined;
+      if (replacement) {
+        db.prepare(
+          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+        ).run(now, replacement.id);
+      } else {
+        db.prepare(
+          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+        ).run(now, id);
+      }
+    }
+    return getChannelAccountForUser(id, ownerUserId);
+  })();
+}
+
+export function updateChannelAccountStatus(
+  id: string,
+  status: ChannelAccount['status'],
+  error?: string | null,
+): void {
+  const now = new Date().toISOString();
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `UPDATE channel_accounts SET transport_status = ?, status = ?, last_error = ?, connected_at = ?, updated_at = ?
+     WHERE id = ?`,
   ).run(
-    jid,
-    group.name,
-    group.folder,
-    group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.executionMode ?? 'container',
-    group.customCwd ?? null,
-    group.initSourcePath ?? null,
-    group.initGitUrl ?? null,
-    group.created_by ?? null,
-    group.is_home ? 1 : 0,
-    null, // selected_skills: deprecated, always null (user-level skills apply globally)
-    group.target_agent_id ?? null,
-    group.target_main_jid ?? null,
-    group.reply_policy ?? 'source_only',
-    group.require_mention === true ? 1 : 0,
-    group.activation_mode ?? 'auto',
-    group.owner_im_id ?? null,
-    'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
-    null, // selected_mcps: deprecated, always null
-    group.conversation_source ?? 'manual',
-    group.conversation_nav_mode ?? 'horizontal',
-    group.binding_mode ?? 'single_context',
-    group.feishu_chat_mode ?? null,
-    group.feishu_group_message_type ?? null,
-    group.sender_allowlist != null ? JSON.stringify(group.sender_allowlist) : null,
+    status,
+    status,
+    error ?? null,
+    status === 'connected' ? now : null,
+    now,
+    id,
   );
 }
 
+export function updateChannelAccountAuthStatus(
+  id: string,
+  authStatus: ChannelAccount['auth_status'],
+  error?: string | null,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE channel_accounts SET auth_status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+  ).run(authStatus, error ?? null, now, id);
+}
+
+export function countChannelAccountBindings(id: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM (
+        SELECT jid AS key FROM registered_groups WHERE channel_account_id = ?
+        UNION SELECT channel_jid AS key FROM channel_mounts WHERE channel_account_id = ?
+        UNION SELECT channel_jid AS key FROM agent_channel_mounts WHERE channel_account_id = ?
+      )`,
+    )
+    .get(id, id, id) as { count: number };
+  return row.count;
+}
+
+export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
+  return db.transaction(() => {
+    const current = getChannelAccountForUser(id, ownerUserId);
+    if (!current) return false;
+    const result = db
+      .prepare(
+        'DELETE FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
+      )
+      .run(id, ownerUserId);
+    if (result.changes > 0 && current.is_default) {
+      const replacement = db
+        .prepare(
+          'SELECT id FROM channel_accounts WHERE owner_user_id = ? AND provider = ? ORDER BY created_at ASC LIMIT 1',
+        )
+        .get(ownerUserId, current.provider) as { id: string } | undefined;
+      if (replacement) {
+        db.prepare(
+          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+        ).run(new Date().toISOString(), replacement.id);
+      }
+    }
+    return result.changes > 0;
+  })();
+}
+
+export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+  db.transaction(() => {
+    const existing = getRegisteredGroup(jid);
+    db.prepare(
+      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      jid,
+      group.name,
+      group.folder,
+      group.added_at,
+      group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+      group.executionMode ?? 'container',
+      group.customCwd ?? null,
+      group.initSourcePath ?? null,
+      group.initGitUrl ?? null,
+      group.created_by ?? null,
+      group.channel_account_id ?? null,
+      group.is_home ? 1 : 0,
+      null, // selected_skills: deprecated, always null (user-level skills apply globally)
+      group.target_agent_id ?? null,
+      group.target_main_jid ?? null,
+      group.reply_policy ?? 'source_only',
+      group.require_mention === true ? 1 : 0,
+      group.activation_mode ?? 'auto',
+      group.owner_im_id ?? null,
+      'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
+      null, // selected_mcps: deprecated, always null
+      group.conversation_source ?? 'manual',
+      group.conversation_nav_mode ?? 'horizontal',
+      group.binding_mode ?? 'single_context',
+      group.native_context_type ?? 'none',
+      group.feishu_chat_mode ?? null,
+      group.feishu_group_message_type ?? null,
+      group.sender_allowlist != null
+        ? JSON.stringify(group.sender_allowlist)
+        : null,
+    );
+    syncWorkspaceFromRegisteredGroup(jid, group);
+    syncChannelMountFromRegisteredGroup(jid, group);
+    if (jid.startsWith('web:')) {
+      if (existing?.folder && existing.folder !== group.folder) {
+        syncWorkspaceRuntimeSessionsForFolder(existing.folder);
+      }
+      syncWorkspaceRuntimeSessionsForFolder(group.folder);
+      syncAgentChannelMountsForWorkspaceJid(jid);
+    }
+  })();
+}
+
 export function deleteRegisteredGroup(jid: string): void {
-  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+  db.transaction(() => {
+    const existing = getRegisteredGroup(jid);
+    deleteChannelMount(jid);
+    db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+    if (jid.startsWith('web:')) {
+      db.prepare(
+        `UPDATE registered_groups
+         SET target_main_jid = NULL, binding_mode = 'single_context'
+         WHERE target_main_jid = ? OR target_main_jid = ?`,
+      ).run(jid, existing?.folder ? `web:${existing.folder}` : jid);
+      deleteWorkspaceMirror(jid, existing?.folder);
+      if (existing?.folder && !getWorkspaceJidForFolder(existing.folder)) {
+        db.prepare(
+          'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+        ).run(existing.folder);
+      }
+    }
+  })();
 }
 
 /**
@@ -2758,7 +7698,9 @@ export function deleteRegisteredGroup(jid: string): void {
  * the bot. Created by buildOnNewChat when a Feishu group is auto-registered
  * before the owner has DM'd the bot. Used by Feishu owner backfill.
  */
-export function findEmptyAllowlistFeishuGroupsForUser(userId: string): string[] {
+export function findEmptyAllowlistFeishuGroupsForUser(
+  userId: string,
+): string[] {
   const rows = db
     .prepare(
       "SELECT jid FROM registered_groups WHERE created_by = ? AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'",
@@ -2788,6 +7730,29 @@ export function backfillEmptyAllowlistsForUser(
   });
   tx(jids);
   return jids;
+}
+
+/** Account-scoped counterpart used by first-class Feishu bots. */
+export function backfillEmptyAllowlistsForChannelAccount(
+  userId: string,
+  channelAccountId: string,
+  ownerOpenId: string,
+): string[] {
+  const rows = db
+    .prepare(
+      `SELECT jid FROM registered_groups
+       WHERE created_by = ? AND channel_account_id = ?
+         AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'`,
+    )
+    .all(userId, channelAccountId) as Array<{ jid: string }>;
+  if (!rows.length) return [];
+  const stmt = db.prepare(
+    'UPDATE registered_groups SET sender_allowlist = ? WHERE jid = ?',
+  );
+  db.transaction(() => {
+    for (const row of rows) stmt.run(JSON.stringify([ownerOpenId]), row.jid);
+  })();
+  return rows.map((row) => row.jid);
 }
 
 /**
@@ -2854,6 +7819,217 @@ export function getGroupsByTargetMainJid(
   return rows.map((row) => ({ jid: row.jid, group: parseGroupRow(row) }));
 }
 
+type ChannelMountRow = {
+  channel_jid: string;
+  channel_account_id: string | null;
+  channel_type: string;
+  workspace_jid: string;
+  session_id: string | null;
+  routing_mode: string | null;
+  reply_policy: string | null;
+  activation_mode: string | null;
+  owner_im_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function parseChannelMountRow(row: ChannelMountRow): ChannelMount {
+  return {
+    channel_jid: row.channel_jid,
+    channel_account_id: row.channel_account_id,
+    channel_type: row.channel_type,
+    workspace_jid: row.workspace_jid,
+    session_id: row.session_id,
+    routing_mode:
+      row.routing_mode === 'thread_map' ? 'thread_map' : 'single_session',
+    reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+    activation_mode: parseActivationMode(row.activation_mode),
+    owner_im_id: row.owner_im_id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function resolveWorkspaceJidForMount(targetMainJid?: string): string | null {
+  if (!targetMainJid) return null;
+  const exists = db
+    .prepare('SELECT 1 FROM registered_groups WHERE jid = ?')
+    .get(targetMainJid);
+  if (exists) return targetMainJid;
+  if (!targetMainJid.startsWith('web:')) return null;
+  const folder = targetMainJid.slice(4);
+  const row = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%' ORDER BY is_home DESC, added_at ASC LIMIT 1",
+    )
+    .get(folder) as { jid: string } | undefined;
+  return row?.jid ?? null;
+}
+
+function channelMountFromRegisteredGroup(
+  channelJid: string,
+  group: RegisteredGroup,
+): Omit<ChannelMount, 'created_at' | 'updated_at'> | null {
+  const channelType = getChannelFromJid(channelJid);
+  if (channelType === 'web') return null;
+
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    if (!agent?.chat_jid) return null;
+    return {
+      channel_jid: channelJid,
+      channel_account_id: group.channel_account_id ?? null,
+      channel_type: channelType,
+      workspace_jid: agent.chat_jid,
+      session_id: group.target_agent_id,
+      routing_mode: 'single_session',
+      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+      activation_mode: group.activation_mode ?? 'auto',
+      owner_im_id: group.owner_im_id ?? null,
+    };
+  }
+
+  if (group.target_main_jid) {
+    const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+    if (!workspaceJid) return null;
+    return {
+      channel_jid: channelJid,
+      channel_account_id: group.channel_account_id ?? null,
+      channel_type: channelType,
+      workspace_jid: workspaceJid,
+      session_id: null,
+      routing_mode:
+        group.binding_mode === 'thread_map' ? 'thread_map' : 'single_session',
+      reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+      activation_mode: group.activation_mode ?? 'auto',
+      owner_im_id: group.owner_im_id ?? null,
+    };
+  }
+
+  return null;
+}
+
+export function upsertChannelMount(
+  mount: Omit<ChannelMount, 'created_at' | 'updated_at'> &
+    Partial<Pick<ChannelMount, 'created_at' | 'updated_at'>>,
+): ChannelMount {
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    const existing = getChannelMount(mount.channel_jid);
+    const createdAt = mount.created_at ?? existing?.created_at ?? now;
+    const updatedAt = mount.updated_at ?? now;
+    db.prepare(
+      `INSERT INTO channel_mounts (
+        channel_jid, channel_account_id, channel_type, workspace_jid, session_id, routing_mode,
+        reply_policy, activation_mode, owner_im_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(channel_jid) DO UPDATE SET
+        channel_account_id = excluded.channel_account_id,
+        channel_type = excluded.channel_type,
+        workspace_jid = excluded.workspace_jid,
+        session_id = excluded.session_id,
+        routing_mode = excluded.routing_mode,
+        reply_policy = excluded.reply_policy,
+        activation_mode = excluded.activation_mode,
+        owner_im_id = excluded.owner_im_id,
+        updated_at = excluded.updated_at`,
+    ).run(
+      mount.channel_jid,
+      mount.channel_account_id ?? null,
+      mount.channel_type,
+      mount.workspace_jid,
+      mount.session_id ?? null,
+      mount.routing_mode,
+      mount.reply_policy,
+      mount.activation_mode,
+      mount.owner_im_id ?? null,
+      createdAt,
+      updatedAt,
+    );
+    const saved = getChannelMount(mount.channel_jid)!;
+    syncAgentChannelMountFromMount(saved);
+    return saved;
+  })();
+}
+
+export function deleteChannelMount(channelJid: string): void {
+  if (!db) return;
+  try {
+    db.transaction(() => {
+      db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(
+        channelJid,
+      );
+      db.prepare('DELETE FROM agent_channel_mounts WHERE channel_jid = ?').run(
+        channelJid,
+      );
+    })();
+  } catch {
+    // Startup can call legacy group deletion paths before a pre-v42 DB has
+    // created channel_mounts. The next init pass will create and backfill it.
+  }
+}
+
+export function getChannelMount(channelJid: string): ChannelMount | undefined {
+  const row = db
+    .prepare('SELECT * FROM channel_mounts WHERE channel_jid = ?')
+    .get(channelJid) as ChannelMountRow | undefined;
+  return row ? parseChannelMountRow(row) : undefined;
+}
+
+export function listChannelMounts(): ChannelMount[] {
+  const rows = db
+    .prepare('SELECT * FROM channel_mounts ORDER BY updated_at DESC')
+    .all() as ChannelMountRow[];
+  return rows.map(parseChannelMountRow);
+}
+
+export function listChannelMountsByWorkspace(
+  workspaceJid: string,
+): ChannelMount[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM channel_mounts WHERE workspace_jid = ? ORDER BY updated_at DESC',
+    )
+    .all(workspaceJid) as ChannelMountRow[];
+  return rows.map(parseChannelMountRow);
+}
+
+export function listChannelMountsBySession(sessionId: string): ChannelMount[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM channel_mounts WHERE session_id = ? ORDER BY updated_at DESC',
+    )
+    .all(sessionId) as ChannelMountRow[];
+  return rows.map(parseChannelMountRow);
+}
+
+export function syncChannelMountFromRegisteredGroup(
+  channelJid: string,
+  group: RegisteredGroup,
+): void {
+  if (getChannelFromJid(channelJid) === 'web') {
+    deleteChannelMount(channelJid);
+    return;
+  }
+  const mount = channelMountFromRegisteredGroup(channelJid, group);
+  if (!mount) {
+    deleteChannelMount(channelJid);
+    return;
+  }
+  upsertChannelMount(mount);
+}
+
+export function syncAllChannelMountsFromRegisteredGroups(): void {
+  db.prepare('DELETE FROM channel_mounts').run();
+  db.prepare('DELETE FROM agent_channel_mounts').run();
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
+  for (const row of rows) {
+    syncChannelMountFromRegisteredGroup(row.jid, parseGroupRow(row));
+  }
+}
+
 function mapImContextBindingRow(
   row: Record<string, unknown>,
 ): ImContextBinding {
@@ -2881,7 +8057,9 @@ export function getImContextBinding(
     .prepare(
       'SELECT * FROM im_context_bindings WHERE source_jid = ? AND context_type = ? AND context_id = ?',
     )
-    .get(sourceJid, contextType, contextId) as Record<string, unknown> | undefined;
+    .get(sourceJid, contextType, contextId) as
+    | Record<string, unknown>
+    | undefined;
   return row ? mapImContextBindingRow(row) : undefined;
 }
 
@@ -2924,6 +8102,17 @@ export function listImContextBindingsByWorkspace(
   return rows.map(mapImContextBindingRow);
 }
 
+export function listImContextBindingsByAgent(
+  agentId: string,
+): ImContextBinding[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM im_context_bindings WHERE agent_id = ? ORDER BY last_active_at DESC, created_at DESC',
+    )
+    .all(agentId) as Record<string, unknown>[];
+  return rows.map(mapImContextBindingRow);
+}
+
 export function deleteImContextBindingsByWorkspace(workspaceJid: string): void {
   db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
     workspaceJid,
@@ -2946,11 +8135,11 @@ export function touchImContextBindingActivity(
   ).run(lastActiveAt, lastActiveAt, sourceJid, contextType, contextId);
 }
 
-/** List feishu_thread agent IDs for a workspace JID (for cleanup on unbind). */
+/** List native-thread agent IDs for a workspace JID (legacy Feishu included). */
 export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
   const rows = db
     .prepare(
-      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind = 'feishu_thread'",
+      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind IN ('native_thread', 'feishu_thread')",
     )
     .all(workspaceJid) as { id: string }[];
   return rows.map((r) => r.id);
@@ -2958,42 +8147,24 @@ export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
 
 /**
  * Find a user's home group (is_home=1 + created_by=userId).
- * For admin users, also matches web:main even if created_by differs
- * (all admins share folder=main).
  */
 export function getUserHomeGroup(
   userId: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
-  // First try exact match: is_home=1 AND created_by=userId
-  let row = db
+  const row = db
     .prepare(
       'SELECT * FROM registered_groups WHERE is_home = 1 AND created_by = ?',
     )
     .get(userId) as RegisteredGroupRow | undefined;
-
-  // Fallback for admin users: all admins share web:main (folder=main).
-  // If no exact match, check if the user is an admin and web:main exists.
-  if (!row) {
-    const user = db
-      .prepare("SELECT role FROM users WHERE id = ? AND status = 'active'")
-      .get(userId) as { role: string } | undefined;
-    if (user?.role === 'admin') {
-      row = db
-        .prepare(
-          "SELECT * FROM registered_groups WHERE jid = 'web:main' AND is_home = 1",
-        )
-        .get() as RegisteredGroupRow | undefined;
-    }
-  }
-
   if (!row) return undefined;
   return parseGroupRow(row);
 }
 
 /**
  * Ensure a user has a home group. If not, create one.
- * Admin gets folder='main' with executionMode='host'.
- * Member gets folder='home-{userId}' with executionMode='container'.
+ * The first admin keeps the legacy web:main home. Every other account gets an
+ * owner-specific home workspace. Admin homes use host execution; member homes
+ * use container execution.
  * Returns the JID of the home group.
  */
 export function ensureUserHomeGroup(
@@ -3006,38 +8177,10 @@ export function ensureUserHomeGroup(
 
   const now = new Date().toISOString();
   const isAdmin = role === 'admin';
-  const jid = isAdmin ? 'web:main' : `web:home-${userId}`;
-  const folder = isAdmin ? 'main' : `home-${userId}`;
-
-  // For admin: check if web:main already exists (created by another admin)
-  // In that case, reuse it rather than overwriting created_by
-  if (isAdmin) {
-    const existingMain = getRegisteredGroup(jid);
-    if (existingMain) {
-      // web:main already exists.
-      // Ensure is_home, created_by, and executionMode are correct for owner-based routing.
-      const patched = { ...existingMain };
-      let changed = false;
-      if (!patched.is_home) {
-        patched.is_home = true;
-        changed = true;
-      }
-      if (!patched.created_by) {
-        patched.created_by = userId;
-        changed = true;
-      }
-      // Admin home container must use host mode
-      if (patched.executionMode !== 'host') {
-        patched.executionMode = 'host';
-        changed = true;
-      }
-      if (changed) {
-        setRegisteredGroup(jid, patched);
-      }
-      ensureChatExists(jid);
-      return jid;
-    }
-  }
+  const existingMain = isAdmin ? getRegisteredGroup('web:main') : undefined;
+  const useLegacyMain = isAdmin && (!existingMain || !existingMain.created_by);
+  const jid = useLegacyMain ? 'web:main' : `web:home-${userId}`;
+  const folder = useLegacyMain ? 'main' : `home-${userId}`;
 
   const name = username ? `${username} Home` : isAdmin ? 'Main' : 'Home';
 
@@ -3090,7 +8233,7 @@ export function deleteChatHistory(chatJid: string): void {
 /**
  * Delete an IM group's registered_groups entry and all jid-scoped data
  * (messages, chat record, pinned references). Does NOT touch folder-scoped
- * data (sessions, scheduled_tasks, group_members) because IM groups typically
+ * data (sessions, scheduled_tasks) because IM groups typically
  * share their folder with the owner's home workspace.
  *
  * Used when an IM group is detected as dead (bot removed, group disbanded,
@@ -3099,13 +8242,40 @@ export function deleteChatHistory(chatJid: string): void {
  */
 export function deleteImGroupRecord(jid: string): void {
   const tx = db.transaction(() => {
+    const conversationJid = channelConversationJid(jid);
+    const replyAgents = db
+      .prepare(
+        'SELECT id, last_im_jid FROM agents WHERE last_im_jid IS NOT NULL',
+      )
+      .all() as Array<{ id: string; last_im_jid: string }>;
+    const clearLastImJid = db.prepare(
+      'UPDATE agents SET last_im_jid = NULL WHERE id = ?',
+    );
+    for (const agent of replyAgents) {
+      if (channelConversationJid(agent.last_im_jid) === conversationJid) {
+        clearLastImJid.run(agent.id);
+      }
+    }
+    db.prepare('DELETE FROM channel_mounts WHERE channel_jid = ?').run(jid);
+    db.prepare('DELETE FROM agent_channel_mounts WHERE channel_jid = ?').run(
+      jid,
+    );
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
+    db.prepare('DELETE FROM im_context_bindings WHERE source_jid = ?').run(jid);
     // Feishu thread agents (source_kind='feishu_thread') and other chat-scoped
     // agents reference this jid via agents.chat_jid — without this, deleting
     // an IM group leaves orphan agent rows visible in the agents list.
+    db.prepare(
+      `DELETE FROM workspace_runtime_sessions
+       WHERE runtime_agent_id IN (SELECT id FROM agents WHERE chat_jid = ?)`,
+    ).run(jid);
+    db.prepare(
+      `DELETE FROM sessions
+       WHERE agent_id IN (SELECT id FROM agents WHERE chat_jid = ?)`,
+    ).run(jid);
     db.prepare('DELETE FROM agents WHERE chat_jid = ?').run(jid);
     db.prepare(
       'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
@@ -3116,25 +8286,63 @@ export function deleteImGroupRecord(jid: string): void {
 
 export function deleteGroupData(jid: string, folder: string): void {
   const tx = db.transaction(() => {
+    const legacyMainJid = `web:${folder}`;
+    db.prepare(
+      `UPDATE registered_groups
+       SET target_main_jid = NULL, binding_mode = 'single_context'
+       WHERE target_main_jid = ? OR target_main_jid = ?`,
+    ).run(jid, legacyMainJid);
+    db.prepare(
+      `UPDATE registered_groups
+       SET target_agent_id = NULL, binding_mode = 'single_context'
+       WHERE target_agent_id IN (
+         SELECT id FROM agents WHERE group_folder = ? OR chat_jid = ?
+       )`,
+    ).run(folder, jid);
+    db.prepare('DELETE FROM channel_mounts WHERE workspace_jid = ?').run(jid);
+    db.prepare('DELETE FROM agent_channel_mounts WHERE workspace_jid = ?').run(
+      jid,
+    );
+    db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
+      jid,
+    );
     // 1. 删除定时任务运行日志 + 定时任务
+    db.prepare(
+      'DELETE FROM task_runs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
+    ).run(folder);
     db.prepare(
       'DELETE FROM task_run_logs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
     ).run(folder);
     db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(
       folder,
     );
-    // 2. 删除成员记录
-    db.prepare('DELETE FROM group_members WHERE group_folder = ?').run(folder);
-    // 3. 删除注册信息
+    // 2. 删除 workspace -> AgentProfile 归属映射
+    db.prepare(
+      'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
+    ).run(folder);
+    // 3b. 删除 canonical workspace/session 镜像
+    db.prepare('DELETE FROM workspaces WHERE jid = ?').run(jid);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
+    ).run(folder);
+    // 4. 删除注册信息
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
-    // 4. 删除会话
+    // 5. 删除会话与 workspace-owned agents
     db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(folder);
-    // 5. 删除聊天记录
+    db.prepare('DELETE FROM agents WHERE group_folder = ? OR chat_jid = ?').run(
+      folder,
+      jid,
+    );
+    // 6. 删除聊天记录
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
+    db.prepare('DELETE FROM messages WHERE chat_jid LIKE ?').run(
+      `${jid}#agent:%`,
+    );
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
-    // 6. 删除 pin 记录
+    db.prepare('DELETE FROM chats WHERE jid LIKE ?').run(`${jid}#agent:%`);
+    // 7. 删除 pin 记录
     db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
-    // 7. 清除定时任务的工作区关联（任务本身不删，只断开绑定）
+    // 8. 清除定时任务的工作区关联（任务本身不删，只断开绑定）
     db.prepare(
       'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
     ).run(jid);
@@ -3445,8 +8653,7 @@ function mapUserRow(row: Record<string, unknown>): User {
       typeof row.avatar_emoji === 'string' ? row.avatar_emoji : null,
     avatar_color:
       typeof row.avatar_color === 'string' ? row.avatar_color : null,
-    avatar_url:
-      typeof row.avatar_url === 'string' ? row.avatar_url : null,
+    avatar_url: typeof row.avatar_url === 'string' ? row.avatar_url : null,
     ai_name: typeof row.ai_name === 'string' ? row.ai_name : null,
     ai_avatar_emoji:
       typeof row.ai_avatar_emoji === 'string' ? row.ai_avatar_emoji : null,
@@ -3586,6 +8793,7 @@ export function createUser(user: CreateUserInput): void {
     user.deleted_at ?? null,
   );
   initializeBillingForUser(user.id, user.role, user.created_at);
+  getOrCreateDefaultAgentProfile(user.id);
 }
 
 export type CreateInitialAdminResult =
@@ -3906,7 +9114,9 @@ export function createUserSession(session: UserSession): void {
 export function getSessionWithUser(
   sessionId: string,
 ): UserSessionWithUser | undefined {
-  const row = stmts().getSessionWithUser.get(sessionId) as Record<string, unknown> | undefined;
+  const row = stmts().getSessionWithUser.get(sessionId) as
+    | Record<string, unknown>
+    | undefined;
   if (!row) return undefined;
   const role = parseUserRole(row.role);
   return {
@@ -4088,6 +9298,7 @@ export function registerUserWithInvite(input: {
         null,
       );
       initializeBillingForUser(params.id, inviteRole, params.created_at);
+      getOrCreateDefaultAgentProfile(params.id);
 
       return { ok: true, role: inviteRole, permissions };
     },
@@ -4144,6 +9355,7 @@ export function registerUserWithoutInvite(input: {
       null,
     );
     initializeBillingForUser(input.id, role, input.created_at);
+    getOrCreateDefaultAgentProfile(input.id);
     return { ok: true, role, permissions };
   } catch (err) {
     if (
@@ -4330,84 +9542,6 @@ export function checkLoginRateLimitFromAudit(
     Math.ceil((retryAt - Date.now()) / 1000),
   );
   return { allowed: false, retryAfterSeconds, attempts };
-}
-
-// ===================== Group Members =====================
-
-export function addGroupMember(
-  groupFolder: string,
-  userId: string,
-  role: 'owner' | 'member',
-  addedBy?: string,
-): void {
-  db.prepare(
-    `INSERT INTO group_members (group_folder, user_id, role, added_at, added_by)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(group_folder, user_id) DO UPDATE SET
-       role = CASE WHEN excluded.role = 'owner' THEN 'owner'
-                   WHEN group_members.role = 'owner' THEN 'owner'
-                   ELSE excluded.role END,
-       added_by = COALESCE(excluded.added_by, group_members.added_by)`,
-  ).run(groupFolder, userId, role, new Date().toISOString(), addedBy ?? null);
-}
-
-export function removeGroupMember(groupFolder: string, userId: string): void {
-  db.prepare(
-    'DELETE FROM group_members WHERE group_folder = ? AND user_id = ?',
-  ).run(groupFolder, userId);
-}
-
-export function getGroupMembers(groupFolder: string): GroupMember[] {
-  const rows = db
-    .prepare(
-      `SELECT gm.user_id, gm.role, gm.added_at, gm.added_by,
-              u.username, COALESCE(u.display_name, '') as display_name
-       FROM group_members gm
-       JOIN users u ON gm.user_id = u.id
-       WHERE gm.group_folder = ?
-       ORDER BY gm.role DESC, gm.added_at ASC`,
-    )
-    .all(groupFolder) as Array<{
-    user_id: string;
-    role: string;
-    added_at: string;
-    added_by: string | null;
-    username: string;
-    display_name: string;
-  }>;
-  return rows.map((r) => ({
-    user_id: r.user_id,
-    role: r.role as 'owner' | 'member',
-    added_at: r.added_at,
-    added_by: r.added_by ?? undefined,
-    username: r.username,
-    display_name: r.display_name,
-  }));
-}
-
-export function getGroupMemberRole(
-  groupFolder: string,
-  userId: string,
-): 'owner' | 'member' | null {
-  const row = db
-    .prepare(
-      'SELECT role FROM group_members WHERE group_folder = ? AND user_id = ?',
-    )
-    .get(groupFolder, userId) as { role: string } | undefined;
-  if (!row) return null;
-  return row.role as 'owner' | 'member';
-}
-
-export function getUserMemberFolders(
-  userId: string,
-): Array<{ group_folder: string; role: 'owner' | 'member' }> {
-  const rows = db
-    .prepare('SELECT group_folder, role FROM group_members WHERE user_id = ?')
-    .all(userId) as Array<{ group_folder: string; role: string }>;
-  return rows.map((r) => ({
-    group_folder: r.group_folder,
-    role: r.role as 'owner' | 'member',
-  }));
 }
 
 // ===================== Sub-Agent CRUD =====================
@@ -4612,10 +9746,24 @@ export function listActiveConversationAgents(): SubAgent[] {
 }
 
 export function deleteAgent(id: string): void {
-  // Delete associated session
-  db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
-  deleteImContextBindingsByAgent(id);
-  db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+  db.transaction(() => {
+    // A product Session can own an SDK runtime resume row and channel mounts;
+    // clear all three projections together so direct DB callers cannot leave
+    // routable ghosts behind.
+    db.prepare(
+      `UPDATE registered_groups
+       SET target_agent_id = NULL, binding_mode = 'single_context'
+       WHERE target_agent_id = ?`,
+    ).run(id);
+    db.prepare('DELETE FROM channel_mounts WHERE session_id = ?').run(id);
+    db.prepare('DELETE FROM agent_channel_mounts WHERE session_id = ?').run(id);
+    db.prepare(
+      'DELETE FROM workspace_runtime_sessions WHERE runtime_agent_id = ?',
+    ).run(id);
+    db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
+    deleteImContextBindingsByAgent(id);
+    db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+  })();
 }
 
 function mapAgentRow(row: Record<string, unknown>): SubAgent {
@@ -4633,13 +9781,16 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.completed_at === 'string' ? row.completed_at : null,
     result_summary:
       typeof row.result_summary === 'string' ? row.result_summary : null,
-    last_im_jid:
-      typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
+    last_im_jid: typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
     spawned_from_jid:
       typeof row.spawned_from_jid === 'string' ? row.spawned_from_jid : null,
     source_kind:
       typeof row.source_kind === 'string'
-        ? (row.source_kind as 'manual' | 'feishu_thread' | 'auto_im')
+        ? (row.source_kind as
+            | 'manual'
+            | 'native_thread'
+            | 'feishu_thread'
+            | 'auto_im')
         : null,
     thread_id: typeof row.thread_id === 'string' ? row.thread_id : null,
     root_message_id:
@@ -4648,6 +9799,7 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.title_source === 'string'
         ? (row.title_source as
             | 'manual'
+            | 'native_root'
             | 'feishu_root'
             | 'auto'
             | 'auto_pending')
@@ -4691,13 +9843,6 @@ export function deleteMessage(chatJid: string, messageId: string): boolean {
     .prepare('DELETE FROM messages WHERE id = ? AND chat_jid = ?')
     .run(messageId, chatJid);
   return result.changes > 0;
-}
-
-export function isGroupShared(groupFolder: string): boolean {
-  const row = db
-    .prepare('SELECT COUNT(*) as cnt FROM group_members WHERE group_folder = ?')
-    .get(groupFolder) as { cnt: number };
-  return row.cnt > 1;
 }
 
 // --- Billing CRUD functions ---
@@ -4894,9 +10039,9 @@ export function updateBillingPlan(
   db.transaction(() => {
     // Clear old default BEFORE setting new one to avoid brief dual-default state
     if (updates.is_default) {
-      db.prepare(
-        'UPDATE billing_plans SET is_default = 0 WHERE id != ?',
-      ).run(id);
+      db.prepare('UPDATE billing_plans SET is_default = 0 WHERE id != ?').run(
+        id,
+      );
     }
     db.prepare(
       `UPDATE billing_plans SET ${fields.join(', ')} WHERE id = ?`,
@@ -4910,9 +10055,7 @@ export function deleteBillingPlan(id: string): boolean {
   // SQLITE_CONSTRAINT_FOREIGNKEY 把请求 500；先在应用层校验给 caller 一个
   // 干净的 false 返回，运维需要手动迁移残留订阅再删 plan。
   const hasReferences = db
-    .prepare(
-      'SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ?',
-    )
+    .prepare('SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ?')
     .get(id) as { cnt: number };
   if (hasReferences.cnt > 0) return false;
   const result = db.prepare('DELETE FROM billing_plans WHERE id = ?').run(id);
@@ -4939,8 +10082,7 @@ function mapBillingPlanRow(row: Record<string, unknown>): BillingPlan {
     weekly_token_quota:
       row.weekly_token_quota != null ? Number(row.weekly_token_quota) : null,
     rate_multiplier: Number(row.rate_multiplier) || 1.0,
-    trial_days:
-      row.trial_days != null ? Number(row.trial_days) : null,
+    trial_days: row.trial_days != null ? Number(row.trial_days) : null,
     sort_order: Number(row.sort_order) || 0,
     display_price:
       typeof row.display_price === 'string' ? row.display_price : null,
@@ -5035,9 +10177,9 @@ export function cancelUserSubscription(userId: string): void {
   db.prepare(
     "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'active'",
   ).run(now, userId);
-  db.prepare(
-    'UPDATE users SET subscription_plan_id = NULL WHERE id = ?',
-  ).run(userId);
+  db.prepare('UPDATE users SET subscription_plan_id = NULL WHERE id = ?').run(
+    userId,
+  );
 }
 
 export function expireSubscriptions(): number {
@@ -5133,9 +10275,17 @@ export function expireSubscriptions(): number {
         `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, cancelled_at, trial_ends_at, notes, auto_renew, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        newSub.id, newSub.user_id, newSub.plan_id, newSub.status,
-        newSub.started_at, newSub.expires_at, newSub.cancelled_at,
-        newSub.trial_ends_at, newSub.notes, newSub.auto_renew, newSub.created_at,
+        newSub.id,
+        newSub.user_id,
+        newSub.plan_id,
+        newSub.status,
+        newSub.started_at,
+        newSub.expires_at,
+        newSub.cancelled_at,
+        newSub.trial_ends_at,
+        newSub.notes,
+        newSub.auto_renew,
+        newSub.created_at,
       );
 
       logBillingAudit('subscription_assigned', userId, null, {
@@ -5251,9 +10401,7 @@ export function adjustUserBalance(
   // Idempotency check: if key already used, return the existing transaction
   if (idempotencyKey) {
     const existing = db
-      .prepare(
-        'SELECT * FROM balance_transactions WHERE idempotency_key = ?',
-      )
+      .prepare('SELECT * FROM balance_transactions WHERE idempotency_key = ?')
       .get(idempotencyKey) as Record<string, unknown> | undefined;
     if (existing) {
       return {
@@ -5262,10 +10410,20 @@ export function adjustUserBalance(
         type: String(existing.type) as BalanceTransactionType,
         amount_usd: Number(existing.amount_usd),
         balance_after: Number(existing.balance_after),
-        description: typeof existing.description === 'string' ? existing.description : null,
-        reference_type: typeof existing.reference_type === 'string' ? existing.reference_type as BalanceReferenceType : null,
-        reference_id: typeof existing.reference_id === 'string' ? existing.reference_id : null,
-        actor_id: typeof existing.actor_id === 'string' ? existing.actor_id : null,
+        description:
+          typeof existing.description === 'string'
+            ? existing.description
+            : null,
+        reference_type:
+          typeof existing.reference_type === 'string'
+            ? (existing.reference_type as BalanceReferenceType)
+            : null,
+        reference_id:
+          typeof existing.reference_id === 'string'
+            ? existing.reference_id
+            : null,
+        actor_id:
+          typeof existing.actor_id === 'string' ? existing.actor_id : null,
         source:
           typeof existing.source === 'string'
             ? (existing.source as BalanceTransactionSource)
@@ -5322,26 +10480,28 @@ export function adjustUserBalance(
     const balanceAfter = Number(newRow.balance_usd);
 
     // Record transaction
-    const result = db.prepare(
-      `INSERT INTO balance_transactions (
+    const result = db
+      .prepare(
+        `INSERT INTO balance_transactions (
         user_id, type, amount_usd, balance_after, description, reference_type,
         reference_id, actor_id, source, operator_type, notes, created_at, idempotency_key
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      userId,
-      type,
-      amount,
-      balanceAfter,
-      description,
-      referenceType,
-      referenceId,
-      actorId,
-      source,
-      operatorType,
-      notes,
-      now,
-      idempotencyKey ?? null,
-    );
+      )
+      .run(
+        userId,
+        type,
+        amount,
+        balanceAfter,
+        description,
+        referenceType,
+        referenceId,
+        actorId,
+        source,
+        operatorType,
+        notes,
+        now,
+        idempotencyKey ?? null,
+      );
 
     return {
       id: Number(result.lastInsertRowid),
@@ -5396,11 +10556,11 @@ export function getBalanceTransactions(
       amount_usd: Number(r.amount_usd),
       balance_after: Number(r.balance_after),
       description: typeof r.description === 'string' ? r.description : null,
-      reference_type: typeof r.reference_type === 'string'
-        ? (r.reference_type as BalanceReferenceType)
-        : null,
-      reference_id:
-        typeof r.reference_id === 'string' ? r.reference_id : null,
+      reference_type:
+        typeof r.reference_type === 'string'
+          ? (r.reference_type as BalanceReferenceType)
+          : null,
+      reference_id: typeof r.reference_id === 'string' ? r.reference_id : null,
       actor_id: typeof r.actor_id === 'string' ? r.actor_id : null,
       source:
         typeof r.source === 'string'
@@ -5438,9 +10598,7 @@ export function getMonthlyUsage(
   month: string,
 ): MonthlyUsage | undefined {
   const row = db
-    .prepare(
-      'SELECT * FROM monthly_usage WHERE user_id = ? AND month = ?',
-    )
+    .prepare('SELECT * FROM monthly_usage WHERE user_id = ? AND month = ?')
     .get(userId, month) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   return mapMonthlyUsageRow(row);
@@ -5503,9 +10661,9 @@ export function getUserMonthlyUsageHistory(
 // --- Redeem Codes ---
 
 export function getRedeemCode(code: string): RedeemCode | undefined {
-  const row = db.prepare('SELECT * FROM redeem_codes WHERE code = ?').get(code) as
-    | Record<string, unknown>
-    | undefined;
+  const row = db
+    .prepare('SELECT * FROM redeem_codes WHERE code = ?')
+    .get(code) as Record<string, unknown> | undefined;
   if (!row) return undefined;
   return mapRedeemCodeRow(row);
 }
@@ -5549,14 +10707,13 @@ export function incrementRedeemCodeUsage(code: string, userId: string): void {
 }
 
 export function deleteRedeemCode(code: string): boolean {
-  const result = db.prepare('DELETE FROM redeem_codes WHERE code = ?').run(code);
+  const result = db
+    .prepare('DELETE FROM redeem_codes WHERE code = ?')
+    .run(code);
   return result.changes > 0;
 }
 
-export function hasUserRedeemedCode(
-  userId: string,
-  code: string,
-): boolean {
+export function hasUserRedeemedCode(userId: string, code: string): boolean {
   const row = db
     .prepare(
       'SELECT COUNT(*) as cnt FROM redeem_code_usage WHERE user_id = ? AND code = ?',
@@ -5571,8 +10728,7 @@ function mapRedeemCodeRow(row: Record<string, unknown>): RedeemCode {
     type: String(row.type) as RedeemCode['type'],
     value_usd: row.value_usd != null ? Number(row.value_usd) : null,
     plan_id: typeof row.plan_id === 'string' ? row.plan_id : null,
-    duration_days:
-      row.duration_days != null ? Number(row.duration_days) : null,
+    duration_days: row.duration_days != null ? Number(row.duration_days) : null,
     max_uses: Number(row.max_uses) || 1,
     used_count: Number(row.used_count) || 0,
     expires_at: typeof row.expires_at === 'string' ? row.expires_at : null,
@@ -5618,7 +10774,8 @@ export function getBillingAuditLog(
     conditions.push('event_type = ?');
     params.push(eventType);
   }
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const where =
+    conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const total = (
     db
@@ -5780,9 +10937,10 @@ export function getDailyUsage(
   return mapDailyUsageRow(row);
 }
 
-export function getWeeklyUsageSummary(
-  userId: string,
-): { totalCost: number; totalTokens: number } {
+export function getWeeklyUsageSummary(userId: string): {
+  totalCost: number;
+  totalTokens: number;
+} {
   // Align to calendar week (Monday–Sunday) to match checkQuota() reset logic
   const now = new Date();
   const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ...
@@ -5817,11 +10975,17 @@ export function getUserDailyUsageHistory(
 export function getDailyUsageSumForMonth(
   userId: string,
   month: string,
-): { totalInputTokens: number; totalOutputTokens: number; totalCost: number; messageCount: number } {
+): {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCost: number;
+  messageCount: number;
+} {
   const startDate = `${month}-01`;
   // End date: first day of next month
   const [y, m] = month.split('-').map(Number);
-  const nextMonth = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+  const nextMonth =
+    m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
   const endDate = `${nextMonth}-01`;
 
   const row = db
@@ -5910,14 +11074,17 @@ export function getDashboardStats(): {
   const month = new Date().toISOString().slice(0, 7);
 
   const totalUsers = (
-    db.prepare("SELECT COUNT(*) as cnt FROM users WHERE status != 'deleted'")
+    db
+      .prepare("SELECT COUNT(*) as cnt FROM users WHERE status != 'deleted'")
       .get() as { cnt: number }
   ).cnt;
 
   const activeUsers = (
-    db.prepare(
-      "SELECT COUNT(DISTINCT user_id) as cnt FROM daily_usage WHERE date = ?",
-    ).get(today) as { cnt: number }
+    db
+      .prepare(
+        'SELECT COUNT(DISTINCT user_id) as cnt FROM daily_usage WHERE date = ?',
+      )
+      .get(today) as { cnt: number }
   ).cnt;
 
   const planDistribution = db
@@ -5933,21 +11100,27 @@ export function getDashboardStats(): {
     .all() as Array<{ plan_name: string; count: number }>;
 
   const todayCost = (
-    db.prepare(
-      'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM daily_usage WHERE date = ?',
-    ).get(today) as { total: number }
+    db
+      .prepare(
+        'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM daily_usage WHERE date = ?',
+      )
+      .get(today) as { total: number }
   ).total;
 
   const monthCost = (
-    db.prepare(
-      'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM monthly_usage WHERE month = ?',
-    ).get(month) as { total: number }
+    db
+      .prepare(
+        'SELECT COALESCE(SUM(total_cost_usd), 0) as total FROM monthly_usage WHERE month = ?',
+      )
+      .get(month) as { total: number }
   ).total;
 
   const activeSubscriptions = (
-    db.prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE status = 'active'",
-    ).get() as { cnt: number }
+    db
+      .prepare(
+        "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE status = 'active'",
+      )
+      .get() as { cnt: number }
   ).cnt;
 
   return {
@@ -6000,7 +11173,14 @@ export function batchAssignPlan(
       db.prepare(
         `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, auto_renew, created_at)
          VALUES (?, ?, ?, 'active', ?, ?, 0, ?)`,
-      ).run(subId, userId, planId, now.toISOString(), expiresAt, now.toISOString());
+      ).run(
+        subId,
+        userId,
+        planId,
+        now.toISOString(),
+        expiresAt,
+        now.toISOString(),
+      );
 
       db.prepare('UPDATE users SET subscription_plan_id = ? WHERE id = ?').run(
         planId,
@@ -6041,7 +11221,6 @@ export function getAllPlanSubscriberCounts(): Record<string, number> {
   }
   return result;
 }
-
 
 /**
  * Atomically increment redeem code usage with optimistic locking.

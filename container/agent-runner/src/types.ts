@@ -25,11 +25,21 @@ export interface ContainerInput {
   /** Whether this is the admin's home container (full privileges). */
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
+  /** Claude session/provider namespace selected by the host runner. */
+  sessionAgentId?: string;
   /** If the last unprocessed message was emitted by a scheduled task prompt,
    * this is that task's ID; used to tag MCP send_message outputs so the host
    * routes results to the task's configured chat_jid / notify channels. */
   messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
+  agentProfile?: {
+    id: string;
+    name: string;
+    version: number;
+    identityHash: string;
+    identityPrompt: string;
+    includeClaudePreset: boolean;
+  };
   agentId?: string;
   agentName?: string;
   /**
@@ -52,13 +62,30 @@ export interface ContainerOutput {
   turnId?: string;
   sessionId?: string;
   sdkMessageUuid?: string;
-  sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy' | 'auto_continue' | 'truncation_continue';
+  sourceKind?:
+    | 'sdk_final'
+    | 'sdk_send_message'
+    | 'interrupt_partial'
+    | 'overflow_partial'
+    | 'compact_partial'
+    | 'legacy'
+    | 'auto_continue'
+    | 'truncation_continue';
   /** 'truncated'：上游断流截断的 partial（usage 双零指纹，runner 会自动续写） */
   finalizationReason?: 'completed' | 'interrupted' | 'error' | 'truncated';
   /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
    * >0 时主进程应把流式卡片保持在「后台任务运行中」而非定稿，后续 turn 的
    * 内容会继续追加到同一张卡。仅 sdk_final 类 result 携带。 */
   pendingBgTasks?: number;
+  /** This SDK result durably completed the user-input turn associated with it.
+   * False/absent for truncated, background-pending, interrupted, and error paths. */
+  inputTurnCompleted?: boolean;
+  ipcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{ timestamp: string; id: string }>;
+    cursor: { timestamp: string; id: string };
+  }>;
 }
 
 export interface SessionEntry {
@@ -72,7 +99,11 @@ export interface SessionsIndex {
   entries: SessionEntry[];
 }
 
-export type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+export type ImageMediaType =
+  | 'image/jpeg'
+  | 'image/png'
+  | 'image/gif'
+  | 'image/webp';
 
 export interface SDKUserMessage {
   type: 'user';
@@ -80,7 +111,17 @@ export interface SDKUserMessage {
     role: 'user';
     content:
       | string
-      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }>;
+      | Array<
+          | { type: 'text'; text: string }
+          | {
+              type: 'image';
+              source: {
+                type: 'base64';
+                media_type: ImageMediaType;
+                data: string;
+              };
+            }
+        >;
   };
   parent_tool_use_id: null;
   session_id: string;

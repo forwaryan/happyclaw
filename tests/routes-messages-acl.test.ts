@@ -12,8 +12,7 @@
  * Coverage (the `/clear` owner-only tightening introduced for #518):
  *   - invalid body                → 400
  *   - unknown group               → 404
- *   - non-member  + /clear        → 403 (Access denied, fails canAccessGroup)
- *   - shared member + /clear      → 403 (owner-only, fails canModifyGroup)
+ *   - non-owner + /clear          → 403 (Access denied)
  *   - owner + /clear              → 200 {cleared:true}; resets session
  *                                   (queue.stopGroup called, context_reset row written)
  *
@@ -27,12 +26,22 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 
 const SHARED_TMP =
   process.env.HAPPYCLAW_TEST_DATA_DIR ??
   (() => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-routes-messages-'));
+    const d = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'happyclaw-routes-messages-'),
+    );
     process.env.HAPPYCLAW_TEST_DATA_DIR = d;
     return d;
   })();
@@ -66,7 +75,9 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
         id: process.env.HAPPYCLAW_TEST_USER_ID ?? 'alice',
         username: 'alice',
         display_name: 'Alice',
-        role: (process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member') as 'admin' | 'member',
+        role: (process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member') as
+          | 'admin'
+          | 'member',
         permissions: [],
       });
       return next();
@@ -78,7 +89,6 @@ const web = await import('../src/web.js');
 const db = await import('../src/db.js');
 
 const OWNER_ID = 'alice';
-const MEMBER_ID = 'bob';
 const OUTSIDER_ID = 'charlie';
 const GROUP_JID = 'web:messages-acl-group';
 const GROUP_FOLDER = 'messages-acl-group';
@@ -114,8 +124,6 @@ function seedTestGroup(): void {
     created_by: OWNER_ID,
     is_home: false,
   } as any);
-  db.addGroupMember(GROUP_FOLDER, OWNER_ID, 'owner');
-  db.addGroupMember(GROUP_FOLDER, MEMBER_ID, 'member');
 }
 
 function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
@@ -123,7 +131,9 @@ function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
   process.env.HAPPYCLAW_TEST_USER_ROLE = role;
 }
 
-async function postMessage(body: unknown): Promise<{ status: number; body: any }> {
+async function postMessage(
+  body: unknown,
+): Promise<{ status: number; body: any }> {
   const res = await app.request('/api/messages', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -140,12 +150,6 @@ beforeAll(() => {
 
 beforeEach(() => {
   stopGroupCalls.length = 0;
-  try {
-    db.removeGroupMember(GROUP_FOLDER, OWNER_ID);
-    db.removeGroupMember(GROUP_FOLDER, MEMBER_ID);
-  } catch {
-    /* ignore */
-  }
   try {
     db.deleteRegisteredGroup(GROUP_JID);
   } catch {
@@ -179,42 +183,44 @@ describe('POST /api/messages — validation & lookup', () => {
 });
 
 describe('POST /api/messages — /clear interception ACL', () => {
-  test('non-member is denied (403 Access denied)', async () => {
+  test('non-owner is denied (403 Access denied)', async () => {
     seedTestGroup();
     asUser(OUTSIDER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '/clear' });
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '/clear',
+    });
     expect(status).toBe(403);
     expect(body.error).toMatch(/access denied/i);
-    expect(stopGroupCalls).toHaveLength(0);
-  });
-
-  test('shared member is denied (403 owner-only)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '/clear' });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
     expect(stopGroupCalls).toHaveLength(0);
   });
 
   test('owner can /clear (200, session reset)', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '/clear' });
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '/clear',
+    });
     expect(status).toBe(200);
     expect(body.cleared).toBe(true);
     // executeSessionReset stopped the folder's sibling containers …
     expect(stopGroupCalls.length).toBeGreaterThan(0);
     expect(stopGroupCalls.every((c) => c.opts?.force === true)).toBe(true);
     // … and wrote a context_reset divider into the chat history.
-    const msgs = db.getMessagesPage(GROUP_JID, undefined, 10) as Array<{ content: string }>;
+    const msgs = db.getMessagesPage(GROUP_JID, undefined, 10) as Array<{
+      content: string;
+    }>;
     expect(msgs.some((m) => m.content === 'context_reset')).toBe(true);
   });
 
   test('owner with leading/trailing whitespace still triggers /clear', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
-    const { status, body } = await postMessage({ chatJid: GROUP_JID, content: '  /clear  ' });
+    const { status, body } = await postMessage({
+      chatJid: GROUP_JID,
+      content: '  /clear  ',
+    });
     expect(status).toBe(200);
     expect(body.cleared).toBe(true);
   });

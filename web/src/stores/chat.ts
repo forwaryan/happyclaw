@@ -3,7 +3,12 @@ import { api } from '../api/client';
 import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
-import { showToast, notifyIfHidden, shouldEmitBackgroundTaskNotice, showNotificationPromptToast } from '../utils/toast';
+import {
+  showToast,
+  notifyIfHidden,
+  shouldEmitBackgroundTaskNotice,
+  showNotificationPromptToast,
+} from '../utils/toast';
 import { invalidateGroupCache } from '../utils/pwaCache';
 import {
   deleteAgentMessageSnapshot,
@@ -29,7 +34,12 @@ export interface Message {
   turn_id?: string | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
-  source_kind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'legacy' | null;
+  source_kind?:
+    | 'sdk_final'
+    | 'sdk_send_message'
+    | 'interrupt_partial'
+    | 'legacy'
+    | null;
   finalization_reason?: 'completed' | 'interrupted' | 'error' | null;
 }
 
@@ -41,7 +51,16 @@ export interface StreamingTimelineEvent {
   id: string;
   timestamp: number;
   text: string;
-  kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+  kind:
+    | 'tool'
+    | 'skill'
+    | 'hook'
+    | 'status'
+    | 'task'
+    | 'memory'
+    | 'debug'
+    | 'context'
+    | 'permission';
 }
 
 export interface StreamingTraceEvent {
@@ -160,10 +179,12 @@ function mergeMessagesChronologically(
   // Defensive: log when message count unexpectedly decreases
   if (result.length < existing.length) {
     const missingIds = existing.filter((m) => !byId.has(m.id)).map((m) => m.id);
-    console.warn(
-      '[mergeMessages] Message count decreased!',
-      { before: existing.length, after: result.length, incoming: incoming.length, missingIds },
-    );
+    console.warn('[mergeMessages] Message count decreased!', {
+      before: existing.length,
+      after: result.length,
+      incoming: incoming.length,
+      missingIds,
+    });
   }
   return result;
 }
@@ -208,7 +229,11 @@ function markThinkingStarted(prev: StreamingState, next: StreamingState): void {
 
 /** Record the elapsed thinking duration on the transition isThinking:true → false. */
 function markThinkingEnded(prev: StreamingState, next: StreamingState): void {
-  if (prev.isThinking && prev.thinkingStartedAt != null && next.thinkingDurationMs == null) {
+  if (
+    prev.isThinking &&
+    prev.thinkingStartedAt != null &&
+    next.thinkingDurationMs == null
+  ) {
     next.thinkingDurationMs = Date.now() - prev.thinkingStartedAt;
   }
 }
@@ -230,66 +255,137 @@ interface ChatState {
   /** Per-group lock: true while clearHistory is in-flight, prevents race re-injection */
   clearing: Record<string, boolean>;
   // Sub-agent state
-  agents: Record<string, AgentInfo[]>;              // jid → agents
-  agentStreaming: Record<string, StreamingState>;    // agentId → streaming state
-  activeAgentTab: Record<string, string | null>;     // jid → selected agentId (null = main)
+  agents: Record<string, AgentInfo[]>; // jid → agents
+  agentStreaming: Record<string, StreamingState>; // agentId → streaming state
+  activeAgentTab: Record<string, string | null>; // jid → selected agentId (null = main)
   // SDK Task subagent state (in-process via Task tool, not DB-persisted)
-  sdkTasks: Record<string, {  // toolUseId → task info
-    chatJid: string;
-    description: string;
-    status: 'running' | 'completed' | 'error';
-    summary?: string;
-    isTeammate?: boolean;
-    startedAt?: number;  // 任务创建时间戳（ms），用于 UI 计时器
-  }>;
+  sdkTasks: Record<
+    string,
+    {
+      // toolUseId → task info
+      chatJid: string;
+      description: string;
+      status: 'running' | 'completed' | 'error';
+      summary?: string;
+      isTeammate?: boolean;
+      startedAt?: number; // 任务创建时间戳（ms），用于 UI 计时器
+    }
+  >;
   // SDK Task alias map: runtime taskId/parentToolUseId -> canonical sdkTasks key
   sdkTaskAliases: Record<string, string>;
   // Conversation agent state
-  agentMessages: Record<string, Message[]>;          // agentId → messages
-  agentWaiting: Record<string, boolean>;             // agentId → waiting for reply
-  agentHasMore: Record<string, boolean>;             // agentId → has more messages
+  agentMessages: Record<string, Message[]>; // agentId → messages
+  agentWaiting: Record<string, boolean>; // agentId → waiting for reply
+  agentHasMore: Record<string, boolean>; // agentId → has more messages
   loadGroups: () => Promise<void>;
   selectGroup: (jid: string) => void;
   loadMessages: (jid: string, loadMore?: boolean) => Promise<void>;
   refreshMessages: (jid: string) => Promise<void>;
-  sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<boolean>;
+  sendMessage: (
+    jid: string,
+    content: string,
+    attachments?: Array<{ data: string; mimeType: string }>,
+  ) => Promise<boolean>;
   stopGroup: (jid: string) => Promise<boolean>;
   interruptQuery: (jid: string) => Promise<boolean>;
   resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
   deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
-  createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
+  createFlow: (
+    name: string,
+    options?: {
+      execution_mode?: 'container' | 'host';
+      custom_cwd?: string;
+      init_source_path?: string;
+      init_git_url?: string;
+      agent_profile_id?: string;
+    },
+  ) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
   togglePin: (jid: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
-  handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
-  handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string, source?: string) => void;
-  handleAgentStatus: (chatJid: string, agentId: string, status: AgentInfo['status'], name: string, prompt: string, resultSummary?: string, kind?: AgentInfo['kind'], titleGenerating?: boolean) => void;
+  handleStreamEvent: (
+    chatJid: string,
+    event: StreamEvent,
+    agentId?: string,
+  ) => void;
+  handleWsNewMessage: (
+    chatJid: string,
+    wsMsg: any,
+    agentId?: string,
+    source?: string,
+  ) => void;
+  handleAgentStatus: (
+    chatJid: string,
+    agentId: string,
+    status: AgentInfo['status'],
+    name: string,
+    prompt: string,
+    resultSummary?: string,
+    kind?: AgentInfo['kind'],
+    titleGenerating?: boolean,
+  ) => void;
   clearStreaming: (
     chatJid: string,
     options?: { preserveThinking?: boolean },
   ) => void;
   restoreActiveState: () => Promise<void>;
-  handleStreamSnapshot: (chatJid: string, snapshot: StreamSnapshotData, agentId?: string) => void;
+  handleStreamSnapshot: (
+    chatJid: string,
+    snapshot: StreamSnapshotData,
+    agentId?: string,
+  ) => void;
   // Sub-agent actions
   loadAgents: (jid: string, opts?: { force?: boolean }) => Promise<void>;
   deleteAgentAction: (jid: string, agentId: string) => Promise<boolean>;
   setActiveAgentTab: (jid: string, agentId: string | null) => void;
   // Conversation agent actions
   reorderConversations: (jid: string, orderedIds: string[]) => void;
-  createConversation: (jid: string, name?: string, description?: string) => Promise<AgentInfo | null>;
-  renameConversation: (jid: string, agentId: string, name: string) => Promise<boolean>;
-  loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
+  createConversation: (
+    jid: string,
+    name?: string,
+    description?: string,
+  ) => Promise<AgentInfo | null>;
+  renameConversation: (
+    jid: string,
+    agentId: string,
+    name: string,
+  ) => Promise<boolean>;
+  loadAgentMessages: (
+    jid: string,
+    agentId: string,
+    loadMore?: boolean,
+  ) => Promise<void>;
   hydrateAgentMessages: (jid: string, agentId: string) => Promise<void>;
-  sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => boolean;
+  sendAgentMessage: (
+    jid: string,
+    agentId: string,
+    content: string,
+    attachments?: Array<{ data: string; mimeType: string }>,
+  ) => boolean;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // Runner state sync
   handleRunnerState: (chatJid: string, state: string) => void;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
-  bindImGroup: (jid: string, agentId: string, imJid: string, force?: boolean) => Promise<boolean>;
-  unbindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
-  bindMainImGroup: (jid: string, imJid: string, force?: boolean, activationMode?: string, ownerImId?: string) => Promise<boolean>;
+  bindImGroup: (
+    jid: string,
+    agentId: string,
+    imJid: string,
+    force?: boolean,
+  ) => Promise<boolean>;
+  unbindImGroup: (
+    jid: string,
+    agentId: string,
+    imJid: string,
+  ) => Promise<boolean>;
+  bindMainImGroup: (
+    jid: string,
+    imJid: string,
+    force?: boolean,
+    activationMode?: string,
+    ownerImId?: string,
+  ) => Promise<boolean>;
   unbindMainImGroup: (jid: string, imJid: string) => Promise<boolean>;
   // Draft persistence across route navigation
   drafts: Record<string, string>;
@@ -303,9 +399,15 @@ interface ChatState {
 const DEFAULT_STREAMING_STATE: StreamingState = {
   turnId: undefined,
   sessionId: undefined,
-  partialText: '', thinkingText: '', isThinking: false,
-  activeTools: [], activeHook: null, systemStatus: null, recentEvents: [],
-  traceEvents: [], taskStates: {},
+  partialText: '',
+  thinkingText: '',
+  isThinking: false,
+  activeTools: [],
+  activeHook: null,
+  systemStatus: null,
+  recentEvents: [],
+  traceEvents: [],
+  taskStates: {},
 };
 
 /**
@@ -325,25 +427,27 @@ function sortByIdOrder(items: AgentInfo[], orderedIds: string[]): AgentInfo[] {
  * keep accumulated text/events, mark as interrupted. Returns null if no data
  * worth preserving (caller should delete the entry).
  */
-function freezeStreamingState(state: StreamingState | undefined): StreamingState | null {
+function freezeStreamingState(
+  state: StreamingState | undefined,
+): StreamingState | null {
   if (!state) return null;
   const hasData =
     state.partialText ||
     state.thinkingText ||
-      state.activeTools.length > 0 ||
-      state.activeHook ||
-      state.systemStatus ||
-      state.recentEvents.length > 0 ||
-      state.traceEvents.length > 0 ||
-      Object.keys(state.taskStates).length > 0 ||
-      (state.todos && state.todos.length > 0);
+    state.activeTools.length > 0 ||
+    state.activeHook ||
+    state.systemStatus ||
+    state.recentEvents.length > 0 ||
+    state.traceEvents.length > 0 ||
+    Object.keys(state.taskStates).length > 0 ||
+    (state.todos && state.todos.length > 0);
   if (!hasData) return null;
   // Preserve any in-flight thinking duration so the interrupted card still shows "已思考 Xs".
-  const thinkingDurationMs = state.thinkingDurationMs ?? (
-    state.isThinking && state.thinkingStartedAt != null
+  const thinkingDurationMs =
+    state.thinkingDurationMs ??
+    (state.isThinking && state.thinkingStartedAt != null
       ? Date.now() - state.thinkingStartedAt
-      : undefined
-  );
+      : undefined);
   return {
     ...state,
     isThinking: false,
@@ -355,13 +459,19 @@ function freezeStreamingState(state: StreamingState | undefined): StreamingState
   };
 }
 
-
 /**
  * Resolve the previous StreamingState for a new event, resetting if turnId changed.
  */
-function resolveStreamingPrev(current: StreamingState | undefined, event: StreamEvent): StreamingState {
+function resolveStreamingPrev(
+  current: StreamingState | undefined,
+  event: StreamEvent,
+): StreamingState {
   if (current?.turnId && event.turnId && current.turnId !== event.turnId) {
-    return { ...DEFAULT_STREAMING_STATE, turnId: event.turnId, sessionId: event.sessionId };
+    return {
+      ...DEFAULT_STREAMING_STATE,
+      turnId: event.turnId,
+      sessionId: event.sessionId,
+    };
   }
   return current || { ...DEFAULT_STREAMING_STATE };
 }
@@ -382,7 +492,10 @@ const completedSdkTaskIds = new Set<string>();
 
 /** DB task agent 自动清理定时器（完成后延迟移除） */
 const DB_TASK_AGENT_AUTO_CLEAN_MS = 5000;
-const dbTaskAgentCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const dbTaskAgentCleanupTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
 
 // ─── Streaming state sessionStorage persistence ───────────────────────
 // Survives page refresh so StreamingDisplay can restore accumulated content.
@@ -390,52 +503,80 @@ const STREAMING_STORAGE_KEY = 'hc_streaming';
 const streamingSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** Debounced save of streaming state to sessionStorage (trailing-edge, 500ms per jid). */
-function saveStreamingToSession(chatJid: string, state: StreamingState | undefined): void {
+function saveStreamingToSession(
+  chatJid: string,
+  state: StreamingState | undefined,
+): void {
   // Cancel previous timer to always save the latest state (trailing-edge debounce)
   const existing = streamingSaveTimers.get(chatJid);
   if (existing) clearTimeout(existing);
-  streamingSaveTimers.set(chatJid, setTimeout(() => {
-    streamingSaveTimers.delete(chatJid);
-    try {
-      const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
-      if (state && (state.partialText || state.thinkingText || state.activeTools.length > 0 || state.recentEvents.length > 0 || state.traceEvents.length > 0 || Object.keys(state.taskStates).length > 0 || state.contextAudit)) {
-        stored[chatJid] = {
-          partialText: state.partialText.slice(-4000), // cap size
-          thinkingText: state.thinkingText.slice(-MAX_THINKING_TEXT),
-          isThinking: state.isThinking,
-          activeTools: state.activeTools,
-          recentEvents: state.recentEvents.slice(-10),
-          traceEvents: state.traceEvents.slice(-50),
-          taskStates: state.taskStates,
-          contextAudit: state.contextAudit,
-          todos: state.todos,
-          systemStatus: state.systemStatus,
-          turnId: state.turnId,
-          ts: Date.now(),
-        };
-      } else {
-        delete stored[chatJid];
+  streamingSaveTimers.set(
+    chatJid,
+    setTimeout(() => {
+      streamingSaveTimers.delete(chatJid);
+      try {
+        const stored = JSON.parse(
+          sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}',
+        );
+        if (
+          state &&
+          (state.partialText ||
+            state.thinkingText ||
+            state.activeTools.length > 0 ||
+            state.recentEvents.length > 0 ||
+            state.traceEvents.length > 0 ||
+            Object.keys(state.taskStates).length > 0 ||
+            state.contextAudit)
+        ) {
+          stored[chatJid] = {
+            partialText: state.partialText.slice(-4000), // cap size
+            thinkingText: state.thinkingText.slice(-MAX_THINKING_TEXT),
+            isThinking: state.isThinking,
+            activeTools: state.activeTools,
+            recentEvents: state.recentEvents.slice(-10),
+            traceEvents: state.traceEvents.slice(-50),
+            taskStates: state.taskStates,
+            contextAudit: state.contextAudit,
+            todos: state.todos,
+            systemStatus: state.systemStatus,
+            turnId: state.turnId,
+            ts: Date.now(),
+          };
+        } else {
+          delete stored[chatJid];
+        }
+        sessionStorage.setItem(STREAMING_STORAGE_KEY, JSON.stringify(stored));
+      } catch {
+        /* quota exceeded or SSR */
       }
-      sessionStorage.setItem(STREAMING_STORAGE_KEY, JSON.stringify(stored));
-    } catch { /* quota exceeded or SSR */ }
-  }, 500));
+    }, 500),
+  );
 }
 
 /** Remove streaming state from sessionStorage. */
 function clearStreamingFromSession(chatJid: string): void {
   const timer = streamingSaveTimers.get(chatJid);
-  if (timer) { clearTimeout(timer); streamingSaveTimers.delete(chatJid); }
+  if (timer) {
+    clearTimeout(timer);
+    streamingSaveTimers.delete(chatJid);
+  }
   try {
-    const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
+    const stored = JSON.parse(
+      sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}',
+    );
     delete stored[chatJid];
     sessionStorage.setItem(STREAMING_STORAGE_KEY, JSON.stringify(stored));
-  } catch { /* SSR */ }
+  } catch {
+    /* SSR */
+  }
 }
 
 /** Restore streaming state from sessionStorage (stale entries > 5min are discarded). */
 function restoreStreamingFromSession(chatJid: string): StreamingState | null {
   try {
-    const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
+    const stored = JSON.parse(
+      sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}',
+    );
     const entry = stored[chatJid];
     if (!entry) return null;
     // Discard stale entries (> 5 minutes old)
@@ -458,7 +599,9 @@ function restoreStreamingFromSession(chatJid: string): StreamingState | null {
       systemStatus: entry.systemStatus || null,
       turnId: entry.turnId,
     };
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -489,18 +632,25 @@ function flushPendingDelta(
 
   if (agentId) {
     set((s) => {
-      if (!s.agentStreaming[agentId] && s.agentWaiting[agentId] === false) return s;
+      if (!s.agentStreaming[agentId] && s.agentWaiting[agentId] === false)
+        return s;
       const prev = s.agentStreaming[agentId] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
       if (mergedText) {
         const combined = prev.partialText + mergedText;
-        next.partialText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
+        next.partialText =
+          combined.length > MAX_STREAMING_TEXT
+            ? combined.slice(-MAX_STREAMING_TEXT)
+            : combined;
         next.isThinking = false;
         markThinkingEnded(prev, next);
       }
       if (mergedThinking) {
         const combined = prev.thinkingText + mergedThinking;
-        next.thinkingText = combined.length > MAX_THINKING_TEXT ? combined.slice(-MAX_THINKING_TEXT) : combined;
+        next.thinkingText =
+          combined.length > MAX_THINKING_TEXT
+            ? combined.slice(-MAX_THINKING_TEXT)
+            : combined;
         next.isThinking = true;
         markThinkingStarted(prev, next);
       }
@@ -514,13 +664,19 @@ function flushPendingDelta(
       const next = { ...prev };
       if (mergedText) {
         const combined = prev.partialText + mergedText;
-        next.partialText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
+        next.partialText =
+          combined.length > MAX_STREAMING_TEXT
+            ? combined.slice(-MAX_STREAMING_TEXT)
+            : combined;
         next.isThinking = false;
         markThinkingEnded(prev, next);
       }
       if (mergedThinking) {
         const combined = prev.thinkingText + mergedThinking;
-        next.thinkingText = combined.length > MAX_THINKING_TEXT ? combined.slice(-MAX_THINKING_TEXT) : combined;
+        next.thinkingText =
+          combined.length > MAX_THINKING_TEXT
+            ? combined.slice(-MAX_THINKING_TEXT)
+            : combined;
         next.isThinking = true;
         markThinkingStarted(prev, next);
       }
@@ -564,7 +720,6 @@ function clearDbTaskAgentCleanupTimer(agentId: string): void {
   }
 }
 
-
 function removeSdkTaskAliases(
   aliases: Record<string, string>,
   taskId: string,
@@ -597,25 +752,36 @@ function pickSdkTaskAliasTarget(
   const usedTargets = new Set(Object.values(state.sdkTaskAliases));
   const unbound = runningIds.filter((id) => !usedTargets.has(id));
   const pool = (unbound.length > 0 ? unbound : runningIds).slice();
-  const createdAtMap = new Map((state.agents[chatJid] || []).map((a) => [a.id, a.created_at]));
-  pool.sort((a, b) => (createdAtMap.get(a) || '').localeCompare(createdAtMap.get(b) || ''));
+  const createdAtMap = new Map(
+    (state.agents[chatJid] || []).map((a) => [a.id, a.created_at]),
+  );
+  pool.sort((a, b) =>
+    (createdAtMap.get(a) || '').localeCompare(createdAtMap.get(b) || ''),
+  );
   return pool[0] || null;
 }
 
-function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
+function isTerminalSystemMessage(
+  message: Pick<Message, 'sender' | 'content'>,
+): boolean {
   if (message.sender === '__billing__') return true;
   // query_interrupted 仅作为视觉分隔线，不参与流式状态清理。
   // 流式状态由 status:interrupted（冻结）→ interrupt_partial（转正）两阶段处理。
-  return message.sender === '__system__' && (
-    message.content === 'context_reset' ||
-    message.content.startsWith('agent_error:') ||
-    message.content.startsWith('agent_max_retries:') ||
-    message.content.startsWith('context_overflow:')
+  return (
+    message.sender === '__system__' &&
+    (message.content === 'context_reset' ||
+      message.content.startsWith('agent_error:') ||
+      message.content.startsWith('agent_max_retries:') ||
+      message.content.startsWith('context_overflow:'))
   );
 }
 
-function isInterruptSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
-  return message.sender === '__system__' && message.content === 'query_interrupted';
+function isInterruptSystemMessage(
+  message: Pick<Message, 'sender' | 'content'>,
+): boolean {
+  return (
+    message.sender === '__system__' && message.content === 'query_interrupted'
+  );
 }
 
 function clearSdkTaskCleanupTimer(taskId: string): void {
@@ -666,7 +832,6 @@ function resetSdkTaskStaleTimer(
   }, SDK_TASK_STALE_TIMEOUT_MS);
   sdkTaskStaleTimers.set(taskId, timer);
 }
-
 
 function doSdkTaskCleanup(
   set: (fn: (s: ChatState) => Partial<ChatState>) => void,
@@ -719,11 +884,16 @@ function tail(text: string, max: number): string {
 }
 
 function traceKind(event: StreamEvent): StreamingTraceEvent['kind'] {
-  if (event.eventType.startsWith('tool_')) return event.skillName ? 'skill' : 'tool';
+  if (event.eventType.startsWith('tool_'))
+    return event.skillName ? 'skill' : 'tool';
   if (event.eventType.startsWith('hook_')) return 'hook';
   if (event.eventType.startsWith('task_')) return 'task';
   if (event.eventType === 'context_audit') return 'context';
-  if (event.eventType === 'memory_recall' || event.eventType === 'compact_boundary') return 'memory';
+  if (
+    event.eventType === 'memory_recall' ||
+    event.eventType === 'compact_boundary'
+  )
+    return 'memory';
   if (event.eventType === 'permission_denied') return 'permission';
   if (event.eventType === 'raw_sdk_event') return 'debug';
   return 'status';
@@ -732,27 +902,53 @@ function traceKind(event: StreamEvent): StreamingTraceEvent['kind'] {
 function traceTitle(event: StreamEvent): string {
   if (event.title) return event.title;
   switch (event.eventType) {
-    case 'tool_use_start': return event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`;
-    case 'tool_use_end': return `工具完成 ${event.toolName || event.toolUseId || ''}`.trim();
-    case 'tool_result': return '工具结果';
-    case 'tool_progress': return `工具进度 ${event.toolName || event.toolUseId || ''}`.trim();
-    case 'task_start': return `Task 启动`;
-    case 'task_progress': return `Task 进度`;
-    case 'task_updated': return `Task 更新`;
-    case 'task_notification': return `Task ${event.taskStatus || '完成'}`;
-    case 'context_audit': return 'Agent Context';
-    case 'status': return event.statusText || '状态更新';
-    case 'permission_denied': return `权限拒绝 ${event.toolName || ''}`.trim();
-    case 'memory_recall': return '记忆召回';
-    case 'compact_boundary': return '上下文压缩';
-    case 'notification': return '通知';
-    case 'prompt_suggestion': return '建议';
-    default: return event.rawType || event.eventType;
+    case 'tool_use_start':
+      return event.skillName
+        ? `技能 ${event.skillName}`
+        : `工具 ${event.toolName || 'unknown'}`;
+    case 'tool_use_end':
+      return `工具完成 ${event.toolName || event.toolUseId || ''}`.trim();
+    case 'tool_result':
+      return '工具结果';
+    case 'tool_progress':
+      return `工具进度 ${event.toolName || event.toolUseId || ''}`.trim();
+    case 'task_start':
+      return `Task 启动`;
+    case 'task_progress':
+      return `Task 进度`;
+    case 'task_updated':
+      return `Task 更新`;
+    case 'task_notification':
+      return `Task ${event.taskStatus || '完成'}`;
+    case 'context_audit':
+      return 'Agent Context';
+    case 'status':
+      return event.statusText || '状态更新';
+    case 'permission_denied':
+      return `权限拒绝 ${event.toolName || ''}`.trim();
+    case 'memory_recall':
+      return '记忆召回';
+    case 'compact_boundary':
+      return '上下文压缩';
+    case 'notification':
+      return '通知';
+    case 'prompt_suggestion':
+      return '建议';
+    default:
+      return event.rawType || event.eventType;
   }
 }
 
-function pushTrace(events: StreamingTraceEvent[], event: StreamEvent): StreamingTraceEvent[] {
-  if (event.eventType === 'text_delta' || event.eventType === 'thinking_delta' || event.eventType === 'usage' || event.eventType === 'init') {
+function pushTrace(
+  events: StreamingTraceEvent[],
+  event: StreamEvent,
+): StreamingTraceEvent[] {
+  if (
+    event.eventType === 'text_delta' ||
+    event.eventType === 'thinking_delta' ||
+    event.eventType === 'usage' ||
+    event.eventType === 'init'
+  ) {
     return events;
   }
   const item: StreamingTraceEvent = {
@@ -761,7 +957,11 @@ function pushTrace(events: StreamingTraceEvent[], event: StreamEvent): Streaming
     kind: traceKind(event),
     scope: event.agentScope,
     title: traceTitle(event),
-    summary: event.summary || event.taskSummary || event.statusText || event.toolInputSummary,
+    summary:
+      event.summary ||
+      event.taskSummary ||
+      event.statusText ||
+      event.toolInputSummary,
     detail: event.detail,
     taskId: event.taskId,
     toolUseId: event.toolUseId,
@@ -772,10 +972,15 @@ function pushTrace(events: StreamingTraceEvent[], event: StreamEvent): Streaming
 }
 
 function taskIdFromEvent(event: StreamEvent): string | null {
-  return event.parentToolUseId || event.taskId || (
-    (event.eventType === 'task_start' || event.eventType === 'task_progress' || event.eventType === 'task_updated' || event.eventType === 'task_notification')
+  return (
+    event.parentToolUseId ||
+    event.taskId ||
+    (event.eventType === 'task_start' ||
+    event.eventType === 'task_progress' ||
+    event.eventType === 'task_updated' ||
+    event.eventType === 'task_notification'
       ? event.toolUseId || null
-      : null
+      : null)
   );
 }
 
@@ -784,46 +989,68 @@ function ensureTaskRuntime(
   taskId: string,
   event: StreamEvent,
 ): StreamingTaskRuntimeState {
-  return taskStates[taskId] || {
-    id: taskId,
-    title: event.taskDescription || event.toolInputSummary || event.summary || 'Task',
-    status: 'running',
-    subagentType: event.subagentType,
-    thinkingTail: '',
-    textTail: '',
-    activeTools: [],
-    recentTools: [],
-    updatedAt: Date.now(),
-  };
+  return (
+    taskStates[taskId] || {
+      id: taskId,
+      title:
+        event.taskDescription ||
+        event.toolInputSummary ||
+        event.summary ||
+        'Task',
+      status: 'running',
+      subagentType: event.subagentType,
+      thinkingTail: '',
+      textTail: '',
+      activeTools: [],
+      recentTools: [],
+      updatedAt: Date.now(),
+    }
+  );
 }
 
-function updateTaskRuntime(prev: StreamingState, next: StreamingState, event: StreamEvent): boolean {
+function updateTaskRuntime(
+  prev: StreamingState,
+  next: StreamingState,
+  event: StreamEvent,
+): boolean {
   const taskId = taskIdFromEvent(event);
   if (!taskId) return false;
   const taskStates = { ...prev.taskStates };
   const task = { ...ensureTaskRuntime(taskStates, taskId, event) };
   task.updatedAt = Date.now();
-  if (event.taskDescription && (!task.title || task.title === 'Task')) task.title = event.taskDescription;
+  if (event.taskDescription && (!task.title || task.title === 'Task'))
+    task.title = event.taskDescription;
   if (event.subagentType) task.subagentType = event.subagentType;
 
   if (event.eventType === 'text_delta') {
     task.textTail = tail(task.textTail + (event.text || ''), MAX_TASK_TAIL);
   } else if (event.eventType === 'thinking_delta') {
-    task.thinkingTail = tail(task.thinkingTail + (event.text || ''), MAX_TASK_TAIL);
+    task.thinkingTail = tail(
+      task.thinkingTail + (event.text || ''),
+      MAX_TASK_TAIL,
+    );
   } else if (event.eventType === 'task_progress') {
     task.status = 'running';
-    task.latestSummary = event.summary || event.taskSummary || event.taskDescription || task.latestSummary;
+    task.latestSummary =
+      event.summary ||
+      event.taskSummary ||
+      event.taskDescription ||
+      task.latestSummary;
     task.lastToolName = event.lastToolName || task.lastToolName;
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed') task.status = 'error';
+    else if (patch?.status === 'failed' || patch?.status === 'killed')
+      task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
-    else if (patch?.status === 'running' || patch?.status === 'pending') task.status = 'running';
-    task.latestSummary = event.summary || patch?.description || patch?.error || task.latestSummary;
+    else if (patch?.status === 'running' || patch?.status === 'pending')
+      task.status = 'running';
+    task.latestSummary =
+      event.summary || patch?.description || patch?.error || task.latestSummary;
   } else if (event.eventType === 'task_notification') {
     task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
-    task.latestSummary = event.taskSummary || event.summary || task.latestSummary;
+    task.latestSummary =
+      event.taskSummary || event.summary || task.latestSummary;
   } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
     const tool = {
       toolName: event.toolName || 'unknown',
@@ -835,17 +1062,37 @@ function updateTaskRuntime(prev: StreamingState, next: StreamingState, event: St
       toolInputSummary: event.toolInputSummary,
       toolInput: event.toolInput,
     };
-    task.activeTools = task.activeTools.some(t => t.toolUseId === tool.toolUseId && tool.toolUseId)
-      ? task.activeTools.map(t => (t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t))
+    task.activeTools = task.activeTools.some(
+      (t) => t.toolUseId === tool.toolUseId && tool.toolUseId,
+    )
+      ? task.activeTools.map((t) =>
+          t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t,
+        )
       : [...task.activeTools, tool];
-    task.recentTools = pushEvent(task.recentTools, event.skillName ? 'skill' : 'tool', `${event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`}${event.toolInputSummary ? ` (${event.toolInputSummary})` : ''}`);
+    task.recentTools = pushEvent(
+      task.recentTools,
+      event.skillName ? 'skill' : 'tool',
+      `${event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`}${event.toolInputSummary ? ` (${event.toolInputSummary})` : ''}`,
+    );
   } else if (event.eventType === 'tool_use_end' && event.parentToolUseId) {
-    task.activeTools = task.activeTools.filter(t => t.toolUseId !== event.toolUseId);
-    task.recentTools = pushEvent(task.recentTools, 'tool', `✓ ${event.toolName || event.toolUseId || '工具'}`);
+    task.activeTools = task.activeTools.filter(
+      (t) => t.toolUseId !== event.toolUseId,
+    );
+    task.recentTools = pushEvent(
+      task.recentTools,
+      'tool',
+      `✓ ${event.toolName || event.toolUseId || '工具'}`,
+    );
   } else if (event.eventType === 'tool_progress' && event.parentToolUseId) {
-    task.activeTools = task.activeTools.map(t => t.toolUseId === event.toolUseId
-      ? { ...t, elapsedSeconds: event.elapsedSeconds, toolInputSummary: event.toolInputSummary || t.toolInputSummary }
-      : t);
+    task.activeTools = task.activeTools.map((t) =>
+      t.toolUseId === event.toolUseId
+        ? {
+            ...t,
+            elapsedSeconds: event.elapsedSeconds,
+            toolInputSummary: event.toolInputSummary || t.toolInputSummary,
+          }
+        : t,
+    );
   }
   taskStates[taskId] = task;
   next.taskStates = taskStates;
@@ -872,7 +1119,8 @@ function applyStreamEvent(
         break;
       }
       const combined = prev.partialText + (event.text || '');
-      next.partialText = combined.length > maxText ? combined.slice(-maxText) : combined;
+      next.partialText =
+        combined.length > maxText ? combined.slice(-maxText) : combined;
       next.isThinking = false;
       markThinkingEnded(prev, next);
       break;
@@ -883,7 +1131,10 @@ function applyStreamEvent(
         break;
       }
       const combined = prev.thinkingText + (event.text || '');
-      next.thinkingText = combined.length > MAX_THINKING_TEXT ? combined.slice(-MAX_THINKING_TEXT) : combined;
+      next.thinkingText =
+        combined.length > MAX_THINKING_TEXT
+          ? combined.slice(-MAX_THINKING_TEXT)
+          : combined;
       next.isThinking = true;
       markThinkingStarted(prev, next);
       break;
@@ -892,7 +1143,9 @@ function applyStreamEvent(
       next.isThinking = false;
       markThinkingEnded(prev, next);
       const toolUseId = event.toolUseId || '';
-      const existing = prev.activeTools.find(t => t.toolUseId === toolUseId && toolUseId);
+      const existing = prev.activeTools.find(
+        (t) => t.toolUseId === toolUseId && toolUseId,
+      );
       const tool = {
         toolName: event.toolName || 'unknown',
         toolUseId,
@@ -903,7 +1156,9 @@ function applyStreamEvent(
         toolInputSummary: event.toolInputSummary,
       };
       next.activeTools = existing
-        ? prev.activeTools.map(t => (t.toolUseId === toolUseId ? { ...t, ...tool } : t))
+        ? prev.activeTools.map((t) =>
+            t.toolUseId === toolUseId ? { ...t, ...tool } : t,
+          )
         : [...prev.activeTools, tool];
       if (event.parentToolUseId) {
         updateTaskRuntime(prev, next, event);
@@ -914,95 +1169,142 @@ function applyStreamEvent(
         ? `技能 ${tool.skillName || 'unknown'}`
         : `工具 ${tool.toolName}`;
       const detail = tool.toolInputSummary ? ` (${tool.toolInputSummary})` : '';
-      next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `${label}${detail}`);
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        isSkill ? 'skill' : 'tool',
+        `${label}${detail}`,
+      );
       break;
     }
-      case 'tool_use_end':
-        if (event.toolUseId) {
-        const ended = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
-        next.activeTools = prev.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+    case 'tool_use_end':
+      if (event.toolUseId) {
+        const ended = prev.activeTools.find(
+          (t) => t.toolUseId === event.toolUseId,
+        );
+        next.activeTools = prev.activeTools.filter(
+          (t) => t.toolUseId !== event.toolUseId,
+        );
         if (ended) {
           const rawSec = (Date.now() - ended.startTime) / 1000;
-          const elapsedSec = rawSec % 1 === 0 ? rawSec.toFixed(0) : rawSec.toFixed(1);
+          const elapsedSec =
+            rawSec % 1 === 0 ? rawSec.toFixed(0) : rawSec.toFixed(1);
           const isSkill = ended.toolName === 'Skill';
           const label = isSkill
             ? `技能 ${ended.skillName || 'unknown'}`
             : `工具 ${ended.toolName}`;
-            next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `✓ ${label} (${elapsedSec}s)`);
-          }
+          next.recentEvents = pushEvent(
+            prev.recentEvents,
+            isSkill ? 'skill' : 'tool',
+            `✓ ${label} (${elapsedSec}s)`,
+          );
         }
-        // An end event without a toolUseId is malformed — ignore it instead of
-        // clearing ALL active tools, which would make genuinely-running tools
-        // suddenly vanish from the UI. Matches the feishu card + WS snapshot
-        // behaviour (both key off toolUseId and skip idless ends).
-        if (event.parentToolUseId) {
-          updateTaskRuntime(prev, next, event);
-        }
-        break;
+      }
+      // An end event without a toolUseId is malformed — ignore it instead of
+      // clearing ALL active tools, which would make genuinely-running tools
+      // suddenly vanish from the UI. Matches the feishu card + WS snapshot
+      // behaviour (both key off toolUseId and skip idless ends).
+      if (event.parentToolUseId) {
+        updateTaskRuntime(prev, next, event);
+      }
+      break;
     case 'tool_progress': {
-      const existing = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
-        if (existing) {
+      const existing = prev.activeTools.find(
+        (t) => t.toolUseId === event.toolUseId,
+      );
+      if (existing) {
         const skillNameResolved = event.skillName && !existing.skillName;
-        next.activeTools = prev.activeTools.map(t =>
+        next.activeTools = prev.activeTools.map((t) =>
           t.toolUseId === event.toolUseId
             ? {
                 ...t,
                 elapsedSeconds: event.elapsedSeconds,
                 ...(event.skillName ? { skillName: event.skillName } : {}),
                 ...(event.toolInput ? { toolInput: event.toolInput } : {}),
-                ...(event.toolInputSummary ? { toolInputSummary: event.toolInputSummary } : {}),
+                ...(event.toolInputSummary
+                  ? { toolInputSummary: event.toolInputSummary }
+                  : {}),
               }
-            : t
+            : t,
         );
         if (skillNameResolved) {
           const oldLabel = `技能 unknown`;
           const newLabel = `技能 ${event.skillName}`;
-          next.recentEvents = prev.recentEvents.map(e =>
+          next.recentEvents = prev.recentEvents.map((e) =>
             e.kind === 'skill' && e.text.includes(oldLabel)
               ? { ...e, text: e.text.replace(oldLabel, newLabel) }
-              : e
+              : e,
           );
         }
-        } else {
-        next.activeTools = [...prev.activeTools, {
-          toolName: event.toolName || 'unknown',
-          toolUseId: event.toolUseId || '',
-          startTime: Date.now(),
-          parentToolUseId: event.parentToolUseId,
-          isNested: event.isNested,
-          elapsedSeconds: event.elapsedSeconds,
-          ...(event.toolInputSummary ? { toolInputSummary: event.toolInputSummary } : {}),
-        }];
-        }
-        if (event.parentToolUseId) {
-          updateTaskRuntime(prev, next, event);
-        }
-        break;
+      } else {
+        next.activeTools = [
+          ...prev.activeTools,
+          {
+            toolName: event.toolName || 'unknown',
+            toolUseId: event.toolUseId || '',
+            startTime: Date.now(),
+            parentToolUseId: event.parentToolUseId,
+            isNested: event.isNested,
+            elapsedSeconds: event.elapsedSeconds,
+            ...(event.toolInputSummary
+              ? { toolInputSummary: event.toolInputSummary }
+              : {}),
+          },
+        ];
       }
+      if (event.parentToolUseId) {
+        updateTaskRuntime(prev, next, event);
+      }
+      break;
+    }
     case 'task_start': {
       updateTaskRuntime(prev, next, event);
-      const desc = event.taskDescription || event.toolInputSummary || event.summary || 'Task';
-      next.recentEvents = pushEvent(prev.recentEvents, 'task', `Task 启动: ${desc}`);
+      const desc =
+        event.taskDescription ||
+        event.toolInputSummary ||
+        event.summary ||
+        'Task';
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'task',
+        `Task 启动: ${desc}`,
+      );
       break;
     }
     case 'task_progress': {
       updateTaskRuntime(prev, next, event);
-      const label = event.lastToolName ? `Task 进度 [${event.lastToolName}]` : 'Task 进度';
-      next.recentEvents = pushEvent(prev.recentEvents, 'task', `${label}: ${event.summary || event.taskDescription || ''}`);
+      const label = event.lastToolName
+        ? `Task 进度 [${event.lastToolName}]`
+        : 'Task 进度';
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'task',
+        `${label}: ${event.summary || event.taskDescription || ''}`,
+      );
       break;
     }
     case 'task_updated': {
       updateTaskRuntime(prev, next, event);
-      next.recentEvents = pushEvent(prev.recentEvents, 'task', `Task 更新: ${event.summary || event.taskPatch?.status || ''}`);
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'task',
+        `Task 更新: ${event.summary || event.taskPatch?.status || ''}`,
+      );
       break;
     }
     case 'task_notification': {
       updateTaskRuntime(prev, next, event);
-      next.recentEvents = pushEvent(prev.recentEvents, 'task', `Task ${event.taskStatus === 'completed' ? '完成' : '结束'}: ${event.taskSummary || event.summary || ''}`);
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'task',
+        `Task ${event.taskStatus === 'completed' ? '完成' : '结束'}: ${event.taskSummary || event.summary || ''}`,
+      );
       break;
     }
     case 'hook_started':
-      next.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      next.activeHook = {
+        hookName: event.hookName || '',
+        hookEvent: event.hookEvent || '',
+      };
       next.recentEvents = pushEvent(
         prev.recentEvents,
         'hook',
@@ -1010,7 +1312,10 @@ function applyStreamEvent(
       );
       break;
     case 'hook_progress':
-      next.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      next.activeHook = {
+        hookName: event.hookName || '',
+        hookEvent: event.hookEvent || '',
+      };
       break;
     case 'hook_response':
       next.activeHook = null;
@@ -1025,43 +1330,68 @@ function applyStreamEvent(
         next.todos = event.todos;
       }
       break;
-      case 'status': {
-        next.systemStatus = event.statusText || null;
+    case 'status': {
+      next.systemStatus = event.statusText || null;
       if (event.statusText) {
-        next.recentEvents = pushEvent(prev.recentEvents, 'status', `状态: ${event.statusText}`);
-      }
-        break;
-      }
-      case 'permission_denied': {
-        const pd = event.permissionDenied;
-        const tool = pd?.toolName || event.toolName || '';
-        const why = pd?.reason || pd?.message || event.summary || event.detail || '权限被拒绝';
         next.recentEvents = pushEvent(
           prev.recentEvents,
-          'permission',
-          `🚫 ${tool ? `${tool}: ` : ''}${why}`.trim(),
+          'status',
+          `状态: ${event.statusText}`,
         );
-        break;
       }
-      case 'memory_recall':
-      case 'compact_boundary':
-        next.recentEvents = pushEvent(prev.recentEvents, 'memory', event.summary || traceTitle(event));
-        break;
-      case 'notification':
-      case 'prompt_suggestion':
-        next.recentEvents = pushEvent(prev.recentEvents, 'status', event.summary || traceTitle(event));
-        break;
-      case 'raw_sdk_event':
-        if (event.displayLevel === 'primary') {
-          next.recentEvents = pushEvent(prev.recentEvents, 'debug', event.summary || traceTitle(event));
-        }
-        break;
-      case 'context_audit':
-        next.contextAudit = event.contextAudit;
-        if (event.contextAudit?.warnings?.length) {
-          next.recentEvents = pushEvent(prev.recentEvents, 'context', `Agent Context: ${event.contextAudit.warnings[0]}`);
-        }
-        break;
+      break;
+    }
+    case 'permission_denied': {
+      const pd = event.permissionDenied;
+      const tool = pd?.toolName || event.toolName || '';
+      const why =
+        pd?.reason ||
+        pd?.message ||
+        event.summary ||
+        event.detail ||
+        '权限被拒绝';
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'permission',
+        `🚫 ${tool ? `${tool}: ` : ''}${why}`.trim(),
+      );
+      break;
+    }
+    case 'memory_recall':
+    case 'compact_boundary':
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'memory',
+        event.summary || traceTitle(event),
+      );
+      break;
+    case 'notification':
+    case 'prompt_suggestion':
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'status',
+        event.summary || traceTitle(event),
+      );
+      break;
+    case 'raw_sdk_event':
+      if (event.displayLevel === 'primary') {
+        next.recentEvents = pushEvent(
+          prev.recentEvents,
+          'debug',
+          event.summary || traceTitle(event),
+        );
+      }
+      break;
+    case 'context_audit':
+      next.contextAudit = event.contextAudit;
+      if (event.contextAudit?.warnings?.length) {
+        next.recentEvents = pushEvent(
+          prev.recentEvents,
+          'context',
+          `Agent Context: ${event.contextAudit.warnings[0]}`,
+        );
+      }
+      break;
     case 'usage':
       // Token usage is handled at handleStreamEvent level (direct message table update).
       // No streaming state mutation needed.
@@ -1102,7 +1432,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadGroups: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ groups: Record<string, GroupInfo> }>('/api/groups');
+      const data = await api.get<{ groups: Record<string, GroupInfo> }>(
+        '/api/groups',
+      );
       set((state) => {
         const currentStillExists =
           state.currentGroup && !!data.groups[state.currentGroup];
@@ -1127,7 +1459,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         };
       });
     } catch (err) {
-      set({ loading: false, error: err instanceof Error ? err.message : String(err) });
+      set({
+        loading: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   },
 
@@ -1142,23 +1477,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadMessages: async (jid: string, loadMore = false) => {
     const state = get();
     const existing = state.messages[jid] || [];
-    const before = loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
+    const before =
+      loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
 
     try {
       const data = await api.get<{ messages: Message[]; hasMore: boolean }>(
         `/api/groups/${encodeURIComponent(jid)}/messages?${new URLSearchParams(
-          before ? { before: String(before), limit: '50' } : { limit: '50' }
-        )}`
+          before ? { before: String(before), limit: '50' } : { limit: '50' },
+        )}`,
       );
       // Messages come in DESC order from API, reverse to chronological for display
       const sorted = [...data.messages].reverse();
       set((s) => {
-        const merged = mergeMessagesChronologically(s.messages[jid] || [], sorted);
+        const merged = mergeMessagesChronologically(
+          s.messages[jid] || [],
+          sorted,
+        );
         const latest = merged.length > 0 ? merged[merged.length - 1] : null;
         const shouldWait =
           !!latest &&
           latest.sender !== '__system__' &&
-          (latest.is_from_me === false || latest.source_kind === 'sdk_send_message');
+          (latest.is_from_me === false ||
+            latest.source_kind === 'sdk_send_message');
         const nextWaiting = { ...s.waiting };
         if (shouldWait) {
           nextWaiting[jid] = true;
@@ -1187,7 +1527,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const state = get();
     const existing = state.messages[jid] || [];
-    const lastTs = existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
+    const lastTs =
+      existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
 
     try {
       // Fetch messages newer than the last one we have
@@ -1195,7 +1536,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (lastTs) params.set('after', lastTs);
 
       const data = await api.get<{ messages: Message[] }>(
-        `/api/groups/${encodeURIComponent(jid)}/messages?${params}`
+        `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
       );
 
       // Re-check clearing lock after async fetch — clearHistory may have started mid-request
@@ -1219,7 +1560,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
               m.source_kind !== 'sdk_send_message' &&
               !(isFrozen && m.source_kind === 'interrupt_partial'),
           );
-          const hasSystemError = data.messages.some((m) => isTerminalSystemMessage(m));
+          const hasSystemError = data.messages.some((m) =>
+            isTerminalSystemMessage(m),
+          );
 
           // Transfer pending thinking to thinkingCache
           let nextThinkingCache = s.thinkingCache;
@@ -1236,26 +1579,39 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   m.source_kind !== 'sdk_send_message',
               );
             if (lastAiMsg) {
-              nextThinkingCache = capThinkingCache({ ...s.thinkingCache, [lastAiMsg.id]: s.pendingThinking[jid] });
+              nextThinkingCache = capThinkingCache({
+                ...s.thinkingCache,
+                [lastAiMsg.id]: s.pendingThinking[jid],
+              });
               const pendingDur = s.pendingThinkingDuration[jid];
               if (pendingDur != null) {
-                nextThinkingDurationCache = capThinkingCache({ ...s.thinkingDurationCache, [lastAiMsg.id]: pendingDur });
+                nextThinkingDurationCache = capThinkingCache({
+                  ...s.thinkingDurationCache,
+                  [lastAiMsg.id]: pendingDur,
+                });
               }
               const { [jid]: _, ...restPending } = s.pendingThinking;
               nextPendingThinking = restPending;
-              const { [jid]: __, ...restPendingDur } = s.pendingThinkingDuration;
+              const { [jid]: __, ...restPendingDur } =
+                s.pendingThinkingDuration;
               nextPendingThinkingDuration = restPendingDur;
             }
           }
 
           return {
             messages: { ...s.messages, [jid]: merged },
-            waiting: (agentReplied || hasSystemError)
-              ? { ...s.waiting, [jid]: false }
-              : s.waiting,
-            streaming: (agentReplied || hasSystemError)
-              ? (() => { const next = { ...s.streaming }; delete next[jid]; return next; })()
-              : s.streaming,
+            waiting:
+              agentReplied || hasSystemError
+                ? { ...s.waiting, [jid]: false }
+                : s.waiting,
+            streaming:
+              agentReplied || hasSystemError
+                ? (() => {
+                    const next = { ...s.streaming };
+                    delete next[jid];
+                    return next;
+                  })()
+                : s.streaming,
             thinkingCache: nextThinkingCache,
             thinkingDurationCache: nextThinkingDurationCache,
             pendingThinking: nextPendingThinking,
@@ -1269,16 +1625,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  sendMessage: async (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => {
+  sendMessage: async (
+    jid: string,
+    content: string,
+    attachments?: Array<{ data: string; mimeType: string }>,
+  ) => {
     try {
       // streaming 状态由以下 3 条路径正确清理，sendMessage 不应无条件清空：
       // 1. handleWsNewMessage 收到 is_from_me 消息时
       // 2. agent_reply WebSocket 事件时
       // 3. status:interrupted 事件时
 
-      const body: { chatJid: string; content: string; attachments?: Array<{ type: 'image'; data: string; mimeType: string }> } = { chatJid: jid, content };
+      const body: {
+        chatJid: string;
+        content: string;
+        attachments?: Array<{ type: 'image'; data: string; mimeType: string }>;
+      } = { chatJid: jid, content };
       if (attachments && attachments.length > 0) {
-        body.attachments = attachments.map(att => ({ type: 'image', ...att }));
+        body.attachments = attachments.map((att) => ({
+          type: 'image',
+          ...att,
+        }));
       }
 
       type ClearedResponse = { success: true; cleared: true };
@@ -1305,7 +1672,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Add user message to local state immediately
       const authState = useAuthStore.getState();
       const sender = authState.user?.id || 'web-user';
-      const senderName = authState.user?.display_name || authState.user?.username || 'Web';
+      const senderName =
+        authState.user?.display_name || authState.user?.username || 'Web';
       const msg: Message = {
         id: data.messageId,
         chat_jid: jid,
@@ -1316,12 +1684,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         timestamp: data.timestamp,
         // is_from_me is from the bot's perspective: true = bot sent it, false = human sent it
         is_from_me: false,
-        attachments: body.attachments ? JSON.stringify(body.attachments) : undefined,
+        attachments: body.attachments
+          ? JSON.stringify(body.attachments)
+          : undefined,
       };
       set((s) => {
         const existing = s.messages[jid] || [];
         if (!s.messages[jid]) {
-          console.warn('[sendMessage] messages[jid] is undefined at send time', { jid, storeKeys: Object.keys(s.messages) });
+          console.warn(
+            '[sendMessage] messages[jid] is undefined at send time',
+            { jid, storeKeys: Object.keys(s.messages) },
+          );
         }
         const merged = mergeMessagesChronologically(existing, [msg]);
         const latest = merged.length > 0 ? merged[merged.length - 1] : null;
@@ -1548,7 +1921,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Release clearing lock on failure
       set((s) => {
         const { [jid]: _, ...nextClearing } = s.clearing;
-        return { clearing: nextClearing, error: err instanceof Error ? err.message : String(err) };
+        return {
+          clearing: nextClearing,
+          error: err instanceof Error ? err.message : String(err),
+        };
       });
       return false;
     }
@@ -1556,7 +1932,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   deleteMessage: async (jid: string, messageId: string) => {
     try {
-      await api.delete(`/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`);
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`,
+      );
       // Invalidate SW cache so paginated message responses don't keep serving
       // the deleted message for up to 24h after deletion (#467).
       void invalidateGroupCache(jid);
@@ -1573,15 +1951,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  createFlow: async (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => {
+  createFlow: async (
+    name: string,
+    options?: {
+      execution_mode?: 'container' | 'host';
+      custom_cwd?: string;
+      init_source_path?: string;
+      init_git_url?: string;
+      agent_profile_id?: string;
+    },
+  ) => {
     try {
       const body: Record<string, string> = { name };
       if (options?.execution_mode) body.execution_mode = options.execution_mode;
       if (options?.custom_cwd) body.custom_cwd = options.custom_cwd;
-      if (options?.init_source_path) body.init_source_path = options.init_source_path;
+      if (options?.init_source_path)
+        body.init_source_path = options.init_source_path;
       if (options?.init_git_url) body.init_git_url = options.init_git_url;
+      if (options?.agent_profile_id)
+        body.agent_profile_id = options.agent_profile_id;
 
-      const needsLongTimeout = !!(options?.init_source_path || options?.init_git_url);
+      const needsLongTimeout = !!(
+        options?.init_source_path || options?.init_git_url
+      );
       const data = await api.post<{
         success: boolean;
         jid: string;
@@ -1603,7 +1995,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   renameFlow: async (jid: string, name: string) => {
     try {
-      await api.patch<{ success: boolean }>(`/api/groups/${encodeURIComponent(jid)}`, { name });
+      await api.patch<{ success: boolean }>(
+        `/api/groups/${encodeURIComponent(jid)}`,
+        { name },
+      );
       set((s) => {
         const group = s.groups[jid];
         if (!group) return s;
@@ -1640,7 +2035,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...s.groups,
             [jid]: {
               ...g,
-              pinned_at: willPin ? (data.pinned_at || new Date().toISOString()) : undefined,
+              pinned_at: willPin
+                ? data.pinned_at || new Date().toISOString()
+                : undefined,
             },
           },
         };
@@ -1652,7 +2049,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   deleteFlow: async (jid: string) => {
     try {
-      await api.delete<{ success: boolean }>(`/api/groups/${encodeURIComponent(jid)}`);
+      await api.delete<{ success: boolean }>(
+        `/api/groups/${encodeURIComponent(jid)}`,
+      );
       // Workspace 已删除，连带把该 jid 下所有 conversation agent 的 IDB 快照
       // 也清掉，避免 IDB 长期堆积孤儿条目。
       void deleteGroupMessageSnapshots(jid);
@@ -1698,13 +2097,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
         };
       });
     } catch (err: unknown) {
-      const apiErr = err as { status?: number; body?: Record<string, unknown>; message?: string };
-      if (apiErr.status === 409 && apiErr.body?.bound_agents) {
-        const e = new Error(apiErr.message || 'IM binding conflict') as Error & { boundAgents: unknown };
+      const apiErr = err as {
+        status?: number;
+        body?: Record<string, unknown>;
+        message?: string;
+      };
+      if (
+        apiErr.status === 409 &&
+        (apiErr.body?.bound_sessions ||
+          apiErr.body?.bound_agents ||
+          apiErr.body?.bound_main_im_groups)
+      ) {
+        const e = new Error(
+          apiErr.message || 'IM binding conflict',
+        ) as Error & {
+          boundSessions?: unknown;
+          boundAgents?: unknown;
+          boundMainImGroups?: unknown;
+        };
+        e.boundSessions = apiErr.body.bound_sessions;
         e.boundAgents = apiErr.body.bound_agents;
+        e.boundMainImGroups = apiErr.body.bound_main_im_groups;
         throw e;
       }
-      set({ error: apiErr.message || (err instanceof Error ? err.message : String(err)) });
+      const message =
+        apiErr.message || (err instanceof Error ? err.message : String(err));
+      set({ error: message });
+      throw err;
     }
   },
 
@@ -1714,12 +2133,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (get().clearing[chatJid]) return;
 
     // ⓪ text_delta / thinking_delta — rAF batch for both agent and main conversation
-    if ((event.eventType === 'text_delta' || event.eventType === 'thinking_delta') && (agentId || !event.parentToolUseId)) {
+    if (
+      (event.eventType === 'text_delta' ||
+        event.eventType === 'thinking_delta') &&
+      (agentId || !event.parentToolUseId)
+    ) {
       const key = agentId ? `agent:${agentId}` : `main:${chatJid}`;
       let entry = pendingDeltas.get(key);
       if (entry) {
         // Already have a pending rAF — just accumulate
-        if (event.eventType === 'text_delta') entry.texts.push(event.text || '');
+        if (event.eventType === 'text_delta')
+          entry.texts.push(event.text || '');
         else entry.thinkings.push(event.text || '');
         return;
       }
@@ -1761,7 +2185,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Fallback：10s 后如果 new_message 未到达，强制清除冻结状态
         setTimeout(() => {
           const state = get();
-          if (state.agentStreaming[agentId]?.interrupted && !state.agentWaiting[agentId]) {
+          if (
+            state.agentStreaming[agentId]?.interrupted &&
+            !state.agentWaiting[agentId]
+          ) {
             set((s) => {
               const next = { ...s.agentStreaming };
               delete next[agentId];
@@ -1785,7 +2212,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
-    const ensureSdkTask = (taskId: string, description?: string, isTeammate?: boolean) => {
+    const ensureSdkTask = (
+      taskId: string,
+      description?: string,
+      isTeammate?: boolean,
+    ) => {
       set((s) => {
         const existingTask = s.sdkTasks[taskId];
         const desc = description || existingTask?.description || 'Task';
@@ -1817,7 +2248,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (state.sdkTasks[resolved]) return resolved;
       const target = pickSdkTaskAliasTarget(state, chatJid);
       if (target && rawId !== target) {
-        set((s) => ({ sdkTaskAliases: { ...s.sdkTaskAliases, [rawId]: target } }));
+        set((s) => ({
+          sdkTaskAliases: { ...s.sdkTaskAliases, [rawId]: target },
+        }));
         return target;
       }
       return resolved;
@@ -1855,10 +2288,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     };
 
-      // ② task_start / Task tool start → 创建/更新虚拟 Agent（SDK Task）
-      if (
-        (event.eventType === 'task_start' && event.toolUseId)
-        || (event.eventType === 'tool_use_start' && event.toolName === 'Task' && event.toolUseId)
+    // ② task_start / Task tool start → 创建/更新虚拟 Agent（SDK Task）
+    if (
+      (event.eventType === 'task_start' && event.toolUseId) ||
+      (event.eventType === 'tool_use_start' &&
+        event.toolName === 'Task' &&
+        event.toolUseId)
     ) {
       ensureSdkTask(
         event.toolUseId!,
@@ -1868,8 +2303,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // 不 return — 让 task_start 同时落入主对话 streaming（显示 Task 工具卡片）
     }
 
-    if (event.eventType === 'task_progress' && (event.toolUseId || event.taskId)) {
-      const resolvedTaskId = resolveOrBindTaskId(event.toolUseId || event.taskId!);
+    if (
+      event.eventType === 'task_progress' &&
+      (event.toolUseId || event.taskId)
+    ) {
+      const resolvedTaskId = resolveOrBindTaskId(
+        event.toolUseId || event.taskId!,
+      );
       set((s) => {
         const existing = s.sdkTasks[resolvedTaskId];
         if (!existing) return {};
@@ -1886,10 +2326,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     }
 
-    if (event.eventType === 'task_updated' && (event.toolUseId || event.taskId)) {
-      const resolvedTaskId = resolveOrBindTaskId(event.toolUseId || event.taskId!);
+    if (
+      event.eventType === 'task_updated' &&
+      (event.toolUseId || event.taskId)
+    ) {
+      const resolvedTaskId = resolveOrBindTaskId(
+        event.toolUseId || event.taskId!,
+      );
       const patchStatus = event.taskPatch?.status;
-      if (patchStatus === 'completed' || patchStatus === 'failed' || patchStatus === 'killed') {
+      if (
+        patchStatus === 'completed' ||
+        patchStatus === 'failed' ||
+        patchStatus === 'killed'
+      ) {
         finalizeSdkTask(
           resolvedTaskId,
           patchStatus === 'completed' ? 'completed' : 'error',
@@ -1910,9 +2359,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Toast + 浏览器通知（仅限后台任务）
       // stream-processor 为前台 Task 合成的 task_notification 不带 isBackground 标记，
       // 仅 SDK 原生的后台完成事件携带 isBackground: true。
-      if (event.isBackground && shouldEmitBackgroundTaskNotice(resolvedTaskId)) {
+      if (
+        event.isBackground &&
+        shouldEmitBackgroundTaskNotice(resolvedTaskId)
+      ) {
         const taskInfo = get().sdkTasks[resolvedTaskId];
-        const desc = (taskInfo?.description || event.taskSummary || '后台任务').slice(0, 60);
+        const desc = (
+          taskInfo?.description ||
+          event.taskSummary ||
+          '后台任务'
+        ).slice(0, 60);
         const status = event.taskStatus === 'completed' ? '已完成' : '失败';
         if (typeof document === 'undefined' || !document.hidden) {
           showToast(`${desc} ${status}`, event.taskSummary);
@@ -1956,7 +2412,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const resolvedToolUseId = resolveOrBindTaskId(event.toolUseId);
       const task = get().sdkTasks[resolvedToolUseId];
       if (task && task.status === 'running') {
-        finalizeSdkTask(resolvedToolUseId, 'completed', task.summary, SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS);
+        finalizeSdkTask(
+          resolvedToolUseId,
+          'completed',
+          task.summary,
+          SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS,
+        );
       }
       // fall-through 到主对话处理，移除 activeTools 中的 Task 条目
     }
@@ -2073,7 +2534,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
         if (targetIdx < 0) return s;
         const updated = [...msgs];
-        updated[targetIdx] = { ...updated[targetIdx], token_usage: tokenUsageJson };
+        updated[targetIdx] = {
+          ...updated[targetIdx],
+          token_usage: tokenUsageJson,
+        };
         return { messages: { ...s.messages, [chatJid]: updated } };
       });
       // 不 return — usage 事件同时落入主对话 streaming（如需 recentEvents 展示）
@@ -2144,9 +2608,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const interruptPartialWhileFrozen =
           msg.source_kind === 'interrupt_partial' && isFrozen;
 
-        const nextAgentStreaming = (isAgentReply && !interruptPartialWhileFrozen)
-          ? (() => { const n = { ...s.agentStreaming }; delete n[agentId]; return n; })()
-          : s.agentStreaming;
+        const nextAgentStreaming =
+          isAgentReply && !interruptPartialWhileFrozen
+            ? (() => {
+                const n = { ...s.agentStreaming };
+                delete n[agentId];
+                return n;
+              })()
+            : s.agentStreaming;
 
         // For user messages (non-reply), set agentWaiting=true so subsequent
         // streaming events are accepted.  This handles messages injected from
@@ -2206,15 +2675,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // 不清除 streaming——保留冻结的富内容（thinking、工具、任务进度）。
       // 消息仍会添加到列表（走下方普通消息分支），10s 兜底计时器做最终清理。
       const interruptPartialWhileFrozen =
-        msg.source_kind === 'interrupt_partial' && s.streaming[chatJid]?.interrupted;
+        msg.source_kind === 'interrupt_partial' &&
+        s.streaming[chatJid]?.interrupted;
       const shouldFinalizeAssistant =
         isAgentReply &&
         !interruptPartialWhileFrozen &&
-        (msg.source_kind === 'sdk_final'
-          || msg.source_kind === 'interrupt_partial'
-          || msg.source_kind === null
-          || msg.source_kind === undefined
-          || msg.source_kind === 'legacy');
+        (msg.source_kind === 'sdk_final' ||
+          msg.source_kind === 'interrupt_partial' ||
+          msg.source_kind === null ||
+          msg.source_kind === undefined ||
+          msg.source_kind === 'legacy');
 
       if (shouldFinalizeAssistant || isSystemError) {
         if (shouldFinalizeAssistant) didFinalizeAssistant = true;
@@ -2222,10 +2692,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Agent 回复或系统错误：立即清除流式状态和等待标志，转移 thinking 缓存
         const streamState = s.streaming[chatJid];
         const thinkingText = isAgentReply
-          ? (streamState?.thinkingText || s.pendingThinking[chatJid])
+          ? streamState?.thinkingText || s.pendingThinking[chatJid]
           : undefined;
         const thinkingDuration = isAgentReply
-          ? (streamState?.thinkingDurationMs ?? s.pendingThinkingDuration[chatJid])
+          ? (streamState?.thinkingDurationMs ??
+            s.pendingThinkingDuration[chatJid])
           : undefined;
         const nextStreaming = { ...s.streaming };
         delete nextStreaming[chatJid];
@@ -2237,9 +2708,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // 未读计数：页面隐藏或不在当前对话时增加
         const isHidden = typeof document !== 'undefined' && document.hidden;
         const isOtherChat = s.currentGroup !== chatJid;
-        const nextUnread = (isHidden || isOtherChat) && shouldFinalizeAssistant
-          ? { ...s.unreadReplies, [chatJid]: (s.unreadReplies[chatJid] || 0) + 1 }
-          : s.unreadReplies;
+        const nextUnread =
+          (isHidden || isOtherChat) && shouldFinalizeAssistant
+            ? {
+                ...s.unreadReplies,
+                [chatJid]: (s.unreadReplies[chatJid] || 0) + 1,
+              }
+            : s.unreadReplies;
 
         return {
           messages: { ...s.messages, [chatJid]: updated },
@@ -2248,8 +2723,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
           pendingThinking: nextPending,
           pendingThinkingDuration: nextPendingDur,
           unreadReplies: nextUnread,
-          ...(thinkingText ? { thinkingCache: capThinkingCache({ ...s.thinkingCache, [msg.id]: thinkingText }) } : {}),
-          ...(thinkingDuration != null ? { thinkingDurationCache: capThinkingCache({ ...s.thinkingDurationCache, [msg.id]: thinkingDuration }) } : {}),
+          ...(thinkingText
+            ? {
+                thinkingCache: capThinkingCache({
+                  ...s.thinkingCache,
+                  [msg.id]: thinkingText,
+                }),
+              }
+            : {}),
+          ...(thinkingDuration != null
+            ? {
+                thinkingDurationCache: capThinkingCache({
+                  ...s.thinkingDurationCache,
+                  [msg.id]: thinkingDuration,
+                }),
+              }
+            : {}),
         };
       }
 
@@ -2293,7 +2782,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // 处理子 Agent 状态变更事件
-  handleAgentStatus: (chatJid, agentId, status, name, prompt, resultSummary?, kind?, titleGenerating?) => {
+  handleAgentStatus: (
+    chatJid,
+    agentId,
+    status,
+    name,
+    prompt,
+    resultSummary?,
+    kind?,
+    titleGenerating?,
+  ) => {
     set((s) => {
       const existing = s.agents[chatJid] || [];
 
@@ -2309,7 +2807,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (nextActiveTab[chatJid] === agentId) nextActiveTab[chatJid] = null;
         const nextSdkTasks = { ...s.sdkTasks };
         delete nextSdkTasks[agentId];
-        const nextSdkTaskAliases = removeSdkTaskAliases(s.sdkTaskAliases, agentId);
+        const nextSdkTaskAliases = removeSdkTaskAliases(
+          s.sdkTaskAliases,
+          agentId,
+        );
         // Clean up conversation agent state
         const nextAgentMessages = { ...s.agentMessages };
         delete nextAgentMessages[agentId];
@@ -2340,13 +2841,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status,
         kind: resolvedKind,
         created_at: previous?.created_at || new Date().toISOString(),
-        completed_at: (status === 'completed' || status === 'error') ? new Date().toISOString() : undefined,
+        completed_at:
+          status === 'completed' || status === 'error'
+            ? new Date().toISOString()
+            : undefined,
         result_summary: resultSummary,
-        title_generating: typeof titleGenerating === 'boolean' ? titleGenerating : previous?.title_generating,
+        title_generating:
+          typeof titleGenerating === 'boolean'
+            ? titleGenerating
+            : previous?.title_generating,
       };
-      const updated = idx >= 0
-        ? existing.map((a, i) => (i === idx ? agentInfo : a))
-        : [...existing, agentInfo];
+      const updated =
+        idx >= 0
+          ? existing.map((a, i) => (i === idx ? agentInfo : a))
+          : [...existing, agentInfo];
 
       // Clean up agent streaming if not actively running
       const nextAgentStreaming = { ...s.agentStreaming };
@@ -2361,7 +2869,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
           clearSdkTaskCleanupTimer(agentId);
           clearSdkTaskStaleTimer(agentId);
           delete nextSdkTasks[agentId];
-          nextSdkTaskAliases = removeSdkTaskAliases(nextSdkTaskAliases, agentId);
+          nextSdkTaskAliases = removeSdkTaskAliases(
+            nextSdkTaskAliases,
+            agentId,
+          );
           // 自动清理已完成的 DB task agent（延迟移除，让用户看到完成状态）
           scheduleDbTaskAgentCleanup(set, agentId, chatJid);
         } else {
@@ -2378,7 +2889,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
       }
       // Spawn agents are fire-and-forget: auto-remove from frontend state after completion
-      if (resolvedKind === 'spawn' && (status === 'completed' || status === 'error')) {
+      if (
+        resolvedKind === 'spawn' &&
+        (status === 'completed' || status === 'error')
+      ) {
         scheduleDbTaskAgentCleanup(set, agentId, chatJid);
       }
 
@@ -2422,8 +2936,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/agents`,
       );
       set((s) => {
-        const visibleAgents = data.agents.filter((a) => a.kind === 'conversation' || (a.kind === 'spawn' && a.status !== 'completed') || a.status === 'running');
-        const runningTasks = data.agents.filter((a) => a.kind === 'task' && a.status === 'running');
+        const visibleAgents = data.agents.filter(
+          (a) =>
+            a.kind === 'conversation' ||
+            (a.kind === 'spawn' && a.status !== 'completed') ||
+            a.status === 'running',
+        );
+        const runningTasks = data.agents.filter(
+          (a) => a.kind === 'task' && a.status === 'running',
+        );
         const runningTaskIds = new Set(runningTasks.map((a) => a.id));
         const runningTaskMap = new Map(runningTasks.map((a) => [a.id, a]));
 
@@ -2466,7 +2987,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         const nextActiveTab = { ...s.activeAgentTab };
         if (nextActiveTab[jid] && !runningTaskIds.has(nextActiveTab[jid]!)) {
-          const stillExists = visibleAgents.some((a) => a.id === nextActiveTab[jid]);
+          const stillExists = visibleAgents.some(
+            (a) => a.id === nextActiveTab[jid],
+          );
           if (!stillExists) nextActiveTab[jid] = null;
         }
 
@@ -2482,14 +3005,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Apply saved conversation order from localStorage (only to conversations)
         let orderedAgents = visibleAgents;
         try {
-          const savedOrder = localStorage.getItem(`happyclaw-agent-order-${jid}`);
+          const savedOrder = localStorage.getItem(
+            `happyclaw-agent-order-${jid}`,
+          );
           if (savedOrder) {
             const ids: string[] = JSON.parse(savedOrder);
-            const conversations = visibleAgents.filter((a) => a.kind === 'conversation');
-            const others = visibleAgents.filter((a) => a.kind !== 'conversation');
+            const conversations = visibleAgents.filter(
+              (a) => a.kind === 'conversation',
+            );
+            const others = visibleAgents.filter(
+              (a) => a.kind !== 'conversation',
+            );
             orderedAgents = [...sortByIdOrder(conversations, ids), ...others];
           }
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
 
         return {
           agents: { ...s.agents, [jid]: orderedAgents },
@@ -2507,7 +3038,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 删除子 Agent
   deleteAgentAction: async (jid, agentId) => {
     try {
-      await api.delete(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`);
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}`,
+      );
       void deleteAgentMessageSnapshot(jid, agentId);
       clearSdkTaskCleanupTimer(agentId);
       clearSdkTaskStaleTimer(agentId);
@@ -2525,7 +3058,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (nextActiveTab[jid] === agentId) nextActiveTab[jid] = null;
         const nextSdkTasks = { ...s.sdkTasks };
         delete nextSdkTasks[agentId];
-        const nextSdkTaskAliases = removeSdkTaskAliases(s.sdkTaskAliases, agentId);
+        const nextSdkTaskAliases = removeSdkTaskAliases(
+          s.sdkTaskAliases,
+          agentId,
+        );
         return {
           agents: { ...s.agents, [jid]: updated },
           agentMessages: nextAgentMessages,
@@ -2538,7 +3074,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         };
       });
       return true;
-    } catch {
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : '删除会话失败' });
       return false;
     }
   },
@@ -2562,23 +3099,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
     // Persist to localStorage
     try {
-      localStorage.setItem(`happyclaw-agent-order-${jid}`, JSON.stringify(orderedIds));
-    } catch { /* ignore */ }
+      localStorage.setItem(
+        `happyclaw-agent-order-${jid}`,
+        JSON.stringify(orderedIds),
+      );
+    } catch {
+      /* ignore */
+    }
   },
 
   createConversation: async (jid, name, description?) => {
     try {
-      const data = await api.post<{ agent: AgentInfo }>(
-        `/api/groups/${encodeURIComponent(jid)}/agents`,
+      const data = await api.post<{ session?: AgentInfo; agent?: AgentInfo }>(
+        `/api/groups/${encodeURIComponent(jid)}/sessions`,
         { name, description },
       );
+      const created = data.session ?? data.agent;
+      if (!created) throw new Error('创建会话失败');
       set((s) => {
         const existing = s.agents[jid] || [];
         // WS agent_status broadcast may have already added it
-        if (existing.some((a) => a.id === data.agent.id)) return s;
-        return { agents: { ...s.agents, [jid]: [...existing, data.agent] } };
+        if (existing.some((a) => a.id === created.id)) return s;
+        return { agents: { ...s.agents, [jid]: [...existing, created] } };
       });
-      return data.agent;
+      return created;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
       return null;
@@ -2587,7 +3131,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   renameConversation: async (jid, agentId, name) => {
     try {
-      await api.patch(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`, { name });
+      await api.patch(
+        `/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}`,
+        { name },
+      );
       set((s) => {
         const agents = (s.agents[jid] || []).map((a) =>
           a.id === agentId ? { ...a, name } : a,
@@ -2602,7 +3149,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadAgentMessages: async (jid, agentId, loadMore = false) => {
     const existing = get().agentMessages[agentId] || [];
-    const before = loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
+    const before =
+      loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
 
     try {
       const params = new URLSearchParams(
@@ -2628,7 +3176,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (!loadMore && snapshotMessages.length === 0) {
         void deleteAgentMessageSnapshot(jid, agentId);
       } else {
-        void saveAgentMessageSnapshot(jid, agentId, snapshotMessages, data.hasMore);
+        void saveAgentMessageSnapshot(
+          jid,
+          agentId,
+          snapshotMessages,
+          data.hasMore,
+        );
       }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -2663,10 +3216,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Send via WebSocket with agentId.
     // NOTE: 先尝试 ws.send，成功后再清 agentStreaming / 置 agentWaiting，
     // 避免失败时 UI 进入"等待中但消息没发出"的不一致状态。
-    const normalizedAttachments = attachments && attachments.length > 0
-      ? attachments.map(att => ({ type: 'image' as const, ...att }))
-      : undefined;
-    const sent = wsManager.send({ type: 'send_message', chatJid: jid, content, agentId, attachments: normalizedAttachments });
+    const normalizedAttachments =
+      attachments && attachments.length > 0
+        ? attachments.map((att) => ({ type: 'image' as const, ...att }))
+        : undefined;
+    const sent = wsManager.send({
+      type: 'send_message',
+      chatJid: jid,
+      content,
+      agentId,
+      attachments: normalizedAttachments,
+    });
     if (!sent) {
       showToast('发送失败', 'WebSocket 未连接，输入已保留，请稍后重试');
       return false;
@@ -2684,7 +3244,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   refreshAgentMessages: async (jid, agentId) => {
     const existing = get().agentMessages[agentId] || [];
-    const lastTs = existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
+    const lastTs =
+      existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
 
     try {
       const params = new URLSearchParams({ limit: '50', agentId });
@@ -2711,7 +3272,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
               m.source_kind !== 'sdk_send_message',
           );
           const nextAgentStreaming = agentReplied
-            ? (() => { const n = { ...s.agentStreaming }; delete n[agentId]; return n; })()
+            ? (() => {
+                const n = { ...s.agentStreaming };
+                delete n[agentId];
+                return n;
+              })()
             : s.agentStreaming;
 
           return {
@@ -2723,7 +3288,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           };
         });
         if (snapshotMessages) {
-          void saveAgentMessageSnapshot(jid, agentId, snapshotMessages, snapshotHasMore);
+          void saveAgentMessageSnapshot(
+            jid,
+            agentId,
+            snapshotMessages,
+            snapshotHasMore,
+          );
         }
       }
     } catch (err) {
@@ -2738,15 +3308,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/im-groups`,
       );
       return data.imGroups;
-    } catch {
-      return [];
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '加载消息渠道失败';
+      set({ error: message });
+      throw err;
     }
   },
 
   bindImGroup: async (jid, agentId, imJid, force) => {
     try {
       await api.put(
-        `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}/im-binding`,
         { im_jid: imJid, ...(force ? { force: true } : {}) },
       );
       // Refresh agents to get updated linked_im_groups
@@ -2760,7 +3332,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unbindImGroup: async (jid, agentId, imJid) => {
     try {
       await api.delete(
-        `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
       );
       get().loadAgents(jid, { force: true });
       return true;
@@ -2772,7 +3344,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   bindMainImGroup: async (jid, imJid, force, activationMode, ownerImId) => {
     try {
       await api.put(
-        `/api/groups/${encodeURIComponent(jid)}/im-binding`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding`,
         {
           im_jid: imJid,
           ...(force ? { force: true } : {}),
@@ -2790,7 +3362,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unbindMainImGroup: async (jid, imJid) => {
     try {
       await api.delete(
-        `/api/groups/${encodeURIComponent(jid)}/im-binding/${encodeURIComponent(imJid)}`,
+        `/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding/${encodeURIComponent(imJid)}`,
       );
       await get().loadGroups();
       return true;
@@ -2802,7 +3374,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 刷新/重连时恢复正在运行的 agent 状态
   restoreActiveState: async () => {
     try {
-      const data = await api.get<{ groups: Array<{ jid: string; active: boolean; pendingMessages?: boolean }> }>('/api/status');
+      const data = await api.get<{
+        groups: Array<{
+          jid: string;
+          active: boolean;
+          pendingMessages?: boolean;
+        }>;
+      }>('/api/status');
       const knownJids = new Set(data.groups.map((g) => g.jid));
 
       // 关键：对 active 群组先 refreshMessages 同步本地与后端真相，再做推断。
@@ -2823,7 +3401,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const nextStreaming = { ...s.streaming };
 
         // 清除后端不可见的 JID 的 waiting/streaming（进程已死）
-        // （pm2 restart 后 queue 为空，所有 JID 都不在集合中）。
+        // （主服务重启后 queue 为空，所有 JID 都不在集合中）。
         for (const jid of Object.keys(nextWaiting)) {
           if (!knownJids.has(jid)) {
             delete nextWaiting[jid];
@@ -2851,7 +3429,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const inferredWaiting =
             !!latest &&
             latest.sender !== '__system__' &&
-            (latest.is_from_me === false || latest.source_kind === 'sdk_send_message');
+            (latest.is_from_me === false ||
+              latest.source_kind === 'sdk_send_message');
           if (inferredWaiting) {
             nextWaiting[g.jid] = true;
             // Restore streaming state from sessionStorage if available
@@ -2974,7 +3553,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       delete next[chatJid];
       if (preserveThinking && thinkingText) {
         nextPendingThinking[chatJid] = thinkingText;
-        if (thinkingDur != null) nextPendingThinkingDuration[chatJid] = thinkingDur;
+        if (thinkingDur != null)
+          nextPendingThinkingDuration[chatJid] = thinkingDur;
         else delete nextPendingThinkingDuration[chatJid];
       } else {
         delete nextPendingThinking[chatJid];
@@ -2993,13 +3573,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const nextAgentStreaming = { ...s.agentStreaming };
       let agentStreamingChanged = false;
       for (const [taskId, task] of Object.entries(s.sdkTasks)) {
-        if (task.chatJid === chatJid && !runningSet.has(taskId) && nextAgentStreaming[taskId]) {
+        if (
+          task.chatJid === chatJid &&
+          !runningSet.has(taskId) &&
+          nextAgentStreaming[taskId]
+        ) {
           delete nextAgentStreaming[taskId];
           agentStreamingChanged = true;
         }
       }
       // 同时清理 agents[] 中已完成的 conversation agent 的 agentStreaming
-      for (const agent of (s.agents[chatJid] || [])) {
+      for (const agent of s.agents[chatJid] || []) {
         if (agent.status !== 'running' && nextAgentStreaming[agent.id]) {
           delete nextAgentStreaming[agent.id];
           agentStreamingChanged = true;
@@ -3011,7 +3595,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         streaming: next,
         pendingThinking: nextPendingThinking,
         pendingThinkingDuration: nextPendingThinkingDuration,
-        ...(agentStreamingChanged ? { agentStreaming: nextAgentStreaming } : {}),
+        ...(agentStreamingChanged
+          ? { agentStreaming: nextAgentStreaming }
+          : {}),
       };
     });
   },
