@@ -17,7 +17,7 @@ afterEach(() => {
   }
 });
 
-function setupSendTool() {
+function setupSendTool(toolName = 'send_message') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-send-ack-'));
   roots.push(root);
   const context: McpContext = {
@@ -32,9 +32,9 @@ function setupSendTool() {
     workspaceMemory: root,
   };
   const sendTool = createMcpTools(context).find(
-    (candidate) => candidate.name === 'send_message',
+    (candidate) => candidate.name === toolName,
   );
-  if (!sendTool) throw new Error('send_message tool missing');
+  if (!sendTool) throw new Error(`${toolName} tool missing`);
   return { root, sendTool };
 }
 
@@ -92,5 +92,69 @@ describe('send_message host acknowledgement', () => {
       error: 'connector unavailable',
     });
     await expect(pending).rejects.toThrow('connector unavailable');
+  });
+});
+
+describe('scheduled media host acknowledgement', () => {
+  test('send_image waits for and surfaces a physical delivery failure', async () => {
+    const { root, sendTool } = setupSendTool('send_image');
+    const imagePath = path.join(root, 'pixel.png');
+    fs.writeFileSync(
+      imagePath,
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0XQAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    const pending = sendTool.handler(
+      { file_path: imagePath, caption: 'status' },
+      {} as never,
+    );
+    const request = await readRequest(root);
+    expect(request).toMatchObject({
+      type: 'image',
+      filePath: 'pixel.png',
+      requestId: expect.any(String),
+    });
+    writeResult(root, request.requestId as string, {
+      success: false,
+      error: 'image connector unavailable',
+    });
+    await expect(pending).rejects.toThrow('image connector unavailable');
+  });
+
+  test('send_file waits for the task IPC delivery result', async () => {
+    const { root, sendTool } = setupSendTool('send_file');
+    fs.writeFileSync(path.join(root, 'report.pdf'), 'report');
+    const pending = sendTool.handler(
+      { filePath: 'report.pdf', fileName: 'report.pdf' },
+      {} as never,
+    );
+    const tasksDir = path.join(root, 'tasks');
+    let requestFile = '';
+    await vi.waitFor(() => {
+      requestFile = fs
+        .readdirSync(tasksDir)
+        .find((name) => !name.includes('_result_'))!;
+      expect(requestFile).toBeTruthy();
+    });
+    const request = JSON.parse(
+      fs.readFileSync(path.join(tasksDir, requestFile), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(request.requestId).toEqual(expect.any(String));
+    fs.writeFileSync(
+      path.join(
+        tasksDir,
+        `send_file_result_${request.requestId as string}.json`,
+      ),
+      JSON.stringify({ success: true }),
+    );
+    await expect(pending).resolves.toMatchObject({
+      content: [
+        expect.objectContaining({
+          text: expect.stringContaining('report.pdf'),
+        }),
+      ],
+    });
   });
 });

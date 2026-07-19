@@ -31,7 +31,8 @@ const {
   clearStaleTaskLeases,
 } = await import('../src/db.js');
 
-const { shouldSkipBackfill } = await import('../src/task-scheduler.js');
+const { shouldSkipBackfill, validateCronMinimumInterval } =
+  await import('../src/task-scheduler.js');
 
 beforeAll(() => {
   initDatabase();
@@ -70,6 +71,17 @@ function makeTask(overrides: Partial<Parameters<typeof createTask>[0]> = {}) {
 }
 
 describe('task backfill grace — db helpers', () => {
+  test('cron minimum interval is deterministic from the complete seconds field', () => {
+    for (const value of ['* * * * * *', '0,30 0 * * * *', '@secondly']) {
+      expect(() => validateCronMinimumInterval(value)).toThrow(
+        'at least 60 seconds',
+      );
+    }
+    for (const value of ['* * * * *', '0 * * * * *', '*/60 * * * * *']) {
+      expect(() => validateCronMinimumInterval(value)).not.toThrow();
+    }
+  });
+
   test('getDueTasks returns all tasks with next_run <= now (regardless of how overdue)', () => {
     const id1 = makeTask({
       next_run: new Date(Date.now() - 60_000).toISOString(), // 1 min overdue

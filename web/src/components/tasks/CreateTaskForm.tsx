@@ -113,6 +113,30 @@ export function CreateTaskForm({
     if (aWeb !== bWeb) return aWeb - bWeb;
     return a.localeCompare(b);
   });
+  const scriptGroupEntries = sortedGroupEntries.filter(
+    ([jid]) => groups[jid]?.execution_mode === 'host',
+  );
+  const defaultWorkspaceMode = Object.values(groups).find(
+    (group) => group.is_my_home,
+  )?.execution_mode;
+
+  useEffect(() => {
+    if (!isScript) return;
+    setExecutionModeExplicit(true);
+    setFormData((previous) =>
+      previous.executionMode === 'host'
+        ? previous
+        : { ...previous, executionMode: 'host' },
+    );
+    const selectedMode = chatJid
+      ? groups[chatJid]?.execution_mode
+      : defaultWorkspaceMode;
+    if (selectedMode === 'host') return;
+    const firstHostJid = Object.keys(groupNames).find(
+      (jid) => groups[jid]?.execution_mode === 'host',
+    );
+    if (firstHostJid && firstHostJid !== chatJid) setChatJid(firstHostJid);
+  }, [isScript, chatJid, groups, groupNames, defaultWorkspaceMode]);
 
   const renderTargetWorkspace = () => (
     <div>
@@ -129,16 +153,22 @@ export function CreateTaskForm({
           <SelectValue />
         </SelectTrigger>
         <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
-          <SelectItem value="__default__">默认工作区</SelectItem>
-          {sortedGroupEntries.map(([jid, name]) => (
-            <SelectItem key={jid} value={jid}>
-              {formatGroupLabel(jid, name)}
-            </SelectItem>
-          ))}
+          {(!isScript || defaultWorkspaceMode === 'host') && (
+            <SelectItem value="__default__">默认工作区</SelectItem>
+          )}
+          {(isScript ? scriptGroupEntries : sortedGroupEntries).map(
+            ([jid, name]) => (
+              <SelectItem key={jid} value={jid}>
+                {formatGroupLabel(jid, name)}
+              </SelectItem>
+            ),
+          )}
         </SelectContent>
       </Select>
       <p className="mt-1 text-xs text-muted-foreground">
-        任务会在这个工作区的目录和环境中执行，并继承该工作区的 Agent。
+        {isScript
+          ? '脚本仅可选择管理员宿主机工作区，并直接在该宿主机目录中执行。'
+          : '任务会在这个工作区的目录和环境中执行，并继承该工作区的 Agent。'}
       </p>
     </div>
   );
@@ -216,6 +246,15 @@ export function CreateTaskForm({
     if (isScript) {
       if (!formData.scriptCommand.trim())
         newErrors.scriptCommand = '请输入脚本命令';
+      if (formData.executionMode !== 'host') {
+        newErrors.executionMode = '脚本任务只能使用宿主机模式';
+      }
+      const selectedMode = chatJid
+        ? groups[chatJid]?.execution_mode
+        : defaultWorkspaceMode;
+      if (selectedMode && selectedMode !== 'host') {
+        newErrors.executionMode = '请选择管理员宿主机工作区';
+      }
     } else {
       if (!formData.prompt.trim()) newErrors.prompt = '请输入 Prompt';
     }
@@ -469,6 +508,7 @@ export function CreateTaskForm({
                 </label>
                 <Select
                   value={formData.executionMode}
+                  disabled={isScript}
                   onValueChange={(value) => {
                     setExecutionModeExplicit(true);
                     setFormData({
@@ -482,14 +522,23 @@ export function CreateTaskForm({
                   </SelectTrigger>
                   <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
                     <SelectItem value="host">宿主机</SelectItem>
-                    <SelectItem value="container">Docker 容器</SelectItem>
+                    {!isScript && (
+                      <SelectItem value="container">Docker 容器</SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {executionModeExplicit
-                    ? '已手动指定执行模式，不再跟随源工作区'
-                    : '默认继承源工作区的执行模式，选择后将锁定不再自动同步'}
+                  {isScript
+                    ? '脚本固定使用宿主机模式；Docker 容器脚本不会被执行。'
+                    : executionModeExplicit
+                      ? '已手动指定执行模式，不再跟随源工作区'
+                      : '默认继承源工作区的执行模式，选择后将锁定不再自动同步'}
                 </p>
+                {errors.executionMode && (
+                  <p className="mt-1 text-sm text-red-600 dark:text-red-400">
+                    {errors.executionMode}
+                  </p>
+                )}
               </div>
             )}
 

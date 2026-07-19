@@ -34,7 +34,11 @@ describe('host script privilege revocation', () => {
     expect(getActiveScriptCount()).toBe(1);
 
     await expect(terminateScriptsForOwner('admin-1')).resolves.toBe(1);
-    await running;
+    await expect(running).resolves.toMatchObject({
+      aborted: true,
+      timedOut: false,
+      exitCode: null,
+    });
     expect(getActiveScriptCount()).toBe(0);
   });
 });

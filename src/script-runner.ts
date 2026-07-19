@@ -10,6 +10,7 @@ export interface ScriptRunResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  aborted: boolean;
   durationMs: number;
 }
 
@@ -20,6 +21,7 @@ interface ActiveScriptRun {
   child: ChildProcess;
   ownerId?: string;
   groupFolder: string;
+  abort: () => void;
   settled: Promise<void>;
 }
 
@@ -58,7 +60,10 @@ export async function terminateScriptsForOwner(
   const targets = [...activeScriptRuns.values()].filter(
     (run) => run.ownerId === userId,
   );
-  for (const run of targets) killScriptProcessTree(run.child);
+  // Use the same state transition as AbortSignal cancellation. Killing the
+  // process tree directly would leave `aborted=false`; a SIGKILL close event
+  // with a null exit code could then be misclassified as a successful script.
+  for (const run of targets) run.abort();
   await Promise.all(
     targets.map((run) =>
       Promise.race([
@@ -80,7 +85,7 @@ const MAX_BUFFER = 1024 * 1024; // 1MB
 export async function runScript(
   command: string,
   groupFolder: string,
-  options?: { ownerId?: string },
+  options?: { ownerId?: string; signal?: AbortSignal },
 ): Promise<ScriptRunResult> {
   const { scriptTimeout } = getSystemSettings();
   const cwd = path.join(GROUPS_DIR, groupFolder);
@@ -98,6 +103,7 @@ export async function runScript(
       let stdout = '';
       let stderr = '';
       let timedOut = false;
+      let aborted = false;
       let finished = false;
       const child = spawn(command, {
         cwd,
@@ -117,6 +123,12 @@ export async function runScript(
         killScriptProcessTree(child);
       }, scriptTimeout);
       timeout.unref?.();
+      const onAbort = () => {
+        aborted = true;
+        killScriptProcessTree(child);
+      };
+      if (options?.signal?.aborted) onAbort();
+      else options?.signal?.addEventListener('abort', onAbort, { once: true });
       child.stdout?.on('data', (chunk: Buffer | string) => {
         if (stdout.length < MAX_BUFFER) stdout += chunk.toString();
       });
@@ -127,6 +139,7 @@ export async function runScript(
         if (finished) return;
         finished = true;
         clearTimeout(timeout);
+        options?.signal?.removeEventListener('abort', onAbort);
         activeScriptRuns.delete(runId);
         activeScriptCount--;
         settleRun();
@@ -142,8 +155,10 @@ export async function runScript(
         resolve({
           stdout: stdout.slice(0, MAX_BUFFER),
           stderr: (spawnError?.message || stderr).slice(0, MAX_BUFFER),
-          exitCode: timedOut ? null : (exitCode ?? (spawnError ? 1 : 0)),
+          exitCode:
+            timedOut || aborted ? null : (exitCode ?? (spawnError ? 1 : 0)),
           timedOut,
+          aborted,
           durationMs,
         });
       };
@@ -153,6 +168,7 @@ export async function runScript(
         child,
         ownerId: options?.ownerId,
         groupFolder,
+        abort: onAbort,
         settled,
       });
     });
@@ -168,6 +184,7 @@ export async function runScript(
       stderr: err instanceof Error ? err.message : String(err),
       exitCode: 1,
       timedOut: false,
+      aborted: false,
       durationMs,
     };
   }

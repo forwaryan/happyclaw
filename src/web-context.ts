@@ -171,7 +171,12 @@ export interface WebDeps {
    * key 为 virtualChatJid（`web:{folder}#agent:{id}`）。主会话路径无需调用
    * ——updateReplyRoute 触发的 route updater 已内置同样的收口。 */
   finalizeHeldCard?: (key: string) => void;
-  triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
+  triggerTaskRun?: (
+    taskId: string,
+    idempotencyKey?: string,
+  ) => { success: boolean; error?: string; runId?: string };
+  /** Stop one occurrence only; future schedule remains unchanged. */
+  cancelTaskRun?: (runId: string) => { success: boolean; error?: string };
   handleSpawnCommand?: (
     chatJid: string,
     message: string,

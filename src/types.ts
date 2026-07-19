@@ -308,9 +308,98 @@ export interface ScheduledTask {
   created_at: string;
   created_by?: string;
   notify_channels?: string[] | null;
+  /** Optimistic-concurrency revision for edits made through REST/MCP/UI. */
+  revision: number;
+  updated_at: string;
+  /** Soft deletion keeps task history queryable while removing future fires. */
+  deleted_at: string | null;
+}
+
+export type TaskRunTrigger = 'scheduled' | 'manual' | 'backfill';
+
+export type TaskRunStatus =
+  | 'queued'
+  | 'running'
+  | 'retry_wait'
+  | 'success'
+  | 'failed'
+  | 'cancelled'
+  | 'missed'
+  | 'delivered';
+
+export type TaskRunNotificationStatus =
+  | 'pending'
+  | 'success'
+  | 'partial_failed'
+  | 'failed'
+  | 'skipped';
+
+export interface TaskRunNotificationSummary {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  failed_channels: string[];
+}
+
+export interface TaskRunNotificationReceipt {
+  status: Exclude<TaskRunNotificationStatus, 'pending'>;
+  summary: TaskRunNotificationSummary;
+  error?: string | null;
+}
+
+/**
+ * Immutable, non-secret definition used by one occurrence. A queued/retried run
+ * must never silently switch to a newer task definition.
+ */
+export interface TaskRunDefinitionSnapshot {
+  prompt: string;
+  group_folder: string;
+  chat_jid: string;
+  context_mode: 'group' | 'isolated';
+  execution_type: 'agent' | 'script';
+  execution_mode: 'host' | 'container' | null;
+  script_command: string | null;
+  notify_channels: string[] | null;
+}
+
+/** Durable state for one scheduled/manual occurrence. */
+export interface TaskRun {
+  id: string;
+  task_id: string;
+  trigger_type: TaskRunTrigger;
+  idempotency_key: string | null;
+  scheduled_for: string;
+  definition_revision: number;
+  definition_snapshot: TaskRunDefinitionSnapshot;
+  status: TaskRunStatus;
+  attempt: number;
+  available_at: string;
+  lease_owner: string | null;
+  lease_token: number;
+  lease_expires_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  duration_ms: number;
+  result: string | null;
+  error: string | null;
+  notification_status: TaskRunNotificationStatus;
+  notification_error: string | null;
+  notification_summary: TaskRunNotificationSummary | null;
+  notification_attempt: number;
+  notification_available_at: string | null;
+}
+
+export interface ClaimedTaskRun extends TaskRun {
+  status: 'running';
+  lease_owner: string;
+  lease_expires_at: string;
 }
 
 export interface TaskRunLog {
+  id?: number;
+  run_id?: string;
   task_id: string;
   run_at: string;
   duration_ms: number;

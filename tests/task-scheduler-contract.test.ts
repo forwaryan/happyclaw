@@ -33,45 +33,55 @@ vi.mock('../src/logger.js', () => ({
   logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
 }));
 
-const { runContainerAgentMock, runHostAgentMock } = vi.hoisted(() => ({
-  runContainerAgentMock: vi.fn(async (_group, input, onProcess, onOutput) => {
-    const sessionDir = path.join(
-      tmpDir,
-      'sessions',
-      input.groupFolder,
-      'agents',
-      input.sessionAgentId,
-      '.claude',
-    );
-    const ipcDir = path.join(
-      tmpDir,
-      'ipc',
-      input.groupFolder,
-      'tasks-run',
-      input.taskRunId,
-      'input',
-    );
-    fs.mkdirSync(sessionDir, { recursive: true });
-    fs.mkdirSync(ipcDir, { recursive: true });
-    fs.writeFileSync(path.join(sessionDir, 'transcript.jsonl'), '{}');
-    fs.writeFileSync(path.join(ipcDir, 'request.json'), '{}');
-    onProcess?.({} as never, `container-${input.taskRunId}`, null);
-    await onOutput?.({
-      status: 'stream',
-      result: 'partial',
-      streamEvent: { type: 'text', text: 'partial' },
-    });
-    return {
+const { runContainerAgentMock, runHostAgentMock, runScriptMock } = vi.hoisted(
+  () => ({
+    runContainerAgentMock: vi.fn(async (_group, input, onProcess, onOutput) => {
+      const sessionDir = path.join(
+        tmpDir,
+        'sessions',
+        input.groupFolder,
+        'agents',
+        input.sessionAgentId,
+        '.claude',
+      );
+      const ipcDir = path.join(
+        tmpDir,
+        'ipc',
+        input.groupFolder,
+        'tasks-run',
+        input.taskRunId,
+        'input',
+      );
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.mkdirSync(ipcDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionDir, 'transcript.jsonl'), '{}');
+      fs.writeFileSync(path.join(ipcDir, 'request.json'), '{}');
+      onProcess?.({} as never, `container-${input.taskRunId}`, null);
+      await onOutput?.({
+        status: 'stream',
+        result: 'partial',
+        streamEvent: { type: 'text', text: 'partial' },
+      });
+      return {
+        status: 'success',
+        result: 'task result',
+        newSessionId: `task-session:${input.taskRunId}`,
+      };
+    }),
+    runHostAgentMock: vi.fn(async () => ({
       status: 'success',
-      result: 'task result',
-      newSessionId: `task-session:${input.taskRunId}`,
-    };
+      result: 'host result',
+    })),
+    runScriptMock: vi.fn(async () => ({
+      stdout: 'script result',
+      stderr: '',
+      exitCode: 0,
+      timedOut: false,
+      aborted: false,
+      durationMs: 10,
+    })),
   }),
-  runHostAgentMock: vi.fn(async () => ({
-    status: 'success',
-    result: 'host result',
-  })),
-}));
+);
 
 vi.mock('../src/container-runner.js', async (importOriginal) => {
   const actual =
@@ -83,9 +93,21 @@ vi.mock('../src/container-runner.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../src/script-runner.js', () => ({
+  hasScriptCapacity: () => true,
+  runScript: runScriptMock,
+}));
+
 const db = await import('../src/db.js');
-const { enqueueIsolatedScheduledTask, getRunningTaskIds, triggerTaskNow } =
-  await import('../src/task-scheduler.js');
+const {
+  cancelTaskRunNow,
+  computeNextRunForTaskResume,
+  deliverPersistedNotificationPayload,
+  enqueueIsolatedScheduledTask,
+  getRunningTaskIds,
+  processClaimedTaskRunNotification,
+  triggerTaskNow,
+} = await import('../src/task-scheduler.js');
 
 const GROUP_JID = 'web:task-contract';
 const GROUP_FOLDER = 'task-contract';
@@ -155,6 +177,7 @@ beforeAll(() => {
 beforeEach(() => {
   runContainerAgentMock.mockClear();
   runHostAgentMock.mockClear();
+  runScriptMock.mockClear();
   db.setRegisteredGroup(GROUP_JID, {
     name: 'Task Contract Workspace',
     folder: GROUP_FOLDER,
@@ -169,6 +192,43 @@ afterAll(() => {
 });
 
 describe('scheduled task workspace/session contract', () => {
+  test('resume accepts only future one-shot schedules', () => {
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const past = new Date(Date.now() - 60_000).toISOString();
+
+    expect(computeNextRunForTaskResume('once', future)).toBe(future);
+    expect(() => computeNextRunForTaskResume('once', past)).toThrow(
+      '执行时间已过',
+    );
+  });
+
+  test('legacy container-mode script is paused without invoking the host runner', () => {
+    const taskId = createTask({
+      id: 'unsafe-container-script',
+      execution_type: 'script',
+      execution_mode: 'container',
+      script_command: 'touch must-not-run',
+      next_run: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    const { deps } = makeDeps(groups);
+
+    const result = triggerTaskNow(taskId, deps);
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('host'),
+    });
+    expect(runScriptMock).not.toHaveBeenCalled();
+    expect(db.getTaskById(taskId)).toMatchObject({
+      status: 'paused',
+      next_run: null,
+    });
+    expect(db.getTaskRunsForTask(taskId)).toHaveLength(0);
+  });
+
   test('isolated task runs in the source workspace with a task-scoped Claude session', async () => {
     const taskId = createTask({ id: 'task-session-contract' });
     db.setSession(GROUP_FOLDER, 'main-session');
@@ -213,7 +273,7 @@ describe('scheduled task workspace/session contract', () => {
 
     expect(queue.enqueueTask).toHaveBeenCalledWith(
       expect.stringMatching(
-        new RegExp(`^${GROUP_JID}#task:task-${taskId}-[a-f0-9-]+$`),
+        new RegExp(`^${GROUP_JID}#task:task-run-[a-f0-9-]+-attempt-1$`),
       ),
       taskId,
       expect.any(Function),
@@ -223,7 +283,7 @@ describe('scheduled task workspace/session contract', () => {
     const input = runContainerAgentMock.mock.calls[0][1];
     expect(input.groupFolder).toBe(GROUP_FOLDER);
     expect(input.chatJid).toBe(GROUP_JID);
-    expect(input.taskRunId).toMatch(new RegExp(`^task-${taskId}-[a-f0-9-]+$`));
+    expect(input.taskRunId).toBe(`task-run-${result.runId}-attempt-1`);
     expect(input.taskRunId).toMatch(/^[a-zA-Z0-9_-]+$/);
     expect(input.sessionAgentId).toBe(`task-${input.taskRunId}`);
     expect(input.sessionAgentId).toMatch(/^[a-zA-Z0-9_-]+$/);
@@ -276,8 +336,8 @@ describe('scheduled task workspace/session contract', () => {
 
     const firstInput = runContainerAgentMock.mock.calls[0][1];
     const secondInput = runContainerAgentMock.mock.calls[1][1];
-    expect(firstInput.taskRunId).toMatch(new RegExp(`^task-${taskId}-`));
-    expect(secondInput.taskRunId).toMatch(new RegExp(`^task-${taskId}-`));
+    expect(firstInput.taskRunId).toMatch(/^task-run-[a-f0-9-]+-attempt-1$/);
+    expect(secondInput.taskRunId).toMatch(/^task-run-[a-f0-9-]+-attempt-1$/);
     expect(secondInput.taskRunId).not.toBe(firstInput.taskRunId);
     expect(firstInput.sessionAgentId).toBe(`task-${firstInput.taskRunId}`);
     expect(secondInput.sessionAgentId).toBe(`task-${secondInput.taskRunId}`);
@@ -341,6 +401,578 @@ describe('scheduled task workspace/session contract', () => {
       status: 'error',
       error: expect.stringContaining('active administrator'),
     });
+  });
+
+  test('script source failure falls back without false delivered state', async () => {
+    const ownerId = 'script-notification-owner';
+    const sourceJid = 'feishu:script-notification-source';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-notification-independent',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+      notify_channels: ['feishu', 'telegram'],
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockRejectedValue(new Error('channel unavailable'));
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'success',
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    expect(trigger).toMatchObject({ success: true, runId: expect.any(String) });
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(runScriptMock).toHaveBeenCalledOnce();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      notification_status: 'success',
+      result: 'script result',
+    });
+    expect(deps.sendMessage).toHaveBeenCalledOnce();
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      sourceJid,
+      expect.stringContaining('[脚本] script result'),
+      expect.objectContaining({
+        skipStore: true,
+        sourceAlreadyDelivered: false,
+      }),
+    );
+    expect(db.getTaskRunLogs(taskId, 1)[0]).toMatchObject({
+      status: 'success',
+      result: 'script result',
+    });
+  });
+
+  test('an owner-revoked script abort is recorded as failed and never sends a success notification', async () => {
+    const ownerId = 'revoked-running-script-owner';
+    const sourceJid = 'web:revoked-running-script';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'owner-revoked-running-script',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'sleep 60',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+    });
+    runScriptMock.mockResolvedValueOnce({
+      stdout: '',
+      stderr: '',
+      exitCode: null,
+      timedOut: false,
+      aborted: true,
+      durationMs: 25,
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'failed',
+      error: '脚本执行已取消',
+      notification_status: 'skipped',
+    });
+    expect(db.getTaskRunLogs(taskId, 1)[0]).toMatchObject({
+      status: 'error',
+      error: '脚本执行已取消',
+    });
+    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalled();
+  });
+
+  test('persists a strict source failure before finish and fallback success consumes only that retry item', async () => {
+    const ownerId = 'script-source-crash-window-owner';
+    const sourceJid = 'feishu:script-source-crash-window';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-source-crash-window',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+      notify_channels: ['feishu', 'telegram'],
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockRejectedValue(new Error('strict source ACK failed'));
+    let resolveFallback!: (receipt: db.TaskRunNotificationReceipt) => void;
+    deps.storeResultAndNotify.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFallback = resolve;
+        }),
+    );
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await vi.waitFor(() => {
+      expect(deps.storeResultAndNotify).toHaveBeenCalledOnce();
+    });
+
+    const beforeFinish = db.getTaskRunById(trigger.runId!)!;
+    expect(beforeFinish).toMatchObject({
+      status: 'running',
+      notification_status: 'failed',
+      notification_error: 'strict source ACK failed',
+    });
+    const rawBefore = beforeFinish as unknown as {
+      notification_payload: string;
+    };
+    expect(JSON.parse(rawBefore.notification_payload)).toMatchObject({
+      kind: 'send_message',
+      chatJid: sourceJid,
+    });
+
+    const ipcPayload: db.TaskRunNotificationPayload = {
+      kind: 'im_image',
+      targetJid: 'telegram:unrelated-ipc',
+      workspaceFolder: GROUP_FOLDER,
+      filePath: 'unrelated.png',
+      mimeType: 'image/png',
+      fileName: 'unrelated.png',
+    };
+    expect(
+      db.recordTaskRunNotificationReceipt(
+        trigger.runId!,
+        {
+          status: 'failed',
+          summary: {
+            attempted: 1,
+            succeeded: 0,
+            failed: 1,
+            failed_channels: ['telegram'],
+          },
+          error: 'unrelated IPC failure',
+        },
+        ipcPayload,
+      ),
+    ).toBe(true);
+
+    resolveFallback({
+      status: 'success',
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    const finished = db.getTaskRunById(trigger.runId!)!;
+    expect(finished).toMatchObject({
+      status: 'success',
+      notification_status: 'partial_failed',
+      notification_summary: {
+        attempted: 2,
+        succeeded: 1,
+        failed: 1,
+        failed_channels: ['telegram'],
+      },
+    });
+    const rawFinished = finished as unknown as {
+      notification_payload: string;
+    };
+    expect(JSON.parse(rawFinished.notification_payload)).toEqual(ipcPayload);
+    expect(
+      db.replaceTaskRunNotificationReceipt(
+        trigger.runId!,
+        {
+          status: 'failed',
+          summary: {
+            attempted: 1,
+            succeeded: 0,
+            failed: 1,
+            failed_channels: ['telegram'],
+          },
+          error: 'unrelated IPC failure',
+        },
+        ipcPayload,
+        {
+          status: 'success',
+          summary: {
+            attempted: 1,
+            succeeded: 1,
+            failed: 0,
+            failed_channels: [],
+          },
+        },
+      ),
+    ).toBe(true);
+  });
+
+  test('script notification failure persists retry-only fallback work', async () => {
+    const ownerId = 'script-notification-retry-owner';
+    const sourceJid = 'feishu:script-notification-retry-source';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-notification-retry-only',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+      notify_channels: ['feishu', 'telegram'],
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockRejectedValue(new Error('source connector failed'));
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'partial_failed',
+      summary: {
+        attempted: 2,
+        succeeded: 1,
+        failed: 1,
+        failed_channels: ['feishu'],
+      },
+      error: 'fallback connector failed',
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+    const finished = db.getTaskRunById(trigger.runId!)!;
+    expect(finished).toMatchObject({
+      status: 'success',
+      notification_status: 'partial_failed',
+      result: 'script result',
+    });
+    expect(finished.notification_summary).toEqual({
+      attempted: 2,
+      succeeded: 1,
+      failed: 1,
+      failed_channels: ['feishu'],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    const retryClaim = db.claimNextTaskRunNotification(
+      'script-notification-retry-worker',
+      60_000,
+    )!;
+    expect(retryClaim.payload).toMatchObject({
+      kind: 'store_result_and_notify',
+      chatJid: sourceJid,
+      options: {
+        skipStore: true,
+        sourceAlreadyDelivered: false,
+        notifyChannels: ['feishu'],
+      },
+    });
+
+    deps.storeResultAndNotify.mockImplementationOnce(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      return {
+        status: 'success',
+        summary: {
+          attempted: 1,
+          succeeded: 1,
+          failed: 0,
+          failed_channels: [],
+        },
+      };
+    });
+    const retrying = processClaimedTaskRunNotification(retryClaim, deps, 60);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(
+      db.claimNextTaskRunNotification('competing-retry-worker', 60),
+    ).toBeUndefined();
+    expect(await retrying).toBe(true);
+    expect(deps.storeResultAndNotify).toHaveBeenLastCalledWith(
+      sourceJid,
+      expect.stringContaining('[脚本] script result'),
+      expect.objectContaining({ skipStore: true }),
+    );
+    expect(deps.sendMessage).toHaveBeenCalledOnce();
+    expect(runScriptMock).toHaveBeenCalledOnce();
+    expect(db.getTaskRunById(trigger.runId!)?.notification_status).toBe(
+      'success',
+    );
+  });
+
+  test('generic persisted fallback exceptions retain the original channel filter', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'store_result_and_notify',
+      chatJid: 'web:notification-retry-source',
+      text: 'scheduled output',
+      options: {
+        ownerId: 'notification-retry-owner',
+        notifyChannels: ['feishu', 'telegram'],
+        skipStore: true,
+      },
+    };
+    const result = await deliverPersistedNotificationPayload(payload, {
+      storeResultAndNotify: vi.fn(async () => {
+        throw new Error('broadcast transport crashed');
+      }),
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt).toMatchObject({
+      status: 'failed',
+      summary: { failed_channels: ['web:notification-retry-source'] },
+    });
+    expect(result.retryPayload).toEqual(payload);
+  });
+
+  test('strictly acknowledged script source is excluded from fallback', async () => {
+    const ownerId = 'script-notification-ack-owner';
+    const sourceJid = 'feishu:script-notification-ack-source';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-notification-no-duplicate',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockResolvedValue('message-id');
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'skipped',
+      summary: {
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(deps.sendMessage).toHaveBeenCalledOnce();
+    expect(deps.storeResultAndNotify).toHaveBeenCalledOnce();
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      sourceJid,
+      expect.stringContaining('[脚本] script result'),
+      expect.objectContaining({ sourceAlreadyDelivered: true }),
+    );
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      notification_status: 'success',
+      notification_summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+  });
+
+  test('successful final-error fallback cannot hide an earlier IPC retry payload', async () => {
+    const ownerId = 'isolated-ipc-before-final-owner';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const group = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      created_by: ownerId,
+    };
+    db.setRegisteredGroup(GROUP_JID, group);
+    const taskId = createTask({
+      id: 'isolated-ipc-failure-before-final-fallback',
+      created_by: ownerId,
+    });
+    const ipcPayload: db.TaskRunNotificationPayload = {
+      kind: 'im_image',
+      targetJid: 'feishu:ipc-target',
+      workspaceFolder: GROUP_FOLDER,
+      filePath: 'failed-image.png',
+      mimeType: 'image/png',
+      fileName: 'failed-image.png',
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        const prefix = 'task-run-';
+        const suffix = '-attempt-1';
+        const durableRunId = input.taskRunId.slice(
+          prefix.length,
+          -suffix.length,
+        );
+        expect(
+          db.recordTaskRunNotificationReceipt(
+            durableRunId,
+            {
+              status: 'failed',
+              summary: {
+                attempted: 1,
+                succeeded: 0,
+                failed: 1,
+                failed_channels: ['feishu'],
+              },
+              error: 'IPC image delivery failed',
+            },
+            ipcPayload,
+          ),
+        ).toBe(true);
+        return { status: 'error', error: 'Agent failed after IPC output' };
+      },
+    );
+    const { deps, waitForRun } = makeDeps({ [GROUP_JID]: group });
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'success',
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'failed',
+      notification_status: 'partial_failed',
+      notification_summary: {
+        attempted: 2,
+        succeeded: 1,
+        failed: 1,
+        failed_channels: ['feishu'],
+      },
+    });
+    expect(
+      JSON.parse(
+        (
+          db.getTaskRunById(trigger.runId!) as unknown as {
+            notification_payload: string;
+          }
+        ).notification_payload,
+      ),
+    ).toEqual(ipcPayload);
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringContaining('Agent failed after IPC output'),
+      expect.objectContaining({ ownerId }),
+    );
   });
 
   test('admin-created cross-group container task does not inherit isAdminHome from its creator', async () => {
@@ -428,15 +1060,24 @@ describe('scheduled task workspace/session contract', () => {
       queue,
     } as any;
 
-    expect(triggerTaskNow(taskId, deps)).toEqual({ success: true });
+    const firstTrigger = triggerTaskNow(taskId, deps);
+    expect(firstTrigger).toEqual({
+      success: true,
+      runId: expect.any(String),
+    });
+    expect(JSON.parse(JSON.stringify(firstTrigger))).toEqual(firstTrigger);
     expect(triggerTaskNow(taskId, deps)).toEqual({
       success: false,
       error: 'Task is already running',
+      runId: firstTrigger.runId,
     });
     expect(queue.enqueueTask).toHaveBeenCalledTimes(1);
 
     await queuedRun!();
-    expect(triggerTaskNow(taskId, deps)).toEqual({ success: true });
+    expect(triggerTaskNow(taskId, deps)).toEqual({
+      success: true,
+      runId: expect.any(String),
+    });
     await queuedRun!();
   });
 
@@ -467,6 +1108,38 @@ describe('scheduled task workspace/session contract', () => {
     expect(triggerTaskNow(taskId, deps).success).toBe(false);
     onDropped?.();
     expect(triggerTaskNow(taskId, deps).success).toBe(true);
+  });
+
+  test('cancel fences a queued callback before Agent execution starts', async () => {
+    const taskId = createTask({ id: 'task-cancel-before-start' });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    let queuedRun: (() => Promise<void>) | null = null;
+    const deps = {
+      ...makeDeps(groups).deps,
+      queue: {
+        enqueueTask: vi.fn(
+          (_jid: string, _taskId: string, fn: () => Promise<void>) => {
+            queuedRun = fn;
+            return true;
+          },
+        ),
+        closeStdin: vi.fn(),
+        stopGroup: vi.fn(async () => undefined),
+        isShuttingDown: () => false,
+      },
+    } as any;
+    const trigger = triggerTaskNow(taskId, deps);
+    expect(trigger).toMatchObject({ success: true, runId: expect.any(String) });
+    expect(cancelTaskRunNow(trigger.runId!)).toEqual({ success: true });
+
+    await queuedRun!();
+    expect(runContainerAgentMock).not.toHaveBeenCalled();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'cancelled',
+      notification_status: 'skipped',
+    });
   });
 
   test('capacity-queued scheduled run keeps one reservation and one pinned JID', async () => {

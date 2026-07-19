@@ -999,10 +999,11 @@ export function createWhatsAppConnection(
               const mime = guessMimeType(imgPath) || 'image/jpeg';
               await sock.sendMessage(jid, { image: buf, mimetype: mime });
             } catch (err) {
-              logger.warn(
+              logger.error(
                 { err, imgPath, chatId },
                 'WhatsApp local image attach failed',
               );
+              throw err;
             }
           }
         }

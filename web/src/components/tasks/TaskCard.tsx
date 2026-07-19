@@ -7,10 +7,12 @@ import {
   ExternalLink,
   Pause,
   Play,
+  RotateCcw,
+  Square,
   Trash2,
   Zap,
 } from 'lucide-react';
-import { ScheduledTask } from '../../stores/tasks';
+import { ScheduledTask, type TaskRun } from '../../stores/tasks';
 import { TaskDetail } from './TaskDetail';
 import { showToast } from '../../utils/toast';
 import {
@@ -25,6 +27,8 @@ interface TaskCardProps {
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
   onRunNow?: (id: string) => void;
+  onStopRun?: (runId: string | number) => void;
+  onRestore?: (id: string) => void;
   isRunning?: boolean;
 }
 
@@ -34,14 +38,44 @@ export function TaskCard({
   onResume,
   onDelete,
   onRunNow,
+  onStopRun,
+  onRestore,
   isRunning = false,
 }: TaskCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
   const navigate = useNavigate();
+  const currentRun = task.current_run;
+  const effectiveRunning =
+    isRunning ||
+    !!currentRun?.status.match(/^(queued|running|recovering|retry_wait)$/);
+
+  const runStatusLabel = (run: TaskRun): string => {
+    switch (run.status) {
+      case 'queued':
+        return '排队中';
+      case 'running':
+        return '运行中';
+      case 'recovering':
+        return '正在恢复';
+      case 'retry_wait':
+        return `等待重试${run.attempt ? `（第 ${run.attempt + 1} 次）` : ''}`;
+      case 'success':
+        return '已成功';
+      case 'failed':
+      case 'error':
+        return '已失败';
+      case 'cancelled':
+        return '已取消';
+      case 'missed':
+        return '已错过';
+      case 'delivered':
+        return '已投递到主会话';
+    }
+  };
 
   const getStatusColor = () => {
-    if (isRunning) {
+    if (effectiveRunning) {
       return 'bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-300';
     }
     switch (task.status) {
@@ -60,7 +94,6 @@ export function TaskCard({
 
   const handleTogglePause = (e: MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
-    if (isRunning) return;
     if (task.status === 'active') {
       onPause(task.id);
     } else {
@@ -70,7 +103,7 @@ export function TaskCard({
 
   const handleRunNow = async (e: MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
-    if (!onRunNow || runningNow || isRunning) return;
+    if (!onRunNow || runningNow || effectiveRunning) return;
     setRunningNow(true);
     try {
       await onRunNow(task.id);
@@ -84,7 +117,7 @@ export function TaskCard({
 
   const handleDelete = (e: MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
-    if (isRunning) return;
+    if (effectiveRunning) return;
     onDelete(task.id);
   };
 
@@ -148,8 +181,21 @@ export function TaskCard({
               <span
                 className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor()}`}
               >
-                {formatTaskStatus(task.status, isRunning)}
+                {currentRun
+                  ? runStatusLabel(currentRun)
+                  : formatTaskStatus(task.status, effectiveRunning)}
               </span>
+              {task.permissions?.execution_blocked_reason && (
+                <span className="ml-2 text-xs text-error">配置已阻止执行</span>
+              )}
+              {task.next_run && !task.deleted_at && (
+                <span className="ml-2 text-xs text-muted-foreground">
+                  下次：{new Date(task.next_run).toLocaleString('zh-CN')}
+                </span>
+              )}
+              {['failed', 'partial_failed'].includes(
+                task.last_run_summary?.notification_status || '',
+              ) && <span className="ml-2 text-xs text-error">通知失败</span>}
             </div>
           </div>
         </button>
@@ -169,11 +215,13 @@ export function TaskCard({
           </button>
 
           {onRunNow &&
+            task.permissions?.can_run !== false &&
+            !task.deleted_at &&
             (task.status === 'active' || task.status === 'paused') && (
               <button
                 type="button"
                 onClick={handleRunNow}
-                disabled={runningNow || isRunning}
+                disabled={runningNow || effectiveRunning}
                 className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-amber-950/40 dark:hover:text-amber-400"
                 title={task.status === 'paused' ? '立即执行一次' : '立即运行'}
                 aria-label={
@@ -183,38 +231,82 @@ export function TaskCard({
                 }
               >
                 <Zap
-                  className={`h-5 w-5 ${runningNow || isRunning ? 'animate-pulse text-amber-500' : ''}`}
+                  className={`h-5 w-5 ${runningNow || effectiveRunning ? 'animate-pulse text-amber-500' : ''}`}
                 />
               </button>
             )}
 
-          {(task.status === 'active' || task.status === 'paused') && (
+          {!task.deleted_at &&
+            task.permissions?.can_pause !== false &&
+            (task.status === 'active' || task.status === 'paused') && (
+              <button
+                type="button"
+                onClick={handleTogglePause}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-brand-50 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                title={
+                  task.status === 'active' ? '暂停后续计划' : '恢复后续计划'
+                }
+                aria-label={
+                  task.status === 'active' ? '暂停后续计划' : '恢复后续计划'
+                }
+              >
+                {task.status === 'active' ? (
+                  <Pause className="h-5 w-5" />
+                ) : (
+                  <Play className="h-5 w-5" />
+                )}
+              </button>
+            )}
+
+          {currentRun &&
+            onStopRun &&
+            task.permissions?.can_stop !== false &&
+            ['queued', 'running', 'recovering', 'retry_wait'].includes(
+              currentRun.status,
+            ) && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onStopRun(currentRun.id);
+                }}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600"
+                title="停止当前运行（不影响后续计划）"
+                aria-label="停止当前运行"
+              >
+                <Square className="h-5 w-5" />
+              </button>
+            )}
+
+          {task.deleted_at &&
+            onRestore &&
+            task.permissions?.can_restore !== false && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRestore(task.id);
+                }}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-brand-50 hover:text-primary"
+                title="恢复为暂停状态"
+                aria-label="恢复任务"
+              >
+                <RotateCcw className="h-5 w-5" />
+              </button>
+            )}
+
+          {!task.deleted_at && task.permissions?.can_delete !== false && (
             <button
               type="button"
-              onClick={handleTogglePause}
-              disabled={isRunning}
-              className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-brand-50 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
-              title={task.status === 'active' ? '暂停' : '恢复'}
-              aria-label={task.status === 'active' ? '暂停任务' : '恢复任务'}
+              onClick={handleDelete}
+              disabled={effectiveRunning}
+              className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/40 dark:hover:text-red-400"
+              title={effectiveRunning ? '请先停止当前运行' : '删除并保留历史'}
+              aria-label="删除任务"
             >
-              {task.status === 'active' ? (
-                <Pause className="h-5 w-5" />
-              ) : (
-                <Play className="h-5 w-5" />
-              )}
+              <Trash2 className="h-5 w-5" />
             </button>
           )}
-
-          <button
-            type="button"
-            onClick={handleDelete}
-            disabled={isRunning}
-            className="flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/40 dark:hover:text-red-400"
-            title={isRunning ? '执行中不可删除' : '删除'}
-            aria-label="删除任务"
-          >
-            <Trash2 className="h-5 w-5" />
-          </button>
 
           <button
             type="button"

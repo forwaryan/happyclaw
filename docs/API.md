@@ -80,8 +80,17 @@
 
 ## 任务
 
-- `GET /api/tasks` · `POST /api/tasks` · `PATCH /api/tasks/:id` · `DELETE /api/tasks/:id`
-- `GET /api/tasks/:id/logs`
+- `GET /api/tasks` · `POST /api/tasks`（列出/创建任务；间隔任务最短 60 秒）
+- `PATCH /api/tasks/:id` · `DELETE /api/tasks/:id`（更新/软删除；写操作使用 `expected_revision` 防止覆盖并发修改）
+- `POST /api/tasks/:id/restore`（恢复软删除任务；恢复后保持暂停，一次性任务重新启用时会校验执行时间）
+- `POST /api/tasks/:id/runs`（立即运行；请求体传 `idempotency_key`，返回稳定 `runId`）
+- `GET /api/tasks/:id/runs` · `GET /api/tasks/runs/:runId`（查询合并后的历史或单次持久化运行详情）
+- `POST /api/tasks/runs/:runId/cancel`（只停止当前运行，不影响周期任务的后续计划）
+- `POST /api/tasks/:id/run`（兼容旧客户端的立即运行入口；支持 `Idempotency-Key` 请求头或请求体 `idempotency_key`）
+- `GET /api/tasks/:id/logs`（旧版运行日志兼容入口）
+- `POST /api/tasks/ai` · `POST /api/tasks/parse`（AI 创建任务/解析自然语言任务草稿）
+
+任务运行状态与通知状态分别记录：通知失败只重试通知，不会重新执行 Agent 或脚本。脚本任务只允许管理员在有权限的宿主机工作区创建和运行，容器工作区不会降级到宿主机执行。
 
 ## 管理
 

@@ -206,6 +206,43 @@ export function parseFeishuRouteTarget(raw: string): FeishuRouteTarget {
   };
 }
 
+function requireFeishuRouteTarget(raw: string): FeishuRouteTarget {
+  const target = parseFeishuRouteTarget(raw);
+  const fragments = raw.split('#').slice(1);
+  const seen = new Set<string>();
+  const valid =
+    target.chatId.length > 0 &&
+    target.chatId.trim() === target.chatId &&
+    !/\s/.test(target.chatId) &&
+    fragments.every((fragment) => {
+      const separator = fragment.indexOf(':');
+      if (separator <= 0 || separator === fragment.length - 1) return false;
+      const kind = fragment.slice(0, separator);
+      const value = fragment.slice(separator + 1);
+      if ((kind !== 'thread' && kind !== 'root') || seen.has(kind)) {
+        return false;
+      }
+      seen.add(kind);
+      return value.trim() === value && !/\s/.test(value);
+    });
+  if (!valid) {
+    throw new Error(`Invalid Feishu route target: ${raw || '<empty>'}`);
+  }
+  return target;
+}
+
+function assertFeishuApiSuccess(operation: string, response: unknown): void {
+  if (!response || typeof response !== 'object') {
+    throw new Error(`${operation} returned no acknowledgement`);
+  }
+  const result = response as { code?: number; msg?: string };
+  if (result.code !== 0) {
+    throw new Error(
+      `${operation} failed (code=${result.code ?? 'unknown'}, msg=${result.msg || 'unknown'})`,
+    );
+  }
+}
+
 function buildFeishuRouteTarget(
   chatId: string,
   threadId?: string,
@@ -878,15 +915,15 @@ export function createFeishuConnection(
     msgType: string,
     content: string,
   ): Promise<void> {
-    if (!client) return;
-    const target = parseFeishuRouteTarget(chatId);
+    if (!client) throw new Error('Feishu client is not initialized');
+    const target = requireFeishuRouteTarget(chatId);
     const receiveIdType = target.chatId.startsWith('oc_')
       ? 'chat_id'
       : 'open_id';
     const replyMsgId =
       target.rootMessageId || lastMessageIdByChat.get(target.chatId);
     if (replyMsgId) {
-      await client.im.message.reply({
+      const response = await client.im.message.reply({
         path: { message_id: replyMsgId },
         data: {
           content,
@@ -894,8 +931,9 @@ export function createFeishuConnection(
           ...(target.replyInThread ? { reply_in_thread: true } : {}),
         },
       });
+      assertFeishuApiSuccess('Feishu message.reply', response);
     } else {
-      await client.im.v1.message.create({
+      const response = await client.im.v1.message.create({
         params: { receive_id_type: receiveIdType },
         data: {
           receive_id: target.chatId,
@@ -903,6 +941,7 @@ export function createFeishuConnection(
           content,
         },
       });
+      assertFeishuApiSuccess('Feishu message.create', response);
     }
   }
 
@@ -1848,12 +1887,10 @@ export function createFeishuConnection(
       localImagePaths?: string[],
     ): Promise<void> {
       if (!client) {
-        logger.warn(
-          { chatId },
-          'Feishu client not initialized, skip sending message',
-        );
-        return;
+        throw new Error('Feishu client is not initialized');
       }
+
+      requireFeishuRouteTarget(chatId);
 
       try {
         // Detect pre-built Feishu interactive card JSON — send directly without wrapping
@@ -1905,13 +1942,12 @@ export function createFeishuConnection(
               | { image_key?: string; data?: { image_key?: string } }
               | null
               | undefined;
+            assertFeishuApiSuccess('Feishu image.create', uploadRes);
             const imageKey = uploadRes?.image_key ?? uploadRes?.data?.image_key;
             if (!imageKey) {
-              logger.warn(
-                { chatId, localImagePath },
-                'Feishu image upload returned no image_key',
+              throw new Error(
+                `Feishu image upload returned no image_key: ${localImagePath}`,
               );
-              continue;
             }
             await sendToFeishu(
               chatId,
@@ -1919,16 +1955,18 @@ export function createFeishuConnection(
               JSON.stringify({ image_key: imageKey }),
             );
           } catch (imageErr) {
-            logger.warn(
+            logger.error(
               { chatId, localImagePath, err: imageErr },
               'Failed to send Feishu image attachment',
             );
+            throw imageErr;
           }
         }
         clearAckForTarget(chatId);
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu card message');
         clearAckForTarget(chatId);
+        throw err;
       }
     },
 
@@ -1940,12 +1978,10 @@ export function createFeishuConnection(
       _fileName?: string /* Feishu image API has no filename field, intentionally unused */,
     ): Promise<void> {
       if (!client) {
-        logger.warn(
-          { chatId },
-          'Feishu client not initialized, skip sending image',
-        );
-        return;
+        throw new Error('Feishu client is not initialized');
       }
+
+      requireFeishuRouteTarget(chatId);
 
       try {
         // Step 1: Upload image to Feishu to get image_key
@@ -1958,6 +1994,8 @@ export function createFeishuConnection(
           | { image_key?: string; data?: { image_key?: string } }
           | null
           | undefined;
+
+        assertFeishuApiSuccess('Feishu image.create', uploadResult);
 
         const imageKey =
           uploadResult?.image_key ?? uploadResult?.data?.image_key;
@@ -2000,12 +2038,10 @@ export function createFeishuConnection(
       fileName: string,
     ): Promise<void> {
       if (!client) {
-        logger.warn(
-          { chatId },
-          'Feishu client not initialized, skip sending file',
-        );
-        return;
+        throw new Error('Feishu client is not initialized');
       }
+
+      requireFeishuRouteTarget(chatId);
 
       try {
         const buffer = await fsPromises.readFile(filePath);
@@ -2032,6 +2068,8 @@ export function createFeishuConnection(
           | { file_key?: string; data?: { file_key?: string } }
           | null
           | undefined;
+
+        assertFeishuApiSuccess('Feishu file.create', uploadResult);
 
         const fileKey = uploadResult?.file_key ?? uploadResult?.data?.file_key;
         if (!fileKey) {

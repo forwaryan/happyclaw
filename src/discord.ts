@@ -718,7 +718,7 @@ export function createDiscordConnection(
         { chatId },
         'Discord sendMessage: failed to resolve channel',
       );
-      return;
+      throw new Error(`Discord sendMessage: unknown chat ${chatId}`);
     }
 
     const chunks = splitDiscordChunks(text);
@@ -734,10 +734,11 @@ export function createDiscordConnection(
             const name = path.basename(imgPath);
             files.push(new AttachmentBuilder(buffer, { name }));
           } catch (err) {
-            logger.warn(
+            logger.error(
               { err, imgPath },
               'Discord sendMessage: failed to read local image',
             );
+            throw err;
           }
         }
         if (files.length > 0) {

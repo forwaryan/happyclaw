@@ -81,8 +81,8 @@ describe('AgentProfile v48 prompt migration', () => {
         .get(),
       // Prompt migration remains v48, while the database may continue through
       // later additive migrations in the same startup (v49 channel accounts,
-      // then v50 channel authorization/transport lifecycle state).
-    ).toEqual({ value: '51' });
+      // then later additive schema migrations).
+    ).toEqual({ value: '54' });
     raw.close();
   });
 });

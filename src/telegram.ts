@@ -150,12 +150,24 @@ export function parseTelegramProviderTarget(
   target: string,
 ): TelegramProviderTarget | null {
   const [rawChatId, ...fragments] = target.split('#');
+  if (!/^-?[1-9]\d*$/.test(rawChatId)) return null;
   const chatId = Number(rawChatId);
   if (!Number.isSafeInteger(chatId)) return null;
-  const threadFragment = fragments.find((part) => part.startsWith('thread:'));
-  const rawThreadId = threadFragment
-    ? decodeURIComponent(threadFragment.slice('thread:'.length))
-    : undefined;
+  if (
+    fragments.length > 1 ||
+    (fragments.length === 1 && !fragments[0].startsWith('thread:'))
+  ) {
+    return null;
+  }
+  const threadFragment = fragments[0];
+  let rawThreadId: string | undefined;
+  try {
+    rawThreadId = threadFragment
+      ? decodeURIComponent(threadFragment.slice('thread:'.length))
+      : undefined;
+  } catch {
+    return null;
+  }
   const messageThreadId = rawThreadId ? Number(rawThreadId) : undefined;
   if (
     messageThreadId !== undefined &&
@@ -1352,17 +1364,12 @@ export function createTelegramConnection(
       localImagePaths?: string[],
     ): Promise<void> {
       if (!bot) {
-        logger.warn(
-          { chatId },
-          'Telegram bot not initialized, skip sending message',
-        );
-        return;
+        throw new Error('Telegram bot is not initialized');
       }
 
       const target = parseTelegramProviderTarget(chatId);
       if (!target) {
-        logger.error({ chatId }, 'Invalid Telegram chat ID');
-        return;
+        throw new Error(`Invalid Telegram chat ID: ${chatId || '<empty>'}`);
       }
       const threadOptions = target.messageThreadId
         ? { message_thread_id: target.messageThreadId }
@@ -1397,10 +1404,11 @@ export function createTelegramConnection(
               threadOptions,
             );
           } catch (imageErr) {
-            logger.warn(
+            logger.error(
               { chatId, localImagePath, err: imageErr },
               'Failed to send Telegram image attachment',
             );
+            throw imageErr;
           }
         }
 
@@ -1419,17 +1427,14 @@ export function createTelegramConnection(
       fileName?: string,
     ): Promise<void> {
       if (!bot) {
-        logger.warn(
-          { chatId },
-          'Telegram bot not initialized, skip sending image',
-        );
-        return;
+        throw new Error('Telegram bot is not initialized');
       }
 
       const target = parseTelegramProviderTarget(chatId);
       if (!target) {
-        logger.error({ chatId }, 'Invalid Telegram chat ID for image');
-        return;
+        throw new Error(
+          `Invalid Telegram chat ID for image: ${chatId || '<empty>'}`,
+        );
       }
       const threadOptions = target.messageThreadId
         ? { message_thread_id: target.messageThreadId }
@@ -1504,17 +1509,14 @@ export function createTelegramConnection(
       fileName: string,
     ): Promise<void> {
       if (!bot) {
-        logger.warn(
-          { chatId },
-          'Telegram bot not initialized, skip sending file',
-        );
-        return;
+        throw new Error('Telegram bot is not initialized');
       }
 
       const target = parseTelegramProviderTarget(chatId);
       if (!target) {
-        logger.error({ chatId }, 'Invalid Telegram chat ID for file');
-        return;
+        throw new Error(
+          `Invalid Telegram chat ID for file: ${chatId || '<empty>'}`,
+        );
       }
 
       try {

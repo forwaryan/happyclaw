@@ -22,10 +22,32 @@ export function getIsolatedTaskRunCompletionMarker(runDir: string): string {
 export interface IsolatedTaskRunCompletion {
   taskId: string;
   taskRunId: string;
+  /** Durable task_runs.id; taskRunId is only the filesystem namespace. */
+  durableRunId?: string;
   workspaceFolder: string;
   virtualChatJid: string;
   sessionAgentId: string;
   completedAt: string;
+}
+
+const DURABLE_RUN_NAMESPACE_RE =
+  /^task-run-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})-attempt-\d+$/i;
+
+/** Recover the durable occurrence id before the completion marker exists. */
+export function extractDurableTaskRunIdFromNamespace(
+  namespace: string | null | undefined,
+): string | null {
+  if (!namespace) return null;
+  return namespace.match(DURABLE_RUN_NAMESPACE_RE)?.[1] ?? null;
+}
+
+/** New IPC requests are disposable only after their result ACK is durable.
+ * Legacy requests without requestId keep the historical fire-and-forget path. */
+export function canDeleteAcknowledgedIpcSource(
+  requestId: string | undefined,
+  resultWritten: boolean,
+): boolean {
+  return !requestId || resultWritten;
 }
 
 /**
@@ -105,7 +127,9 @@ export function tryCleanupCompletedIsolatedTaskRunIpc(
     !completion ||
     typeof completion.workspaceFolder !== 'string' ||
     typeof completion.virtualChatJid !== 'string' ||
-    typeof completion.sessionAgentId !== 'string'
+    typeof completion.sessionAgentId !== 'string' ||
+    (completion.durableRunId !== undefined &&
+      typeof completion.durableRunId !== 'string')
   ) {
     throw new Error(`Invalid isolated task completion marker: ${markerPath}`);
   }

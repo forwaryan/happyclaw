@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Check, Pencil, RefreshCw, X } from 'lucide-react';
 import { ScheduledTask, TaskRunLog, useTasksStore } from '../../stores/tasks';
+import type { ApiError } from '../../api/client';
 import { showToast } from '../../utils/toast';
 import {
   INTERVAL_UNITS,
@@ -43,6 +44,16 @@ const LOG_STATUS_STYLES: Record<
     text: 'text-blue-700 dark:text-blue-300',
     label: '运行中',
   },
+  recovering: {
+    bg: 'bg-blue-100 dark:bg-blue-900/40',
+    text: 'text-blue-700 dark:text-blue-300',
+    label: '正在恢复',
+  },
+  retry_wait: {
+    bg: 'bg-amber-100 dark:bg-amber-900/40',
+    text: 'text-amber-700 dark:text-amber-300',
+    label: '等待重试',
+  },
   success: {
     bg: 'bg-green-100 dark:bg-green-900/40',
     text: 'text-green-700 dark:text-green-300',
@@ -53,6 +64,41 @@ const LOG_STATUS_STYLES: Record<
     text: 'text-red-700 dark:text-red-300',
     label: '失败',
   },
+  failed: {
+    bg: 'bg-red-100 dark:bg-red-900/40',
+    text: 'text-red-700 dark:text-red-300',
+    label: '失败',
+  },
+  cancelled: {
+    bg: 'bg-muted',
+    text: 'text-muted-foreground',
+    label: '已取消',
+  },
+  missed: {
+    bg: 'bg-amber-100 dark:bg-amber-900/40',
+    text: 'text-amber-700 dark:text-amber-300',
+    label: '已错过',
+  },
+  delivered: {
+    bg: 'bg-cyan-100 dark:bg-cyan-900/40',
+    text: 'text-cyan-700 dark:text-cyan-300',
+    label: '已投递到主会话',
+  },
+};
+
+const TRIGGER_LABEL: Record<string, string> = {
+  scheduled: '计划触发',
+  manual: '立即运行',
+  backfill: '恢复补跑',
+  retry: '自动重试',
+};
+
+const NOTIFICATION_LABEL: Record<string, string> = {
+  pending: '待发送',
+  success: '发送成功',
+  partial_failed: '部分失败',
+  failed: '发送失败',
+  skipped: '无需通知',
 };
 
 function RunLogStatusBadge({ status }: { status: string }) {
@@ -97,7 +143,12 @@ export function TaskDetail({ task }: TaskDetailProps) {
 
   useEffect(() => {
     loadLogs(task.id);
-  }, [task.id, loadLogs]);
+  }, [
+    task.id,
+    task.current_run?.updated_at,
+    task.last_run_summary?.updated_at,
+    loadLogs,
+  ]);
 
   useEffect(() => {
     void loadGroups();
@@ -121,7 +172,9 @@ export function TaskDetail({ task }: TaskDetailProps) {
     schedule_value: task.schedule_value,
     notify_channels: task.notify_channels ?? null,
     chat_jid: task.chat_jid,
-    execution_mode: (task.execution_mode ?? 'container') as TaskExecutionMode,
+    execution_mode: (task.execution_type === 'script'
+      ? 'host'
+      : (task.execution_mode ?? 'container')) as TaskExecutionMode,
     context_mode: task.context_mode,
   });
 
@@ -143,8 +196,9 @@ export function TaskDetail({ task }: TaskDetailProps) {
         schedule_value: task.schedule_value,
         notify_channels: task.notify_channels ?? null,
         chat_jid: task.chat_jid,
-        execution_mode: (task.execution_mode ??
-          'container') as TaskExecutionMode,
+        execution_mode: (task.execution_type === 'script'
+          ? 'host'
+          : (task.execution_mode ?? 'container')) as TaskExecutionMode,
         context_mode: task.context_mode,
       });
       const decomposed = decomposeInterval(task.schedule_value);
@@ -191,8 +245,18 @@ export function TaskDetail({ task }: TaskDetailProps) {
         showToast('保存成功', '任务已更新');
       }
       setEditing(false);
-    } catch {
-      showToast('保存失败', '请稍后重试');
+    } catch (error) {
+      const apiError = error as ApiError;
+      if (apiError.status === 409) {
+        showToast(
+          '任务已被其他操作修改',
+          '为避免覆盖最新配置，已退出编辑并重新加载。',
+        );
+        setEditing(false);
+        await useTasksStore.getState().loadTasks();
+      } else {
+        showToast('保存失败', apiError.message || '请稍后重试');
+      }
     } finally {
       setSaving(false);
     }
@@ -206,7 +270,9 @@ export function TaskDetail({ task }: TaskDetailProps) {
       schedule_value: task.schedule_value,
       notify_channels: task.notify_channels ?? null,
       chat_jid: task.chat_jid,
-      execution_mode: (task.execution_mode ?? 'container') as TaskExecutionMode,
+      execution_mode: (task.execution_type === 'script'
+        ? 'host'
+        : (task.execution_mode ?? 'container')) as TaskExecutionMode,
       context_mode: task.context_mode,
     });
     const decomposed = decomposeInterval(task.schedule_value);
@@ -331,7 +397,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
               <Check className="w-3.5 h-3.5" /> {saving ? '保存中...' : '保存'}
             </button>
           </>
-        ) : (
+        ) : task.deleted_at || task.permissions?.can_edit === false ? null : (
           <button
             onClick={() => setEditing(true)}
             className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-primary hover:bg-brand-50 rounded-lg transition-colors cursor-pointer"
@@ -340,6 +406,39 @@ export function TaskDetail({ task }: TaskDetailProps) {
           </button>
         )}
       </div>
+
+      {task.permissions && (
+        <div className="rounded-lg border border-border bg-card p-3">
+          <div className="mb-2 text-sm font-medium text-foreground">
+            权限与执行范围
+          </div>
+          <div className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+            <div>
+              <span className="text-muted-foreground">文件范围：</span>
+              当前工作区目录
+            </div>
+            <div>
+              <span className="text-muted-foreground">执行环境：</span>
+              {task.permissions.execution_scope === 'workspace_host'
+                ? '宿主机'
+                : 'Docker 容器'}
+            </div>
+            <div>
+              <span className="text-muted-foreground">上下文：</span>
+              {formatContextMode(task.context_mode)}
+            </div>
+            <div>
+              <span className="text-muted-foreground">可执行操作：</span>
+              {task.permissions.can_run ? '可运行' : '仅查看'}
+            </div>
+          </div>
+          {task.permissions.risk_level === 'high' && (
+            <p className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+              高权限任务：可在宿主机执行 Shell 命令，仅管理员可以修改或运行。
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Script Command (script mode) */}
       {task.execution_type === 'script' && (
@@ -502,6 +601,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
             <>
               <select
                 value={editForm.execution_mode}
+                disabled={task.execution_type === 'script'}
                 onChange={(event) =>
                   setEditForm({
                     ...editForm,
@@ -511,10 +611,14 @@ export function TaskDetail({ task }: TaskDetailProps) {
                 className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
               >
                 <option value="host">宿主机</option>
-                <option value="container">Docker 容器</option>
+                {task.execution_type !== 'script' && (
+                  <option value="container">Docker 容器</option>
+                )}
               </select>
               <p className="mt-1 text-xs text-muted-foreground">
-                切换工作区时会自动继承目标工作区模式，也可在保存前手动调整。
+                {task.execution_type === 'script'
+                  ? '脚本固定为宿主机模式；必须同时选择管理员宿主机工作区。'
+                  : '切换工作区时会自动继承目标工作区模式，也可在保存前手动调整。'}
               </p>
             </>
           ) : (
@@ -596,12 +700,23 @@ export function TaskDetail({ task }: TaskDetailProps) {
                 disabled={groupsLoading || !!groupsError}
                 className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
               >
-                {Object.entries(groupNames).map(([jid, name]) => (
-                  <option key={jid} value={jid}>
-                    {formatGroupLabel(jid, name)}
-                  </option>
-                ))}
+                {Object.entries(groupNames)
+                  .filter(
+                    ([jid]) =>
+                      task.execution_type !== 'script' ||
+                      groups[jid]?.execution_mode === 'host',
+                  )
+                  .map(([jid, name]) => (
+                    <option key={jid} value={jid}>
+                      {formatGroupLabel(jid, name)}
+                    </option>
+                  ))}
               </select>
+              {task.permissions?.execution_blocked_reason && (
+                <p className="mt-1 text-xs text-error">
+                  {task.permissions.execution_blocked_reason}
+                </p>
+              )}
               {groupsLoading && (
                 <p className="mt-1 text-xs text-muted-foreground">
                   正在加载工作区执行模式…
@@ -707,12 +822,16 @@ export function TaskDetail({ task }: TaskDetailProps) {
           <p className="text-xs text-muted-foreground">暂无执行记录</p>
         ) : (
           <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full min-w-[720px] text-sm">
+            <table className="w-full min-w-[980px] text-sm">
               <thead>
                 <tr className="bg-brand-50 text-primary text-xs">
-                  <th className="text-left px-4 py-2 font-medium">运行时间</th>
+                  <th className="text-left px-4 py-2 font-medium">计划时间</th>
+                  <th className="text-left px-4 py-2 font-medium">实际开始</th>
+                  <th className="text-left px-4 py-2 font-medium">触发来源</th>
                   <th className="text-left px-4 py-2 font-medium">耗时</th>
                   <th className="text-left px-4 py-2 font-medium">状态</th>
+                  <th className="text-left px-4 py-2 font-medium">尝试</th>
+                  <th className="text-left px-4 py-2 font-medium">通知</th>
                   <th className="text-left px-4 py-2 font-medium">结果</th>
                 </tr>
               </thead>
@@ -720,15 +839,39 @@ export function TaskDetail({ task }: TaskDetailProps) {
                 {taskLogs.map((log: TaskRunLog) => (
                   <tr key={log.id}>
                     <td className="px-4 py-2.5 text-foreground whitespace-nowrap">
-                      {formatDate(log.run_at)}
+                      {formatDate(log.scheduled_for ?? log.run_at)}
                     </td>
                     <td className="px-4 py-2.5 text-foreground whitespace-nowrap">
-                      {log.status === 'running'
+                      {formatDate(log.started_at ?? log.run_at)}
+                    </td>
+                    <td className="px-4 py-2.5 text-foreground whitespace-nowrap">
+                      {TRIGGER_LABEL[log.trigger_type || 'scheduled'] ||
+                        log.trigger_type ||
+                        '-'}
+                    </td>
+                    <td className="px-4 py-2.5 text-foreground whitespace-nowrap">
+                      {[
+                        'queued',
+                        'running',
+                        'recovering',
+                        'retry_wait',
+                      ].includes(log.status)
                         ? '-'
                         : formatDuration(log.duration_ms)}
                     </td>
                     <td className="px-4 py-2.5">
                       <RunLogStatusBadge status={log.status} />
+                    </td>
+                    <td className="px-4 py-2.5 text-foreground whitespace-nowrap">
+                      {log.attempt ?? 1}
+                    </td>
+                    <td
+                      className={`px-4 py-2.5 whitespace-nowrap ${log.notification_status === 'failed' || log.notification_status === 'partial_failed' ? 'text-error' : 'text-foreground'}`}
+                      title={log.notification_error || ''}
+                    >
+                      {NOTIFICATION_LABEL[
+                        log.notification_status || 'skipped'
+                      ] || log.notification_status}
                     </td>
                     <td
                       className="px-4 py-2.5 text-foreground truncate max-w-xs"
@@ -740,8 +883,12 @@ export function TaskDetail({ task }: TaskDetailProps) {
                         </span>
                       ) : log.result ? (
                         log.result.slice(0, 100)
-                      ) : log.status === 'running' ? (
-                        <span className="text-muted-foreground">执行中...</span>
+                      ) : ['queued', 'running', 'recovering'].includes(
+                          log.status,
+                        ) ? (
+                        <span className="text-muted-foreground">
+                          {log.status === 'queued' ? '排队中...' : '执行中...'}
+                        </span>
                       ) : (
                         ''
                       )}

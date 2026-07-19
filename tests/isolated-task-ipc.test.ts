@@ -4,8 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  canDeleteAcknowledgedIpcSource,
   ISOLATED_TASK_RUN_COMPLETE_MARKER,
   awaitRequiredIpcSideEffects,
+  extractDurableTaskRunIdFromNamespace,
   getIsolatedTaskRunCompletionMarker,
   markIsolatedTaskRunIpcComplete,
   tryCleanupCompletedIsolatedTaskRunIpc,
@@ -29,6 +31,22 @@ afterEach(() => {
 });
 
 describe('isolated task IPC completion handshake', () => {
+  test('retains acknowledged-protocol source until result file is durable', () => {
+    expect(canDeleteAcknowledgedIpcSource('request-1', false)).toBe(false);
+    expect(canDeleteAcknowledgedIpcSource('request-1', true)).toBe(true);
+    expect(canDeleteAcknowledgedIpcSource(undefined, false)).toBe(true);
+  });
+
+  test('extracts only the explicit durable run namespace segment', () => {
+    const runId = '27b33c99-0558-4a50-a7e6-e0b2334fccf0';
+    expect(
+      extractDurableTaskRunIdFromNamespace(`task-run-${runId}-attempt-3`),
+    ).toBe(runId);
+    expect(
+      extractDurableTaskRunIdFromNamespace(`task-legacy-${runId}`),
+    ).toBeNull();
+  });
+
   test('never removes an unmarked producer namespace', () => {
     const runDir = makeRunDir();
     expect(tryCleanupCompletedIsolatedTaskRunIpc(runDir)).toBe(false);

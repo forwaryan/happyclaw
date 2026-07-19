@@ -118,6 +118,64 @@ export interface DingTalkConnection {
   >;
 }
 
+export interface DingTalkGroupMessageSuccess {
+  processQueryKey?: string;
+  errcode?: number;
+  errmsg?: string;
+  code?: string | number;
+  message?: string;
+}
+
+/** Validate the persistent groupMessages endpoint's transport and envelope. */
+export function parseDingTalkGroupMessageResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkGroupMessageSuccess {
+  if (!statusCode || statusCode < 200 || statusCode >= 300) {
+    throw new Error(
+      `DingTalk groupMessages API HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error('DingTalk groupMessages API returned an empty response');
+  }
+  let data: DingTalkGroupMessageSuccess;
+  try {
+    data = JSON.parse(body) as DingTalkGroupMessageSuccess;
+  } catch {
+    throw new Error('DingTalk groupMessages API returned invalid JSON');
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('DingTalk groupMessages API returned an invalid envelope');
+  }
+  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
+    throw new Error(
+      `DingTalk groupMessages API error: ${data.errcode} ${data.errmsg ?? data.message ?? ''}`,
+    );
+  }
+  const successCodes = new Set(['0', 'ok', 'success']);
+  if (
+    data.code !== undefined &&
+    !successCodes.has(String(data.code).toLowerCase())
+  ) {
+    throw new Error(
+      `DingTalk groupMessages API error: ${String(data.code)} ${data.message ?? data.errmsg ?? ''}`,
+    );
+  }
+  const hasSuccessMarker =
+    (typeof data.processQueryKey === 'string' &&
+      data.processQueryKey.length > 0) ||
+    data.errcode === 0 ||
+    (data.code !== undefined &&
+      successCodes.has(String(data.code).toLowerCase()));
+  if (!hasSuccessMarker) {
+    throw new Error(
+      'DingTalk groupMessages API returned an unrecognized success envelope',
+    );
+  }
+  return data;
+}
+
 interface DingTalkAccessToken {
   token: string;
   expiresAt: number;
@@ -842,16 +900,11 @@ export function createDingTalkConnection(
           res.on('data', (chunk: Buffer) => chunks.push(chunk));
           res.on('end', () => {
             const respBody = Buffer.concat(chunks).toString('utf8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(
-                  `DingTalk groupMessages API HTTP failed (${res.statusCode}): ${respBody}`,
-                ),
-              );
-              return;
-            }
             try {
-              const data = JSON.parse(respBody);
+              const data = parseDingTalkGroupMessageResponse(
+                res.statusCode,
+                respBody,
+              );
               logger.info(
                 {
                   statusCode: res.statusCode,
@@ -861,16 +914,9 @@ export function createDingTalkConnection(
                 },
                 'DingTalk sendViaGroupMessagesAPI response',
               );
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk groupMessages API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
+            } catch (err) {
+              reject(err);
+              return;
             }
             resolve();
           });
@@ -2086,7 +2132,7 @@ export function createDingTalkConnection(
       const parsed = parseDingTalkChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid DingTalk chat ID format');
-        return;
+        throw new Error(`Invalid DingTalk chat ID format: ${chatId}`);
       }
 
       // Reconstruct the full jid to match how sessionWebhook/senderStaffId was stored
@@ -2128,8 +2174,11 @@ export function createDingTalkConnection(
               { chatId, cardErr },
               'DingTalk sendMessage: AI Card fallback also failed',
             );
+            throw cardErr;
           }
-          return;
+          throw new Error(
+            `DingTalk sendMessage: no outbound route for C2C chat ${chatId}`,
+          );
         }
         const plainText = markdownToPlainText(text);
         const chunks = splitTextChunks(plainText, MSG_SPLIT_LIMIT);

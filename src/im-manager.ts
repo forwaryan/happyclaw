@@ -629,7 +629,7 @@ export class IMConnectionManager {
     const channelType = getChannelType(jid);
     if (!channelType) {
       logger.debug({ jid }, 'Unknown channel type for JID, skip sending');
-      return;
+      throw new Error(`Unknown channel type for JID: ${jid}`);
     }
 
     const chatId = extractProviderTarget(jid);
@@ -653,7 +653,7 @@ export class IMConnectionManager {
     const channelType = getChannelType(jid);
     if (!channelType) {
       logger.debug({ jid }, 'Unknown channel type for JID, skip sending image');
-      return;
+      throw new Error(`Unknown channel type for image JID: ${jid}`);
     }
 
     const chatId = extractProviderTarget(jid);
@@ -670,6 +670,7 @@ export class IMConnectionManager {
     }
 
     logger.warn({ jid, channelType }, 'No IM channel available to send image');
+    throw new Error(`No IM channel available for ${jid} (${channelType})`);
   }
 
   /**

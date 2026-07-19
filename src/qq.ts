@@ -2012,7 +2012,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       const parsed = parseQQChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid QQ chat ID format');
-        return;
+        throw new Error(`Invalid QQ chat ID format: ${chatId}`);
       }
 
       try {
@@ -2029,10 +2029,11 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             await sendQQImageMessage(parsed.type, parsed.openid, buf);
             logger.info({ chatId, imgPath }, 'QQ local image sent');
           } catch (imgErr) {
-            logger.warn(
+            logger.error(
               { err: imgErr, chatId, imgPath },
               'Failed to send local image via QQ',
             );
+            throw imgErr;
           }
         }
 
@@ -2053,7 +2054,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       const parsed = parseQQChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid QQ chat ID format for image');
-        return;
+        throw new Error(`Invalid QQ chat ID format for image: ${chatId}`);
       }
 
       try {
@@ -2078,7 +2079,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       const parsed = parseQQChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid QQ chat ID format for file');
-        return;
+        throw new Error(`Invalid QQ chat ID format for file: ${chatId}`);
       }
 
       try {

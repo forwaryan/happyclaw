@@ -345,11 +345,26 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         const data = buildSendMessageData(ctx, {
           type: 'image',
           imageBase64: base64,
+          filePath: path.relative(ctx.workspaceGroup, resolved),
           mimeType,
           caption: args.caption || undefined,
           fileName: path.basename(resolved),
+          requestId: newRequestId(),
         });
-        writeIpcFile(MESSAGES_DIR, data);
+        const delivery = await pollIpcResult(
+          MESSAGES_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_message_result',
+          120_000,
+          MESSAGE_RESULTS_DIR,
+        );
+        if (!delivery.success) {
+          throw new Error(
+            typeof delivery.error === 'string'
+              ? delivery.error
+              : 'Image delivery failed.',
+          );
+        }
         return {
           content: [
             {
@@ -448,8 +463,21 @@ Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
           type: 'send_file',
           filePath: relativePath,
           fileName: args.fileName,
+          requestId: newRequestId(),
         });
-        writeIpcFile(TASKS_DIR, data);
+        const delivery = await pollIpcResult(
+          TASKS_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_file_result',
+          120_000,
+        );
+        if (!delivery.success) {
+          throw new Error(
+            typeof delivery.error === 'string'
+              ? delivery.error
+              : 'File delivery failed.',
+          );
+        }
         return {
           content: [
             {
@@ -526,9 +554,9 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           ),
         context_mode: z
           .enum(['group', 'isolated'])
-          .default('group')
+          .default('isolated')
           .describe(
-            '(agent mode only) group=runs with persistent workspace context (recommended), isolated=fresh session each time',
+            '(agent mode only) isolated=fresh session each time (default), group=runs with persistent workspace context',
           ),
         target_group_jid: z
           .string()
@@ -578,9 +606,12 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         // Validate schedule_value before writing IPC
         if (args.schedule_type === 'cron') {
           try {
-            CronExpressionParser.parse(args.schedule_value, {
+            const interval = CronExpressionParser.parse(args.schedule_value, {
               tz: process.env.TZ || 'Asia/Shanghai',
             });
+            if (interval.fields.second.values.length !== 1) {
+              throw new Error('Cron frequency must be at least 60 seconds');
+            }
           } catch {
             return {
               content: [
@@ -593,13 +624,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             };
           }
         } else if (args.schedule_type === 'interval') {
-          const ms = parseInt(args.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
+          const ms = Number(args.schedule_value);
+          if (!Number.isFinite(ms) || ms < 60_000) {
             return {
               content: [
                 {
                   type: 'text' as const,
-                  text: `Invalid interval: "${args.schedule_value}". Must be positive milliseconds (e.g., "300000" for 5 min).`,
+                  text: `Invalid interval: "${args.schedule_value}". Must be at least 60000 milliseconds (e.g., "300000" for 5 min).`,
                 },
               ],
               isError: true,
@@ -631,7 +662,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           prompt: args.prompt || '',
           schedule_type: args.schedule_type,
           schedule_value: args.schedule_value,
-          context_mode: args.context_mode || 'group',
+          context_mode: args.context_mode || 'isolated',
           execution_type: execType,
           targetJid,
           createdBy: ctx.groupFolder,
@@ -694,8 +725,15 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     tool(
       'list_tasks',
       "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks.",
-      {},
-      async () => {
+      {
+        include_deleted: z
+          .boolean()
+          .default(false)
+          .describe(
+            'Include soft-deleted tasks so they can be inspected/restored',
+          ),
+      },
+      async (args) => {
         const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
@@ -705,6 +743,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
               requestId,
               groupFolder: ctx.groupFolder,
               isAdminHome: hasCrossGroupAccess,
+              includeDeleted: args.include_deleted,
               timestamp: new Date().toISOString(),
             },
             'list_tasks_result',
@@ -726,7 +765,10 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             schedule_type: string;
             schedule_value: string;
             status: string;
-            next_run: string;
+            next_run: string | null;
+            revision: number;
+            current_run?: { id: string; status: string } | null;
+            deleted_at?: string | null;
           }>;
           if (tasks.length === 0) {
             return {
@@ -738,7 +780,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           const formatted = tasks
             .map(
               (t) =>
-                `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${formatIsoLocal(t.next_run)}`,
+                `- [${t.id}] rev=${t.revision}${t.deleted_at ? ' [deleted]' : ''} ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.current_run?.status || t.status}, next: ${t.next_run ? formatIsoLocal(t.next_run) : '-'}`,
             )
             .join('\n');
           return {
@@ -763,13 +805,21 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- pause_task ---
     tool(
       'pause_task',
-      'Pause a scheduled task. It will not run until resumed.',
-      { task_id: z.string().describe('The task ID to pause') },
+      'Pause future scheduled occurrences. A currently running occurrence continues; use stop_task_run to stop it.',
+      {
+        task_id: z.string().describe('The task ID to pause'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'pause_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
@@ -814,12 +864,20 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     tool(
       'resume_task',
       'Resume a paused task.',
-      { task_id: z.string().describe('The task ID to resume') },
+      {
+        task_id: z.string().describe('The task ID to resume'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'resume_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
@@ -863,13 +921,21 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- cancel_task ---
     tool(
       'cancel_task',
-      'Cancel and delete a scheduled task.',
-      { task_id: z.string().describe('The task ID to cancel') },
+      'Soft-delete a scheduled task. Future runs stop, but run history is retained.',
+      {
+        task_id: z.string().describe('The task ID to delete'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'cancel_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
@@ -895,7 +961,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             content: [
               {
                 type: 'text' as const,
-                text: `Task ${args.task_id} cancelled and deleted.`,
+                text: `Task ${args.task_id} deleted. Its run history is retained.`,
               },
             ],
           };
@@ -919,6 +985,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       `Update an existing scheduled task IN PLACE. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
       {
         task_id: z.string().describe('The task ID to update'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            'Revision returned by list_tasks. The update is rejected if the task changed since it was listed.',
+          ),
         prompt: z
           .string()
           .optional()
@@ -970,6 +1043,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           type: 'update_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
@@ -1020,6 +1094,256 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
                 type: 'text' as const,
                 text: `Timeout waiting for update confirmation for task ${args.task_id}.`,
               },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- run_task_now ---
+    tool(
+      'run_task_now',
+      'Run a scheduled task once now without changing its future schedule. A paused task stays paused.',
+      {
+        task_id: z.string().describe('The task ID to run'),
+        idempotency_key: z
+          .string()
+          .optional()
+          .describe(
+            'Stable retry key; reuse it when retrying an uncertain request',
+          ),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        const idempotencyKey = args.idempotency_key || requestId;
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'run_task_now',
+              requestId,
+              taskId: args.task_id,
+              idempotencyKey,
+              timestamp: new Date().toISOString(),
+            },
+            'run_task_now_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to run task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              structuredContent: {
+                success: false,
+                task_id: args.task_id,
+                error: result.error || 'Unknown error',
+                existing_run_id: result.runId ?? null,
+                idempotency_key: idempotencyKey,
+              },
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task queued. run_id=${result.runId ?? '?'}. This one-time run does not change the future schedule.`,
+              },
+            ],
+            structuredContent: {
+              success: true,
+              task_id: args.task_id,
+              run_id: result.runId ?? null,
+              status: 'queued',
+              idempotency_key: idempotencyKey,
+            },
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout while starting task ${args.task_id}. Retry with idempotency_key=${idempotencyKey} or inspect task runs first.`,
+              },
+            ],
+            structuredContent: {
+              success: false,
+              task_id: args.task_id,
+              uncertain: true,
+              idempotency_key: idempotencyKey,
+            },
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- stop_task_run ---
+    tool(
+      'stop_task_run',
+      'Stop one queued or running occurrence. This does not pause future scheduled runs.',
+      {
+        run_id: z
+          .string()
+          .describe('Run ID returned by run_task_now/list_task_runs'),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'stop_task_run',
+              requestId,
+              runId: args.run_id,
+              timestamp: new Date().toISOString(),
+            },
+            'stop_task_run_result',
+          );
+          return result.success
+            ? {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Run ${args.run_id} stopped. Future task schedules are unchanged.`,
+                  },
+                ],
+              }
+            : {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to stop run ${args.run_id}: ${result.error || 'Unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for stop confirmation for run ${args.run_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- restore_task ---
+    tool(
+      'restore_task',
+      'Restore a soft-deleted task as paused. It will not run until explicitly resumed.',
+      {
+        task_id: z.string(),
+        expected_revision: z.number().int().positive(),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'restore_task',
+              requestId,
+              taskId: args.task_id,
+              expectedRevision: args.expected_revision,
+              timestamp: new Date().toISOString(),
+            },
+            'restore_task_result',
+          );
+          return result.success
+            ? {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Task ${args.task_id} restored as paused (revision ${result.revision ?? '?'}).`,
+                  },
+                ],
+              }
+            : {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to restore task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for restore confirmation for task ${args.task_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- list_task_runs ---
+    tool(
+      'list_task_runs',
+      'List recent occurrences for a scheduled task, including attempts and notification state.',
+      {
+        task_id: z.string(),
+        limit: z.number().int().min(1).max(50).default(20),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'list_task_runs',
+              requestId,
+              taskId: args.task_id,
+              limit: args.limit,
+              timestamp: new Date().toISOString(),
+            },
+            'list_task_runs_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to list runs: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const runs = (result.runs || []) as Array<Record<string, unknown>>;
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  runs.length === 0
+                    ? 'No task runs found.'
+                    : runs
+                        .map(
+                          (run) =>
+                            `- [${String(run.id)}] ${String(run.status)} trigger=${String(run.trigger_type)} attempt=${String(run.attempt)} scheduled=${formatIsoLocal(String(run.scheduled_for))} notification=${String(run.notification_status)}`,
+                        )
+                        .join('\n'),
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              { type: 'text' as const, text: 'Timeout listing task runs.' },
             ],
             isError: true,
           };

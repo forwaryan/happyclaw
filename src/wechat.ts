@@ -157,6 +157,70 @@ interface CDNMedia {
   aes_key?: string;
 }
 
+type WeChatApiEnvelope = {
+  ret?: unknown;
+  errcode?: unknown;
+  error_code?: unknown;
+  errno?: unknown;
+  code?: unknown;
+  errmsg?: unknown;
+  error_msg?: unknown;
+  message?: unknown;
+  base_resp?: { ret?: unknown; errcode?: unknown; errmsg?: unknown };
+};
+
+function nonZeroApiCode(value: unknown): boolean {
+  if (value === undefined || value === null || value === '') return false;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric !== 0 : true;
+}
+
+/** Reject transport-success responses that encode a WeChat API failure. */
+export function assertWeChatApiSuccess(
+  response: WeChatApiEnvelope,
+  operation: string,
+): void {
+  const codes: Array<[string, unknown]> = [
+    ['ret', response.ret],
+    ['errcode', response.errcode],
+    ['error_code', response.error_code],
+    ['errno', response.errno],
+    ['code', response.code],
+    ['base_resp.ret', response.base_resp?.ret],
+    ['base_resp.errcode', response.base_resp?.errcode],
+  ];
+  const failure = codes.find(([, value]) => nonZeroApiCode(value));
+  if (!failure) return;
+  const message =
+    response.errmsg ??
+    response.error_msg ??
+    response.message ??
+    response.base_resp?.errmsg ??
+    '';
+  throw new Error(
+    `${operation} failed: ${failure[0]}=${String(failure[1])}${message ? ` message=${String(message)}` : ''}`,
+  );
+}
+
+export async function parseWeChatApiResponse<T>(
+  response: Response,
+  endpoint: string,
+): Promise<T> {
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `WeChat API ${endpoint} HTTP ${response.status}: ${text.slice(0, 200)}`,
+    );
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(
+      `WeChat API ${endpoint} invalid JSON: ${text.slice(0, 200)}`,
+    );
+  }
+}
+
 interface GetUpdatesResponse {
   ret?: number;
   msgs?: WeixinMessage[];
@@ -324,14 +388,7 @@ export function createWeChatConnection(
         signal: controller.signal,
       });
 
-      const text = await res.text();
-      try {
-        return JSON.parse(text) as T;
-      } catch {
-        throw new Error(
-          `WeChat API ${endpoint} invalid JSON: ${text.slice(0, 200)}`,
-        );
-      }
+      return await parseWeChatApiResponse<T>(res, endpoint);
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
         throw new Error(`WeChat API ${endpoint} timed out`);
@@ -384,11 +441,7 @@ export function createWeChatConnection(
       base_info: baseInfo(),
     });
 
-    if (resp.ret !== undefined && resp.ret !== 0) {
-      throw new Error(
-        `sendMessage failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`,
-      );
-    }
+    assertWeChatApiSuccess(resp, 'sendMessage');
   }
 
   async function getTypingTicket(
@@ -939,7 +992,7 @@ export function createWeChatConnection(
           { chatId },
           'No context_token available for WeChat user, cannot send message',
         );
-        return;
+        throw new Error(`No context_token available for WeChat chat ${chatId}`);
       }
 
       try {
@@ -972,7 +1025,7 @@ export function createWeChatConnection(
           { chatId },
           'No context_token for WeChat user, cannot send image',
         );
-        return;
+        throw new Error(`No context_token available for WeChat chat ${chatId}`);
       }
 
       if (imageBuffer.length > MAX_FILE_SIZE) {
@@ -1040,11 +1093,7 @@ export function createWeChatConnection(
           base_info: baseInfo(),
         });
 
-        if (resp.ret !== undefined && resp.ret !== 0) {
-          throw new Error(
-            `sendImage failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`,
-          );
-        }
+        assertWeChatApiSuccess(resp, 'sendImage');
 
         logger.info(
           { chatId, size: imageBuffer.length, fileName: resolvedFileName },
@@ -1069,7 +1118,7 @@ export function createWeChatConnection(
           { chatId },
           'No context_token for WeChat user, cannot send file',
         );
-        return;
+        throw new Error(`No context_token available for WeChat chat ${chatId}`);
       }
 
       // Single readFile + size check, then pass buffer to uploadMediaBuffer —
@@ -1125,11 +1174,7 @@ export function createWeChatConnection(
           base_info: baseInfo(),
         });
 
-        if (resp.ret !== undefined && resp.ret !== 0) {
-          throw new Error(
-            `sendFile failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`,
-          );
-        }
+        assertWeChatApiSuccess(resp, 'sendFile');
 
         logger.info({ chatId, size: buf.length, fileName }, 'WeChat file sent');
       } catch (err) {

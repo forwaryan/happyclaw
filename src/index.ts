@@ -5,8 +5,6 @@ import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 
-import { CronExpressionParser } from 'cron-parser';
-
 import {
   ASSISTANT_NAME,
   CONTAINER_IMAGE,
@@ -59,6 +57,7 @@ import {
   getAllSessions,
   hasContainerModeGroups,
   getAllTasks,
+  getDeletedTasks,
   getJidsByFolder,
   getLastGroupSync,
   getRegisteredGroup,
@@ -69,6 +68,14 @@ import {
   getRouterStateByPrefix,
   deleteRouterState,
   getTaskById,
+  getTaskRunById,
+  getActiveTaskRunForTask,
+  getTaskRunsForTask,
+  recordTaskRunNotificationReceipt,
+  finalizeTaskRunNotificationIfPending,
+  type TaskRunAtomicNotificationPayload,
+  type TaskRunNotificationPayload,
+  type TaskRunNotificationReceipt,
   getUserHomeGroup,
   initDatabase,
   listUsers,
@@ -83,6 +90,9 @@ import {
   rebuildMessageTokenUsageFromLedger,
   updateChatName,
   updateTask,
+  updateTaskWithRevision,
+  softDeleteTaskWithRevision,
+  restoreTaskWithRevision,
   createAgent,
   getAgent,
   updateAgentStatus,
@@ -169,9 +179,15 @@ import {
   resolveTaskRoutingDecision,
 } from './task-routing.js';
 import {
-  awaitRequiredIpcSideEffects,
+  canDeleteAcknowledgedIpcSource,
+  extractDurableTaskRunIdFromNamespace,
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
+import {
+  buildFailedTaskImageNotification,
+  settleTaskNotificationDeliveries,
+  type TaskNotificationDeliveryAttempt,
+} from './task-notification.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
   applyAutoIsolateContextForGroups,
@@ -230,9 +246,19 @@ import { GroupQueue, type IpcDeliveryReceipt } from './group-queue.js';
 import {
   startSchedulerLoop,
   triggerTaskNow,
+  cancelTaskRunNow,
+  notifyTaskSchedulerChanged,
   computeNextRunForSchedule,
+  computeNextRunForTaskResume,
   getRunningTaskIds,
 } from './task-scheduler.js';
+import { getMergedTaskRunHistory } from './task-run-history.js';
+import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
+import {
+  getScriptTaskHostExecutionError,
+  resolveTaskExecutionModeForTarget,
+  SCRIPT_TASK_HOST_REQUIRED_ERROR,
+} from './script-task-policy.js';
 import {
   checkBillingAccessFresh,
   formatBillingAccessDeniedMessage,
@@ -1609,6 +1635,69 @@ async function sendImWithRetry(
     }
   }
   return false;
+}
+
+async function sendTaskImageWithRetry(
+  targetJid: string,
+  imageBuffer: Buffer,
+  mimeType: string,
+  caption?: string,
+  fileName?: string,
+): Promise<boolean> {
+  if (!imManager.isChannelAvailableForJid(targetJid)) return false;
+  return retryImOperation('send_task_image', targetJid, () =>
+    imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+  );
+}
+
+async function sendTaskFileWithRetry(
+  targetJid: string,
+  filePath: string,
+  fileName: string,
+): Promise<boolean> {
+  if (!imManager.isChannelAvailableForJid(targetJid)) return false;
+  return retryImOperation('send_task_file', targetJid, () =>
+    imManager.sendFile(targetJid, filePath, fileName),
+  );
+}
+
+function taskRunAcceptsLateIpcOutput(runId: string | null): boolean {
+  if (!runId) return true;
+  const run = getTaskRunById(runId);
+  return Boolean(run && run.status !== 'cancelled' && run.status !== 'missed');
+}
+
+async function settleAndRecordTaskIpcDeliveries(
+  runId: string | null,
+  attempts: TaskNotificationDeliveryAttempt[],
+): Promise<{
+  accepted: boolean;
+  receipt: TaskRunNotificationReceipt;
+}> {
+  if (!taskRunAcceptsLateIpcOutput(runId)) {
+    return {
+      accepted: false,
+      receipt: {
+        status: 'skipped',
+        summary: {
+          attempted: 0,
+          succeeded: 0,
+          failed: 0,
+          failed_channels: [],
+        },
+        error: 'Task run was cancelled before IPC delivery',
+      },
+    };
+  }
+  const outcome = await settleTaskNotificationDeliveries(attempts);
+  if (runId) {
+    recordTaskRunNotificationReceipt(
+      runId,
+      outcome.receipt,
+      outcome.retryPayload,
+    );
+  }
+  return { accepted: true, receipt: outcome.receipt };
 }
 
 /** Fire-and-forget wrapper for sendImWithRetry (used in non-await contexts). */
@@ -5901,6 +5990,7 @@ function startIpcWatcher(): void {
       agentId: ipcAgentId,
       taskId: ipcTaskId,
     } of ipcRoots) {
+      const durableTaskRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
       const messagesDir = path.join(ipcRoot, 'messages');
       const messageResultsDir = path.join(ipcRoot, 'message-results');
       const tasksDir = path.join(ipcRoot, 'tasks');
@@ -5935,6 +6025,29 @@ function startIpcWatcher(): void {
               await fsp.unlink(filePath);
               continue;
             }
+            if (
+              data.type === 'image' &&
+              (typeof data.chatJid !== 'string' ||
+                !data.chatJid ||
+                typeof data.imageBase64 !== 'string' ||
+                !data.imageBase64)
+            ) {
+              messageResultWritten = writeIpcMessageResult(
+                messageResultsDir,
+                messageRequestId,
+                { success: false, error: 'Invalid image request.' },
+              );
+              if (
+                !canDeleteAcknowledgedIpcSource(
+                  messageRequestId,
+                  messageResultWritten,
+                )
+              ) {
+                throw new Error('Failed to acknowledge invalid image request');
+              }
+              await fsp.unlink(filePath);
+              continue;
+            }
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = registeredGroups[data.chatJid];
               let messageDelivered = false;
@@ -5963,6 +6076,22 @@ function startIpcWatcher(): void {
                   data.taskId ||
                   ipcTaskId
                 );
+                if (
+                  isTaskIpcMessage &&
+                  durableTaskRunId &&
+                  !taskRunAcceptsLateIpcOutput(durableTaskRunId)
+                ) {
+                  messageResultWritten = writeIpcMessageResult(
+                    messageResultsDir,
+                    messageRequestId,
+                    {
+                      success: false,
+                      error: 'Task run was cancelled before message delivery.',
+                    },
+                  );
+                  await fsp.unlink(filePath);
+                  continue;
+                }
                 // Conversation agents and isolated scheduled tasks route to
                 // virtual JIDs so output appears in their own tab/session,
                 // not the workspace main conversation.
@@ -6019,48 +6148,82 @@ function startIpcWatcher(): void {
                     !!sourceGroupEntry?.created_by,
                     { getTaskById, getChannelType },
                   );
-                  if (
-                    routingDecision.mode !== 'none' &&
-                    sourceGroupEntry?.created_by
-                  ) {
+                  if (isTaskIpcMessage) {
                     const taskLocalImages = extractLocalImImagePaths(
                       data.text,
                       sourceGroup,
                     );
-                    if (routingDecision.mode === 'direct') {
-                      // Task targets a specific IM group; send there unless
-                      // the prior branches already delivered to the same jid.
-                      if (
-                        routingDecision.taskChatJid !== data.chatJid &&
-                        routingDecision.taskChatJid !== ipcImRoute
-                      ) {
-                        await awaitRequiredIpcSideEffects([
-                          sendImWithRetry(
-                            routingDecision.taskChatJid,
-                            data.text,
-                            taskLocalImages,
-                          ),
-                        ]);
+                    const attempts: TaskNotificationDeliveryAttempt[] = [];
+                    const addTargetAttempts = (targetJid: string): void => {
+                      const channel = getChannelType(targetJid) ?? targetJid;
+                      attempts.push({
+                        channel,
+                        payload: {
+                          kind: 'im_message',
+                          targetJid,
+                          text: data.text,
+                          localImagePaths: [],
+                        },
+                        deliver: () =>
+                          sendImWithRetry(targetJid, data.text, []),
+                      });
+                      for (const imagePath of taskLocalImages) {
+                        const imageBuffer = fs.readFileSync(imagePath);
+                        const mimeType = detectImageMimeType(imageBuffer);
+                        const fileName = path.basename(imagePath);
+                        attempts.push({
+                          channel,
+                          payload: {
+                            kind: 'im_image',
+                            targetJid,
+                            workspaceFolder: sourceGroup,
+                            filePath: path.relative(
+                              path.resolve(GROUPS_DIR, sourceGroup),
+                              imagePath,
+                            ),
+                            mimeType,
+                            fileName,
+                          },
+                          deliver: () =>
+                            sendTaskImageWithRetry(
+                              targetJid,
+                              imageBuffer,
+                              mimeType,
+                              undefined,
+                              fileName,
+                            ),
+                        });
                       }
-                    } else {
+                    };
+                    if (routingDecision.mode === 'direct') {
+                      const targetJid = routingDecision.taskChatJid;
+                      addTargetAttempts(targetJid);
+                    } else if (
+                      routingDecision.mode === 'broadcast' &&
+                      sourceGroupEntry?.created_by
+                    ) {
                       // Fallback: broadcast to all connected IM channels
                       const alreadySent = new Set<string>(
                         [data.chatJid, ipcImRoute].filter(Boolean) as string[],
                       );
-                      const pendingSends: Promise<boolean>[] = [];
                       broadcastToOwnerIMChannels(
                         sourceGroupEntry.created_by,
                         broadcastFolder,
                         alreadySent,
                         (jid) => {
-                          pendingSends.push(
-                            sendImWithRetry(jid, data.text, taskLocalImages),
-                          );
+                          addTargetAttempts(jid);
                         },
                         routingDecision.notifyChannels,
                       );
-                      await awaitRequiredIpcSideEffects(pendingSends);
                     }
+                    const delivery = await settleAndRecordTaskIpcDeliveries(
+                      durableTaskRunId,
+                      attempts,
+                    );
+                    messageDelivered =
+                      delivery.accepted &&
+                      (delivery.receipt.status === 'success' ||
+                        delivery.receipt.status === 'skipped');
                   }
                 }
                 if (messageDelivered) {
@@ -6115,6 +6278,9 @@ function startIpcWatcher(): void {
             ) {
               // Handle image IPC messages from send_image MCP tool
               const targetGroup = registeredGroups[data.chatJid];
+              let taskImageTargetJids: string[] = [];
+              let taskImageDeliverySettled = false;
+              let isTaskIpcImage = false;
               if (
                 canSendCrossGroupMessage(
                   isAdminHome,
@@ -6130,11 +6296,37 @@ function startIpcWatcher(): void {
                   const caption = data.caption || undefined;
                   const fileName = data.fileName || undefined;
 
-                  const isTaskIpcImage = !!(
+                  isTaskIpcImage = !!(
                     data.isScheduledTask ||
                     data.taskId ||
                     ipcTaskId
                   );
+                  if (
+                    isTaskIpcImage &&
+                    durableTaskRunId &&
+                    !taskRunAcceptsLateIpcOutput(durableTaskRunId)
+                  ) {
+                    messageResultWritten = writeIpcMessageResult(
+                      messageResultsDir,
+                      messageRequestId,
+                      {
+                        success: false,
+                        error: 'Task run was cancelled before image delivery.',
+                      },
+                    );
+                    if (
+                      !canDeleteAcknowledgedIpcSource(
+                        messageRequestId,
+                        messageResultWritten,
+                      )
+                    ) {
+                      throw new Error(
+                        'Failed to acknowledge cancelled image request',
+                      );
+                    }
+                    await fsp.unlink(filePath);
+                    continue;
+                  }
                   const imgImRoute = isTaskIpcImage
                     ? null
                     : resolveImRoute({
@@ -6143,6 +6335,31 @@ function startIpcWatcher(): void {
                         chatJid: data.chatJid,
                         sourceGroup,
                       });
+                  if (isTaskIpcImage) {
+                    const imgRoutingDecision = resolveTaskRoutingDecision(
+                      data,
+                      ipcTaskId,
+                      !!sourceGroupEntry?.created_by,
+                      { getTaskById, getChannelType },
+                    );
+                    if (imgRoutingDecision.mode === 'direct') {
+                      taskImageTargetJids = [imgRoutingDecision.taskChatJid];
+                    } else if (
+                      imgRoutingDecision.mode === 'broadcast' &&
+                      sourceGroupEntry?.created_by
+                    ) {
+                      const alreadySent = new Set<string>(
+                        [data.chatJid, imgImRoute].filter(Boolean) as string[],
+                      );
+                      broadcastToOwnerIMChannels(
+                        sourceGroupEntry.created_by,
+                        broadcastFolder,
+                        alreadySent,
+                        (jid) => taskImageTargetJids.push(jid),
+                        imgRoutingDecision.notifyChannels,
+                      );
+                    }
+                  }
                   if (imgImRoute) {
                     const sent = await retryImOperation(
                       'send_image',
@@ -6215,62 +6432,62 @@ function startIpcWatcher(): void {
 
                   // Scheduled-task image routing uses the same direct target /
                   // notify-channel fan-out contract as text and file outputs.
-                  const imgRoutingDecision = ipcAgentId
-                    ? { mode: 'none' as const }
-                    : resolveTaskRoutingDecision(
-                        data,
-                        ipcTaskId,
-                        !!sourceGroupEntry?.created_by,
-                        { getTaskById, getChannelType },
-                      );
-                  if (
-                    imgRoutingDecision.mode !== 'none' &&
-                    sourceGroupEntry?.created_by
-                  ) {
-                    if (imgRoutingDecision.mode === 'direct') {
-                      await retryImOperation(
-                        'send_task_image',
-                        imgRoutingDecision.taskChatJid,
-                        () =>
-                          imManager.sendImage(
-                            imgRoutingDecision.taskChatJid,
-                            imageBuffer,
-                            mimeType,
-                            caption,
-                            fileName,
-                          ),
-                      );
-                    } else {
-                      const alreadySent = new Set<string>(
-                        [data.chatJid, imgImRoute].filter(Boolean) as string[],
-                      );
-                      const pendingSends: Promise<unknown>[] = [];
-                      broadcastToOwnerIMChannels(
-                        sourceGroupEntry.created_by,
-                        broadcastFolder,
-                        alreadySent,
-                        (jid) => {
-                          pendingSends.push(
-                            imManager
-                              .sendImage(
-                                jid,
-                                imageBuffer,
-                                mimeType,
-                                caption,
-                                fileName,
-                              )
-                              .catch((err) =>
-                                logger.warn(
-                                  { jid, err },
-                                  'Failed to broadcast task image to IM',
-                                ),
-                              ),
-                          );
-                        },
-                        imgRoutingDecision.notifyChannels,
-                      );
-                      await Promise.allSettled(pendingSends);
+                  if (isTaskIpcImage) {
+                    const attempts: TaskNotificationDeliveryAttempt[] = [];
+                    const relativeImagePath =
+                      typeof data.filePath === 'string' ? data.filePath : '';
+                    const imageAttempt = (
+                      targetJid: string,
+                    ): TaskNotificationDeliveryAttempt => ({
+                      channel: getChannelType(targetJid) ?? targetJid,
+                      payload: {
+                        kind: 'im_image',
+                        targetJid,
+                        workspaceFolder: sourceGroup,
+                        filePath: relativeImagePath,
+                        mimeType,
+                        caption,
+                        fileName,
+                      },
+                      deliver: () =>
+                        sendTaskImageWithRetry(
+                          targetJid,
+                          imageBuffer,
+                          mimeType,
+                          caption,
+                          fileName,
+                        ),
+                    });
+                    for (const targetJid of taskImageTargetJids) {
+                      attempts.push(imageAttempt(targetJid));
                     }
+                    const delivery = await settleAndRecordTaskIpcDeliveries(
+                      durableTaskRunId,
+                      attempts,
+                    );
+                    taskImageDeliverySettled = true;
+                    const delivered =
+                      delivery.accepted &&
+                      (delivery.receipt.status === 'success' ||
+                        delivery.receipt.status === 'skipped');
+                    messageResultWritten = writeIpcMessageResult(
+                      messageResultsDir,
+                      messageRequestId,
+                      delivered
+                        ? { success: true }
+                        : {
+                            success: false,
+                            error:
+                              delivery.receipt.error ||
+                              'Image could not be delivered to its target.',
+                          },
+                    );
+                  } else {
+                    messageResultWritten = writeIpcMessageResult(
+                      messageResultsDir,
+                      messageRequestId,
+                      { success: true },
+                    );
                   }
 
                   logger.info(
@@ -6284,17 +6501,55 @@ function startIpcWatcher(): void {
                     'IPC image sent',
                   );
                 } catch (err) {
+                  if (
+                    isTaskIpcImage &&
+                    durableTaskRunId &&
+                    !taskImageDeliverySettled
+                  ) {
+                    const failed = buildFailedTaskImageNotification({
+                      targetJids: taskImageTargetJids,
+                      workspaceFolder: sourceGroup,
+                      filePath:
+                        typeof data.filePath === 'string' ? data.filePath : '',
+                      mimeType: data.mimeType || 'image/png',
+                      caption: data.caption || undefined,
+                      fileName: data.fileName || undefined,
+                      error: err,
+                      getChannel: getChannelType,
+                    });
+                    if (failed) {
+                      recordTaskRunNotificationReceipt(
+                        durableTaskRunId,
+                        failed.receipt,
+                        failed.payload,
+                      );
+                    }
+                  }
                   logger.error(
                     { chatJid: data.chatJid, sourceGroup, err },
                     'Failed to process IPC image',
                   );
+                  throw err;
                 }
               } else {
                 logger.warn(
                   { chatJid: data.chatJid, sourceGroup },
                   'Unauthorized IPC image attempt blocked',
                 );
+                messageResultWritten = writeIpcMessageResult(
+                  messageResultsDir,
+                  messageRequestId,
+                  { success: false, error: 'Unauthorized image target.' },
+                );
               }
+            }
+            if (
+              !canDeleteAcknowledgedIpcSource(
+                messageRequestId,
+                messageResultWritten,
+              )
+            ) {
+              throw new Error('Failed to acknowledge IPC delivery result');
             }
             await fsp.unlink(filePath);
           } catch (err) {
@@ -6318,13 +6573,8 @@ function startIpcWatcher(): void {
             } catch (renameErr) {
               logger.error(
                 { file, sourceGroup, renameErr },
-                'Failed to move IPC message to error directory, deleting',
+                'Failed to move IPC message to error directory; retaining source for retry',
               );
-              try {
-                await fsp.unlink(filePath);
-              } catch {
-                /* ignore */
-              }
             }
           }
         }
@@ -6353,6 +6603,11 @@ function startIpcWatcher(): void {
           'pause_task_result_',
           'resume_task_result_',
           'update_task_result_',
+          'run_task_now_result_',
+          'stop_task_run_result_',
+          'restore_task_result_',
+          'list_task_runs_result_',
+          'send_file_result_',
           'discord_get_history_result_',
           'discord_get_channel_info_result_',
           'discord_get_server_info_result_',
@@ -6472,6 +6727,11 @@ function startIpcWatcher(): void {
                 throw new Error(
                   'Isolated task completion marker does not match its IPC namespace',
                 );
+              }
+              const completedDurableRunId =
+                completion.durableRunId ?? durableTaskRunId;
+              if (completedDurableRunId) {
+                finalizeTaskRunNotificationIfPending(completedDurableRunId);
               }
               deleteSession(sourceGroup, completion.sessionAgentId);
               deleteMessagesForChatJid(completion.virtualChatJid);
@@ -6660,6 +6920,9 @@ async function processTaskIpc(
   data: {
     type: string;
     taskId?: string;
+    runId?: string;
+    expectedRevision?: number;
+    idempotencyKey?: string;
     isScheduledTask?: boolean;
     prompt?: string;
     schedule_type?: string;
@@ -6686,6 +6949,7 @@ async function processTaskIpc(
     fileName?: string;
     // For list_tasks
     isAdminHome?: boolean;
+    includeDeleted?: boolean;
     // For discord_get_history
     limit?: number;
     before?: string;
@@ -6698,6 +6962,7 @@ async function processTaskIpc(
   ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
   ipcTaskId: string | null = null, // Non-null for an isolated scheduled-task run namespace
 ): Promise<void> {
+  const durableTaskRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
   const ownerHomeFolderCandidate = sourceGroupEntry?.created_by
     ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder
     : null;
@@ -6758,33 +7023,15 @@ async function processTaskIpc(
 
         const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
 
-        let nextRun: string | null = null;
-        if (scheduleType === 'cron') {
-          try {
-            const interval = CronExpressionParser.parse(data.schedule_value, {
-              tz: TIMEZONE,
-            });
-            nextRun = interval.next().toISOString();
-          } catch {
-            failSchedule(`Invalid cron expression: ${data.schedule_value}`);
-            break;
-          }
-        } else if (scheduleType === 'interval') {
-          const ms = Number(data.schedule_value);
-          if (!Number.isFinite(ms) || ms < 60_000) {
-            failSchedule(
-              `Invalid interval (must be at least 60000 ms): ${data.schedule_value}`,
-            );
-            break;
-          }
-          nextRun = new Date(Date.now() + ms).toISOString();
-        } else if (scheduleType === 'once') {
-          const scheduled = new Date(data.schedule_value);
-          if (isNaN(scheduled.getTime())) {
-            failSchedule(`Invalid timestamp: ${data.schedule_value}`);
-            break;
-          }
-          nextRun = scheduled.toISOString();
+        let nextRun: string;
+        try {
+          nextRun = computeNextRunForSchedule(
+            scheduleType,
+            data.schedule_value,
+          );
+        } catch (err) {
+          failSchedule(err instanceof Error ? err.message : 'Invalid schedule');
+          break;
         }
 
         const contextMode =
@@ -6792,23 +7039,50 @@ async function processTaskIpc(
             ? data.context_mode
             : 'isolated';
 
+        // Resolve the effective execution mode before compatibility deduplication.
+        // The requested mode is part of task identity: otherwise an identical
+        // prompt could silently reuse a task running across a different security
+        // boundary (host vs container).
+        let executionMode: 'host' | 'container';
+        try {
+          executionMode = resolveTaskExecutionModeForTarget(
+            targetGroupEntry.executionMode,
+            data.execution_mode === 'host' ||
+              data.execution_mode === 'container'
+              ? data.execution_mode
+              : undefined,
+          );
+        } catch (err) {
+          failSchedule(err instanceof Error ? err.message : String(err));
+          break;
+        }
+        if (execType === 'script' && executionMode !== 'host') {
+          failSchedule(SCRIPT_TASK_HOST_REQUIRED_ERROR);
+          break;
+        }
+        const taskCreatedBy = resolveTaskOwner(
+          {},
+          sourceGroupEntry,
+          targetGroupEntry,
+        );
+
         // 幂等去重：仅对 agent 任务生效。#564 的递归增殖只发生在 agent 触发回放路径；
         // 而 script 任务真正承载工作的是 script_command（prompt 常为空），prompt/schedule
-        // 相同但命令不同的多个 script 任务是合法的，按 prompt 去重会静默丢任务。故只去重
-        // agent 任务，并把 context_mode 纳入判定（group/isolated 视为不同任务）。
-        const dupExisting =
-          execType === 'agent'
-            ? getAllTasks().find(
-                (t) =>
-                  t.group_folder === targetFolder &&
-                  t.status === 'active' &&
-                  t.execution_type === 'agent' &&
-                  t.prompt === (data.prompt || '') &&
-                  t.schedule_type === scheduleType &&
-                  t.schedule_value === data.schedule_value &&
-                  t.context_mode === contextMode,
-              )
-            : undefined;
+        // 相同但命令不同的多个 script 任务是合法的，按 prompt 去重会静默丢任务。agent
+        // 任务则比较全部执行定义；目标会话、最终执行环境或路由配置不同都不是重复任务。
+        const dupExisting = findDuplicateActiveAgentTask(getAllTasks(), {
+          group_folder: targetFolder,
+          chat_jid: targetJid,
+          prompt: data.prompt || '',
+          schedule_type: scheduleType,
+          schedule_value: data.schedule_value,
+          context_mode: contextMode,
+          execution_type: execType,
+          execution_mode: executionMode,
+          script_command: data.script_command ?? null,
+          created_by: taskCreatedBy,
+          notify_channels: null,
+        });
         if (dupExisting) {
           logger.info(
             { sourceGroup, taskId: dupExisting.id },
@@ -6824,35 +7098,6 @@ async function processTaskIpc(
         }
 
         const taskId = crypto.randomUUID();
-        // Inherit execution_mode from the source workspace.
-        // - Source is host: default host, allow explicit container downgrade.
-        // - Source is container: default container, REJECT explicit host
-        //   (prevents container-bound agents from escaping isolation; security).
-        // This matches the user-facing semantics: "a task created from a
-        // docker workspace runs in docker; a task created from a host workspace
-        // runs on host unless explicitly overridden to docker."
-        const sourceIsHost = sourceGroupEntry?.executionMode === 'host';
-        let executionMode: 'host' | 'container';
-        if (data.execution_mode === 'host') {
-          if (!sourceIsHost) {
-            logger.warn(
-              { sourceGroup, targetJid },
-              'schedule_task: host mode requested from container source — forcing container',
-            );
-            executionMode = 'container';
-          } else {
-            executionMode = 'host';
-          }
-        } else if (data.execution_mode === 'container') {
-          executionMode = 'container';
-        } else {
-          executionMode = sourceIsHost ? 'host' : 'container';
-        }
-        const taskCreatedBy = resolveTaskOwner(
-          {},
-          sourceGroupEntry,
-          targetGroupEntry,
-        );
 
         createTask({
           id: taskId,
@@ -6871,6 +7116,7 @@ async function processTaskIpc(
           created_by: taskCreatedBy,
           notify_channels: null,
         });
+        notifyTaskSchedulerChanged();
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode, execType },
           'Task created via IPC',
@@ -6890,14 +7136,43 @@ async function processTaskIpc(
       if (data.taskId) {
         const task = getTaskById(data.taskId);
         if (task && (isAdminHome || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'paused' });
+          if (!Number.isInteger(data.expectedRevision)) {
+            writeTaskResult(tasksDir, 'pause_task', data.requestId, {
+              success: false,
+              error: 'expected_revision is required. Call list_tasks first.',
+            });
+            break;
+          }
+          const mutation = updateTaskWithRevision(
+            data.taskId,
+            data.expectedRevision!,
+            { status: 'paused' },
+          );
+          if (mutation.status === 'conflict') {
+            writeTaskResult(tasksDir, 'pause_task', data.requestId, {
+              success: false,
+              code: 'TASK_REVISION_CONFLICT',
+              error: `Task changed; current revision is ${mutation.task.revision}. Call list_tasks and retry.`,
+              task: mutation.task,
+            });
+            break;
+          }
+          if (mutation.status === 'not_found') {
+            writeTaskResult(tasksDir, 'pause_task', data.requestId, {
+              success: false,
+              error: 'Task not found.',
+            });
+            break;
+          }
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
           );
+          notifyTaskSchedulerChanged();
           writeTaskResult(tasksDir, 'pause_task', data.requestId, {
             success: true,
             taskId: data.taskId,
+            revision: mutation.task.revision,
           });
         } else {
           logger.warn(
@@ -6930,6 +7205,26 @@ async function processTaskIpc(
             });
             break;
           }
+          if (task.execution_type === 'script') {
+            if (!isAdminHome) {
+              writeTaskResult(tasksDir, 'resume_task', data.requestId, {
+                success: false,
+                error: 'Only the admin home container can resume script tasks.',
+              });
+              break;
+            }
+            const policyError = getScriptTaskHostExecutionError(
+              task,
+              registeredGroups,
+            );
+            if (policyError) {
+              writeTaskResult(tasksDir, 'resume_task', data.requestId, {
+                success: false,
+                error: policyError,
+              });
+              break;
+            }
+          }
           if (task.status === 'completed' && task.schedule_type === 'once') {
             writeTaskResult(tasksDir, 'resume_task', data.requestId, {
               success: false,
@@ -6939,9 +7234,9 @@ async function processTaskIpc(
             break;
           }
           const patch: Parameters<typeof updateTask>[1] = { status: 'active' };
-          if (task.next_run == null && task.schedule_type !== 'once') {
+          if (task.schedule_type === 'once' || task.next_run == null) {
             try {
-              patch.next_run = computeNextRunForSchedule(
+              patch.next_run = computeNextRunForTaskResume(
                 task.schedule_type,
                 task.schedule_value,
               );
@@ -6953,14 +7248,43 @@ async function processTaskIpc(
               break;
             }
           }
-          updateTask(data.taskId, patch);
+          if (!Number.isInteger(data.expectedRevision)) {
+            writeTaskResult(tasksDir, 'resume_task', data.requestId, {
+              success: false,
+              error: 'expected_revision is required. Call list_tasks first.',
+            });
+            break;
+          }
+          const mutation = updateTaskWithRevision(
+            data.taskId,
+            data.expectedRevision!,
+            patch,
+          );
+          if (mutation.status === 'conflict') {
+            writeTaskResult(tasksDir, 'resume_task', data.requestId, {
+              success: false,
+              code: 'TASK_REVISION_CONFLICT',
+              error: `Task changed; current revision is ${mutation.task.revision}. Call list_tasks and retry.`,
+              task: mutation.task,
+            });
+            break;
+          }
+          if (mutation.status === 'not_found') {
+            writeTaskResult(tasksDir, 'resume_task', data.requestId, {
+              success: false,
+              error: 'Task not found.',
+            });
+            break;
+          }
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
           );
+          notifyTaskSchedulerChanged();
           writeTaskResult(tasksDir, 'resume_task', data.requestId, {
             success: true,
             taskId: data.taskId,
+            revision: mutation.task.revision,
           });
         } else {
           logger.warn(
@@ -6986,7 +7310,17 @@ async function processTaskIpc(
       if (data.taskId) {
         const task = getTaskById(data.taskId);
         if (task && (isAdminHome || task.group_folder === sourceGroup)) {
-          if (getRunningTaskIds().includes(data.taskId)) {
+          if (task.execution_type === 'script' && !isAdminHome) {
+            writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
+              success: false,
+              error: 'Only the admin home container can delete script tasks.',
+            });
+            break;
+          }
+          if (
+            !getActiveTaskRunForTask(data.taskId) &&
+            getRunningTaskIds().includes(data.taskId)
+          ) {
             writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
               success: false,
               error:
@@ -6994,14 +7328,51 @@ async function processTaskIpc(
             });
             break;
           }
-          deleteTask(data.taskId);
+          if (!Number.isInteger(data.expectedRevision)) {
+            writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
+              success: false,
+              error: 'expected_revision is required. Call list_tasks first.',
+            });
+            break;
+          }
+          const mutation = softDeleteTaskWithRevision(
+            data.taskId,
+            data.expectedRevision!,
+          );
+          if (mutation.status === 'conflict') {
+            writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
+              success: false,
+              code: 'TASK_REVISION_CONFLICT',
+              error: `Task changed; current revision is ${mutation.task.revision}. Call list_tasks and retry.`,
+              task: mutation.task,
+            });
+            break;
+          }
+          if (mutation.status === 'active_run') {
+            writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
+              success: false,
+              code: 'TASK_HAS_ACTIVE_RUN',
+              error: 'Task is running. Stop the current run before deleting.',
+              runId: mutation.run.id,
+            });
+            break;
+          }
+          if (mutation.status === 'not_found') {
+            writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
+              success: false,
+              error: 'Task not found.',
+            });
+            break;
+          }
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
           );
+          notifyTaskSchedulerChanged();
           writeTaskResult(tasksDir, 'cancel_task', data.requestId, {
             success: true,
             taskId: data.taskId,
+            revision: mutation.task.revision,
           });
         } else {
           logger.warn(
@@ -7036,6 +7407,10 @@ async function processTaskIpc(
       };
       if (!data.taskId) {
         failUpdate('Missing task_id.');
+        break;
+      }
+      if (!Number.isInteger(data.expectedRevision)) {
+        failUpdate('expected_revision is required. Call list_tasks first.');
         break;
       }
       const task = getTaskById(data.taskId);
@@ -7102,19 +7477,258 @@ async function processTaskIpc(
       // 与 schedule_task 一致：最终为 script 执行的任务必须有 script_command，
       // 否则每次触发都会在 script 空命令分支静默失败，而 agent 收到的却是 success。
       const finalExecType = patch.execution_type ?? task.execution_type;
+      const finalExecutionMode = patch.execution_mode ?? task.execution_mode;
       if (finalExecType === 'script') {
         const finalScript = patch.script_command ?? task.script_command;
         if (!finalScript || !finalScript.trim()) {
           failUpdate('Script execution requires a non-empty script_command.');
           break;
         }
+        if (finalExecutionMode !== 'host') {
+          failUpdate(SCRIPT_TASK_HOST_REQUIRED_ERROR);
+          break;
+        }
+      } else {
+        const finalPrompt = patch.prompt ?? task.prompt;
+        if (!finalPrompt.trim()) {
+          failUpdate('Agent execution requires a non-empty prompt.');
+          break;
+        }
       }
-      updateTask(data.taskId, patch);
+      if (finalExecutionMode === 'host') {
+        const targetGroup =
+          registeredGroups[task.chat_jid] ?? getRegisteredGroup(task.chat_jid);
+        if (!targetGroup || targetGroup.executionMode !== 'host') {
+          failUpdate(
+            'Target workspace runs in container mode; host execution is not allowed.',
+          );
+          break;
+        }
+      }
+      const mutation = updateTaskWithRevision(
+        data.taskId,
+        data.expectedRevision!,
+        patch,
+      );
+      if (mutation.status === 'conflict') {
+        writeTaskResult(tasksDir, 'update_task', data.requestId, {
+          success: false,
+          code: 'TASK_REVISION_CONFLICT',
+          error: `Task changed; current revision is ${mutation.task.revision}. Call list_tasks and retry.`,
+          task: mutation.task,
+        });
+        break;
+      }
+      if (mutation.status === 'not_found') {
+        failUpdate('Task not found.');
+        break;
+      }
       logger.info({ taskId: data.taskId, sourceGroup }, 'Task updated via IPC');
+      notifyTaskSchedulerChanged();
       writeTaskResult(tasksDir, 'update_task', data.requestId, {
         success: true,
         taskId: data.taskId,
         nextRun: updatedNextRun,
+        revision: mutation.task.revision,
+      });
+      break;
+    }
+
+    case 'run_task_now': {
+      if (!data.taskId) {
+        writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
+          success: false,
+          error: 'Missing task_id.',
+        });
+        break;
+      }
+      const task = getTaskById(data.taskId);
+      if (!task || task.deleted_at) {
+        writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
+          success: false,
+          error: 'Task not found.',
+        });
+        break;
+      }
+      if (!isAdminHome && task.group_folder !== sourceGroup) {
+        writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
+          success: false,
+          error: 'Not authorized to run this task.',
+        });
+        break;
+      }
+      if (task.execution_type === 'script' && !isAdminHome) {
+        writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
+          success: false,
+          error: 'Only the admin home container can run script tasks.',
+        });
+        break;
+      }
+      const runPolicyError = getScriptTaskHostExecutionError(
+        task,
+        registeredGroups,
+      );
+      if (runPolicyError) {
+        updateTaskWithRevision(task.id, task.revision, {
+          status: 'paused',
+          next_run: null,
+        });
+        notifyTaskSchedulerChanged();
+        writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
+          success: false,
+          error: runPolicyError,
+        });
+        break;
+      }
+      const trigger = getWebDeps()?.triggerTaskRun;
+      if (!trigger) {
+        writeTaskResult(tasksDir, 'run_task_now', data.requestId, {
+          success: false,
+          error: 'Scheduler not available.',
+        });
+        break;
+      }
+      const result = trigger(
+        data.taskId,
+        data.idempotencyKey ?? data.requestId,
+      );
+      writeTaskResult(tasksDir, 'run_task_now', data.requestId, result);
+      break;
+    }
+
+    case 'stop_task_run': {
+      if (!data.runId) {
+        writeTaskResult(tasksDir, 'stop_task_run', data.requestId, {
+          success: false,
+          error: 'Missing run_id.',
+        });
+        break;
+      }
+      const run = getTaskRunById(data.runId);
+      const task = run ? getTaskById(run.task_id) : undefined;
+      if (!run || !task) {
+        writeTaskResult(tasksDir, 'stop_task_run', data.requestId, {
+          success: false,
+          error: 'Task run not found.',
+        });
+        break;
+      }
+      if (!isAdminHome && task.group_folder !== sourceGroup) {
+        writeTaskResult(tasksDir, 'stop_task_run', data.requestId, {
+          success: false,
+          error: 'Not authorized to stop this run.',
+        });
+        break;
+      }
+      if (task.execution_type === 'script' && !isAdminHome) {
+        writeTaskResult(tasksDir, 'stop_task_run', data.requestId, {
+          success: false,
+          error: 'Only the admin home container can stop script task runs.',
+        });
+        break;
+      }
+      const cancel = getWebDeps()?.cancelTaskRun;
+      if (!cancel) {
+        writeTaskResult(tasksDir, 'stop_task_run', data.requestId, {
+          success: false,
+          error: 'Run cancellation is not available.',
+        });
+        break;
+      }
+      writeTaskResult(
+        tasksDir,
+        'stop_task_run',
+        data.requestId,
+        cancel(data.runId),
+      );
+      break;
+    }
+
+    case 'restore_task': {
+      if (!data.taskId || !Number.isInteger(data.expectedRevision)) {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          error: 'task_id and expected_revision are required.',
+        });
+        break;
+      }
+      const task = getTaskById(data.taskId);
+      if (!task || !task.deleted_at) {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          error: 'Deleted task not found.',
+        });
+        break;
+      }
+      if (!isAdminHome && task.group_folder !== sourceGroup) {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          error: 'Not authorized to restore this task.',
+        });
+        break;
+      }
+      if (task.execution_type === 'script' && !isAdminHome) {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          error: 'Only the admin home container can restore script tasks.',
+        });
+        break;
+      }
+      const restorePolicyError = getScriptTaskHostExecutionError(
+        task,
+        registeredGroups,
+      );
+      if (restorePolicyError) {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          error: restorePolicyError,
+        });
+        break;
+      }
+      const mutation = restoreTaskWithRevision(task.id, data.expectedRevision!);
+      if (mutation.status === 'conflict') {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          code: 'TASK_REVISION_CONFLICT',
+          error: `Task changed; current revision is ${mutation.task.revision}.`,
+          task: mutation.task,
+        });
+      } else if (mutation.status === 'updated') {
+        notifyTaskSchedulerChanged();
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: true,
+          taskId: task.id,
+          revision: mutation.task.revision,
+        });
+      } else {
+        writeTaskResult(tasksDir, 'restore_task', data.requestId, {
+          success: false,
+          error: 'Deleted task not found.',
+        });
+      }
+      break;
+    }
+
+    case 'list_task_runs': {
+      if (!data.taskId) {
+        writeTaskResult(tasksDir, 'list_task_runs', data.requestId, {
+          success: false,
+          error: 'Missing task_id.',
+        });
+        break;
+      }
+      const task = getTaskById(data.taskId);
+      if (!task || (!isAdminHome && task.group_folder !== sourceGroup)) {
+        writeTaskResult(tasksDir, 'list_task_runs', data.requestId, {
+          success: false,
+          error: 'Task not found or not authorized.',
+        });
+        break;
+      }
+      const limit = Math.min(Math.max(data.limit ?? 20, 1), 50);
+      writeTaskResult(tasksDir, 'list_task_runs', data.requestId, {
+        success: true,
+        runs: getMergedTaskRunHistory(task.id, limit),
       });
       break;
     }
@@ -7145,7 +7759,9 @@ async function processTaskIpc(
 
         fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
         try {
-          const allTasks = getAllTasks();
+          const allTasks = data.includeDeleted
+            ? [...getAllTasks(), ...getDeletedTasks()]
+            : getAllTasks();
           // Admin home sees all tasks, others only see their own group's tasks
           const filteredTasks = isAdminHome
             ? allTasks
@@ -7158,6 +7774,9 @@ async function processTaskIpc(
             schedule_value: t.schedule_value,
             status: t.status,
             next_run: t.next_run,
+            revision: t.revision,
+            deleted_at: t.deleted_at,
+            current_run: getActiveTaskRunForTask(t.id) ?? null,
           }));
           const resultData = JSON.stringify({ success: true, tasks: taskList });
           const tmpPath = `${resultFilePath}.tmp`;
@@ -7397,11 +8016,24 @@ async function processTaskIpc(
       break;
 
     case 'send_file':
+      const finishSendFile = (success: boolean, error?: string): void => {
+        writeTaskResult(tasksDir, 'send_file', data.requestId, {
+          success,
+          ...(error ? { error } : {}),
+        });
+      };
       logger.debug(
         { data, sourceGroup, isAdminHome, isHome },
         'processTaskIpc send_file reached',
       );
       if (data.chatJid && data.filePath && data.fileName) {
+        if (
+          durableTaskRunId &&
+          !taskRunAcceptsLateIpcOutput(durableTaskRunId)
+        ) {
+          finishSendFile(false, 'Task run was cancelled before file delivery.');
+          break;
+        }
         // Cross-group authorization check (same as send_message)
         const targetGroup = registeredGroups[data.chatJid];
         if (
@@ -7417,6 +8049,7 @@ async function processTaskIpc(
             { chatJid: data.chatJid, sourceGroup },
             'Unauthorized IPC send_file attempt blocked',
           );
+          finishSendFile(false, 'Unauthorized file delivery target.');
           break;
         }
 
@@ -7432,6 +8065,7 @@ async function processTaskIpc(
               { sourceGroup, filePath: data.filePath, resolvedPath },
               'Path traversal attempt blocked in send_file IPC',
             );
+            finishSendFile(false, 'Invalid file path.');
             break;
           }
 
@@ -7473,6 +8107,7 @@ async function processTaskIpc(
                 { filePath: data.filePath, resolvedPath },
                 'send_file: file not found',
               );
+              finishSendFile(false, 'File not found.');
               break;
             }
           }
@@ -7505,43 +8140,83 @@ async function processTaskIpc(
                 { sourceGroup, filePath: data.filePath, resolvedPath },
                 'Symlink traversal attempt blocked in send_file IPC',
               );
+              finishSendFile(false, 'Invalid file path.');
               break;
             }
             const imFileName = data.fileName || path.basename(resolvedPath);
             if (fileRoutingDecision.mode === 'direct') {
               const targetJid = fileRoutingDecision.taskChatJid;
-              const sent = await retryImOperation(
-                'send_task_file',
-                targetJid,
-                () => imManager.sendFile(targetJid, resolvedPath, imFileName),
+              const delivery = await settleAndRecordTaskIpcDeliveries(
+                durableTaskRunId,
+                [
+                  {
+                    channel: getChannelType(targetJid) ?? targetJid,
+                    payload: {
+                      kind: 'im_file',
+                      targetJid,
+                      workspaceFolder: sourceGroup,
+                      filePath: data.filePath,
+                      fileName: imFileName,
+                    },
+                    deliver: () =>
+                      sendTaskFileWithRetry(
+                        targetJid,
+                        resolvedPath,
+                        imFileName,
+                      ),
+                  },
+                ],
               );
+              const sent =
+                delivery.accepted && delivery.receipt.status === 'success';
               if (!sent) {
                 broadcastToWebClients(
                   sourceGroup,
                   `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`,
                 );
               }
+              finishSendFile(
+                sent,
+                sent
+                  ? undefined
+                  : delivery.receipt.error || 'File delivery failed.',
+              );
             } else if (fileRoutingDecision.mode === 'broadcast') {
-              const pendingSends: Promise<unknown>[] = [];
+              const attempts: TaskNotificationDeliveryAttempt[] = [];
               broadcastToOwnerIMChannels(
                 sourceGroupEntry!.created_by!,
                 broadcastFolder,
                 new Set<string>(),
                 (jid) => {
-                  pendingSends.push(
-                    imManager
-                      .sendFile(jid, resolvedPath, imFileName)
-                      .catch((err) =>
-                        logger.warn(
-                          { jid, err },
-                          'Failed to broadcast task file to IM',
-                        ),
-                      ),
-                  );
+                  attempts.push({
+                    channel: getChannelType(jid) ?? jid,
+                    payload: {
+                      kind: 'im_file',
+                      targetJid: jid,
+                      workspaceFolder: sourceGroup,
+                      filePath: data.filePath!,
+                      fileName: imFileName,
+                    },
+                    deliver: () =>
+                      sendTaskFileWithRetry(jid, resolvedPath, imFileName),
+                  });
                 },
                 fileRoutingDecision.notifyChannels,
               );
-              await Promise.allSettled(pendingSends);
+              const delivery = await settleAndRecordTaskIpcDeliveries(
+                durableTaskRunId,
+                attempts,
+              );
+              const sent =
+                delivery.accepted &&
+                (delivery.receipt.status === 'success' ||
+                  delivery.receipt.status === 'skipped');
+              finishSendFile(
+                sent,
+                sent
+                  ? undefined
+                  : delivery.receipt.error || 'File delivery failed.',
+              );
             } else if (regularFileImRoute) {
               const sent = await retryImOperation(
                 'send_file',
@@ -7562,6 +8237,7 @@ async function processTaskIpc(
                   // ignore — failure notification itself failing should not crash
                 }
               }
+              finishSendFile(sent, sent ? undefined : 'File delivery failed.');
             }
           } else {
             logger.debug(
@@ -7571,6 +8247,10 @@ async function processTaskIpc(
             // Notify the user that file delivery to IM was skipped
             const skipMsg = `⚠️ 文件 "${data.fileName}" 未发送到 IM 通道（当前会话无 IM 路由绑定，文件仅保存在工作区）。`;
             broadcastToWebClients(data.chatJid ?? sourceGroup, skipMsg);
+            finishSendFile(
+              false,
+              'No IM route is available for file delivery.',
+            );
           }
           logger.info(
             {
@@ -7587,12 +8267,17 @@ async function processTaskIpc(
           );
         } catch (err) {
           logger.error({ err, data }, 'Failed to send file via IPC');
+          finishSendFile(
+            false,
+            err instanceof Error ? err.message : String(err),
+          );
         }
       } else {
         logger.warn(
           { data },
           'Invalid send_file request - missing required fields',
         );
+        finishSendFile(false, 'Invalid send_file request.');
       }
       break;
 
@@ -12328,7 +13013,13 @@ async function main(): Promise<void> {
         taskRunId,
         selectedProviderId,
       }),
-    sendMessage,
+    sendMessage: async (jid, text, options) => {
+      const outcome = await sendMessageWithOutcome(jid, text, options);
+      if (!outcome.targetDelivered) {
+        throw new Error(`Scheduled-task target did not acknowledge: ${jid}`);
+      }
+      return outcome.messageId;
+    },
     broadcastStreamEvent,
     onWorkspaceCreated: broadcastGroupCreated,
     storePromptMessage: (chatJid, senderId, senderName, text, taskId) => {
@@ -12368,29 +13059,149 @@ async function main(): Promise<void> {
         });
       }
 
-      if (options.ownerId) {
-        const ownerHome = getUserHomeGroup(options.ownerId);
-        const broadcastFolder = options.workspaceFolder ?? ownerHome?.folder;
-        if (broadcastFolder) {
-          const localImages = extractLocalImImagePaths(text, broadcastFolder);
-          // chatJid 指向任务关联的源 workspace。当它本身是 IM channel（如 feishu:），
-          // 说明源群已通过上游 `sendMessage(chatJid, ...)` 直发收到本消息（见
-          // runScriptTask 在 task-scheduler.ts:~671 的 step 1）。把它加入 alreadySentJids
-          // 让 broadcast 跳过同 channel 的 fallback 群，避免同一条消息被重复推到 owner
-          // 注册的另一个飞书/Telegram 群。isolated agent 任务的 workspace.jid 是
-          // ephemeral `web:task-xxx`，getChannelType 返回 null，自然不会加入此集合，
-          // 行为与修复前保持一致。
-          const alreadySent = new Set<string>();
-          if (getChannelType(chatJid)) alreadySent.add(chatJid);
-          broadcastToOwnerIMChannels(
-            options.ownerId,
-            broadcastFolder,
-            alreadySent,
-            (jid) => sendImWithFailTracking(jid, text, localImages),
-            options.notifyChannels,
+      if (!options.ownerId) return;
+      const ownerHome = getUserHomeGroup(options.ownerId);
+      const broadcastFolder = options.workspaceFolder ?? ownerHome?.folder;
+      if (!broadcastFolder) {
+        return {
+          status: 'skipped',
+          summary: {
+            attempted: 0,
+            succeeded: 0,
+            failed: 0,
+            failed_channels: [],
+          },
+        };
+      }
+
+      const localImages = extractLocalImImagePaths(text, broadcastFolder);
+      // Only a strict connector ACK may suppress the source channel fallback.
+      // Merely having an IM-shaped chatJid is insufficient: the generic Web
+      // persistence path can succeed after the physical connector failed.
+      const alreadySent = new Set<string>();
+      if (options.sourceAlreadyDelivered && getChannelType(chatJid)) {
+        alreadySent.add(chatJid);
+      }
+      const deliveries: Array<{ channel: string; result: Promise<boolean> }> =
+        [];
+      broadcastToOwnerIMChannels(
+        options.ownerId,
+        broadcastFolder,
+        alreadySent,
+        (jid) => {
+          deliveries.push({
+            // Notification retries filter on channel type, not the concrete
+            // binding jid. Keep the concrete jid only as a defensive fallback.
+            channel: getChannelType(jid) ?? jid,
+            result: sendImWithRetry(jid, text, localImages),
+          });
+        },
+        options.notifyChannels,
+      );
+      if (deliveries.length === 0) {
+        return {
+          status: 'skipped',
+          summary: {
+            attempted: 0,
+            succeeded: 0,
+            failed: 0,
+            failed_channels: [],
+          },
+        };
+      }
+
+      const outcomes = await Promise.all(
+        deliveries.map(async (delivery) => ({
+          channel: delivery.channel,
+          success: await delivery.result,
+        })),
+      );
+      const failedChannels = outcomes
+        .filter((outcome) => !outcome.success)
+        .map((outcome) => outcome.channel);
+      const succeeded = outcomes.length - failedChannels.length;
+      return {
+        status:
+          failedChannels.length === 0
+            ? 'success'
+            : succeeded > 0
+              ? 'partial_failed'
+              : 'failed',
+        summary: {
+          attempted: outcomes.length,
+          succeeded,
+          failed: failedChannels.length,
+          failed_channels: failedChannels,
+        },
+        error:
+          failedChannels.length > 0
+            ? `通知发送失败：${failedChannels.join(', ')}`
+            : null,
+      };
+    },
+    retryTaskNotification: async (payload) => {
+      const targetJid =
+        'targetJid' in payload ? payload.targetJid : payload.chatJid;
+      const channel = getChannelType(targetJid) ?? targetJid;
+      let success = false;
+      let error: string | null = null;
+      try {
+        if (payload.kind === 'im_message') {
+          success = await sendImWithRetry(
+            payload.targetJid,
+            payload.text,
+            payload.localImagePaths,
+          );
+        } else if (payload.kind === 'im_image' || payload.kind === 'im_file') {
+          const workspaceRoot = path.resolve(
+            GROUPS_DIR,
+            payload.workspaceFolder,
+          );
+          const resolvedPath = path.resolve(workspaceRoot, payload.filePath);
+          if (
+            resolvedPath !== workspaceRoot &&
+            !resolvedPath.startsWith(`${workspaceRoot}${path.sep}`)
+          ) {
+            throw new Error('Persisted notification path left its workspace');
+          }
+          if (!isRealpathInside(resolvedPath, workspaceRoot)) {
+            throw new Error('Persisted notification file is unavailable');
+          }
+          if (payload.kind === 'im_image') {
+            success = await sendTaskImageWithRetry(
+              payload.targetJid,
+              fs.readFileSync(resolvedPath),
+              payload.mimeType,
+              payload.caption,
+              payload.fileName,
+            );
+          } else {
+            success = await sendTaskFileWithRetry(
+              payload.targetJid,
+              resolvedPath,
+              payload.fileName,
+            );
+          }
+        } else {
+          throw new Error(
+            `Unsupported direct notification kind: ${payload.kind}`,
           );
         }
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
       }
+      if (!success && !error)
+        error = `Notification delivery failed: ${channel}`;
+      return {
+        status: success ? 'success' : 'failed',
+        summary: {
+          attempted: 1,
+          succeeded: success ? 1 : 0,
+          failed: success ? 0 : 1,
+          failed_channels: success ? [] : [channel],
+        },
+        error,
+      };
     },
     assistantName: ASSISTANT_NAME,
   };
@@ -12399,8 +13210,9 @@ async function main(): Promise<void> {
   // Inject triggerTaskRun into WebDeps (schedulerDeps must exist first)
   const webDeps = getWebDeps();
   if (webDeps) {
-    webDeps.triggerTaskRun = (taskId: string) =>
-      triggerTaskNow(taskId, schedulerDeps);
+    webDeps.triggerTaskRun = (taskId: string, idempotencyKey?: string) =>
+      triggerTaskNow(taskId, schedulerDeps, idempotencyKey);
+    webDeps.cancelTaskRun = (runId: string) => cancelTaskRunNow(runId);
   }
 
   startIpcWatcher();
