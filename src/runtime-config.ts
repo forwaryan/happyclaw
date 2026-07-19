@@ -81,7 +81,42 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
+  'HAPPYCLAW_CLAUDE_ENDPOINT_KIND',
 ]);
+
+export const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
+
+const INHERITED_CLAUDE_PROVIDER_ENV_KEYS = [
+  CLAUDE_ENDPOINT_KIND_ENV,
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_CUSTOM_HEADERS',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_NO_FLICKER',
+  'API_TIMEOUT_MS',
+] as const;
+
+/**
+ * Remove provider-owned values inherited from the HappyClaw parent process.
+ * The selected provider is reapplied afterwards from buildContainerEnvLines().
+ * Without this reset, switching to an official provider in host mode can retain
+ * a previous ANTHROPIC_BASE_URL/model/token and silently use the wrong endpoint.
+ */
+export function clearInheritedClaudeProviderEnv(
+  env: Record<string, string | undefined>,
+): void {
+  for (const key of INHERITED_CLAUDE_PROVIDER_ENV_KEYS) {
+    delete env[key];
+  }
+}
 
 const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
   // These values receive provider-level defaults below, but remain editable
@@ -2876,7 +2911,10 @@ export function buildContainerEnvLines(
   profileCustomEnv?: Record<string, string>,
 ): string[] {
   const merged = mergeClaudeEnvConfig(global, override);
-  const lines = buildClaudeEnvLines(merged, profileCustomEnv);
+  const lines = [
+    `${CLAUDE_ENDPOINT_KIND_ENV}=${merged.anthropicBaseUrl ? 'custom' : 'official'}`,
+    ...buildClaudeEnvLines(merged, profileCustomEnv),
+  ];
 
   // Append custom env vars (with safety sanitization as defense-in-depth)
   if (override.customEnv) {

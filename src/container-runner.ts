@@ -23,6 +23,7 @@ import {
 } from './mount-security.js';
 import {
   buildContainerEnvLines,
+  clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
   getEnabledProviders,
@@ -1827,6 +1828,10 @@ export async function runHostAgent(
   // Otherwise disabled/custom MCP can inherit servers from an earlier wrapper
   // environment even when this run intentionally resolves to an empty set.
   delete hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'];
+  // Provider selection is authoritative. Do not let API settings inherited
+  // from the HappyClaw parent process leak into a host-mode child after the
+  // user switches providers (especially third-party -> official OAuth).
+  clearInheritedClaudeProviderEnv(hostEnv);
 
   // Strip macOS launch-context vars that must not be inherited by child
   // processes. When happyclaw is started by a background process manager
