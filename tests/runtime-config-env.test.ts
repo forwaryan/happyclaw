@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest';
 import {
   buildClaudeEnvLines,
   buildContainerEnvLines,
+  clearInheritedClaudeProviderEnv,
   type ClaudeProviderConfig,
 } from '../src/runtime-config.js';
 
@@ -117,5 +118,55 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).not.toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=stale-model');
     expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=42');
     expect(lines).toContain('PROJECT_ENV=kept');
+  });
+
+  test('injects an authoritative endpoint kind that custom env cannot replace', () => {
+    const thirdParty = buildContainerEnvLines(
+      config({ anthropicBaseUrl: 'https://proxy.test' }),
+      { customEnv: { HAPPYCLAW_CLAUDE_ENDPOINT_KIND: 'official' } },
+      { HAPPYCLAW_CLAUDE_ENDPOINT_KIND: 'official' },
+    );
+    const official = buildContainerEnvLines(
+      config({ anthropicBaseUrl: '', anthropicModel: '' }),
+      {},
+      NO_CUSTOM_ENV,
+    );
+
+    expect(thirdParty).toContain('HAPPYCLAW_CLAUDE_ENDPOINT_KIND=custom');
+    expect(thirdParty).not.toContain('HAPPYCLAW_CLAUDE_ENDPOINT_KIND=official');
+    expect(official).toContain('HAPPYCLAW_CLAUDE_ENDPOINT_KIND=official');
+  });
+
+  test('clears inherited provider values before host-mode config is applied', () => {
+    const env: Record<string, string | undefined> = {
+      ANTHROPIC_BASE_URL: 'https://stale-proxy.test',
+      ANTHROPIC_AUTH_TOKEN: 'stale-token',
+      ANTHROPIC_API_KEY: 'stale-key',
+      ANTHROPIC_MODEL: 'stale-model',
+      ANTHROPIC_CUSTOM_HEADERS: 'x-stale-auth: yes',
+      HAPPYCLAW_CLAUDE_ENDPOINT_KIND: 'custom',
+      KEEP_ME: 'yes',
+    };
+
+    clearInheritedClaudeProviderEnv(env);
+
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_MODEL).toBeUndefined();
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBeUndefined();
+    expect(env.HAPPYCLAW_CLAUDE_ENDPOINT_KIND).toBeUndefined();
+    expect(env.KEEP_ME).toBe('yes');
+
+    const selectedProviderLines = buildContainerEnvLines(
+      config({ anthropicBaseUrl: '', anthropicModel: '' }),
+      {},
+      { ANTHROPIC_CUSTOM_HEADERS: 'x-current-provider: yes' },
+    );
+    for (const line of selectedProviderLines) {
+      const separator = line.indexOf('=');
+      env[line.slice(0, separator)] = line.slice(separator + 1);
+    }
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('x-current-provider: yes');
   });
 });
