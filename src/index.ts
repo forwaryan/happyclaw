@@ -489,7 +489,13 @@ export function feedStreamEventToCard(
       break;
     case 'status':
       if (se.statusText && se.statusText !== 'interrupted') {
-        session.setSystemStatus(se.statusText);
+        session.setSystemStatus(
+          se.statusText === 'requesting'
+            ? '正在处理…'
+            : se.statusText === 'compacting'
+              ? '正在整理上下文…'
+              : se.statusText,
+        );
       }
       break;
     case 'hook_started':
@@ -621,9 +627,13 @@ export function feedStreamEventToCard(
       }
       break;
     case 'context_audit':
+      // Context audits describe HappyClaw/Claude runtime wiring. Keep them in
+      // service logs for operators, but never leak framework internals into a
+      // user's conversation or streaming card.
       if (se.contextAudit?.warnings?.length) {
-        session.pushRecentEvent(
-          `Agent Context: ${se.contextAudit.warnings[0].slice(0, 80)}`,
+        logger.warn(
+          { warnings: se.contextAudit.warnings },
+          'Agent context audit warning',
         );
       }
       break;

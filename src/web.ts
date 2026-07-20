@@ -1387,8 +1387,7 @@ function setupWebSocket(server: any): WebSocketServer {
           snap.activeTools.length === 0 &&
           snap.recentEvents.length === 0 &&
           snap.traceEvents.length === 0 &&
-          Object.keys(snap.taskStates).length === 0 &&
-          !snap.contextAudit
+          Object.keys(snap.taskStates).length === 0
         ) {
           continue;
         }
@@ -1408,7 +1407,6 @@ function setupWebSocket(server: any): WebSocketServer {
                 recentEvents: snap.recentEvents,
                 traceEvents: snap.traceEvents,
                 taskStates: snap.taskStates,
-                contextAudit: snap.contextAudit,
                 todos: snap.todos,
                 systemStatus: snap.systemStatus,
                 isThinking: snap.isThinking,
@@ -2221,7 +2219,6 @@ interface StreamingSnapshotEntry {
       | 'status'
       | 'task'
       | 'memory'
-      | 'context'
       | 'debug'
       | 'permission';
   }>;
@@ -2235,7 +2232,6 @@ interface StreamingSnapshotEntry {
       | 'status'
       | 'task'
       | 'memory'
-      | 'context'
       | 'debug'
       | 'permission';
     scope?: StreamEvent['agentScope'];
@@ -2247,7 +2243,6 @@ interface StreamingSnapshotEntry {
     parentToolUseId?: string | null;
     displayLevel?: StreamEvent['displayLevel'];
   }>;
-  contextAudit?: StreamEvent['contextAudit'];
   taskStates: Record<
     string,
     {
@@ -2305,7 +2300,6 @@ function pushRecentEvent(
       | 'status'
       | 'task'
       | 'memory'
-      | 'context'
       | 'debug'
       | 'permission';
   },
@@ -2324,7 +2318,10 @@ function pushTraceEvent(
     event.eventType === 'text_delta' ||
     event.eventType === 'thinking_delta' ||
     event.eventType === 'usage' ||
-    event.eventType === 'init'
+    event.eventType === 'init' ||
+    event.eventType === 'context_audit' ||
+    (event.eventType === 'status' &&
+      isInternalLifecycleStatus(event.statusText))
   )
     return;
   const kind = event.eventType.startsWith('tool_')
@@ -2338,13 +2335,11 @@ function pushTraceEvent(
         : event.eventType === 'memory_recall' ||
             event.eventType === 'compact_boundary'
           ? 'memory'
-          : event.eventType === 'context_audit'
-            ? 'context'
-            : event.eventType === 'permission_denied'
-              ? 'permission'
-              : event.eventType === 'raw_sdk_event'
-                ? 'debug'
-                : 'status';
+          : event.eventType === 'permission_denied'
+            ? 'permission'
+            : event.eventType === 'raw_sdk_event'
+              ? 'debug'
+              : 'status';
   const title =
     event.title ||
     event.summary ||
@@ -2373,6 +2368,15 @@ function pushTraceEvent(
 
 function tailText(text: string, max: number): string {
   return text.length > max ? text.slice(-max) : text;
+}
+
+function isInternalLifecycleStatus(statusText?: string | null): boolean {
+  return (
+    statusText === 'requesting' ||
+    statusText === 'compacting' ||
+    statusText === 'idle' ||
+    statusText === 'interrupted'
+  );
 }
 
 function snapshotTaskId(event: StreamEvent): string | null {
@@ -2465,6 +2469,10 @@ function updateStreamingSnapshot(
   normalizedJid: string,
   event: StreamEvent,
 ): void {
+  // Context audits are operator diagnostics. They must not enter user-facing
+  // WebSocket snapshots, even if this helper is called outside the broadcaster.
+  if (event.eventType === 'context_audit') return;
+
   // turn 干净结束（silent-success）：删除快照而非累积，避免 WS 重连恢复到
   // 「生成中」僵尸快照。前端收到同一 idle 事件后清 waiting/streaming。
   if (event.eventType === 'status' && event.statusText === 'idle') {
@@ -2607,7 +2615,7 @@ function updateStreamingSnapshot(
 
     case 'status':
       snap.systemStatus = event.statusText || null;
-      if (event.statusText) {
+      if (event.statusText && !isInternalLifecycleStatus(event.statusText)) {
         pushRecentEvent(snap, {
           id: `status-${Date.now()}`,
           timestamp: Date.now(),
@@ -2653,18 +2661,6 @@ function updateStreamingSnapshot(
       });
       break;
 
-    case 'context_audit':
-      snap.contextAudit = event.contextAudit;
-      if (event.contextAudit?.warnings?.length) {
-        pushRecentEvent(snap, {
-          id: `context-audit-${Date.now()}`,
-          timestamp: Date.now(),
-          text: `Agent Context: ${event.contextAudit.warnings[0]}`,
-          kind: 'context',
-        });
-      }
-      break;
-
     case 'todo_update':
       if (event.todos) {
         snap.todos = event.todos.map((t) => ({
@@ -2705,6 +2701,18 @@ export function broadcastStreamEvent(
   event: StreamEvent,
   agentId?: string,
 ): void {
+  // Keep runtime context audits on the server side. Sending them over the
+  // user WebSocket exposes paths, prompt wiring, and framework terminology.
+  if (event.eventType === 'context_audit') {
+    if (event.contextAudit?.warnings?.length) {
+      logger.warn(
+        { chatJid, warnings: event.contextAudit.warnings },
+        'Agent context audit warning',
+      );
+    }
+    return;
+  }
+
   const jid = normalizeHomeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(chatJid);
   const msg: WsMessageOut = agentId

@@ -186,7 +186,6 @@ export interface StreamingState {
   recentEvents: StreamingTimelineEvent[];
   traceEvents: StreamingTraceEvent[];
   taskStates: Record<string, StreamingTaskRuntimeState>;
-  contextAudit?: StreamEvent['contextAudit'];
   todos?: Array<{ id: string; content: string; status: string }>;
   interrupted?: boolean;
 }
@@ -561,6 +560,23 @@ const dbTaskAgentCleanupTimers = new Map<
 const STREAMING_STORAGE_KEY = 'hc_streaming';
 const streamingSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+function isInternalLifecycleStatus(statusText?: string | null): boolean {
+  return (
+    statusText === 'requesting' ||
+    statusText === 'compacting' ||
+    statusText === 'idle' ||
+    statusText === 'interrupted'
+  );
+}
+
+function isUserVisibleTimelineEvent(event: StreamingTimelineEvent): boolean {
+  return event.kind !== 'context' && !event.text.startsWith('Agent Context:');
+}
+
+function isUserVisibleTraceEvent(event: StreamingTraceEvent): boolean {
+  return event.kind !== 'context' && event.title !== 'Agent Context';
+}
+
 /** Debounced save of streaming state to sessionStorage (trailing-edge, 500ms per jid). */
 function saveStreamingToSession(
   chatJid: string,
@@ -584,18 +600,20 @@ function saveStreamingToSession(
             state.activeTools.length > 0 ||
             state.recentEvents.length > 0 ||
             state.traceEvents.length > 0 ||
-            Object.keys(state.taskStates).length > 0 ||
-            state.contextAudit)
+            Object.keys(state.taskStates).length > 0)
         ) {
           stored[chatJid] = {
             partialText: state.partialText.slice(-4000), // cap size
             thinkingText: state.thinkingText.slice(-MAX_THINKING_TEXT),
             isThinking: state.isThinking,
             activeTools: state.activeTools,
-            recentEvents: state.recentEvents.slice(-10),
-            traceEvents: state.traceEvents.slice(-50),
+            recentEvents: state.recentEvents
+              .filter(isUserVisibleTimelineEvent)
+              .slice(-10),
+            traceEvents: state.traceEvents
+              .filter(isUserVisibleTraceEvent)
+              .slice(-50),
             taskStates: state.taskStates,
-            contextAudit: state.contextAudit,
             todos: state.todos,
             systemStatus: state.systemStatus,
             turnId: state.turnId,
@@ -650,10 +668,11 @@ function restoreStreamingFromSession(chatJid: string): StreamingState | null {
       thinkingText: entry.thinkingText || '',
       isThinking: entry.isThinking || false,
       activeTools: entry.activeTools || [],
-      recentEvents: entry.recentEvents || [],
-      traceEvents: entry.traceEvents || [],
+      recentEvents: (entry.recentEvents || []).filter(
+        isUserVisibleTimelineEvent,
+      ),
+      traceEvents: (entry.traceEvents || []).filter(isUserVisibleTraceEvent),
       taskStates: entry.taskStates || {},
-      contextAudit: entry.contextAudit,
       todos: entry.todos,
       systemStatus: entry.systemStatus || null,
       turnId: entry.turnId,
@@ -947,7 +966,6 @@ function traceKind(event: StreamEvent): StreamingTraceEvent['kind'] {
     return event.skillName ? 'skill' : 'tool';
   if (event.eventType.startsWith('hook_')) return 'hook';
   if (event.eventType.startsWith('task_')) return 'task';
-  if (event.eventType === 'context_audit') return 'context';
   if (
     event.eventType === 'memory_recall' ||
     event.eventType === 'compact_boundary'
@@ -979,8 +997,6 @@ function traceTitle(event: StreamEvent): string {
       return `Task 更新`;
     case 'task_notification':
       return `Task ${event.taskStatus || '完成'}`;
-    case 'context_audit':
-      return 'Agent Context';
     case 'status':
       return event.statusText || '状态更新';
     case 'permission_denied':
@@ -1006,7 +1022,10 @@ function pushTrace(
     event.eventType === 'text_delta' ||
     event.eventType === 'thinking_delta' ||
     event.eventType === 'usage' ||
-    event.eventType === 'init'
+    event.eventType === 'init' ||
+    event.eventType === 'context_audit' ||
+    (event.eventType === 'status' &&
+      isInternalLifecycleStatus(event.statusText))
   ) {
     return events;
   }
@@ -1391,7 +1410,7 @@ function applyStreamEvent(
       break;
     case 'status': {
       next.systemStatus = event.statusText || null;
-      if (event.statusText) {
+      if (event.statusText && !isInternalLifecycleStatus(event.statusText)) {
         next.recentEvents = pushEvent(
           prev.recentEvents,
           'status',
@@ -1442,14 +1461,7 @@ function applyStreamEvent(
       }
       break;
     case 'context_audit':
-      next.contextAudit = event.contextAudit;
-      if (event.contextAudit?.warnings?.length) {
-        next.recentEvents = pushEvent(
-          prev.recentEvents,
-          'context',
-          `Agent Context: ${event.contextAudit.warnings[0]}`,
-        );
-      }
+      // Operator-only runtime diagnostics; intentionally absent from chat UI.
       break;
     case 'usage':
       // Token usage is handled at handleStreamEvent level (direct message table update).
@@ -2285,6 +2297,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   handleStreamEvent: (chatJid, event, agentId?) => {
     // Skip while clearHistory is in-flight
     if (get().clearing[chatJid]) return;
+
+    // Runtime context audits may contain host paths and prompt wiring. They are
+    // useful to operators, but never belong in a user's conversation state.
+    if (event.eventType === 'context_audit') return;
 
     // ⓪ text_delta / thinking_delta — rAF batch for both agent and main conversation
     if (
@@ -3671,10 +3687,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         toolInputSummary: t.toolInputSummary,
         parentToolUseId: t.parentToolUseId,
       })),
-      recentEvents: (snapshot.recentEvents || []) as StreamingTimelineEvent[],
-      traceEvents: snapshot.traceEvents || [],
+      recentEvents: (
+        (snapshot.recentEvents || []) as StreamingTimelineEvent[]
+      ).filter(isUserVisibleTimelineEvent),
+      traceEvents: (snapshot.traceEvents || []).filter(isUserVisibleTraceEvent),
       taskStates: snapshot.taskStates || {},
-      contextAudit: snapshot.contextAudit,
       todos: snapshot.todos,
       systemStatus: snapshot.systemStatus || null,
       isThinking: snapshot.isThinking ?? false,
