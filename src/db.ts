@@ -6713,7 +6713,10 @@ export function deleteSessionsByProviderId(
           'DELETE FROM sessions WHERE provider_id = ? OR provider_id IS NULL',
         )
         .run(id);
-      return { deletedCount: result.changes, affectedFolders: rows.map((r) => r.group_folder) };
+      return {
+        deletedCount: result.changes,
+        affectedFolders: rows.map((r) => r.group_folder),
+      };
     }
     rows = db
       .prepare(
@@ -6726,7 +6729,10 @@ export function deleteSessionsByProviderId(
     const result = db
       .prepare('DELETE FROM sessions WHERE provider_id = ?')
       .run(id);
-    return { deletedCount: result.changes, affectedFolders: rows.map((r) => r.group_folder) };
+    return {
+      deletedCount: result.changes,
+      affectedFolders: rows.map((r) => r.group_folder),
+    };
   });
   return tx(providerId);
 }
