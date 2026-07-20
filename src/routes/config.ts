@@ -218,19 +218,31 @@ async function applyClaudeConfigToAllGroups(
   }
 
   const groupJids = Object.keys(deps.getRegisteredGroups());
+  // Also stop agent sub-processes — they run under {jid}#agent:{id} keys
+  // which are not in registeredGroups and would otherwise keep running with
+  // stale ANTHROPIC_MODEL env vars after a provider config change.
+  const allJidsToStop = groupJids.flatMap((jid) => [
+    jid,
+    ...deps.queue.listDescendantJids(jid),
+  ]);
   const results = await Promise.allSettled(
-    groupJids.map((jid) => deps.queue.stopGroup(jid)),
+    allJidsToStop.map((jid) => deps.queue.stopGroup(jid)),
   );
   const failedCount = results.filter((r) => r.status === 'rejected').length;
-  const stoppedCount = groupJids.length - failedCount;
+  const stoppedCount = allJidsToStop.length - failedCount;
 
   // Narrowed session cleanup: only drop sticky bindings for the provider whose
   // protocol-level fields actually changed. Bindings to other providers stay
   // intact so a routine update doesn't reset the entire pool. See issue #476.
   let clearedSessionsCount: number | undefined;
   if (options?.clearSessionsForProviderId) {
+    // In single-provider deployments, unbound (NULL) sessions certainly belong
+    // to the only provider. In multi-provider setups they could belong to any
+    // provider, so only delete exact matches to avoid collateral damage.
+    const isSingleProvider = getEnabledProviders().length <= 1;
     const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
       options.clearSessionsForProviderId,
+      { includeUnbound: isSingleProvider },
     );
     clearedSessionsCount = deletedCount;
     for (const folder of affectedFolders) {
@@ -485,6 +497,12 @@ configRoutes.patch(
       // If this provider is enabled, apply to running containers
       let applied: ClaudeApplyResultPayload | null = null;
       if (updated.enabled) {
+        // Third-party providers typically don't verify thinking block signatures,
+        // so model changes can be applied without destroying session context.
+        // Only clear sessions for official providers where signature verification
+        // would reject a cross-model resume.
+        const shouldClearSessions =
+          protocolFieldChanged && updated.type === 'official';
         applied = await applyClaudeConfigToAllGroups(
           actor,
           {
@@ -492,7 +510,7 @@ configRoutes.patch(
             providerId: id,
             protocolFieldChanged,
           },
-          protocolFieldChanged ? { clearSessionsForProviderId: id } : undefined,
+          shouldClearSessions ? { clearSessionsForProviderId: id } : undefined,
         );
       }
 

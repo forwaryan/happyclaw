@@ -6689,27 +6689,44 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
  * Returns the affected `group_folder` values so callers can also evict the
  * in-memory sessions cache and the row count for telemetry.
  */
-export function deleteSessionsByProviderId(providerId: string): {
+export function deleteSessionsByProviderId(
+  providerId: string,
+  options?: { includeUnbound?: boolean },
+): {
   deletedCount: number;
   affectedFolders: string[];
 } {
+  const includeUnbound = options?.includeUnbound ?? false;
   const tx = db.transaction((id: string) => {
-    const rows = db
+    let rows: Array<{ group_folder: string }>;
+    if (includeUnbound) {
+      rows = db
+        .prepare(
+          'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ? OR provider_id IS NULL',
+        )
+        .all(id) as Array<{ group_folder: string }>;
+      db.prepare(
+        'DELETE FROM workspace_runtime_sessions WHERE provider_id = ? OR provider_id IS NULL',
+      ).run(id);
+      const result = db
+        .prepare(
+          'DELETE FROM sessions WHERE provider_id = ? OR provider_id IS NULL',
+        )
+        .run(id);
+      return { deletedCount: result.changes, affectedFolders: rows.map((r) => r.group_folder) };
+    }
+    rows = db
       .prepare(
         'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?',
       )
       .all(id) as Array<{ group_folder: string }>;
-    const affectedFolders = rows.map((r) => r.group_folder);
     db.prepare(
       'DELETE FROM workspace_runtime_sessions WHERE provider_id = ?',
     ).run(id);
     const result = db
       .prepare('DELETE FROM sessions WHERE provider_id = ?')
       .run(id);
-    return {
-      deletedCount: result.changes,
-      affectedFolders,
-    };
+    return { deletedCount: result.changes, affectedFolders: rows.map((r) => r.group_folder) };
   });
   return tx(providerId);
 }
