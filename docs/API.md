@@ -25,7 +25,7 @@
 
 - `GET|POST /api/agent-profiles`（列出/创建当前用户的自定义 Agent）
 - `POST /api/agent-profiles/generate` · `POST /api/agent-profiles/:id/refine-prompt`（生成或优化四段提示词）
-- `POST /api/agent-profiles/:id/effective-capabilities`（预览最终 Skills、MCP 与工具策略）
+- `POST /api/agent-profiles/:id/effective-capabilities`（预览最终 Skills 与 MCP）
 - `PATCH|DELETE /api/agent-profiles/:id` · `GET /api/agent-profiles/:id/workspaces`
 - `POST|DELETE /api/agent-profiles/:id/avatar`
 - `GET /api/agent-profiles/:id/prompt-versions` · `POST /api/agent-profiles/:id/prompt-versions/:version/restore`

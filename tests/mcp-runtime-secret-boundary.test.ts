@@ -275,7 +275,6 @@ describe('managed MCP runtime secret boundary', () => {
           runtimePolicy: {
             skills: { mode: 'inherit', ids: [] },
             mcp: { mode: 'custom', ids: ['system:legacyArgs'] },
-            tools: { mode: 'inherit' },
           },
         },
       ),

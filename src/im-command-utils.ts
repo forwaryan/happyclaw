@@ -338,15 +338,16 @@ export function checkImOwnerCommand(
  * a group and the user falls back to `/owner_mention`.
  */
 export function isDirectMessageJid(chatJid: string): boolean {
-  if (chatJid.startsWith('qq:')) return chatJid.startsWith('qq:c2c:');
-  if (chatJid.startsWith('dingtalk:'))
-    return chatJid.startsWith('dingtalk:c2c:');
-  if (chatJid.startsWith('discord:')) return chatJid.startsWith('discord:dm:');
-  if (chatJid.startsWith('whatsapp:'))
-    return chatJid.endsWith('@s.whatsapp.net');
-  if (chatJid.startsWith('wechat:')) return true; // WeChat integration is 1:1 only
-  if (chatJid.startsWith('telegram:')) {
-    const id = Number(chatJid.slice('telegram:'.length));
+  const [baseJid] = chatJid.split('#');
+  if (baseJid.startsWith('qq:')) return baseJid.startsWith('qq:c2c:');
+  if (baseJid.startsWith('dingtalk:'))
+    return baseJid.startsWith('dingtalk:c2c:');
+  if (baseJid.startsWith('discord:')) return baseJid.startsWith('discord:dm:');
+  if (baseJid.startsWith('whatsapp:'))
+    return baseJid.endsWith('@s.whatsapp.net');
+  if (baseJid.startsWith('wechat:')) return true; // WeChat integration is 1:1 only
+  if (baseJid.startsWith('telegram:')) {
+    const id = Number(baseJid.slice('telegram:'.length));
     return Number.isFinite(id) && id > 0;
   }
   // feishu / web / unknown → not eligible for DM auto-claim.

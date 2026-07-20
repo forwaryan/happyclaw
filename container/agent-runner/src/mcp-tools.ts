@@ -214,6 +214,34 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   const hasCrossGroupAccess = ctx.isAdminHome;
   const toRelativePath = createToRelativePath(ctx);
 
+  const callAgentBuilder = async (
+    type: string,
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const requestId = newRequestId();
+    const result = await pollIpcResult(
+      TASKS_DIR,
+      {
+        type,
+        ...payload,
+        requestId,
+        chatJid: ctx.chatJid,
+        isScheduledTask: ctx.isScheduledTask || undefined,
+        timestamp: new Date().toISOString(),
+      },
+      `${type}_result`,
+      120_000,
+    );
+    if (!result.success) {
+      throw new Error(
+        typeof result.error === 'string'
+          ? result.error
+          : 'Agent Builder request failed',
+      );
+    }
+    return result;
+  };
+
   const tools: SdkMcpToolDefinition<any>[] = [
     // --- send_message ---
     tool(
@@ -1660,6 +1688,172 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
       },
     ),
   ];
+
+  // Agent Builder tools are visible in home runtimes. The host additionally
+  // rejects conversation agents, scheduled tasks, and non-default profiles.
+  if (ctx.isHome) {
+    const capabilityPolicySchema = z.object({
+      mode: z.enum(['inherit', 'custom', 'disabled']),
+      ids: z.array(z.string()).max(100),
+    });
+    const agentDefinitionSchema = z.object({
+      name: z.string().min(1).max(80),
+      prompt_schema_version: z.literal(2).optional().default(2),
+      identity_prompt: z.string().max(20_000).optional().default(''),
+      soul_prompt: z.string().max(20_000).optional().default(''),
+      agents_prompt: z.string().max(20_000).optional().default(''),
+      tools_prompt: z.string().max(20_000).optional().default(''),
+      prompt_mode: z.enum(['append', 'replace']).optional().default('append'),
+      avatar_emoji: z.string().max(8).nullable().optional().default(null),
+      avatar_color: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .nullable()
+        .optional()
+        .default(null),
+      runtime_policy: z
+        .object({
+          context: z
+            .object({
+              source: z.enum(['managed', 'host_claude']),
+              auto_compact_window: z.number().int().min(0),
+              auto_compact_percentage: z.number().int().min(0),
+            })
+            .optional(),
+          skills: capabilityPolicySchema.optional(),
+          mcp: capabilityPolicySchema.optional(),
+        })
+        .optional(),
+    });
+
+    tools.push(
+      tool(
+        'agent_profile_list',
+        "List the current user's top-level Agents and resumable ready drafts. Use this before editing or resuming work so you can identify the target, current version, draft ID, and draft revision. The main HappyClaw is returned for context but cannot edit itself with Agent Builder.",
+        {},
+        async () => {
+          const result = await callAgentBuilder('agent_profile_list', {});
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      tool(
+        'agent_profile_get',
+        'Read the complete editable definition of one top-level Agent before preparing an update.',
+        { profile_id: z.string().min(1) },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_get', {
+            profileId: args.profile_id,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      tool(
+        'agent_profile_draft_get',
+        'Read the complete persisted definition and assumptions of a resumable Agent draft before revising or publishing it.',
+        { draft_id: z.string().min(1) },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_draft_get', {
+            draftId: args.draft_id,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      tool(
+        'agent_capability_catalog',
+        'List the real user Skills and MCP references that may be selected in an Agent definition. Use this before choosing custom capability IDs; never invent IDs.',
+        {},
+        async () => {
+          const result = await callAgentBuilder('agent_capability_catalog', {});
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      tool(
+        'agent_profile_prepare',
+        `Create or revise a persistent Agent draft and return a structured preview. Use natural conversation to understand the user's needs first. Pass the full desired definition on every call.
+
+For a new Agent, omit target_agent_profile_id. For an edit, call agent_profile_get first and pass both target_agent_profile_id and expected_agent_version. To revise an existing draft, pass draft_id and expected_draft_revision.
+
+This tool never publishes. Show preview.confirmation_phrase verbatim and ask the user to send exactly that phrase in a later message.`,
+        {
+          draft_id: z.string().optional(),
+          expected_draft_revision: z.number().int().positive().optional(),
+          target_agent_profile_id: z.string().optional(),
+          expected_agent_version: z.number().int().positive().optional(),
+          definition: agentDefinitionSchema,
+          assumptions: z.array(z.string().max(500)).max(20).optional(),
+        },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_prepare', {
+            draftId: args.draft_id,
+            expectedDraftRevision: args.expected_draft_revision,
+            targetAgentProfileId: args.target_agent_profile_id,
+            expectedAgentVersion: args.expected_agent_version,
+            definition: args.definition,
+            assumptions: args.assumptions,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      tool(
+        'agent_profile_publish',
+        `Publish a previously prepared Agent draft. Only call this when the current persisted human message exactly equals the draft's confirmation_phrase. The host enforces the phrase, later-message boundary, and draft revision. Never treat a generic approval or your own proposal as confirmation.`,
+        {
+          draft_id: z.string().min(1),
+          expected_draft_revision: z.number().int().positive(),
+        },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_publish', {
+            draftId: args.draft_id,
+            expectedDraftRevision: args.expected_draft_revision,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      tool(
+        'agent_profile_discard',
+        'Discard a prepared Agent draft without changing any published Agent.',
+        {
+          draft_id: z.string().min(1),
+          expected_draft_revision: z.number().int().positive(),
+        },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_discard', {
+            draftId: args.draft_id,
+            expectedDraftRevision: args.expected_draft_revision,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+    );
+  }
 
   // Skill 安装/卸载仅限主容器（与 memory_* 工具一致）
   if (ctx.isHome) {

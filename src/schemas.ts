@@ -290,11 +290,6 @@ export const AgentProfileRuntimePolicySchema = z
         ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
       })
       .optional(),
-    tools: z
-      .object({
-        mode: z.enum(['inherit', 'readonly', 'restricted']).optional(),
-      })
-      .optional(),
   })
   .strict();
 

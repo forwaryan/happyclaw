@@ -7,11 +7,6 @@ import { pathToFileURL } from 'node:url';
 import { afterAll, describe, expect, test } from 'vitest';
 
 import { createMcpTools } from '../container/agent-runner/src/mcp-tools.js';
-import {
-  filterHappyclawToolsForPolicy,
-  resolveAgentToolPolicy,
-  type AgentToolPolicyMode,
-} from '../container/agent-runner/src/runtime-tool-policy.js';
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-tool-init-'));
 const runnerRoot = path.resolve('container/agent-runner');
@@ -35,83 +30,31 @@ function cleanEnv(): Record<string, string> {
   );
 }
 
-async function captureInitializedTools(
-  mode: Exclude<AgentToolPolicyMode, 'inherit'>,
-): Promise<{
-  actual: string[];
-  expectedBuiltins: string[];
-  expectedMcp: string[];
-}> {
-  const allTools = createMcpTools({
+function toolNames(
+  isHome: boolean,
+  options: { isScheduledTask?: boolean; currentTaskId?: string | null } = {},
+): string[] {
+  return createMcpTools({
     chatJid: 'web:tool-init',
     groupFolder: 'tool-init',
-    isHome: true,
+    isHome,
     isAdminHome: true,
-    isScheduledTask: false,
-    currentTaskId: null,
-    workspaceIpc: path.join(cwd, 'ipc'),
-    workspaceGroup: cwd,
-    workspaceGlobal: path.join(cwd, 'global'),
-    workspaceMemory: path.join(cwd, 'memory'),
-  });
-  const policy = resolveAgentToolPolicy(
-    mode,
-    allTools.map((tool) => tool.name),
-  );
-  const filtered = filterHappyclawToolsForPolicy(policy, allTools);
-  const server = runnerSdk.createSdkMcpServer({
-    name: 'happyclaw',
-    version: 'test',
-    tools: filtered,
-  });
-  const stream = runnerSdk.query({
-    prompt: 'Reply with OK.',
-    options: {
-      pathToClaudeCodeExecutable: runnerClaudeExecutable,
-      cwd,
-      model: 'claude-sonnet-4-5-20250929',
-      env: {
-        ...cleanEnv(),
-        ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
-        ANTHROPIC_AUTH_TOKEN: 'happyclaw-init-test',
-        ANTHROPIC_API_KEY: '',
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      },
-      tools: policy.builtinTools,
-      allowedTools: [
-        ...(policy.builtinTools ?? []),
-        ...filtered.map((tool) => `mcp__happyclaw__${tool.name}`),
-      ],
-      disallowedTools: policy.disallowedTools,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: [],
-      strictMcpConfig: true,
-      mcpServers: { happyclaw: server },
-    },
-  });
-
-  let init: { tools: string[] } | undefined;
-  for await (const message of stream) {
-    if (message.type === 'system' && message.subtype === 'init') {
-      init = message;
-      break;
-    }
-  }
-  if (!init) throw new Error(`Claude CLI did not emit system/init for ${mode}`);
-  return {
-    actual: init.tools,
-    expectedBuiltins: policy.builtinTools ?? [],
-    expectedMcp: filtered.map((tool) => `mcp__happyclaw__${tool.name}`),
-  };
+    isScheduledTask: options.isScheduledTask ?? false,
+    currentTaskId: options.currentTaskId ?? null,
+    currentInputTurnId: 'turn-1',
+    workspaceIpc: '/tmp/tool-init-ipc',
+    workspaceGroup: '/tmp/tool-init-group',
+    workspaceGlobal: '/tmp/tool-init-global',
+    workspaceMemory: '/tmp/tool-init-memory',
+  }).map((tool) => tool.name);
 }
 
 afterAll(() => {
   fs.rmSync(cwd, { recursive: true, force: true });
 });
 
-describe('real Claude CLI tool initialization', () => {
-  test('imports the exact SDK version pinned by the reproducible container build', () => {
+describe('HappyClaw tool initialization', () => {
+  test('uses the SDK and Claude CLI versions pinned by the runner build', () => {
     const runnerPackage = JSON.parse(
       fs.readFileSync(path.join(runnerRoot, 'package.json'), 'utf8'),
     ) as { dependencies: Record<string, string> };
@@ -129,7 +72,8 @@ describe('real Claude CLI tool initialization', () => {
         'utf8',
       ),
     ) as { version: string };
-    const pinned = runnerPackage.dependencies['@anthropic-ai/claude-agent-sdk'];
+    const pinnedSdk =
+      runnerPackage.dependencies['@anthropic-ai/claude-agent-sdk'];
     const pinnedCli = runnerPackage.dependencies['@anthropic-ai/claude-code'];
     const runnerCliPackage = JSON.parse(
       fs.readFileSync(
@@ -144,13 +88,13 @@ describe('real Claude CLI tool initialization', () => {
       ),
     ) as { version: string };
 
-    expect(pinned).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(pinnedSdk).toMatch(/^\d+\.\d+\.\d+$/);
     expect(runnerSdkEntry.startsWith(`${runnerRoot}${path.sep}`)).toBe(true);
-    expect(importedSdkPackage.version).toBe(pinned);
+    expect(importedSdkPackage.version).toBe(pinnedSdk);
     expect(
       runnerLock.packages['node_modules/@anthropic-ai/claude-agent-sdk']
         .version,
-    ).toBe(pinned);
+    ).toBe(pinnedSdk);
     expect(runnerCliPackage.version).toBe(pinnedCli);
     expect(
       runnerLock.packages['node_modules/@anthropic-ai/claude-code'].version,
@@ -162,29 +106,103 @@ describe('real Claude CLI tool initialization', () => {
     ).toContain(pinnedCli);
     expect(
       runnerLock.packages[''].dependencies?.['@anthropic-ai/claude-agent-sdk'],
-    ).toBe(pinned);
-
-    const dockerfile = fs.readFileSync('container/Dockerfile', 'utf8');
-    expect(dockerfile).toContain(
+    ).toBe(pinnedSdk);
+    expect(fs.readFileSync('container/Dockerfile', 'utf8')).toContain(
       'COPY agent-runner/package.json agent-runner/package-lock.json ./',
     );
-    expect(dockerfile).toContain('RUN npm ci');
   });
 
-  test.each(['readonly', 'restricted'] as const)(
-    '%s exposes exactly the classified builtin and HappyClaw MCP sets',
-    async (mode) => {
-      const { actual, expectedBuiltins, expectedMcp } =
-        await captureInitializedTools(mode);
-      const builtins = actual.filter((name) => !name.startsWith('mcp__'));
-      const mcp = actual.filter((name) => name.startsWith('mcp__'));
+  test('home runtime exposes the complete tool set and Agent Builder', () => {
+    const names = toolNames(true);
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'schedule_task',
+        'install_skill',
+        'memory_append',
+        'agent_profile_list',
+        'agent_profile_get',
+        'agent_profile_draft_get',
+        'agent_capability_catalog',
+        'agent_profile_prepare',
+        'agent_profile_publish',
+        'agent_profile_discard',
+      ]),
+    );
+  });
 
-      expect(new Set(builtins)).toEqual(new Set(expectedBuiltins));
-      expect(new Set(mcp)).toEqual(new Set(expectedMcp));
-      expect(actual).not.toContain('Bash');
-      expect(actual).not.toContain('mcp__happyclaw__schedule_task');
-      expect(actual).not.toContain('mcp__happyclaw__install_skill');
-    },
-    20_000,
-  );
+  test('non-home runtime keeps ordinary tools but does not advertise owner tools', () => {
+    const names = toolNames(false);
+    expect(names).toContain('schedule_task');
+    expect(names).not.toContain('install_skill');
+    expect(names).not.toContain('agent_profile_prepare');
+  });
+
+  test('home tool registration stays stable across scheduled and human turns', () => {
+    expect(toolNames(true, { isScheduledTask: true })).toContain(
+      'agent_profile_prepare',
+    );
+    expect(
+      toolNames(true, { currentTaskId: 'scheduled-group-task' }),
+    ).toContain('agent_profile_publish');
+  });
+
+  test('real Claude CLI initializes unrestricted builtins and Agent Builder tools', async () => {
+    const tools = createMcpTools({
+      chatJid: 'web:tool-init-real',
+      groupFolder: 'tool-init-real',
+      isHome: true,
+      isAdminHome: true,
+      isScheduledTask: false,
+      currentTaskId: null,
+      currentInputTurnId: 'turn-real',
+      workspaceIpc: path.join(cwd, 'ipc'),
+      workspaceGroup: cwd,
+      workspaceGlobal: path.join(cwd, 'global'),
+      workspaceMemory: path.join(cwd, 'memory'),
+    });
+    const server = runnerSdk.createSdkMcpServer({
+      name: 'happyclaw',
+      version: 'test',
+      tools,
+    });
+    const stream = runnerSdk.query({
+      prompt: 'Reply with OK.',
+      options: {
+        pathToClaudeCodeExecutable: runnerClaudeExecutable,
+        cwd,
+        model: 'claude-sonnet-4-5-20250929',
+        env: {
+          ...cleanEnv(),
+          ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
+          ANTHROPIC_AUTH_TOKEN: 'happyclaw-init-test',
+          ANTHROPIC_API_KEY: '',
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        },
+        allowedTools: ['Bash', 'Write', 'Edit', 'Task', 'mcp__happyclaw__*'],
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        settingSources: [],
+        strictMcpConfig: true,
+        mcpServers: { happyclaw: server },
+      },
+    });
+
+    let initializedTools: string[] | undefined;
+    for await (const message of stream) {
+      if (message.type === 'system' && message.subtype === 'init') {
+        initializedTools = message.tools;
+        break;
+      }
+    }
+    expect(initializedTools).toEqual(
+      expect.arrayContaining([
+        'Bash',
+        'Write',
+        'Edit',
+        'Task',
+        'mcp__happyclaw__agent_profile_prepare',
+        'mcp__happyclaw__agent_profile_publish',
+      ]),
+    );
+  }, 20_000);
 });

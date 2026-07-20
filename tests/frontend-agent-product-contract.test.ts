@@ -43,7 +43,6 @@ describe('Agent-first frontend product contracts', () => {
       context: { source: 'managed' },
       skills: { mode: 'custom', ids: ['review'] },
       mcp: { mode: 'custom', ids: ['github'] },
-      tools: { mode: 'readonly' },
     };
 
     expect(getAgentContextSource(managedPolicy)).toBe('managed');

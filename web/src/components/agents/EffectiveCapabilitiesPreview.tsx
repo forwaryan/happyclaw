@@ -159,13 +159,7 @@ export function EffectiveCapabilitiesPreview({
               label="MCP"
               entries={preview.mcp.entries}
               conflicts={preview.mcp.conflicts}
-              disabled={preview.mcp.disabledByToolBoundary}
             />
-            <PreviewRow label="能力边界">
-              <span className="text-sm text-foreground">
-                {preview.tools.summary}
-              </span>
-            </PreviewRow>
             <div className="space-y-1 py-3">
               {preview.notes.map((note) => (
                 <p
@@ -204,12 +198,10 @@ function CapabilityEntriesRow({
   label,
   entries,
   conflicts,
-  disabled = false,
 }: {
   label: string;
   entries: EffectiveCapabilityEntry[];
   conflicts: string[];
-  disabled?: boolean;
 }) {
   return (
     <PreviewRow label={label}>
@@ -221,9 +213,7 @@ function CapabilityEntriesRow({
             <Badge
               key={entry.id}
               variant="outline"
-              className={
-                disabled || !entry.available ? 'opacity-50 line-through' : ''
-              }
+              className={!entry.available ? 'opacity-50 line-through' : ''}
               title={
                 entry.overrides.length > 0
                   ? `覆盖：${entry.overrides.map(capabilitySourceLabel).join('、')}`
@@ -238,11 +228,6 @@ function CapabilityEntriesRow({
       {conflicts.length > 0 && (
         <span className="basis-full text-[11px] text-warning">
           {conflicts.length} 个同名覆盖：{conflicts.join('、')}
-        </span>
-      )}
-      {disabled && (
-        <span className="basis-full text-[11px] text-warning">
-          已被当前能力边界关闭
         </span>
       )}
     </PreviewRow>

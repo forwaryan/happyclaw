@@ -78,7 +78,6 @@ describe('AgentProfile DB model', () => {
       },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
-      tools: { mode: 'inherit' },
     });
     expect(profiles[0].identity_hash).toBe(
       computeAgentProfileIdentityHash('', true, undefined, 'HappyClaw'),
@@ -114,7 +113,6 @@ describe('AgentProfile DB model', () => {
       provider_id: null,
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
-      tools: { mode: 'inherit' },
     };
     const rawDb = new Database(path.join(tmpStoreDir, 'messages.db'));
     rawDb
@@ -169,7 +167,7 @@ describe('AgentProfile DB model', () => {
     expect(listAgentProfilesForUser(userId)[0].name).toBe(custom?.name);
   });
 
-  test('ignores historical AgentProfile provider and model policy when normalizing', () => {
+  test('ignores retired provider, model and tool policies when normalizing', () => {
     expect(
       normalizeAgentProfileRuntimePolicy({
         provider_id: 'provider-a',
@@ -184,7 +182,6 @@ describe('AgentProfile DB model', () => {
       },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'inherit', ids: [] },
-      tools: { mode: 'readonly' },
     });
   });
 
@@ -313,7 +310,6 @@ describe('AgentProfile DB model', () => {
       runtimePolicy: {
         skills: { mode: 'custom', ids: ['review', 'research', 'review'] },
         mcp: { mode: 'disabled', ids: ['ignored'] },
-        tools: { mode: 'readonly' },
       },
     });
 
@@ -325,7 +321,6 @@ describe('AgentProfile DB model', () => {
       },
       skills: { mode: 'custom', ids: ['review', 'research'] },
       mcp: { mode: 'disabled', ids: ['ignored'] },
-      tools: { mode: 'readonly' },
     });
     expect(profile.identity_hash).toBe(
       computeAgentProfileIdentityHash(
@@ -353,7 +348,6 @@ describe('AgentProfile DB model', () => {
           context: { source: 'host_claude' },
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
-          tools: { mode: 'restricted' },
         },
       },
     );
@@ -366,7 +360,6 @@ describe('AgentProfile DB model', () => {
       },
       skills: { mode: 'inherit', ids: [] },
       mcp: { mode: 'custom', ids: ['github'] },
-      tools: { mode: 'restricted' },
     });
     expect(updated?.identity_hash).toBe(
       computeAgentProfileIdentityHash(
@@ -397,7 +390,7 @@ describe('AgentProfile DB model', () => {
     expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
 
     const policyUpdated = updateAgentProfile(profile.id, userId, {
-      runtimePolicy: { tools: { mode: 'readonly' } },
+      runtimePolicy: { skills: { mode: 'disabled' } },
     })!;
     expect(policyUpdated.version).toBe(renamed.version + 1);
     expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
@@ -439,14 +432,13 @@ describe('AgentProfile DB model', () => {
         context: { source: 'host_claude' },
         skills: { mode: 'disabled', ids: ['kept-for-audit'] },
         mcp: { mode: 'custom', ids: ['github'] },
-        tools: { mode: 'restricted' },
       },
     });
 
     const updated = updateAgentProfile(
       profile.id,
       'agent-profile-user-policy-merge',
-      { runtimePolicy: { tools: { mode: 'readonly' } } },
+      { runtimePolicy: { mcp: { ids: ['github', 'linear'] } } },
     );
 
     expect(updated?.runtime_policy).toEqual({
@@ -456,8 +448,7 @@ describe('AgentProfile DB model', () => {
         auto_compact_percentage: 0,
       },
       skills: { mode: 'disabled', ids: ['kept-for-audit'] },
-      mcp: { mode: 'custom', ids: ['github'] },
-      tools: { mode: 'readonly' },
+      mcp: { mode: 'custom', ids: ['github', 'linear'] },
     });
   });
 

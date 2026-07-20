@@ -24,7 +24,7 @@ export interface EffectiveCapabilityEntry {
   source: CapabilityLayerSource;
   overrides: CapabilityLayerSource[];
   available: boolean;
-  unavailableReason?: 'tool_boundary' | 'system_admin_only';
+  unavailableReason?: 'system_admin_only';
 }
 
 export interface AgentCapabilityPreview {
@@ -43,11 +43,6 @@ export interface AgentCapabilityPreview {
     mode: AgentProfile['runtime_policy']['mcp']['mode'];
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
-    disabledByToolBoundary: boolean;
-  };
-  tools: {
-    mode: AgentProfile['runtime_policy']['tools']['mode'];
-    summary: string;
   };
   notes: string[];
 }
@@ -79,7 +74,6 @@ function mergeLayers(
     available?: boolean;
     unavailableReason?: EffectiveCapabilityEntry['unavailableReason'];
   }>,
-  available = true,
 ): { entries: EffectiveCapabilityEntry[]; conflicts: string[] } {
   const entries = new Map<string, EffectiveCapabilityEntry>();
   const conflicts = new Set<string>();
@@ -95,12 +89,10 @@ function mergeLayers(
               (source, index, all) => all.indexOf(source) === index,
             )
           : [],
-        available: available && layer.available !== false,
-        ...(!available
-          ? { unavailableReason: 'tool_boundary' as const }
-          : layer.available === false && layer.unavailableReason
-            ? { unavailableReason: layer.unavailableReason }
-            : {}),
+        available: layer.available !== false,
+        ...(layer.available === false && layer.unavailableReason
+          ? { unavailableReason: layer.unavailableReason }
+          : {}),
       });
     }
   }
@@ -228,8 +220,7 @@ export function buildAgentCapabilityPreview(options: {
     unavailableReason: 'system_admin_only',
   });
   mcpLayers.push({ source: 'user', ids: selectedUserMcpIds });
-  const mcpDisabled = policy.tools.mode !== 'inherit';
-  const mcp = mergeLayers(mcpLayers, !mcpDisabled);
+  const mcp = mergeLayers(mcpLayers);
 
   const notes = [
     '系统附加能力与宿主机、项目上下文是叠加关系，不会因继承宿主机配置而被替换。',
@@ -245,7 +236,6 @@ export function buildAgentCapabilityPreview(options: {
     notes.push(
       '同名 MCP 按宿主机 → 工作区 → 系统 MCP → 用户 MCP 的稳定顺序覆盖。',
     );
-  if (mcpDisabled) notes.push('当前工具边界会在执行时关闭所有外部 MCP。');
   if (restrictedSystemIds.size > 0) {
     notes.push(
       `有 ${restrictedSystemIds.size} 个系统 MCP 仅限管理员，普通成员 Agent 不会继承。`,
@@ -269,20 +259,7 @@ export function buildAgentCapabilityPreview(options: {
         : 0,
     },
     skills: { mode: policy.skills.mode, ...skills },
-    mcp: {
-      mode: policy.mcp.mode,
-      ...mcp,
-      disabledByToolBoundary: mcpDisabled,
-    },
-    tools: {
-      mode: policy.tools.mode,
-      summary:
-        policy.tools.mode === 'inherit'
-          ? '完整能力'
-          : policy.tools.mode === 'readonly'
-            ? '只读：禁写入、Bash、子 Agent、外部 MCP 与插件'
-            : '严格只读：额外禁用网页搜索与抓取',
-    },
+    mcp: { mode: policy.mcp.mode, ...mcp },
     notes,
   };
 }

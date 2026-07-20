@@ -3625,6 +3625,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
       feishu_group_message_type:
         chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
+      ...(ownerImId !== undefined
+        ? { owner_claim_source: 'configured' as const }
+        : {}),
     };
     applyBindingUpdate(imJid, updated);
     if (freshImGroup.binding_mode === 'thread_map') {
@@ -3651,6 +3654,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         ? { activation_mode: activationMode }
         : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
+      ...(ownerImId !== undefined
+        ? { owner_claim_source: 'configured' as const }
+        : {}),
     };
     applyBindingUpdate(imJid, updated);
     logger.info(

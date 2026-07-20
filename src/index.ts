@@ -69,6 +69,7 @@ import {
   getJidsByFolder,
   getLastGroupSync,
   getRegisteredGroup,
+  getAgentBuilderInputMessage,
   getUserById,
   getMessagesSince,
   getNewMessages,
@@ -219,6 +220,22 @@ import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cros
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
+  AgentBuilderTurnRegistry,
+  isAgentBuilderOwnerInput,
+  ownerImIdFromDirectConversationJid,
+  resolveTrustedDirectOwnerUpgrade,
+} from './agent-builder-turn-auth.js';
+import {
+  discardPreparedAgentDraft,
+  getAgentCapabilityCatalogForBuilder,
+  getAgentBuilderDraftForBuilder,
+  getAgentProfileForBuilder,
+  listAgentProfilesForBuilder,
+  prepareAgentBuilderDraft,
+  publishAgentBuilderDraft,
+  type AgentBuilderActor,
+} from './agent-builder.js';
+import {
   loadChannelAccountSecret,
   saveChannelAccountSecret,
   type ChannelAccountSecret,
@@ -348,6 +365,7 @@ import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
 import {
   claimOwner,
+  claimOwnerFromMention,
   releaseOwner,
   addToAllowlist,
   removeFromAllowlist,
@@ -1022,6 +1040,10 @@ const activeImReplyRoutes = new Map<string, string | null>();
 // only the currently running object avoids stale timestamps/message-id reuse
 // across later turns and sibling JIDs that share one folder.
 const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
+
+// Host-owned current-turn registry. Agent Builder authorization never trusts
+// turn/chat/task claims from the runner's writable IPC JSON.
+const activeAgentBuilderTurns = new AgentBuilderTurnRegistry();
 
 // ── 卡片挂起完成机制的共享工具 ──
 // 挂起卡内各 turn 文本之间的分隔线（最终定稿卡片正文按时间序拼接各 turn）。
@@ -2319,6 +2341,7 @@ async function handleCommand(
     OWNER_REQUIRED_IM_COMMANDS.has(cmd) &&
     group &&
     !group.owner_im_id &&
+    group.owner_claim_source !== 'transfer_reset' &&
     senderImId &&
     isDirectMessageJid(chatJid)
   ) {
@@ -2822,6 +2845,10 @@ function handleOwnerMentionCommand(
     return '无法识别发送者身份，请在飞书或钉钉群聊中使用此命令';
   }
 
+  if (group.owner_claim_source === 'transfer_reset') {
+    return '⚠️ 此会话刚完成凭据转移，请重新配对或在 Web 中配置 owner';
+  }
+
   // 已有 owner 时，任意 activation_mode 下都拒绝非 owner 的认领，避免任意人通过
   // /owner_mention 覆盖已存在的 owner_im_id（哪怕群组当前是 'auto' / 'always' /
   // 'when_mentioned' 模式，owner_im_id 也可能由 /allow 回填或别处设置过）。
@@ -2832,7 +2859,7 @@ function handleOwnerMentionCommand(
 
   // 仅认领 owner，不强制切换 activation_mode：用户当前的群组激活策略（auto /
   // always / when_mentioned）保持不变，避免 bootstrap 时被意外改成「仅 owner 响应」。
-  const updated = claimOwner(group, senderImId);
+  const updated = claimOwnerFromMention(group, senderImId);
   persistGroupUpdate(chatJid, updated, registeredGroups);
 
   logger.info(
@@ -2874,7 +2901,11 @@ function handleAllowCommand(
   // Backfill owner_im_id if the group was registered before the user-level
   // ownerOpenId was known (e.g., bot added to group first, owner DM'd later).
   // Only backfill when the sender matches the user-level ownerOpenId.
-  if (!group.owner_im_id && group.created_by) {
+  if (
+    !group.owner_im_id &&
+    group.owner_claim_source !== 'transfer_reset' &&
+    group.created_by
+  ) {
     const userOwnerOpenId = getUserFeishuConfig(group.created_by)?.ownerOpenId;
     if (userOwnerOpenId && userOwnerOpenId === senderImId) {
       const updated = claimOwner(group, senderImId);
@@ -3854,6 +3885,46 @@ export function collectMessageImages(
   return images;
 }
 
+/** A paired/registered direct chat is already bound to one HappyClaw user.
+ * Learn that chat's provider-native owner identity from its first durable human
+ * message so natural-language owner workflows do not require a bootstrap slash
+ * command. Group chats remain explicit-claim only. */
+function learnDirectMessageOwners(
+  ownerUserId: string,
+  messages: NewMessage[],
+): void {
+  for (const message of messages) {
+    if (
+      message.task_id ||
+      message.source_kind === 'scheduled_task_prompt' ||
+      !message.sender
+    ) {
+      continue;
+    }
+    const sourceJid = message.source_jid || message.chat_jid;
+    const conversationJid = channelConversationJid(sourceJid);
+    if (!isDirectMessageJid(conversationJid)) continue;
+    const sourceGroup =
+      registeredGroups[conversationJid] ?? getRegisteredGroup(conversationJid);
+    if (!sourceGroup || sourceGroup.created_by !== ownerUserId) {
+      continue;
+    }
+    const ownerImId = resolveTrustedDirectOwnerUpgrade(
+      sourceJid,
+      message.sender,
+      sourceGroup.owner_im_id,
+      sourceGroup.owner_claim_source,
+    );
+    if (!ownerImId) continue;
+    const claimed = claimOwner(sourceGroup, ownerImId, 'trusted_direct');
+    persistGroupUpdate(conversationJid, claimed, registeredGroups);
+    logger.info(
+      { conversationJid, ownerUserId },
+      'Learned IM owner from a trusted direct message',
+    );
+  }
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -3967,6 +4038,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
       missedMessages = toSend;
     }
+  }
+
+  if (effectiveGroup.created_by) {
+    learnDirectMessageOwners(effectiveGroup.created_by, missedMessages);
   }
 
   const agentProfile = resolveEffectiveAgentProfile(
@@ -4417,6 +4492,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const currentSourceJid =
     missedMessages[missedMessages.length - 1]?.source_jid || chatJid;
   activeIpcReplyTurnTrackers.set(effectiveGroup.folder, ipcReplyTurnTracker);
+  activeAgentBuilderTurns.startBatch(
+    effectiveGroup.folder,
+    missedMessages.map((message) => ({
+      chatJid,
+      messageId: message.id,
+      scheduledTaskId: message.task_id ?? null,
+    })),
+  );
   try {
     output = await runAgent(
       effectiveGroup,
@@ -4453,6 +4536,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           if (result.inputTurnCompleted) {
             healthyInputTurnCompleted = true;
+            const completedInputs = result.ipcReceipts?.length
+              ? result.ipcReceipts.flatMap((receipt) =>
+                  (receipt.coveredCursors ?? [receipt.cursor]).map(
+                    (cursor) => ({
+                      chatJid: receipt.chatJid,
+                      messageId: cursor.id,
+                    }),
+                  ),
+                )
+              : [{ chatJid, messageId: lastProcessed.id }];
+            activeAgentBuilderTurns.clearCompleted(
+              effectiveGroup.folder,
+              completedInputs,
+            );
           }
           if (result.newSessionId && result.status !== 'error') {
             activeSessionId = result.newSessionId;
@@ -5270,6 +5367,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
     activeImReplyRoutes.delete(effectiveGroup.folder);
+    activeAgentBuilderTurns.delete(effectiveGroup.folder);
     if (
       activeIpcReplyTurnTrackers.get(effectiveGroup.folder) ===
       ipcReplyTurnTracker
@@ -6412,9 +6510,15 @@ function startIpcWatcher(): void {
   const processGroupIpc = async (sourceGroup: string) => {
     if (shuttingDown) return;
     // Determine if this IPC directory belongs to an admin home group
-    const sourceGroupEntry = Object.values(registeredGroups).find(
-      (g) => g.folder === sourceGroup,
+    const sourceFolderEntries = Object.values(registeredGroups).filter(
+      (group) => group.folder === sourceGroup,
     );
+    // A home runtime can serve sibling channel JIDs that share its folder.
+    // Prefer the home record so folder-level IPC gets the identity of the
+    // process that actually owns it, independent of object insertion order.
+    const sourceGroupEntry =
+      sourceFolderEntries.find((group) => group.is_home) ??
+      sourceFolderEntries[0];
     const sourceOwner = sourceGroupEntry?.created_by
       ? getUserById(sourceGroupEntry.created_by)
       : undefined;
@@ -7108,6 +7212,13 @@ function startIpcWatcher(): void {
           'discord_get_history_result_',
           'discord_get_channel_info_result_',
           'discord_get_server_info_result_',
+          'agent_profile_list_result_',
+          'agent_profile_get_result_',
+          'agent_profile_draft_get_result_',
+          'agent_capability_catalog_result_',
+          'agent_profile_prepare_result_',
+          'agent_profile_publish_result_',
+          'agent_profile_discard_result_',
         ];
         const isResultFile = (name: string) =>
           RESULT_FILE_PREFIXES.some((p) => name.startsWith(p));
@@ -7450,6 +7561,14 @@ async function processTaskIpc(
     // For discord_get_history
     limit?: number;
     before?: string;
+    // For the main HappyClaw's conversational Agent Builder
+    profileId?: string;
+    draftId?: string;
+    expectedDraftRevision?: number;
+    targetAgentProfileId?: string;
+    expectedAgentVersion?: number;
+    definition?: unknown;
+    assumptions?: string[];
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -7468,7 +7587,183 @@ async function processTaskIpc(
     ownerHomeFolderCandidate,
   );
 
+  const requireAgentBuilderActor = (): AgentBuilderActor => {
+    if (
+      !isHome ||
+      ipcAgentId !== null ||
+      ipcTaskId !== null ||
+      data.isScheduledTask
+    ) {
+      throw new Error(
+        'Agent Builder is only available to the main HappyClaw in a user home conversation',
+      );
+    }
+    const ownerId = sourceGroupEntry?.created_by;
+    const user = ownerId ? getUserById(ownerId) : undefined;
+    if (!user || user.status !== 'active') {
+      throw new Error('No active user owns this home workspace');
+    }
+    const sourceProfile = getAgentProfileForWorkspace(sourceGroup, user.id);
+    if (!sourceProfile?.is_default) {
+      throw new Error('Only the main HappyClaw may use Agent Builder');
+    }
+    const activeTurn = activeAgentBuilderTurns.requireOwnerHumanTurn(
+      sourceGroup,
+      getAgentBuilderInputMessage,
+      (input) =>
+        isAgentBuilderOwnerInput(
+          input,
+          user.id,
+          (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+        ),
+    );
+    return {
+      user,
+      sourceGroup,
+      sourceChatJid: activeTurn.chatJid,
+      sourceTurnId: activeTurn.messageId,
+      sourceMessageContent: activeTurn.content,
+    };
+  };
+
   switch (data.type) {
+    case 'agent_profile_list': {
+      try {
+        const actor = requireAgentBuilderActor();
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          ...listAgentProfilesForBuilder(actor.user.id),
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
+    case 'agent_profile_get': {
+      try {
+        const actor = requireAgentBuilderActor();
+        if (!data.profileId) throw new Error('profileId is required');
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          ...getAgentProfileForBuilder(actor.user.id, data.profileId),
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
+    case 'agent_profile_draft_get': {
+      try {
+        const actor = requireAgentBuilderActor();
+        if (!data.draftId) throw new Error('draftId is required');
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          draft: getAgentBuilderDraftForBuilder(actor.user.id, data.draftId),
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
+    case 'agent_capability_catalog': {
+      try {
+        const actor = requireAgentBuilderActor();
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          catalog: getAgentCapabilityCatalogForBuilder(actor),
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
+    case 'agent_profile_prepare': {
+      try {
+        const actor = requireAgentBuilderActor();
+        const result = prepareAgentBuilderDraft(actor, {
+          draftId: data.draftId,
+          expectedDraftRevision: data.expectedDraftRevision,
+          targetAgentProfileId: data.targetAgentProfileId,
+          expectedAgentVersion: data.expectedAgentVersion,
+          definition: data.definition,
+          assumptions: data.assumptions,
+        });
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          ...result,
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
+    case 'agent_profile_publish': {
+      try {
+        const actor = requireAgentBuilderActor();
+        if (!data.draftId || data.expectedDraftRevision === undefined) {
+          throw new Error('draftId and expectedDraftRevision are required');
+        }
+        const result = await publishAgentBuilderDraft(
+          actor,
+          data.draftId,
+          data.expectedDraftRevision,
+        );
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          ...result,
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
+    case 'agent_profile_discard': {
+      try {
+        const actor = requireAgentBuilderActor();
+        if (!data.draftId || data.expectedDraftRevision === undefined) {
+          throw new Error('draftId and expectedDraftRevision are required');
+        }
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: true,
+          draft: discardPreparedAgentDraft(
+            actor.user.id,
+            data.draftId,
+            data.expectedDraftRevision,
+          ),
+        });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
+
     case 'schedule_task': {
       const failSchedule = (error: string): void => {
         logger.warn({ sourceGroup, error }, 'schedule_task rejected');
@@ -10585,6 +10880,10 @@ async function startMessageLoop(): Promise<void> {
           const images = collectMessageImages(chatJid, messagesToSend);
           const imagesForAgent = images.length > 0 ? images : undefined;
 
+          if (group.created_by) {
+            learnDirectMessageOwners(group.created_by, messagesToSend);
+          }
+
           // Determine the IM source JID for route update on successful injection
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
@@ -10603,6 +10902,18 @@ async function startMessageLoop(): Promise<void> {
             imagesForAgent,
             (receipt) => {
               // IPC write succeeded — update reply route for the running agent
+              if (receipt) {
+                activeAgentBuilderTurns.enqueueBatch(
+                  group.folder,
+                  (receipt.coveredCursors ?? [receipt.cursor]).map(
+                    (cursor) => ({
+                      chatJid: receipt.chatJid,
+                      messageId: cursor.id,
+                      scheduledTaskId: injectionTaskId ?? null,
+                    }),
+                  ),
+                );
+              }
               activeRouteUpdaters.get(group.folder)?.(
                 lastSourceJidForRoute,
                 receipt?.deliveryId,
@@ -11095,8 +11406,15 @@ function buildOnNewChat(
         } else {
           // Credential transfer: previous owner no longer connected on this channel
           const previousFolder = existing.folder;
-          existing.folder = homeFolder;
-          existing.created_by = userId;
+          Object.assign(existing, releaseOwner(existing), {
+            folder: homeFolder,
+            created_by: userId,
+            // Trust belongs to the previous HappyClaw user's channel binding,
+            // not merely to the provider chat id. Never carry that trust into
+            // the new user's Agent Builder authorization boundary.
+            owner_claim_source: 'transfer_reset' as const,
+            sender_allowlist: getOwnerOpenId ? [] : undefined,
+          });
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;
           logger.info(
@@ -11126,6 +11444,7 @@ function buildOnNewChat(
       added_at: new Date().toISOString(),
       created_by: userId,
       owner_im_id: ownerOpenId,
+      owner_claim_source: ownerOpenId ? 'auto_feishu' : undefined,
       // Only Feishu path (getOwnerOpenId provided) opts into the default
       // allowlist lock. Other channels leave allowlist unrestricted.
       sender_allowlist: getOwnerOpenId
@@ -11515,8 +11834,18 @@ function buildOnPairAttempt(
               ? {}
               : { target_main_jid: fallbackWorkspaceJid }),
           };
-      setRegisteredGroup(jid, updated);
-      registeredGroups[jid] = updated;
+      const pairedOwnerImId = ownerImIdFromDirectConversationJid(jid);
+      const paired = pairedOwnerImId
+        ? claimOwner(
+            updated,
+            pairedOwnerImId,
+            updated.owner_claim_source === 'configured'
+              ? 'configured'
+              : 'trusted_direct',
+          )
+        : updated;
+      setRegisteredGroup(jid, paired);
+      registeredGroups[jid] = paired;
     }
     return true;
   };
@@ -12210,16 +12539,19 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           onP2pSender: (senderOpenId: string) => {
             // First valid DM claims this bot. Never let a later arbitrary DM
             // replace the account owner.
-            if (!senderOpenId || secret.ownerOpenId) return;
-            secret.ownerOpenId = senderOpenId;
-            saveChannelAccountSecret(account.secret_ref, secret);
-            if (account.is_legacy_default) {
-              saveFeishuOwnerOpenId(account.owner_user_id, senderOpenId);
+            if (!senderOpenId) return;
+            const ownerOpenId = secret.ownerOpenId ?? senderOpenId;
+            if (!secret.ownerOpenId) {
+              secret.ownerOpenId = senderOpenId;
+              saveChannelAccountSecret(account.secret_ref, secret);
+              if (account.is_legacy_default) {
+                saveFeishuOwnerOpenId(account.owner_user_id, senderOpenId);
+              }
             }
             for (const jid of backfillEmptyAllowlistsForChannelAccount(
               account.owner_user_id,
               account.id,
-              senderOpenId,
+              ownerOpenId,
             )) {
               const fresh = getRegisteredGroup(jid);
               if (fresh) registeredGroups[jid] = fresh;
@@ -13466,7 +13798,18 @@ async function main(): Promise<void> {
       sourceJid: string | null,
       inputTurnId?: string,
       inputCursor?: MessageCursor,
+      inputChatJid?: string,
+      inputTaskId?: string,
     ) => {
+      if (inputCursor && inputChatJid) {
+        activeAgentBuilderTurns.enqueueBatch(folder, [
+          {
+            chatJid: inputChatJid,
+            messageId: inputCursor.id,
+            scheduledTaskId: inputTaskId ?? null,
+          },
+        ]);
+      }
       activeRouteUpdaters.get(folder)?.(sourceJid, inputTurnId, inputCursor);
     },
     finalizeHeldCard: (key: string) => {

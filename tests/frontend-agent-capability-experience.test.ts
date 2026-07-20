@@ -101,7 +101,7 @@ describe('Agent prompt and capability frontend contract', () => {
       /宿主机提示词、Rules、全部 Skills[\s\S]*和 MCP\s+已自动生效/,
     );
     expect(main).toContain("skill.source === 'user' && skill.enabled");
-    expect(main).toMatch(/系统\s*内置 Skills\s*始终生效且不进入选择器/);
+    expect(main).toMatch(/系统\s*内置\s*Skills\s*始终生效且不进入选择器/);
     expect(system).toMatch(/无需再逐项选择/);
   });
 

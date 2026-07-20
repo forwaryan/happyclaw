@@ -32,6 +32,7 @@ import {
 import {
   evaluateMentionGate,
   isBotMentioned,
+  stripLeadingBotMention,
   type MentionGateMention,
 } from './feishu-mention-gate.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
@@ -1248,6 +1249,17 @@ export function createFeishuConnection(
           }
           return;
         }
+      }
+
+      // Feishu requires @bot in mention-gated groups, but the durable human
+      // text should contain the actual request. Strip only the leading bot
+      // token proven by Feishu mention metadata; other @mentions remain.
+      if (chatType === 'group') {
+        text = stripLeadingBotMention(
+          text,
+          botOpenId,
+          mentions as MentionGateMention[] | undefined,
+        );
       }
 
       // Validate the binding before registration, owner learning, metadata or

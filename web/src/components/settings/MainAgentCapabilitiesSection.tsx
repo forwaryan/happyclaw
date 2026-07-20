@@ -23,7 +23,6 @@ import {
 } from '@/components/ui/select';
 
 type CapabilityMode = 'inherit' | 'custom' | 'disabled';
-type ToolMode = 'inherit' | 'readonly' | 'restricted';
 
 export function MainAgentCapabilitiesSection() {
   const profiles = useAgentProfilesStore((state) => state.profiles);
@@ -49,7 +48,6 @@ export function MainAgentCapabilitiesSection() {
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<CapabilityMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
-  const [toolsMode, setToolsMode] = useState<ToolMode>('inherit');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -62,7 +60,6 @@ export function MainAgentCapabilitiesSection() {
     setSkillIds(profile.runtime_policy.skills.ids);
     setMcpMode(profile.runtime_policy.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids));
-    setToolsMode(profile.runtime_policy.tools.mode);
   }, [profile?.id, profile?.updated_at]);
 
   useEffect(() => {
@@ -107,8 +104,7 @@ export function MainAgentCapabilitiesSection() {
       JSON.stringify(mcpIds) !==
         JSON.stringify(
           normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids),
-        ) ||
-      toolsMode !== profile.runtime_policy.tools.mode);
+        ));
 
   const currentRuntimePolicy = useMemo<AgentProfileRuntimePolicy | null>(
     () =>
@@ -117,10 +113,9 @@ export function MainAgentCapabilitiesSection() {
             ...profile.runtime_policy,
             skills: { mode: skillsMode, ids: skillIds },
             mcp: { mode: mcpMode, ids: mcpIds },
-            tools: { mode: toolsMode },
           }
         : null,
-    [mcpIds, mcpMode, profile, skillIds, skillsMode, toolsMode],
+    [mcpIds, mcpMode, profile, skillIds, skillsMode],
   );
 
   const save = async () => {
@@ -131,7 +126,6 @@ export function MainAgentCapabilitiesSection() {
         runtime_policy: {
           skills: { mode: skillsMode, ids: skillIds },
           mcp: { mode: mcpMode, ids: mcpIds },
-          tools: { mode: toolsMode },
         } satisfies Partial<AgentProfileRuntimePolicy>,
       });
       await loadProfiles();
@@ -164,8 +158,8 @@ export function MainAgentCapabilitiesSection() {
       <div>
         <h3 className="text-sm font-semibold text-foreground">系统附加能力</h3>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          控制 HappyClaw 为主 Agent 额外附加的用户 Skills、MCP 与工具边界。系统
-          内置 Skills 始终生效且不进入选择器。若主 Agent 继承宿主机
+          控制 HappyClaw 为主 Agent 额外附加的用户 Skills 与 MCP。 系统内置
+          Skills 始终生效且不进入选择器。若主 Agent 继承宿主机
           ~/.claude，宿主机提示词、Rules、全部 Skills 和 MCP
           已自动生效，不受这里的选择影响。
         </p>
@@ -211,29 +205,6 @@ export function MainAgentCapabilitiesSection() {
             />
           )}
         </CapabilityPicker>
-      </div>
-
-      <div className="space-y-2 border-t border-border pt-5">
-        <label className="text-xs font-medium text-muted-foreground">
-          工具与扩展能力边界
-        </label>
-        <Select
-          value={toolsMode}
-          onValueChange={(value) => setToolsMode(value as ToolMode)}
-        >
-          <SelectTrigger aria-label="主 HappyClaw 工具能力边界">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="inherit">完整能力</SelectItem>
-            <SelectItem value="readonly">
-              只读（禁写、Bash、子 Agent、全部外部 MCP 与用户插件）
-            </SelectItem>
-            <SelectItem value="restricted">
-              严格只读（额外关闭 WebSearch / WebFetch）
-            </SelectItem>
-          </SelectContent>
-        </Select>
       </div>
 
       <div className="flex justify-end">

@@ -98,6 +98,14 @@ export interface RegisteredGroup {
     | 'owner_mentioned'
     | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
   owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
+  /** Provenance for privileged owner workflows. Weak automatic/explicit claims
+   * and credential-transfer quarantine cannot authorize Agent Builder. */
+  owner_claim_source?:
+    | 'explicit'
+    | 'configured'
+    | 'trusted_direct'
+    | 'auto_feishu'
+    | 'transfer_reset';
   sender_allowlist?: string[] | null; // null/undefined = 不限制，[] = 仅 owner 可触发（未 /claim 时无人可触发），[ids] = 白名单
   mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
   selected_mcps?: string[] | null; // custom 模式下选中的 MCP server IDs
@@ -182,7 +190,7 @@ export interface AgentProfile {
   agents_prompt: string;
   /** TOOLS: tool-selection and tool-usage guidance. */
   tools_prompt: string;
-  /** Append to or replace the Claude Code preset. HappyClaw safety always remains. */
+  /** Append to or replace the Claude Code preset. Platform runtime instructions remain. */
   prompt_mode: AgentProfilePromptMode;
   /** @deprecated Compatibility alias for prompt_mode === 'append'. */
   include_claude_preset: boolean;
@@ -233,9 +241,31 @@ export interface AgentProfileRuntimePolicy {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
   };
-  tools: {
-    mode: 'inherit' | 'readonly' | 'restricted';
-  };
+}
+
+export interface AgentBuilderDefinition extends AgentProfilePrompts {
+  name: string;
+  avatar_emoji: string | null;
+  avatar_color: string | null;
+  runtime_policy: AgentProfileRuntimePolicy;
+}
+
+export interface AgentBuilderDraft {
+  id: string;
+  owner_user_id: string;
+  source_group: string;
+  source_chat_jid: string;
+  target_agent_profile_id: string | null;
+  base_agent_version: number | null;
+  revision: number;
+  state: 'ready' | 'published' | 'discarded';
+  definition: AgentBuilderDefinition;
+  assumptions: string[];
+  prepared_turn_id: string | null;
+  confirmation_phrase: string;
+  published_agent_profile_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface NewMessage {

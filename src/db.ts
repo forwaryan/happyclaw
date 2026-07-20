@@ -7,6 +7,8 @@ import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { logger } from './logger.js';
 import {
   AgentProfile,
+  AgentBuilderDefinition,
+  AgentBuilderDraft,
   AgentProfilePromptMode,
   AgentProfilePrompts,
   AgentProfilePromptVersion,
@@ -867,6 +869,26 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
       ON agent_profile_prompt_versions(agent_profile_id, version DESC);
 
+    CREATE TABLE IF NOT EXISTS agent_builder_drafts (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      source_group TEXT NOT NULL,
+      source_chat_jid TEXT NOT NULL,
+      target_agent_profile_id TEXT,
+      base_agent_version INTEGER,
+      revision INTEGER NOT NULL DEFAULT 1,
+      state TEXT NOT NULL DEFAULT 'ready',
+      definition_json TEXT NOT NULL,
+      assumptions_json TEXT NOT NULL DEFAULT '[]',
+      prepared_turn_id TEXT,
+      confirmation_phrase TEXT NOT NULL DEFAULT '',
+      published_agent_profile_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_builder_drafts_owner
+      ON agent_builder_drafts(owner_user_id, updated_at DESC);
+
     CREATE TABLE IF NOT EXISTS workspace_agent_profiles (
       group_folder TEXT PRIMARY KEY,
       agent_profile_id TEXT NOT NULL,
@@ -1199,6 +1221,17 @@ export function initDatabase(): void {
   ensureColumn('registered_groups', 'selected_mcps', 'TEXT');
   ensureColumn('registered_groups', 'activation_mode', "TEXT DEFAULT 'auto'");
   ensureColumn('registered_groups', 'owner_im_id', 'TEXT');
+  ensureColumn('registered_groups', 'owner_claim_source', 'TEXT');
+  // Existing owner anchors predate provenance and may include credentials that
+  // were transferred between HappyClaw users. Keep them usable for legacy
+  // owner-only commands, but never let an ordinary DM silently turn them into
+  // Agent Builder trust; the user must re-pair or configure the owner in Web.
+  db.prepare(
+    `UPDATE registered_groups
+     SET owner_claim_source = 'explicit'
+     WHERE owner_im_id IS NOT NULL AND owner_im_id <> ''
+       AND (owner_claim_source IS NULL OR owner_claim_source = '')`,
+  ).run();
   ensureColumn(
     'registered_groups',
     'conversation_source',
@@ -1288,9 +1321,10 @@ export function initDatabase(): void {
           init_source_path TEXT,
           init_git_url TEXT,
           created_by TEXT,
+          owner_claim_source TEXT,
           is_home INTEGER DEFAULT 0
         );
-        INSERT INTO registered_groups_new SELECT jid, name, folder, added_at, container_config, execution_mode, custom_cwd, NULL, NULL, NULL, 0 FROM registered_groups;
+        INSERT INTO registered_groups_new SELECT jid, name, folder, added_at, container_config, execution_mode, custom_cwd, NULL, NULL, NULL, NULL, 0 FROM registered_groups;
         DROP TABLE registered_groups;
         ALTER TABLE registered_groups_new RENAME TO registered_groups;
       `);
@@ -1809,6 +1843,11 @@ export function initDatabase(): void {
     'prompt_mode',
     "TEXT NOT NULL DEFAULT 'append'",
   );
+  ensureColumn(
+    'agent_builder_drafts',
+    'confirmation_phrase',
+    "TEXT NOT NULL DEFAULT ''",
+  );
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
       id TEXT PRIMARY KEY,
@@ -2029,6 +2068,7 @@ export function initDatabase(): void {
   // table so stale grants cannot survive an upgrade.
   db.exec('DROP TABLE IF EXISTS group_members');
   backfillAgentProfileDefaultsAndWorkspaceMappings();
+  removeLegacyAgentToolPolicies();
   reconcileCanonicalRuntimeProjections();
 
   // v50 -> v51: make usage a first-class, idempotent event ledger. Historical
@@ -6378,14 +6418,12 @@ const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   },
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
-  tools: { mode: 'inherit' },
 };
 
 type RuntimePolicyInput = Partial<{
   context: Partial<AgentProfileRuntimePolicy['context']> | null;
   skills: Partial<AgentProfileRuntimePolicy['skills']> | null;
   mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
-  tools: Partial<AgentProfileRuntimePolicy['tools']> | null;
 }>;
 
 function normalizeIdList(value: unknown): string[] {
@@ -6460,13 +6498,6 @@ export function normalizeAgentProfileRuntimePolicy(
       ),
       ids: normalizeIdList(raw.mcp?.ids),
     },
-    tools: {
-      mode: normalizeMode(
-        raw.tools?.mode,
-        ['inherit', 'readonly', 'restricted'] as const,
-        'inherit',
-      ),
-    },
   };
   if (normalized.context.auto_compact_percentage > 0) {
     normalized.context.auto_compact_window = 0;
@@ -6507,13 +6538,6 @@ export function mergeAgentProfileRuntimePolicy(
       : current.context,
     skills: has('skills') ? mergeCapability('skills') : current.skills,
     mcp: has('mcp') ? mergeCapability('mcp') : current.mcp,
-    tools: has('tools')
-      ? patch.tools === null
-        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.tools
-        : {
-            mode: patch.tools?.mode ?? current.tools.mode,
-          }
-      : current.tools,
   });
 }
 
@@ -6521,6 +6545,62 @@ export function serializeAgentProfileRuntimePolicy(
   input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
 ): string {
   return JSON.stringify(normalizeAgentProfileRuntimePolicy(input));
+}
+
+/**
+ * Remove the retired Agent-level tool boundary from persisted profiles.
+ * Profiles that previously restricted tools receive a new identity version so
+ * their next run cannot resume a session created under the old restriction.
+ */
+function removeLegacyAgentToolPolicies(): void {
+  const rows = db.prepare('SELECT * FROM agent_profiles').all() as Array<
+    Record<string, unknown>
+  >;
+  const legacyRows = rows.filter((row) => {
+    try {
+      const parsed =
+        typeof row.runtime_policy === 'string'
+          ? JSON.parse(row.runtime_policy)
+          : row.runtime_policy;
+      return (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        Object.prototype.hasOwnProperty.call(parsed, 'tools')
+      );
+    } catch {
+      return false;
+    }
+  });
+  if (legacyRows.length === 0) return;
+
+  const update = db.prepare(
+    `UPDATE agent_profiles
+     SET runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+     WHERE id = ?`,
+  );
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    for (const row of legacyRows) {
+      const profile = mapAgentProfileRow(row);
+      const identityHash = computeAgentProfileIdentityHash(
+        profile,
+        profile.runtime_policy,
+        profile.name,
+      );
+      const identityChanged = identityHash !== profile.identity_hash;
+      update.run(
+        serializeAgentProfileRuntimePolicy(profile.runtime_policy),
+        identityHash,
+        identityChanged ? profile.version + 1 : profile.version,
+        identityChanged ? now : profile.updated_at,
+        profile.id,
+      );
+    }
+  })();
+  logger.info(
+    { rows: legacyRows.length },
+    'Removed retired Agent tool policies from persisted profiles',
+  );
 }
 
 export function migrateAgentProfileAutoCompactWindow(
@@ -6648,13 +6728,11 @@ export function computeAgentProfileIdentityHash(
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
     mcp: normalizedPolicy.mcp,
-    tools: normalizedPolicy.tools,
   };
   const defaultIdentityPolicy = {
     context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
     skills: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.skills,
     mcp: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.mcp,
-    tools: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.tools,
   };
   if (name) payload.name = name;
   if (
@@ -6819,6 +6897,212 @@ export function getAgentProfileForUser(
   return row ? mapAgentProfileRow(row) : undefined;
 }
 
+function mapAgentBuilderDraftRow(
+  row: Record<string, unknown>,
+): AgentBuilderDraft {
+  let definition: AgentBuilderDefinition;
+  let assumptions: string[];
+  try {
+    definition = JSON.parse(String(row.definition_json));
+  } catch {
+    throw new Error(
+      `Invalid Agent Builder draft definition: ${String(row.id)}`,
+    );
+  }
+  try {
+    const parsed = JSON.parse(String(row.assumptions_json ?? '[]'));
+    assumptions = Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    assumptions = [];
+  }
+  return {
+    id: String(row.id),
+    owner_user_id: String(row.owner_user_id),
+    source_group: String(row.source_group),
+    source_chat_jid: String(row.source_chat_jid),
+    target_agent_profile_id:
+      typeof row.target_agent_profile_id === 'string'
+        ? row.target_agent_profile_id
+        : null,
+    base_agent_version:
+      row.base_agent_version == null ? null : Number(row.base_agent_version),
+    revision: Number(row.revision),
+    state:
+      row.state === 'published' || row.state === 'discarded'
+        ? row.state
+        : 'ready',
+    definition,
+    assumptions,
+    prepared_turn_id:
+      typeof row.prepared_turn_id === 'string' ? row.prepared_turn_id : null,
+    confirmation_phrase:
+      typeof row.confirmation_phrase === 'string'
+        ? row.confirmation_phrase
+        : '',
+    published_agent_profile_id:
+      typeof row.published_agent_profile_id === 'string'
+        ? row.published_agent_profile_id
+        : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+export function getAgentBuilderDraftForUser(
+  draftId: string,
+  ownerUserId: string,
+): AgentBuilderDraft | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM agent_builder_drafts WHERE id = ? AND owner_user_id = ?',
+    )
+    .get(draftId, ownerUserId) as Record<string, unknown> | undefined;
+  return row ? mapAgentBuilderDraftRow(row) : undefined;
+}
+
+export function listReadyAgentBuilderDraftsForUser(
+  ownerUserId: string,
+): AgentBuilderDraft[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM agent_builder_drafts
+       WHERE owner_user_id = ? AND state = 'ready'
+       ORDER BY updated_at DESC LIMIT 20`,
+    )
+    .all(ownerUserId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentBuilderDraftRow);
+}
+
+export function saveAgentBuilderDraft(input: {
+  id?: string;
+  ownerUserId: string;
+  sourceGroup: string;
+  sourceChatJid: string;
+  targetAgentProfileId: string | null;
+  baseAgentVersion: number | null;
+  expectedRevision?: number;
+  definition: AgentBuilderDefinition;
+  assumptions?: string[];
+  preparedTurnId?: string | null;
+  confirmationPhrase: string;
+}): AgentBuilderDraft | undefined {
+  const now = new Date().toISOString();
+  if (input.id) {
+    const current = getAgentBuilderDraftForUser(input.id, input.ownerUserId);
+    if (
+      !current ||
+      current.state !== 'ready' ||
+      input.expectedRevision === undefined ||
+      current.revision !== input.expectedRevision
+    ) {
+      return undefined;
+    }
+    const nextRevision = current.revision + 1;
+    const result = db
+      .prepare(
+        `UPDATE agent_builder_drafts
+         SET source_group = ?, source_chat_jid = ?, target_agent_profile_id = ?,
+             base_agent_version = ?, revision = ?, definition_json = ?,
+             assumptions_json = ?, prepared_turn_id = ?,
+             confirmation_phrase = ?, updated_at = ?
+         WHERE id = ? AND owner_user_id = ? AND revision = ? AND state = 'ready'`,
+      )
+      .run(
+        input.sourceGroup,
+        input.sourceChatJid,
+        input.targetAgentProfileId,
+        input.baseAgentVersion,
+        nextRevision,
+        JSON.stringify(input.definition),
+        JSON.stringify(input.assumptions ?? []),
+        input.preparedTurnId ?? null,
+        input.confirmationPhrase,
+        now,
+        input.id,
+        input.ownerUserId,
+        current.revision,
+      );
+    if (result.changes === 0) return undefined;
+    return getAgentBuilderDraftForUser(input.id, input.ownerUserId);
+  }
+
+  const id = crypto.randomUUID();
+  db.prepare(
+    `INSERT INTO agent_builder_drafts (
+      id, owner_user_id, source_group, source_chat_jid,
+      target_agent_profile_id, base_agent_version, revision, state,
+      definition_json, assumptions_json, prepared_turn_id,
+      confirmation_phrase, published_agent_profile_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, 'ready', ?, ?, ?, ?, NULL, ?, ?)`,
+  ).run(
+    id,
+    input.ownerUserId,
+    input.sourceGroup,
+    input.sourceChatJid,
+    input.targetAgentProfileId,
+    input.baseAgentVersion,
+    JSON.stringify(input.definition),
+    JSON.stringify(input.assumptions ?? []),
+    input.preparedTurnId ?? null,
+    input.confirmationPhrase,
+    now,
+    now,
+  );
+  return getAgentBuilderDraftForUser(id, input.ownerUserId);
+}
+
+export function discardAgentBuilderDraft(
+  draftId: string,
+  ownerUserId: string,
+  expectedRevision: number,
+): AgentBuilderDraft | undefined {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE agent_builder_drafts
+       SET state = 'discarded', updated_at = ?
+       WHERE id = ? AND owner_user_id = ? AND revision = ? AND state = 'ready'`,
+    )
+    .run(now, draftId, ownerUserId, expectedRevision);
+  return result.changes > 0
+    ? getAgentBuilderDraftForUser(draftId, ownerUserId)
+    : undefined;
+}
+
+export function commitAgentBuilderDraft(
+  draftId: string,
+  ownerUserId: string,
+  expectedRevision: number,
+  commit: (draft: AgentBuilderDraft) => AgentProfile,
+): { draft: AgentBuilderDraft; profile: AgentProfile } | undefined {
+  return db.transaction(() => {
+    const draft = getAgentBuilderDraftForUser(draftId, ownerUserId);
+    if (
+      !draft ||
+      draft.state !== 'ready' ||
+      draft.revision !== expectedRevision
+    ) {
+      return undefined;
+    }
+    const profile = commit(draft);
+    const now = new Date().toISOString();
+    const result = db
+      .prepare(
+        `UPDATE agent_builder_drafts
+         SET state = 'published', published_agent_profile_id = ?, updated_at = ?
+         WHERE id = ? AND owner_user_id = ? AND revision = ? AND state = 'ready'`,
+      )
+      .run(profile.id, now, draftId, ownerUserId, expectedRevision);
+    if (result.changes === 0) throw new Error('Agent Builder draft changed');
+    return {
+      draft: getAgentBuilderDraftForUser(draftId, ownerUserId)!,
+      profile,
+    };
+  })();
+}
+
 const DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
 const LEGACY_DEFAULT_AGENT_PROFILE_NAME = 'Default Agent';
 
@@ -6919,6 +7203,7 @@ export function listAgentProfilesForUser(userId: string): AgentProfile[] {
 }
 
 export function createAgentProfile(input: {
+  profileId?: string;
   ownerUserId: string;
   name: string;
   identityPrompt?: string;
@@ -6932,7 +7217,7 @@ export function createAgentProfile(input: {
   runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
 }): AgentProfile {
   const now = new Date().toISOString();
-  const id = crypto.randomUUID();
+  const id = input.profileId ?? crypto.randomUUID();
   const prompts = normalizeAgentProfilePrompts({
     identity_prompt: input.identityPrompt ?? '',
     soul_prompt: input.soulPrompt ?? '',
@@ -7293,6 +7578,7 @@ type RegisteredGroupRow = {
   require_mention: number;
   activation_mode: string | null;
   owner_im_id: string | null;
+  owner_claim_source: string | null;
   mcp_mode: string | null;
   selected_mcps: string | null;
   conversation_source: string | null;
@@ -7366,6 +7652,14 @@ function parseGroupRow(
     require_mention: row.require_mention === 1,
     activation_mode: parseActivationMode(row.activation_mode),
     owner_im_id: row.owner_im_id ?? undefined,
+    owner_claim_source:
+      row.owner_claim_source === 'explicit' ||
+      row.owner_claim_source === 'configured' ||
+      row.owner_claim_source === 'trusted_direct' ||
+      row.owner_claim_source === 'auto_feishu' ||
+      row.owner_claim_source === 'transfer_reset'
+        ? row.owner_claim_source
+        : undefined,
     conversation_source:
       row.conversation_source === 'native_thread' ||
       row.conversation_source === 'feishu_thread'
@@ -8155,8 +8449,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.transaction(() => {
     const existing = getRegisteredGroup(jid);
     db.prepare(
-      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, owner_claim_source, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       jid,
       group.name,
@@ -8177,6 +8471,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       group.require_mention === true ? 1 : 0,
       group.activation_mode ?? 'auto',
       group.owner_im_id ?? null,
+      group.owner_claim_source ?? null,
       'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
       null, // selected_mcps: deprecated, always null
       group.conversation_source ?? 'manual',
@@ -8223,27 +8518,27 @@ export function deleteRegisteredGroup(jid: string): void {
 }
 
 /**
- * Find groups owned by `userId` whose sender_allowlist is the empty array `[]` —
- * the "owner-locked trap" state where no one (not even the owner) can trigger
- * the bot. Created by buildOnNewChat when a Feishu group is auto-registered
- * before the owner has DM'd the bot. Used by Feishu owner backfill.
+ * Find Feishu groups that still need owner learning: either their allowlist is
+ * the empty-array "owner-locked trap", or owner_im_id was never populated.
  */
 export function findEmptyAllowlistFeishuGroupsForUser(
   userId: string,
 ): string[] {
   const rows = db
     .prepare(
-      "SELECT jid FROM registered_groups WHERE created_by = ? AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'",
+      `SELECT jid FROM registered_groups
+       WHERE created_by = ? AND jid LIKE 'feishu:%'
+         AND COALESCE(owner_claim_source, '') <> 'transfer_reset'
+         AND (sender_allowlist = '[]' OR owner_im_id IS NULL OR owner_im_id = '')`,
     )
     .all(userId) as Array<{ jid: string }>;
   return rows.map((r) => r.jid);
 }
 
 /**
- * Replace empty `sender_allowlist=[]` with `[ownerOpenId]` for the user's
- * Feishu groups. Returns the JIDs that were updated. Run once when the
- * Feishu owner is first identified via P2P DM, to unstick groups that were
- * registered before the owner was known.
+ * Persist the owner learned from a trusted Feishu P2P DM and replace an empty
+ * allowlist with that owner. Existing non-empty owner/allowlist values are not
+ * overwritten. Returns all changed JIDs so the caller can refresh its cache.
  */
 export function backfillEmptyAllowlistsForUser(
   userId: string,
@@ -8251,12 +8546,26 @@ export function backfillEmptyAllowlistsForUser(
 ): string[] {
   const jids = findEmptyAllowlistFeishuGroupsForUser(userId);
   if (jids.length === 0) return [];
-  const allowlistJson = JSON.stringify([ownerOpenId]);
   const stmt = db.prepare(
-    'UPDATE registered_groups SET sender_allowlist = ? WHERE jid = ?',
+    `UPDATE registered_groups
+     SET owner_im_id = CASE
+           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN ?
+           ELSE owner_im_id
+         END,
+         owner_claim_source = CASE
+           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN 'auto_feishu'
+           ELSE owner_claim_source
+         END,
+         sender_allowlist = CASE
+           WHEN sender_allowlist = '[]' THEN ?
+           ELSE sender_allowlist
+         END
+     WHERE jid = ?`,
   );
   const tx = db.transaction((targets: string[]) => {
-    for (const jid of targets) stmt.run(allowlistJson, jid);
+    for (const jid of targets) {
+      stmt.run(ownerOpenId, JSON.stringify([ownerOpenId]), jid);
+    }
   });
   tx(jids);
   return jids;
@@ -8272,15 +8581,32 @@ export function backfillEmptyAllowlistsForChannelAccount(
     .prepare(
       `SELECT jid FROM registered_groups
        WHERE created_by = ? AND channel_account_id = ?
-         AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'`,
+         AND jid LIKE 'feishu:%'
+         AND COALESCE(owner_claim_source, '') <> 'transfer_reset'
+         AND (sender_allowlist = '[]' OR owner_im_id IS NULL OR owner_im_id = '')`,
     )
     .all(userId, channelAccountId) as Array<{ jid: string }>;
   if (!rows.length) return [];
   const stmt = db.prepare(
-    'UPDATE registered_groups SET sender_allowlist = ? WHERE jid = ?',
+    `UPDATE registered_groups
+     SET owner_im_id = CASE
+           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN ?
+           ELSE owner_im_id
+         END,
+         owner_claim_source = CASE
+           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN 'auto_feishu'
+           ELSE owner_claim_source
+         END,
+         sender_allowlist = CASE
+           WHEN sender_allowlist = '[]' THEN ?
+           ELSE sender_allowlist
+         END
+     WHERE jid = ?`,
   );
   db.transaction(() => {
-    for (const row of rows) stmt.run(JSON.stringify([ownerOpenId]), row.jid);
+    for (const row of rows) {
+      stmt.run(ownerOpenId, JSON.stringify([ownerOpenId]), row.jid);
+    }
   })();
   return rows.map((row) => row.jid);
 }
@@ -10372,6 +10698,45 @@ export function getMessage(
       }
     | undefined;
   return row ?? null;
+}
+
+/** Read the host-persisted human input used to authorize Agent Builder calls. */
+export function getAgentBuilderInputMessage(
+  chatJid: string,
+  messageId: string,
+): {
+  id: string;
+  chat_jid: string;
+  content: string;
+  sender: string | null;
+  source_jid: string | null;
+  is_from_me: number;
+  source_kind: string | null;
+  task_id: string | null;
+} | null {
+  const row = db
+    .prepare(
+      `SELECT id, chat_jid, content, sender, source_jid, is_from_me, source_kind, task_id
+       FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1`,
+    )
+    .get(messageId, chatJid) as
+    | {
+        id: string;
+        chat_jid: string;
+        content: unknown;
+        sender: string | null;
+        source_jid: string | null;
+        is_from_me: number;
+        source_kind: string | null;
+        task_id: string | null;
+      }
+    | undefined;
+  return row
+    ? {
+        ...row,
+        content: toUtf8String(row.content),
+      }
+    : null;
 }
 
 export function deleteMessage(chatJid: string, messageId: string): boolean {

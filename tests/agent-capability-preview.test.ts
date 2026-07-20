@@ -84,7 +84,7 @@ beforeAll(() => {
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
 describe('buildAgentCapabilityPreview', () => {
-  test('shows additive layers, overrides, host context and tool-boundary effects', () => {
+  test('shows additive layers, overrides and host context', () => {
     const preview = buildAgentCapabilityPreview({
       profile: {
         id: 'profile',
@@ -109,7 +109,6 @@ describe('buildAgentCapabilityPreview', () => {
           },
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'inherit', ids: [] },
-          tools: { mode: 'readonly' },
         },
       },
       workspace: {
@@ -145,17 +144,16 @@ describe('buildAgentCapabilityPreview', () => {
           id: 'shared',
           source: 'user',
           overrides: ['host', 'system'],
-          available: false,
+          available: true,
         }),
         expect.objectContaining({ id: 'platform', source: 'system' }),
         expect.objectContaining({
           id: 'project',
           source: 'workspace',
-          available: false,
+          available: true,
         }),
       ]),
     );
-    expect(preview.mcp.disabledByToolBoundary).toBe(true);
   });
 
   test('marks admin-only system MCP unavailable to members and available to admins', () => {
@@ -182,7 +180,6 @@ describe('buildAgentCapabilityPreview', () => {
         },
         skills: { mode: 'inherit' as const, ids: [] },
         mcp: { mode: 'inherit' as const, ids: [] },
-        tools: { mode: 'inherit' as const },
       },
     };
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import {
   evaluateMentionGate,
+  stripLeadingBotMention,
   type MentionGateInput,
   type MentionGateMention,
 } from '../src/feishu-mention-gate.js';
@@ -145,5 +146,34 @@ describe('evaluateMentionGate', () => {
       }),
     );
     expect(seen).toEqual({ chatJid: CHAT, sender: SENDER });
+  });
+});
+
+describe('stripLeadingBotMention', () => {
+  const mentions = [
+    { name: 'Happy Claw', id: { open_id: BOT_OPEN_ID } },
+    { name: 'Alice', id: { open_id: 'ou_alice' } },
+  ];
+
+  test('strips the trusted leading bot mention before an exact confirmation phrase', () => {
+    expect(
+      stripLeadingBotMention(
+        '@Happy Claw  确认发布 AGENT-A1B2C3D4',
+        BOT_OPEN_ID,
+        mentions,
+      ),
+    ).toBe('确认发布 AGENT-A1B2C3D4');
+  });
+
+  test('does not strip another user mention or a non-leading bot mention', () => {
+    expect(
+      stripLeadingBotMention('@Alice 确认发布', BOT_OPEN_ID, mentions),
+    ).toBe('@Alice 确认发布');
+    expect(
+      stripLeadingBotMention('请 @Happy Claw 确认发布', BOT_OPEN_ID, mentions),
+    ).toBe('请 @Happy Claw 确认发布');
+    expect(stripLeadingBotMention('@Happy Claw', BOT_OPEN_ID, mentions)).toBe(
+      '@Happy Claw',
+    );
   });
 });

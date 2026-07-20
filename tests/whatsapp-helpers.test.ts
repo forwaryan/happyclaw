@@ -8,6 +8,7 @@ import {
   isMentioningBot,
   normalizeTimestamp,
   stripChannelPrefix,
+  stripLeadingWhatsAppBotMention,
 } from '../src/whatsapp.js';
 
 describe('extractMessageText', () => {
@@ -203,5 +204,53 @@ describe('isMentioningBot', () => {
         null,
       ),
     ).toBe(false);
+  });
+});
+
+describe('stripLeadingWhatsAppBotMention', () => {
+  const SELF = '15551234567:42@s.whatsapp.net';
+  const trustedMention = {
+    extendedTextMessage: {
+      text: '@15551234567 确认发布 AGENT-A1B2C3D4',
+      contextInfo: { mentionedJid: ['15551234567@s.whatsapp.net'] },
+    },
+  } as proto.IMessage;
+
+  test('strips only the leading trusted bot mention', () => {
+    expect(
+      stripLeadingWhatsAppBotMention(
+        '@15551234567 确认发布 AGENT-A1B2C3D4',
+        trustedMention,
+        SELF,
+      ),
+    ).toBe('确认发布 AGENT-A1B2C3D4');
+  });
+
+  test('keeps untrusted, non-leading, prefix-collision, and mention-only text', () => {
+    const untrusted = {
+      extendedTextMessage: {
+        contextInfo: { mentionedJid: ['999999@s.whatsapp.net'] },
+      },
+    } as proto.IMessage;
+    expect(
+      stripLeadingWhatsAppBotMention('@15551234567 确认发布', untrusted, SELF),
+    ).toBe('@15551234567 确认发布');
+    expect(
+      stripLeadingWhatsAppBotMention(
+        '请 @15551234567 确认发布',
+        trustedMention,
+        SELF,
+      ),
+    ).toBe('请 @15551234567 确认发布');
+    expect(
+      stripLeadingWhatsAppBotMention(
+        '@155512345678 确认发布',
+        trustedMention,
+        SELF,
+      ),
+    ).toBe('@155512345678 确认发布');
+    expect(
+      stripLeadingWhatsAppBotMention('@15551234567', trustedMention, SELF),
+    ).toBe('@15551234567');
   });
 });

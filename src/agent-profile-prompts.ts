@@ -56,9 +56,9 @@ export function hasAgentProfilePrompts(
 
 /**
  * Build the user-configurable Agent prompt in one canonical order. This is not
- * the complete HappyClaw system prompt: runtime security, channel, memory, and
- * tool-policy instructions are appended outside this block and cannot be
- * removed by prompt_mode=replace.
+ * the complete HappyClaw system prompt: platform runtime, channel, and memory
+ * instructions are appended outside this block and cannot be removed by
+ * prompt_mode=replace.
  */
 export function buildAgentProfilePrompt(
   input: Partial<AgentProfilePrompts>,

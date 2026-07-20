@@ -48,7 +48,6 @@ const profile: AgentProfile = {
     context: { source: 'managed' },
     skills: { mode: 'inherit', ids: [] },
     mcp: { mode: 'inherit', ids: [] },
-    tools: { mode: 'inherit' },
   },
   identity_hash: 'hash',
   version: 1,

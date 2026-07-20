@@ -703,7 +703,7 @@ export function createWhatsAppConnection(
       // Unwrap ephemeral / view-once envelopes once so text, media, and mention
       // detection all see the real inner message (they otherwise diverge).
       const inner = unwrapMessageContent(content);
-      const text = extractMessageText(inner);
+      let text = extractMessageText(inner);
       const rawChatJid = `${CHANNEL_PREFIX}${remoteJid}`;
       const chatJid = opts.normalizeIncomingJid?.(rawChatJid) ?? rawChatJid;
       const isGroup = remoteJid.endsWith('@g.us');
@@ -786,6 +786,9 @@ export function createWhatsAppConnection(
             'WhatsApp dropped: owner_mentioned mode, sender is not group owner',
           );
           return;
+        }
+        if (isBotMentioned && text) {
+          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user?.id);
         }
       }
 
@@ -1320,6 +1323,26 @@ export function isMentioningBot(
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
   return mentioned.some((m) => jidNormalizedUser(m) === selfNorm);
+}
+
+/** Remove a leading WhatsApp display token only when trusted message metadata
+ * says the same account was mentioned. Mention-only messages retain their
+ * original text instead of becoming an empty durable message. */
+export function stripLeadingWhatsAppBotMention(
+  text: string,
+  content: proto.IMessage,
+  selfJid: string | null | undefined,
+): string {
+  if (!selfJid || !isMentioningBot(content, selfJid)) return text;
+  const selfSubject = jidNormalizedUser(selfJid).split('@', 1)[0];
+  if (!selfSubject) return text;
+  const normalized = text.trimStart();
+  const displayToken = `@${selfSubject}`;
+  if (!normalized.startsWith(displayToken)) return text;
+  const next = normalized.charAt(displayToken.length);
+  if (next && !/\s/.test(next)) return text;
+  const remainder = normalized.slice(displayToken.length).trimStart();
+  return remainder || text;
 }
 
 /**

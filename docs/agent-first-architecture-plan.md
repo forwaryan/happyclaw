@@ -16,7 +16,7 @@ The correct target hierarchy is:
 Agent
   - identity prompt
   - Claude preset inclusion policy
-  - user Skill / user MCP / tool policy（Provider 与凭据由系统统一管理）
+  - user Skill / user MCP policy（Provider 与凭据由系统统一管理）
   - channel mounts
   - workspaces
       - runtime isolation boundary
@@ -44,9 +44,8 @@ by the old in-memory runner. This must be fixed before deeper schema migration.
   parity tests are required until every reader has migrated.
 - The old `agents` table is still the conversation/task/spawn-agent model, not the new
   top-level Agent concept.
-- Agent runtime policy currently filters enabled user Skills and user MCP servers. Project,
-  external, and plugin Skills are not selected by that policy, but their actions remain subject
-  to the Agent tool boundary.
+- Agent runtime policy filters enabled user Skills and user MCP servers. Project, external, and
+  plugin Skills are not selected by that policy. Agent tools themselves remain fully available.
 
 ### Frontend
 
@@ -59,7 +58,7 @@ by the old in-memory runner. This must be fixed before deeper schema migration.
 - Runtime-policy editors use the live user Skill and user MCP catalogs rather than free-form
   identifiers. Provider selection is not part of Agent policy.
 - The effective-capability preview resolves host, HappyClaw-managed, and workspace project layers,
-  and reports name conflicts and tool-boundary shutdowns before execution.
+  and reports name conflicts before execution.
 - Agent and IM load failures are distinct from valid empty states and expose retry actions.
 
 ## Target Domain Model
@@ -75,7 +74,7 @@ Fields:
 - `name`
 - `identity_prompt`
 - `include_claude_preset`
-- `runtime_policy` (user Skill policy, user MCP policy, context policy, tool boundary；不包含 Provider)
+- `runtime_policy` (user Skill policy, user MCP policy, context policy；不包含 Provider)
 - `identity_hash`
 - `version`
 - `status`
@@ -253,11 +252,10 @@ Implementation:
   uploaded as a validated ZIP. Import rejects traversal/symlink payloads, stops on conflicts by
   default, and records source URL, commit/version, and install time.
 - User MCP policy inherits, selects, or disables enabled user MCP servers.
-- `readonly` and `restricted` are security boundaries: both enable strict MCP config, disable user
-  MCP and user plugins, block write/Bash/sub-Agent tools, and default-deny unclassified HappyClaw
-  tools. Only explicitly classified query, memory-read, and reply capabilities remain;
-  `restricted` additionally blocks WebSearch and WebFetch.
-- Any Skill that is still discoverable remains constrained by the selected tool boundary.
+- Agent-level tool security modes have been removed. Bash, file writes, web access, sub-Agents,
+  built-in HappyClaw tools and plugins are not reduced by AgentProfile configuration.
+- User Skill and MCP modes remain explicit user choices. Exact MCP selections use strict MCP
+  materialization to honor the selected set, not as a general tool permission boundary.
 
 ### Phase 5: Scheduled Task Context Semantics
 

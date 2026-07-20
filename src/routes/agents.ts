@@ -1272,6 +1272,9 @@ router.put(
       feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
       feishu_group_message_type:
         chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
+      ...(ownerImId !== undefined
+        ? { owner_claim_source: 'configured' as const }
+        : {}),
     };
     commitChannelMountUpdate(imJid, updated);
     detachPreviousThreadMapIfLast(
@@ -1654,6 +1657,9 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
     feishu_group_message_type:
       chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
+    ...(ownerImId !== undefined
+      ? { owner_claim_source: 'configured' as const }
+      : {}),
   };
   commitChannelMountUpdate(imJid, updated);
   detachPreviousThreadMapIfLast(

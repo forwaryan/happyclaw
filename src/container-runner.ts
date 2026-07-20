@@ -484,33 +484,6 @@ function resolveAgentProfileMcpPolicy(
   };
 }
 
-function resolveAgentProfileDisallowedTools(
-  agentProfile?: RunnerAgentProfile,
-): string[] {
-  switch (agentProfile?.runtimePolicy?.tools.mode) {
-    case 'readonly':
-      return ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash'];
-    case 'restricted':
-      return [
-        'Write',
-        'Edit',
-        'MultiEdit',
-        'NotebookEdit',
-        'Bash',
-        'WebSearch',
-        'WebFetch',
-      ];
-    default:
-      return [];
-  }
-}
-
-function getAgentProfileToolPolicyMode(
-  agentProfile?: RunnerAgentProfile,
-): 'inherit' | 'readonly' | 'restricted' {
-  return agentProfile?.runtimePolicy?.tools.mode ?? 'inherit';
-}
-
 function getAgentProfileMcpPolicyMode(
   agentProfile?: RunnerAgentProfile,
 ): 'inherit' | 'custom' | 'disabled' {
@@ -1037,11 +1010,14 @@ export function buildVolumeMounts(
     containerOverride,
     resolvedProvider?.customEnv,
   );
-  // Agent policy is authoritative; do not inherit the former global/custom env.
+  // Agent policy is authoritative; do not inherit global/custom runtime env.
   for (let index = envLines.length - 1; index >= 0; index -= 1) {
     if (
       envLines[index]?.startsWith('AUTO_COMPACT_WINDOW=') ||
-      envLines[index]?.startsWith('AUTO_COMPACT_PERCENTAGE=')
+      envLines[index]?.startsWith('AUTO_COMPACT_PERCENTAGE=') ||
+      envLines[index]?.startsWith('HAPPYCLAW_AGENT_TOOL_POLICY=') ||
+      envLines[index]?.startsWith('HAPPYCLAW_AGENT_DISALLOWED_TOOLS=') ||
+      envLines[index]?.startsWith('HAPPYCLAW_AGENT_MCP_POLICY=')
     ) {
       envLines.splice(index, 1);
     }
@@ -1053,19 +1029,9 @@ export function buildVolumeMounts(
   } else if (autoCompactWindow > 0) {
     envLines.push(`AUTO_COMPACT_WINDOW=${autoCompactWindow}`);
   }
-  const disallowedTools = resolveAgentProfileDisallowedTools(agentProfile);
-  const toolPolicyMode = getAgentProfileToolPolicyMode(agentProfile);
   const mcpPolicyMode = getAgentProfileMcpPolicyMode(agentProfile);
-  if (toolPolicyMode !== 'inherit') {
-    envLines.push(`HAPPYCLAW_AGENT_TOOL_POLICY=${toolPolicyMode}`);
-  }
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
-  }
-  if (disallowedTools.length > 0) {
-    envLines.push(
-      `HAPPYCLAW_AGENT_DISALLOWED_TOOLS=${JSON.stringify(disallowedTools)}`,
-    );
   }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
@@ -1970,24 +1936,12 @@ export async function runHostAgent(
     } else if (autoCompactWindow > 0) {
       hostEnv['AUTO_COMPACT_WINDOW'] = String(autoCompactWindow);
     }
-    const hostDisallowedTools = resolveAgentProfileDisallowedTools(
-      input.agentProfile,
-    );
-    const hostToolPolicyMode = getAgentProfileToolPolicyMode(
-      input.agentProfile,
-    );
     const hostMcpPolicyMode = getAgentProfileMcpPolicyMode(input.agentProfile);
     delete hostEnv['HAPPYCLAW_AGENT_TOOL_POLICY'];
+    delete hostEnv['HAPPYCLAW_AGENT_DISALLOWED_TOOLS'];
     delete hostEnv['HAPPYCLAW_AGENT_MCP_POLICY'];
-    if (hostToolPolicyMode !== 'inherit') {
-      hostEnv['HAPPYCLAW_AGENT_TOOL_POLICY'] = hostToolPolicyMode;
-    }
     if (hostMcpPolicyMode !== 'inherit') {
       hostEnv['HAPPYCLAW_AGENT_MCP_POLICY'] = hostMcpPolicyMode;
-    }
-    if (hostDisallowedTools.length > 0) {
-      hostEnv['HAPPYCLAW_AGENT_DISALLOWED_TOOLS'] =
-        JSON.stringify(hostDisallowedTools);
     }
 
     // 路径映射

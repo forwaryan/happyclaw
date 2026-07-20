@@ -58,12 +58,9 @@ import {
 import { StreamEventProcessor } from './stream-processor.js';
 import { createMcpTools } from './mcp-tools.js';
 import {
-  filterHappyclawToolsForPolicy,
-  getAgentToolPolicyFlagSettings,
   parseAgentMcpPolicyMode,
-  parseAgentToolPolicyMode,
-  resolveAgentToolPolicy,
-} from './runtime-tool-policy.js';
+  resolveAgentMcpPolicy,
+} from './runtime-mcp-policy.js';
 import {
   IpcTurnDeliveryTracker,
   isHealthyInputTurnCompletion,
@@ -179,36 +176,7 @@ const MEMORY_FLUSH_KEEP_MCP = new Set([
   'mcp__happyclaw__memory_search',
 ]);
 
-function parseDisallowedToolsEnv(): string[] {
-  const raw = process.env.HAPPYCLAW_AGENT_DISALLOWED_TOOLS;
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((tool): tool is string => typeof tool === 'string')
-      .map((tool) => tool.trim())
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-const AGENT_PROFILE_DISALLOWED_TOOLS = parseDisallowedToolsEnv();
-let activeAgentToolPolicy = resolveAgentToolPolicy('inherit', []);
-
-function mergeDisallowedTools(
-  disallowedTools?: string[],
-): string[] | undefined {
-  const merged = Array.from(
-    new Set([
-      ...(disallowedTools ?? []),
-      ...AGENT_PROFILE_DISALLOWED_TOOLS,
-      ...activeAgentToolPolicy.disallowedTools,
-    ]),
-  );
-  return merged.length > 0 ? merged : undefined;
-}
+let activeAgentMcpPolicy = resolveAgentMcpPolicy('inherit');
 
 const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
 
@@ -263,6 +231,7 @@ const OUTPUT_GUIDELINES = loadPrompt('output.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
 const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
 const CONVERSATION_AGENT_GUIDELINES = loadPrompt('agent-override.md');
+const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
 const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
 const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
 
@@ -1934,6 +1903,17 @@ async function runQuery(
           },
         ]
       : []),
+    ...(isHome &&
+    !containerInput.agentId &&
+    !containerInput.isScheduledTask &&
+    !containerInput.messageTaskId
+      ? [
+          {
+            name: 'agent-builder.md',
+            text: `<agent-builder>\n${AGENT_BUILDER_GUIDELINES}\n</agent-builder>`,
+          },
+        ]
+      : []),
     { name: 'guidelines', text: GUIDELINES_BLOCK },
     ...(channelGuidelines
       ? [
@@ -2029,11 +2009,6 @@ async function runQuery(
       );
     }
   }
-  Object.assign(
-    flagSettings,
-    getAgentToolPolicyFlagSettings(activeAgentToolPolicy),
-  );
-
   // Resolve the actual claude CLI path for the SDK.
   // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-{platform} 等）不保证被安装，
   // pathToClaudeCodeExecutable 留空、且 SDK 自带平台包缺失时会报
@@ -2080,18 +2055,26 @@ async function runQuery(
   // Paths are already runtime-translated upstream (container-internal for
   // Docker, host absolute for host mode).
   const userPlugins =
-    activeAgentToolPolicy.loadUserPlugins &&
+    activeAgentMcpPolicy.loadUserPlugins &&
     containerInput.plugins &&
     containerInput.plugins.length > 0
-      ? containerInput.plugins
+      ? containerInput.plugins.map((plugin) => ({
+          ...plugin,
+          ...(activeAgentMcpPolicy.skipPluginMcpDiscovery
+            ? { skipMcpDiscovery: true }
+            : {}),
+        }))
       : undefined;
   if (userPlugins) {
     log(
       `Loading ${userPlugins.length} plugin(s): ${userPlugins.map((p) => p.path).join(', ')}`,
     );
   }
-  const effectiveDisallowedTools = mergeDisallowedTools(disallowedTools);
-  const userMcpServers = activeAgentToolPolicy.includeUserMcpServers
+  const effectiveDisallowedTools =
+    disallowedTools && disallowedTools.length > 0
+      ? [...new Set(disallowedTools)]
+      : undefined;
+  const userMcpServers = activeAgentMcpPolicy.includeUserMcpServers
     ? loadUserMcpServers()
     : {};
 
@@ -2106,9 +2089,6 @@ async function runQuery(
         resume: sessionId,
         ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
         systemPrompt,
-        ...(activeAgentToolPolicy.builtinTools
-          ? { tools: activeAgentToolPolicy.builtinTools }
-          : {}),
         allowedTools,
         ...(effectiveDisallowedTools && {
           disallowedTools: effectiveDisallowedTools,
@@ -2117,10 +2097,7 @@ async function runQuery(
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         agentProgressSummaries: true,
-        settingSources: activeAgentToolPolicy.settingSources,
-        ...(activeAgentToolPolicy.managedSettings
-          ? { managedSettings: activeAgentToolPolicy.managedSettings }
-          : {}),
+        settingSources: activeAgentMcpPolicy.settingSources,
         // 启用全部已发现的技能到主会话。SDK 0.3.x 起 skills 是"打开技能的唯一正确位置"
         // （用了它就无需再往 allowedTools 塞已废弃的 'Skill'）。'all' = 启用所有发现的技能，
         // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
@@ -2136,7 +2113,7 @@ async function runQuery(
           ? { settings: flagSettings as any }
           : {}),
         ...(userPlugins && { plugins: userPlugins }),
-        ...(activeAgentToolPolicy.strictMcpConfig
+        ...(activeAgentMcpPolicy.strictMcpConfig
           ? { strictMcpConfig: true }
           : {}),
         mcpServers: {
@@ -2900,22 +2877,14 @@ async function main(): Promise<void> {
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
   };
-  const happyclawToolNames = createMcpTools(mcpToolsConfig).map(
-    (tool) => tool.name,
-  );
-  activeAgentToolPolicy = resolveAgentToolPolicy(
-    parseAgentToolPolicyMode(process.env.HAPPYCLAW_AGENT_TOOL_POLICY),
-    happyclawToolNames,
+  activeAgentMcpPolicy = resolveAgentMcpPolicy(
     parseAgentMcpPolicyMode(process.env.HAPPYCLAW_AGENT_MCP_POLICY),
   );
   const buildMcpServerConfig = () =>
     createSdkMcpServer({
       name: 'happyclaw',
       version: '1.0.0',
-      tools: filterHappyclawToolsForPolicy(
-        activeAgentToolPolicy,
-        createMcpTools(mcpToolsConfig),
-      ),
+      tools: createMcpTools(mcpToolsConfig),
     });
   let mcpServerConfig = buildMcpServerConfig();
 
@@ -2994,6 +2963,7 @@ async function main(): Promise<void> {
       const tid = pendingDrain.messages[i].taskId;
       if (tid) {
         mcpToolsConfig.currentTaskId = tid;
+        containerInput.messageTaskId = tid;
         break;
       }
     }
@@ -3215,6 +3185,8 @@ async function main(): Promise<void> {
         );
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+        containerInput.messageTaskId =
+          mcpToolsConfig.currentTaskId ?? undefined;
         // Update chatJid so per-channel MCP tools see the correct incoming chat.
         if (nextMessage.sourceJid)
           mcpToolsConfig.chatJid = nextMessage.sourceJid;
@@ -3541,6 +3513,7 @@ async function main(): Promise<void> {
       // Forgetting to clear would cause regular user replies to be broadcast
       // to the task's notify channels, hijacking later conversation.
       mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+      containerInput.messageTaskId = mcpToolsConfig.currentTaskId ?? undefined;
       // Update chatJid so per-channel MCP tools see the correct incoming chat.
       if (nextMessage.sourceJid) mcpToolsConfig.chatJid = nextMessage.sourceJid;
     }

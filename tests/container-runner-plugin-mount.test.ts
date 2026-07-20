@@ -246,7 +246,6 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
           context: { source: 'host_claude' },
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'inherit', ids: [] },
-          tools: { mode: 'inherit' },
         },
       } as any,
     );
@@ -332,7 +331,7 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
 });
 
 describe('buildVolumeMounts — AgentProfile runtime policy', () => {
-  test('writes AgentProfile tools policy into the container env file', () => {
+  test('does not write retired Agent tool restrictions into the container env', () => {
     buildVolumeMounts(
       fakeGroup('grp-policy-tools', USER) as any,
       false,
@@ -352,17 +351,14 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         runtimePolicy: {
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'inherit', ids: [] },
-          tools: { mode: 'readonly' },
         },
       },
     );
 
     const envFile = path.join(tmpDataDir, 'env', 'grp-policy-tools', 'env');
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    expect(envContent).toContain('HAPPYCLAW_AGENT_DISALLOWED_TOOLS=');
-    expect(envContent).toContain("HAPPYCLAW_AGENT_TOOL_POLICY='readonly'");
-    expect(envContent).toContain('Write');
-    expect(envContent).toContain('Bash');
+    expect(envContent).not.toContain('HAPPYCLAW_AGENT_DISALLOWED_TOOLS=');
+    expect(envContent).not.toContain('HAPPYCLAW_AGENT_TOOL_POLICY=');
   });
 
   test('custom skills policy exposes only selected user skills', () => {
@@ -394,7 +390,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         runtimePolicy: {
           skills: { mode: 'custom', ids: ['review'] },
           mcp: { mode: 'inherit', ids: [] },
-          tools: { mode: 'inherit' },
         },
       },
     );
@@ -426,7 +421,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       runtimePolicy: {
         skills: { mode: 'custom' as const, ids: ['review'] },
         mcp: { mode: 'inherit' as const, ids: [] },
-        tools: { mode: 'inherit' as const },
       },
     });
 
@@ -481,7 +475,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       runtimePolicy: {
         skills: { mode: 'custom' as const, ids: ['review'] },
         mcp: { mode: 'inherit' as const, ids: [] },
-        tools: { mode: 'inherit' as const },
       },
     };
 
@@ -569,7 +562,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
         runtimePolicy: {
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
-          tools: { mode: 'inherit' },
         },
       },
     );
@@ -680,7 +672,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
             mode: 'custom',
             ids: ['system:platform', 'managedA'],
           },
-          tools: { mode: 'inherit' },
         },
       },
     );
@@ -758,7 +749,6 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       runtimePolicy: {
         skills: { mode: 'inherit' as const, ids: [] },
         mcp: { mode: 'custom' as const, ids: ['github'] },
-        tools: { mode: 'inherit' as const },
       },
     };
     buildVolumeMounts(

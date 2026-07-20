@@ -152,9 +152,8 @@ describe('settings information architecture', () => {
     );
 
     expect(settings).toContain('<MainAgentCapabilitiesSection />');
-    expect(mainCapabilities).toMatch(
-      /HappyClaw 用户 Skills|HappyClaw MCP|工具与扩展能力边界/,
-    );
+    expect(mainCapabilities).toMatch(/HappyClaw 用户 Skills|HappyClaw MCP/);
+    expect(mainCapabilities).not.toContain('工具与扩展能力边界');
     expect(mainCapabilities).toContain('/api/agent-profiles/');
     expect(workspaceCapabilities).toMatch(
       /CLAUDE\.md、\.claude\/skills 和项目 MCP/,

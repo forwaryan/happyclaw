@@ -159,7 +159,6 @@ describe('/api/agent-profiles routes', () => {
         runtime_policy: {
           skills: { mode: 'custom', ids: ['research'] },
           mcp: { mode: 'inherit', ids: [] },
-          tools: { mode: 'readonly' },
         },
       }),
     });
@@ -175,7 +174,6 @@ describe('/api/agent-profiles routes', () => {
         auto_compact_percentage: 0,
       },
       skills: { mode: 'custom', ids: ['research'] },
-      tools: { mode: 'readonly' },
     });
     expect(created.version).toBe(1);
 
@@ -189,7 +187,6 @@ describe('/api/agent-profiles routes', () => {
         runtime_policy: {
           skills: { mode: 'disabled', ids: [] },
           mcp: { mode: 'custom', ids: ['github'] },
-          tools: { mode: 'restricted' },
         },
       }),
     });
@@ -205,7 +202,6 @@ describe('/api/agent-profiles routes', () => {
       },
       skills: { mode: 'disabled', ids: [] },
       mcp: { mode: 'custom', ids: ['github'] },
-      tools: { mode: 'restricted' },
     });
     expect(patchedBody.profile.version).toBe(2);
   });
@@ -391,7 +387,6 @@ describe('/api/agent-profiles routes', () => {
       runtimePolicy: {
         skills: { mode: 'custom', ids: ['research'] },
         mcp: { mode: 'custom', ids: ['github'] },
-        tools: { mode: 'restricted' },
       },
     });
 
@@ -399,7 +394,7 @@ describe('/api/agent-profiles routes', () => {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        runtime_policy: { tools: { mode: 'readonly' } },
+        runtime_policy: { skills: { mode: 'disabled' } },
       }),
     });
 
@@ -411,10 +406,25 @@ describe('/api/agent-profiles routes', () => {
         auto_compact_window: 0,
         auto_compact_percentage: 0,
       },
-      skills: { mode: 'custom', ids: ['research'] },
+      skills: { mode: 'disabled', ids: ['research'] },
       mcp: { mode: 'custom', ids: ['github'] },
-      tools: { mode: 'readonly' },
     });
+  });
+
+  test('rejects the retired Agent tool policy', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'No Tool Modes',
+    });
+    const res = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { tools: { mode: 'readonly' } },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(db.getAgentProfile(profile.id)?.version).toBe(profile.version);
   });
 
   test('previews the effective additive capabilities without exposing Provider selection', async () => {
@@ -424,7 +434,6 @@ describe('/api/agent-profiles routes', () => {
       runtimePolicy: {
         skills: { mode: 'custom', ids: ['research'] },
         mcp: { mode: 'custom', ids: ['github'] },
-        tools: { mode: 'readonly' },
       },
     });
 
@@ -443,9 +452,8 @@ describe('/api/agent-profiles routes', () => {
           ]),
         },
         mcp: {
-          disabledByToolBoundary: true,
           entries: expect.arrayContaining([
-            expect.objectContaining({ id: 'github', available: false }),
+            expect.objectContaining({ id: 'github', available: true }),
           ]),
         },
       },
@@ -867,7 +875,6 @@ describe('/api/agent-profiles routes', () => {
       runtimePolicy: {
         skills: { mode: 'inherit', ids: [] },
         mcp: { mode: 'inherit', ids: [] },
-        tools: { mode: 'inherit' },
       },
     });
     const folder = 'stable-runtime-workspace';
@@ -900,7 +907,6 @@ describe('/api/agent-profiles routes', () => {
         runtime_policy: {
           skills: { mode: 'inherit', ids: [] },
           mcp: { mode: 'inherit', ids: [] },
-          tools: { mode: 'inherit' },
         },
       }),
     });

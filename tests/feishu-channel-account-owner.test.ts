@@ -94,8 +94,14 @@ describe('Feishu owner discovery is per channel account', () => {
     const second = account(`feishu-b-${Date.now()}`);
     const firstJid = `feishu:shared#account:${first.id}`;
     const secondJid = `feishu:shared#account:${second.id}`;
+    const quarantinedJid = `feishu:quarantined#account:${first.id}`;
     group(firstJid, first.id, []);
     group(secondJid, second.id, []);
+    group(quarantinedJid, first.id, []);
+    db.setRegisteredGroup(quarantinedJid, {
+      ...db.getRegisteredGroup(quarantinedJid)!,
+      owner_claim_source: 'transfer_reset',
+    });
 
     expect(
       db.backfillEmptyAllowlistsForChannelAccount(
@@ -107,7 +113,19 @@ describe('Feishu owner discovery is per channel account', () => {
     expect(db.getRegisteredGroup(firstJid)?.sender_allowlist).toEqual([
       'ou_owner_for_first_bot',
     ]);
+    expect(db.getRegisteredGroup(firstJid)?.owner_im_id).toBe(
+      'ou_owner_for_first_bot',
+    );
+    expect(db.getRegisteredGroup(firstJid)?.owner_claim_source).toBe(
+      'auto_feishu',
+    );
     expect(db.getRegisteredGroup(secondJid)?.sender_allowlist).toEqual([]);
+    expect(db.getRegisteredGroup(secondJid)?.owner_im_id).toBeUndefined();
+    expect(db.getRegisteredGroup(quarantinedJid)).toMatchObject({
+      owner_claim_source: 'transfer_reset',
+      sender_allowlist: [],
+    });
+    expect(db.getRegisteredGroup(quarantinedJid)?.owner_im_id).toBeUndefined();
   });
 
   test('the connection manager does not share owner callbacks between accounts', async () => {
@@ -159,8 +177,11 @@ describe('Feishu owner discovery is per channel account', () => {
     expect(reload).toContain(
       'saveChannelAccountSecret(account.secret_ref, secret)',
     );
+    expect(reload).toContain(
+      'const ownerOpenId = secret.ownerOpenId ?? senderOpenId',
+    );
     expect(reload).toMatch(
-      /backfillEmptyAllowlistsForChannelAccount\(\s*account\.owner_user_id,\s*account\.id,\s*senderOpenId,\s*\)/,
+      /backfillEmptyAllowlistsForChannelAccount\(\s*account\.owner_user_id,\s*account\.id,\s*ownerOpenId,\s*\)/,
     );
     expect(reload).not.toContain('saveUserFeishuConfig');
   });

@@ -18,6 +18,7 @@ vi.mock('../src/db.js', () => ({
 
 const {
   claimOwner,
+  claimOwnerFromMention,
   releaseOwner,
   addToAllowlist,
   removeFromAllowlist,
@@ -37,6 +38,7 @@ describe('claimOwner', () => {
     const g = base({ activation_mode: 'owner_mentioned' });
     const r = claimOwner(g, 'u1');
     expect(r.owner_im_id).toBe('u1');
+    expect(r.owner_claim_source).toBe('explicit');
     expect(r.activation_mode).toBe('owner_mentioned');
   });
 
@@ -44,6 +46,39 @@ describe('claimOwner', () => {
     const g = base({ owner_im_id: undefined });
     claimOwner(g, 'u1');
     expect(g.owner_im_id).toBeUndefined();
+  });
+});
+
+describe('claimOwnerFromMention', () => {
+  test.each(['configured', 'trusted_direct'] as const)(
+    'preserves an existing %s provenance on an idempotent mention',
+    (source) => {
+      const r = claimOwnerFromMention(
+        base({ owner_im_id: 'u1', owner_claim_source: source }),
+        'u1',
+      );
+      expect(r.owner_claim_source).toBe(source);
+    },
+  );
+
+  test.each([undefined, 'explicit', 'auto_feishu'] as const)(
+    'records a weak/new %s claim as explicit',
+    (source) => {
+      const r = claimOwnerFromMention(
+        base({
+          owner_im_id: source ? 'u1' : undefined,
+          owner_claim_source: source,
+        }),
+        'u1',
+      );
+      expect(r.owner_claim_source).toBe('explicit');
+    },
+  );
+
+  test('keeps credential-transfer quarantine sticky', () => {
+    const group = base({ owner_claim_source: 'transfer_reset' });
+    expect(claimOwnerFromMention(group, 'old-owner')).toBe(group);
+    expect(group.owner_im_id).toBeUndefined();
   });
 });
 
@@ -56,13 +91,21 @@ describe('releaseOwner', () => {
     });
     const r = releaseOwner(g);
     expect(r.owner_im_id).toBeUndefined();
+    expect(r.owner_claim_source).toBeUndefined();
     expect(r.sender_allowlist).toBeUndefined();
     expect(r.activation_mode).toBe('when_mentioned');
   });
 
   test('preserves every non-owner_mentioned activation mode', () => {
-    for (const mode of ['auto', 'always', 'when_mentioned', 'disabled'] as const) {
-      const r = releaseOwner(base({ owner_im_id: 'u1', activation_mode: mode }));
+    for (const mode of [
+      'auto',
+      'always',
+      'when_mentioned',
+      'disabled',
+    ] as const) {
+      const r = releaseOwner(
+        base({ owner_im_id: 'u1', activation_mode: mode }),
+      );
       expect(r.activation_mode).toBe(mode);
       expect(r.owner_im_id).toBeUndefined();
     }
@@ -76,10 +119,11 @@ describe('releaseOwner', () => {
 
 describe('addToAllowlist', () => {
   test('seeds with the owner when the allowlist is unset, then appends deduped', () => {
-    const { group, added } = addToAllowlist(base({ owner_im_id: 'owner' }), 'owner', [
-      'a',
-      'b',
-    ]);
+    const { group, added } = addToAllowlist(
+      base({ owner_im_id: 'owner' }),
+      'owner',
+      ['a', 'b'],
+    );
     expect(group.sender_allowlist).toEqual(['owner', 'a', 'b']);
     expect(added).toEqual(['a', 'b']);
   });
@@ -105,7 +149,9 @@ describe('removeFromAllowlist', () => {
 
   test('is a no-op on an empty or unset allowlist', () => {
     expect(removeFromAllowlist(base({}), ['a']).removed).toBe(0);
-    expect(removeFromAllowlist(base({ sender_allowlist: [] }), ['a']).removed).toBe(0);
+    expect(
+      removeFromAllowlist(base({ sender_allowlist: [] }), ['a']).removed,
+    ).toBe(0);
   });
 
   test('reports 0 removed when targets are absent from a non-empty allowlist', () => {

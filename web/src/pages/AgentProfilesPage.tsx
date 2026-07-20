@@ -78,11 +78,9 @@ const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   },
   skills: { mode: 'inherit', ids: [] },
   mcp: { mode: 'inherit', ids: [] },
-  tools: { mode: 'inherit' },
 };
 
 type RuntimePolicyMode = 'inherit' | 'custom' | 'disabled';
-type ToolPolicyMode = 'inherit' | 'readonly' | 'restricted';
 
 function normalizeRuntimePolicy(
   policy?: Partial<AgentProfileRuntimePolicy> | null,
@@ -106,9 +104,6 @@ function normalizeRuntimePolicy(
     mcp: {
       mode: policy?.mcp?.mode ?? 'inherit',
       ids: policy?.mcp?.ids ?? [],
-    },
-    tools: {
-      mode: policy?.tools?.mode ?? 'inherit',
     },
   };
 }
@@ -201,7 +196,6 @@ export function AgentProfilesPage() {
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<RuntimePolicyMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
-  const [toolsMode, setToolsMode] = useState<ToolPolicyMode>('inherit');
   const [saving, setSaving] = useState(false);
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -316,7 +310,6 @@ export function AgentProfilesPage() {
     setSkillIds(normalized.skills.ids);
     setMcpMode(normalized.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(normalized.mcp.ids));
-    setToolsMode(normalized.tools.mode);
     setContextSource(getAgentContextSource(normalized));
     const compactWindow = normalized.context?.auto_compact_window ?? 0;
     const compactPercentage = normalized.context?.auto_compact_percentage ?? 0;
@@ -360,7 +353,6 @@ export function AgentProfilesPage() {
         },
         skills: { mode: skillsMode, ids: skillIds },
         mcp: { mode: mcpMode, ids: mcpIds },
-        tools: { mode: toolsMode },
       }),
     [
       autoCompactPercentage,
@@ -370,7 +362,6 @@ export function AgentProfilesPage() {
       mcpMode,
       skillIds,
       skillsMode,
-      toolsMode,
       useSdkCompactDefault,
     ],
   );
@@ -1368,9 +1359,10 @@ export function AgentProfilesPage() {
                         能力配置
                       </h2>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        这里只控制 HappyClaw 额外附加给 Agent 的 Skills、MCP
-                        与工具边界。继承宿主机配置时，宿主机中的全部 Skills 和
-                        MCP 已自动生效，无需在这里重复选择。
+                        这里只控制 HappyClaw 额外附加给 Agent 的 Skills 与
+                        MCP。继承宿主机配置时，宿主机中的全部 Skills 和 MCP
+                        已自动生效，无需在这里重复选择。Agent
+                        始终拥有完整工具权限。
                       </p>
                     </div>
                     <div className="space-y-5 px-5 py-5">
@@ -1456,8 +1448,7 @@ export function AgentProfilesPage() {
                           )}
                           <p className="text-[11px] leading-5 text-muted-foreground">
                             只控制 HappyClaw 额外附加的 MCP；继承宿主机
-                            ~/.claude 时，宿主机全部 MCP 已自动生效。“只读”或
-                            “严格只读”能力边界仍会统一关闭外部 MCP。
+                            ~/.claude 时，宿主机全部 MCP 已自动生效。
                           </p>
                         </div>
                       </div>
@@ -1559,40 +1550,6 @@ export function AgentProfilesPage() {
                             )}
                           </div>
                         )}
-                      </div>
-
-                      <div className="min-w-0">
-                        <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-                          工具与扩展能力边界
-                        </label>
-                        <Select
-                          value={toolsMode}
-                          onValueChange={(value) =>
-                            setToolsMode(value as ToolPolicyMode)
-                          }
-                        >
-                          <SelectTrigger aria-label="工具与扩展能力边界">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="inherit">
-                              不增加 Agent 级限制
-                            </SelectItem>
-                            <SelectItem value="readonly">
-                              只读（禁写、Bash、子 Agent、全部外部 MCP
-                              与用户插件）
-                            </SelectItem>
-                            <SelectItem value="restricted">
-                              严格只读（在只读基础上禁用 WebSearch / WebFetch）
-                            </SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">
-                          两种只读模式都会启用严格 MCP、关闭用户 MCP
-                          与用户插件、禁用写入/Bash/子
-                          Agent，并默认拒绝尚未分类的 HappyClaw
-                          工具；仅保留已分类的查询、记忆读取和消息回复等内置能力。严格只读再关闭网页搜索与抓取。
-                        </p>
                       </div>
                     </div>
                   </section>

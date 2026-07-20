@@ -91,9 +91,6 @@ export interface AgentProfileRuntimePolicy {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
   };
-  tools: {
-    mode: 'inherit' | 'readonly' | 'restricted';
-  };
 }
 
 export type AgentContextSource = NonNullable<
@@ -174,7 +171,7 @@ export interface EffectiveCapabilityEntry {
   source: CapabilityLayerSource;
   overrides: CapabilityLayerSource[];
   available: boolean;
-  unavailableReason?: 'tool_boundary' | 'system_admin_only';
+  unavailableReason?: 'system_admin_only';
 }
 
 export interface AgentCapabilityPreview {
@@ -193,11 +190,6 @@ export interface AgentCapabilityPreview {
     mode: AgentProfileRuntimePolicy['mcp']['mode'];
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
-    disabledByToolBoundary: boolean;
-  };
-  tools: {
-    mode: AgentProfileRuntimePolicy['tools']['mode'];
-    summary: string;
   };
   notes: string[];
 }
