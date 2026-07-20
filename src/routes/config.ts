@@ -218,9 +218,10 @@ async function applyClaudeConfigToAllGroups(
   }
 
   const groupJids = Object.keys(deps.getRegisteredGroups());
-  // Also stop agent sub-processes — they run under {jid}#agent:{id} keys
-  // which are not in registeredGroups and would otherwise keep running with
-  // stale ANTHROPIC_MODEL env vars after a provider config change.
+  // Also stop descendant runners (agents and scheduled tasks) — they run
+  // under {jid}#agent:{id} or {jid}#task:{id} keys which are not in
+  // registeredGroups and would otherwise keep running with stale
+  // ANTHROPIC_MODEL env vars after a provider config change.
   const allJidsToStop = groupJids.flatMap((jid) => [
     jid,
     ...deps.queue.listDescendantJids(jid),
