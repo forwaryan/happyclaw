@@ -92,6 +92,7 @@ import {
 import { buildHappyClawPromptPlan, type PromptPlan } from './prompt-plan.js';
 import { withHappyClawSubagentContract } from './sdk-compat.js';
 import { assessContextBudget } from './context-budget.js';
+import { resolveManagedHostClaudeMdExcludes } from './claude-memory-policy.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -2033,6 +2034,15 @@ async function runQuery(
     legacyAutoCompactWindow,
   );
   const flagSettings: Record<string, unknown> = {};
+  const claudeMdExcludes = resolveManagedHostClaudeMdExcludes({
+    executionMode: contextAuditBase.executionMode,
+    runtimePolicy: containerInput.agentProfile?.runtimePolicy,
+    externalClaudeDir: contextAuditBase.externalClaudeDir,
+    homeDir: process.env.HOME,
+  });
+  if (claudeMdExcludes.length > 0) {
+    flagSettings.claudeMdExcludes = claudeMdExcludes;
+  }
   if (percentageWindow !== undefined) {
     flagSettings.autoCompactWindow = percentageWindow;
   } else if (safeLegacyAutoCompactWindow !== undefined) {
