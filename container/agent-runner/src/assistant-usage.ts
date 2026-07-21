@@ -66,11 +66,31 @@ function parseAssistantUsage(
   const value = {
     id,
     model: String(message.model || 'unknown').trim() || 'unknown',
-    inputTokens: nonNegative(usage.input_tokens),
-    outputTokens: nonNegative(usage.output_tokens),
-    cacheReadInputTokens: nonNegative(usage.cache_read_input_tokens),
-    cacheCreationInputTokens: nonNegative(usage.cache_creation_input_tokens),
-    reasoningTokens: nonNegative(usage.reasoning_output_tokens),
+    // Official Anthropic transcript objects use snake_case. Some Agent SDK
+    // compatible providers expose the same live object in camelCase and only
+    // serialize it to snake_case on disk. Accept both so a valid turn cannot
+    // be persisted as a misleading zero-token event.
+    inputTokens: Math.max(
+      nonNegative(usage.input_tokens),
+      nonNegative(usage.inputTokens),
+    ),
+    outputTokens: Math.max(
+      nonNegative(usage.output_tokens),
+      nonNegative(usage.outputTokens),
+    ),
+    cacheReadInputTokens: Math.max(
+      nonNegative(usage.cache_read_input_tokens),
+      nonNegative(usage.cacheReadInputTokens),
+    ),
+    cacheCreationInputTokens: Math.max(
+      nonNegative(usage.cache_creation_input_tokens),
+      nonNegative(usage.cacheCreationInputTokens),
+    ),
+    reasoningTokens: Math.max(
+      nonNegative(usage.reasoning_output_tokens),
+      nonNegative(usage.reasoningOutputTokens),
+      nonNegative(usage.reasoningTokens),
+    ),
   };
   return {
     ...value,

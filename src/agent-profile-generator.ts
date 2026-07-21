@@ -131,9 +131,13 @@ function normalizeText(value: unknown): string {
 }
 
 function normalizePromptText(value: unknown): string {
-  return typeof value === 'string'
-    ? value.slice(0, AGENT_PROMPT_SECTION_MAX_LENGTH)
-    : '';
+  if (typeof value !== 'string') return '';
+  if (value.length > AGENT_PROMPT_SECTION_MAX_LENGTH) {
+    throw new Error(
+      `AI 生成的单段提示词超过 ${AGENT_PROMPT_SECTION_MAX_LENGTH} 字符限制，请缩小要求后重试`,
+    );
+  }
+  return value;
 }
 
 function normalizeDraft(parsed: unknown): AgentProfileDraft | null {

@@ -30,6 +30,7 @@ describe('frontend capability source semantics', () => {
     expect(capabilitySourceLabel('user')).toBe('我的 MCP');
     expect(capabilitySourceLabel('host')).toBe('宿主机');
     expect(capabilitySourceLabel('workspace')).toBe('工作区项目');
+    expect(capabilitySourceLabel('plugin')).toBe('插件');
   });
 
   test('identifies the effective definition for same-name Skills', () => {

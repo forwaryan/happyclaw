@@ -50,3 +50,16 @@ export function buildStoppedReply(
 export function buildSteeredReply(partialText: string): string {
   return partialText.trimEnd();
 }
+
+/**
+ * A Workflow completion card already communicates that work finished. Remove
+ * the model's redundant bridge paragraph when it is immediately followed by
+ * the actual Markdown report.
+ */
+export function stripRedundantCompletionPreamble(text: string): string {
+  const trimmed = text.trimStart();
+  return trimmed.replace(
+    /^(?:(?:分析|任务|工作流|处理).{0,24}完成|已完成)[^\n]{0,240}\s*\n\n---\s*\n\n(?=#\s)/u,
+    '',
+  );
+}

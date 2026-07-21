@@ -16,6 +16,10 @@ import { randomUUID } from 'node:crypto';
 
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
+import {
+  buildEffectiveMcpManifest,
+  loadPluginMcpDefinitions,
+} from './effective-mcp-manifest.js';
 import { resolveHostNodeBinary } from './node-resolver.js';
 import {
   loadMountAllowlist,
@@ -69,6 +73,10 @@ import {
   buildClaudeContextPlan,
   syncHostClaudeContext,
 } from './claude-context-resolver.js';
+import {
+  pluginSkillLayers,
+  reconcileSessionSkills,
+} from './effective-skill-resolver.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
 import type { AgentProfileRuntimePolicy } from './types.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
@@ -277,6 +285,8 @@ export interface ContainerInput {
   plugins?: Array<{ type: 'local'; path: string }>;
   /** Runtime context audit bootstrap; agent-runner enriches it with SDK usage. */
   contextAudit?: ClaudeContextAudit;
+  /** Canonical effective Skill set for SDK selection and run provenance. */
+  skillManifest?: { hash: string; selectedSkillIds: string[] };
 }
 
 export interface ContainerOutput {
@@ -484,6 +494,44 @@ function resolveAgentProfileMcpPolicy(
     servers: resolved.servers,
     replaceMcpServers: policy?.mode !== 'inherit',
   };
+}
+
+function resolveRuntimeMcpServers(
+  group: RegisteredGroup,
+  agentProfile?: RunnerAgentProfile,
+): Record<string, Record<string, unknown>> {
+  const managedLayers = group.created_by
+    ? loadManagedMcpLayers(group.created_by, {
+        allowAdminOnlySystemMcp: ownerCanUseAdminOnlySystemMcp(
+          group.created_by,
+        ),
+      })
+    : { system: {}, user: {}, restrictedSystemIds: [] };
+  const managed = resolveAgentProfileMcpPolicy(
+    managedLayers,
+    agentProfile,
+  ).servers;
+  const context = loadClaudeContextMcpServers({
+    workspaceDir: path.join(GROUPS_DIR, group.folder),
+    externalClaudeDir: getEffectiveExternalDir(),
+    includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
+  });
+  return mergeMcpServerLayers(context, managed);
+}
+
+function buildRuntimeMcpManifest(
+  group: RegisteredGroup,
+  agentProfile: RunnerAgentProfile | undefined,
+  plugins: SdkPluginConfig[],
+) {
+  const pluginServers =
+    getAgentProfileMcpPolicyMode(agentProfile) === 'inherit'
+      ? loadPluginMcpDefinitions(plugins)
+      : {};
+  return buildEffectiveMcpManifest({
+    ...resolveRuntimeMcpServers(group, agentProfile),
+    ...pluginServers,
+  });
 }
 
 function getAgentProfileMcpPolicyMode(
@@ -829,6 +877,7 @@ export function buildVolumeMounts(
     ownerId,
     agentProfile,
   );
+  const pluginSkills = ownerId ? prepareHostPlugins(ownerId) : [];
   const claudeContextPlan = buildClaudeContextPlan({
     executionMode: 'container',
     group,
@@ -840,22 +889,16 @@ export function buildVolumeMounts(
     includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
     mountUserSkills: mountUserSkills && userSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
+    managedSkillPolicy: agentProfile?.runtimePolicy?.skills,
+    pluginSkillLayers: pluginSkillLayers(pluginSkills),
+  });
+  reconcileSessionSkills(groupSessionsDir, claudeContextPlan.effectiveSkills, {
+    materializeLinks: false,
   });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const mcpLayers = ownerId
-    ? loadManagedMcpLayers(ownerId, {
-        allowAdminOnlySystemMcp: ownerCanUseAdminOnlySystemMcp(ownerId),
-      })
-    : { system: {}, user: {}, restrictedSystemIds: [] };
-  const mcpPolicy = resolveAgentProfileMcpPolicy(mcpLayers, agentProfile);
-  const contextMcpServers = loadClaudeContextMcpServers({
-    workspaceDir: groupDir,
-    externalClaudeDir: getEffectiveExternalDir(),
-    includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
-  });
   ensureSettingsJson(
     settingsFile,
-    mergeMcpServerLayers(contextMcpServers, mcpPolicy.servers),
+    resolveRuntimeMcpServers(group, agentProfile),
     {
       // The session settings file is HappyClaw-owned. Always replace this map
       // with the resolved layers so removed/unselected managed MCP cannot
@@ -891,9 +934,7 @@ export function buildVolumeMounts(
     readonly: true,
   });
 
-  // Skills：以只读卷挂载宿主机目录（由 entrypoint 创建符号链接）
-  // 用户的所有 skills 在其所有工作区中全量生效
-  const projectSkillsDir = claudeContextPlan.projectSkillsDir;
+  // Skills are exposed only through explicit per-Skill read-only mounts below.
   const userSkillsDir = claudeContextPlan.userSkillsDir ?? null;
 
   // Ensure user skills directory exists so it can always be mounted.
@@ -903,18 +944,21 @@ export function buildVolumeMounts(
     fs.mkdirSync(userSkillsDir, { recursive: true });
   }
 
-  // 全量挂载：用户的所有 skills 在所有工作区中生效
-  if (fs.existsSync(projectSkillsDir)) {
+  // Every selected Skill gets an explicit read-only mount. entrypoint rebuilds
+  // /home/node/.claude/skills exclusively from this directory, so a real
+  // directory persisted by an earlier container can never survive a restart.
+  for (const skill of claudeContextPlan.effectiveSkills.selected) {
+    if (skill.source === 'plugin') continue;
+    let hostPath = skill.path;
+    try {
+      hostPath = fs.realpathSync(hostPath);
+    } catch {
+      // The resolver already validated SKILL.md. Keep the original path so
+      // Docker reports a deterministic mount error if it vanished afterward.
+    }
     mounts.push({
-      hostPath: projectSkillsDir,
-      containerPath: '/workspace/project-skills',
-      readonly: true,
-    });
-  }
-  if (userSkillsDir) {
-    mounts.push({
-      hostPath: userSkillsDir,
-      containerPath: '/workspace/user-skills',
+      hostPath,
+      containerPath: `/workspace/effective-skills/${skill.id}`,
       readonly: true,
     });
   }
@@ -1118,16 +1162,6 @@ export function buildVolumeMounts(
         readonly: true,
       });
     }
-    if (
-      claudeContextPlan.externalSkillsDir &&
-      fs.existsSync(claudeContextPlan.externalSkillsDir)
-    ) {
-      mounts.push({
-        hostPath: claudeContextPlan.externalSkillsDir,
-        containerPath: '/workspace/external-skills',
-        readonly: true,
-      });
-    }
   }
 
   // Per-group persistent extra directory: provides a durable /workspace/extra/ even when
@@ -1299,7 +1333,7 @@ export async function runContainerAgent(
             group.created_by,
             input.agentProfile,
           );
-          return buildClaudeContextPlan({
+          const audit = buildClaudeContextPlan({
             executionMode: 'container',
             group,
             ownerHomeFolder,
@@ -1322,7 +1356,65 @@ export async function runContainerAgent(
             mountUserSkills:
               shouldMountUserSkills && skillsPolicy.mountUserSkills,
             userSkillsDirOverride: skillsPolicy.userSkillsDirOverride,
+            managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
+            pluginSkillLayers: pluginSkillLayers(
+              group.created_by
+                ? loadUserPlugins(group.created_by, { runtime: 'host' })
+                : [],
+            ),
           }).audit;
+          const mcpManifest = buildRuntimeMcpManifest(
+            group,
+            input.agentProfile,
+            group.created_by
+              ? loadUserPlugins(group.created_by, { runtime: 'host' })
+              : [],
+          );
+          audit.mcp = {
+            manifestHash: mcpManifest.hash,
+            serverIds: mcpManifest.serverIds,
+          };
+          return audit;
+        })(),
+        skillManifest: (() => {
+          const skillsPolicy = resolveAgentProfileUserSkillsPolicy(
+            group.created_by,
+            input.agentProfile,
+          );
+          const manifest = buildClaudeContextPlan({
+            executionMode: 'container',
+            group,
+            ownerHomeFolder,
+            externalClaudeDir: getEffectiveExternalDir(),
+            projectRoot: process.cwd(),
+            dataDir: DATA_DIR,
+            groupSessionsDir: sessionAgentId
+              ? path.join(
+                  DATA_DIR,
+                  'sessions',
+                  group.folder,
+                  'agents',
+                  sessionAgentId,
+                  '.claude',
+                )
+              : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
+            includeHostClaudeContext: shouldIncludeHostClaudeContext(
+              input.agentProfile,
+            ),
+            mountUserSkills:
+              shouldMountUserSkills && skillsPolicy.mountUserSkills,
+            userSkillsDirOverride: skillsPolicy.userSkillsDirOverride,
+            managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
+            pluginSkillLayers: pluginSkillLayers(
+              group.created_by
+                ? loadUserPlugins(group.created_by, { runtime: 'host' })
+                : [],
+            ),
+          }).effectiveSkills;
+          return {
+            hash: manifest.hash,
+            selectedSkillIds: manifest.selected.map((skill) => skill.id),
+          };
         })(),
       };
       container.stdin.write(JSON.stringify(dockerInput));
@@ -1737,27 +1829,9 @@ export async function runHostAgent(
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = group.created_by
-    ? loadManagedMcpLayers(group.created_by, {
-        allowAdminOnlySystemMcp: ownerCanUseAdminOnlySystemMcp(
-          group.created_by,
-        ),
-      })
-    : { system: {}, user: {}, restrictedSystemIds: [] };
-  const hostMcpPolicy = resolveAgentProfileMcpPolicy(
-    hostMcpServers,
-    input.agentProfile,
-  );
-  const hostContextMcpServers = loadClaudeContextMcpServers({
-    workspaceDir: groupDir,
-    externalClaudeDir: getEffectiveExternalDir(),
-    includeHostClaudeContext: shouldIncludeHostClaudeContext(
-      input.agentProfile,
-    ),
-  });
   ensureSettingsJson(
     settingsFile,
-    mergeMcpServerLayers(hostContextMcpServers, hostMcpPolicy.servers),
+    resolveRuntimeMcpServers(group, input.agentProfile),
     { replaceMcpServers: true },
   );
 
@@ -1767,6 +1841,7 @@ export async function runHostAgent(
     group.created_by,
     input.agentProfile,
   );
+  const preparedHostPlugins = prepareHostPlugins(group.created_by);
   const hostClaudeContextPlan = buildClaudeContextPlan({
     executionMode: 'host',
     group,
@@ -1780,6 +1855,8 @@ export async function runHostAgent(
     ),
     mountUserSkills: hostUserSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
+    managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
+    pluginSkillLayers: pluginSkillLayers(preparedHostPlugins),
     happyclawMemoryActive: true,
   });
   const hostClaudeContextSync = syncHostClaudeContext(
@@ -1789,6 +1866,15 @@ export async function runHostAgent(
   hostClaudeContextPlan.audit.claudeMd.status =
     hostClaudeContextSync.claudeMdStatus;
   hostClaudeContextPlan.audit.warnings = hostClaudeContextSync.warnings;
+  const hostMcpManifest = buildRuntimeMcpManifest(
+    group,
+    input.agentProfile,
+    preparedHostPlugins,
+  );
+  hostClaudeContextPlan.audit.mcp = {
+    manifestHash: hostMcpManifest.hash,
+    serverIds: hostMcpManifest.serverIds,
+  };
 
   // 5. 构建环境变量
   const hostEnv: Record<string, string> = {
@@ -2133,8 +2219,14 @@ export async function runHostAgent(
       // plugins.
       const hostInput: ContainerInput = {
         ...input,
-        plugins: prepareHostPlugins(group.created_by),
+        plugins: preparedHostPlugins,
         contextAudit: hostClaudeContextPlan.audit,
+        skillManifest: {
+          hash: hostClaudeContextPlan.effectiveSkills.hash,
+          selectedSkillIds: hostClaudeContextPlan.effectiveSkills.selected.map(
+            (skill) => skill.id,
+          ),
+        },
       };
       proc.stdin.write(JSON.stringify(hostInput));
       proc.stdin.end();

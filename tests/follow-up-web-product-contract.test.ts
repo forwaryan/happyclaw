@@ -11,6 +11,7 @@ import { getPresentedMessageContent } from '../web/src/lib/message-presentation.
 import {
   buildSteeredReply,
   buildStoppedReply,
+  stripRedundantCompletionPreamble,
 } from '../src/reply-finalization.js';
 
 const root = process.cwd();
@@ -115,5 +116,22 @@ describe('Codex-style Web follow-up product contract', () => {
         finalization_reason: 'interrupted',
       }),
     ).toBe('');
+  });
+
+  test('keeps held progress out of the final Workflow conclusion', () => {
+    const legacy =
+      '已启动分析工作流。\n\n> ⏳ 1 个后台任务运行中，完成后将继续汇总\n\n---\n\n分析完成。以下是完整报告。\n\n---\n\n# 最终报告';
+    expect(
+      getPresentedMessageContent({
+        content: legacy,
+        source_kind: 'sdk_final',
+        finalization_reason: 'completed',
+      }),
+    ).toBe('# 最终报告');
+    expect(
+      stripRedundantCompletionPreamble(
+        '分析完成。以下是完整报告。\n\n---\n\n# 最终报告',
+      ),
+    ).toBe('# 最终报告');
   });
 });

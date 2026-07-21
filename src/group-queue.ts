@@ -42,7 +42,9 @@ function compareIpcMessageCursors(
 interface QueuedTask {
   id: string;
   groupJid: string;
-  fn: () => Promise<void>;
+  /** Returning false asks GroupQueue to replay this exact task with the same
+   * bounded backoff used by message runs. Void/true remain one-shot success. */
+  fn: () => Promise<void | boolean>;
   /** Manual runs may execute even when the task config is paused. */
   allowInactive?: boolean;
   /** Release caller-owned reservations when queued work is discarded. */
@@ -66,6 +68,10 @@ interface GroupState {
   active: boolean;
   /** True when the active runner is executing a scheduled task (not user messages). */
   activeRunnerIsTask: boolean;
+  /** Exact task currently owning this state. Mutation stops park this task so
+   * resume cannot accidentally route a conversation-agent turn through the
+   * ordinary processGroupMessages lane. */
+  activeTask: QueuedTask | null;
   /** Last time this runner produced any observable output. */
   lastActivityAt: number | null;
   /** True while the runner is inside an active query turn. */
@@ -90,6 +96,8 @@ interface GroupState {
   taskRunId: string | null;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /** Exact task captured by a retry timer; null means a message-lane retry. */
+  retryTask: QueuedTask | null;
   restarting: boolean;
   /** Provider profile ID selected for the current active runner (null = default/override). */
   selectedProviderId: string | null;
@@ -178,6 +186,7 @@ export class GroupQueue {
         teardownWaiters: new Set(),
         active: false,
         activeRunnerIsTask: false,
+        activeTask: null,
         lastActivityAt: null,
         queryInFlight: false,
         queryId: null,
@@ -193,6 +202,7 @@ export class GroupQueue {
         taskRunId: null,
         retryCount: 0,
         retryTimer: null,
+        retryTask: null,
         restarting: false,
         selectedProviderId: null,
         drainSentinelWritten: false,
@@ -594,6 +604,7 @@ export class GroupQueue {
       clearTimeout(state.retryTimer);
       state.retryTimer = null;
     }
+    state.retryTask = null;
     state.retryCount = 0;
   }
 
@@ -608,6 +619,29 @@ export class GroupQueue {
       clearTimeout(state.retryTimer);
       state.retryTimer = null;
     }
+    state.retryTask = null;
+  }
+
+  /** Preserve the exact task lane across a policy mutation stop. Returning
+   * true tells stopGroup not to synthesize pendingMessages for this state. */
+  private parkTaskForMutation(state: GroupState, groupJid: string): boolean {
+    const retryTask = state.retryTask;
+    const task = state.activeTask ?? retryTask;
+    const isVirtualTaskLane =
+      this.isVirtualJid(groupJid) &&
+      !state.active &&
+      state.pendingTasks.length > 0;
+    if (!task && !isVirtualTaskLane) return false;
+
+    if (
+      task &&
+      !state.pendingTasks.some((candidate) => candidate.id === task.id)
+    ) {
+      state.pendingTasks.unshift(task);
+    }
+    if (retryTask) this.cancelRetryTimer(state);
+    this.waitingGroups.add(groupJid);
+    return true;
   }
 
   /**
@@ -625,6 +659,16 @@ export class GroupQueue {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Describe the latest explicit stop for the active folder. Ordinary user or
+   * lifecycle stops discard the interrupted input; capability mutations park
+   * it so the replacement runtime can replay under the committed policy.
+   */
+  getRecentStopDisposition(folder: string): 'none' | 'discard' | 'preserve' {
+    if (!this.isRecentlyStopped(folder)) return 'none';
+    return this.mutationStoppedFolders.has(folder) ? 'preserve' : 'discard';
   }
 
   private isHostMode(groupJid: string): boolean {
@@ -1049,7 +1093,7 @@ export class GroupQueue {
   enqueueTask(
     groupJid: string,
     taskId: string,
-    fn: () => Promise<void>,
+    fn: () => Promise<void | boolean>,
     options?: { allowInactive?: boolean; onDropped?: () => void },
   ): boolean {
     if (this.shuttingDown) return false;
@@ -1652,6 +1696,9 @@ export class GroupQueue {
       requestedState.pendingMessages = false;
       this.discardPendingTasks(requestedState, groupJid);
       this.clearRetryTimer(requestedState);
+    } else if (!this.parkTaskForMutation(requestedState, groupJid)) {
+      requestedState.pendingMessages = true;
+      this.waitingGroups.add(groupJid);
     }
     // 标记 stop 时间：runForGroup finally + index.ts OOM 计数 + 主消息循环
     // 都用这个时间窗判断 user-stopped vs 真 OOM / IPC-injected drain。
@@ -1663,7 +1710,6 @@ export class GroupQueue {
       }
       this.recentlyStoppedFolders.set(requestedState.groupFolder, Date.now());
     }
-
     const activeRunner = this.findActiveRunnerFor(groupJid);
     const targetJid = activeRunner || groupJid;
     const state = this.getGroup(targetJid);
@@ -1673,6 +1719,9 @@ export class GroupQueue {
         state.pendingMessages = false;
         this.discardPendingTasks(state, targetJid);
         this.clearRetryTimer(state);
+      } else if (!this.parkTaskForMutation(state, targetJid)) {
+        state.pendingMessages = true;
+        this.waitingGroups.add(targetJid);
       }
     }
     if (preserveQueuedWork) {
@@ -1777,6 +1826,10 @@ export class GroupQueue {
       return;
     }
     state.restarting = true;
+    // restartGroup owns the replacement launch. Cancel any older failed-run
+    // timer up front so it cannot fire while the fresh runner is still active
+    // and turn that replacement into a second pending/drain cycle.
+    this.clearRetryTimer(state);
 
     try {
       if (state.groupFolder) {
@@ -1876,6 +1929,18 @@ export class GroupQueue {
       );
       return;
     }
+    // A fresh user message may legitimately start a replacement before the
+    // previous failed run's backoff expires. That launch supersedes the old
+    // timer; leaving it armed would enqueue/drain the new active runner when
+    // it fires and can cause a second close cycle. Preserve retryCount so a
+    // sequence of closed/no-reply outcomes still reaches MAX_RETRIES.
+    this.cancelRetryTimer(state);
+    // A new user request after an ordinary Stop owns a fresh lifecycle. Clear
+    // the old discard marker before processGroupMessages starts; mutation
+    // markers are removed by resumeGroupsAfterMutation before reaching here.
+    if (state.stopRequested) {
+      this.recentlyStoppedFolders.delete(this.getSerializationKey(groupJid));
+    }
     state.stopRequested = false;
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
@@ -1919,23 +1984,31 @@ export class GroupQueue {
           // Defensive: clear any lingering retry timer from a previous failed
           // run that was superseded by a successful drain-triggered run.
           this.clearRetryTimer(state);
-        } else if (!state.stopRequested) {
+        } else if (this.canScheduleRetry(state)) {
           this.scheduleRetry(groupJid, state);
         } else {
           logger.info(
-            { groupJid },
-            'Runner stopped explicitly; suppressing failed-run retry',
+            {
+              groupJid,
+              stopRequested: state.stopRequested,
+              restarting: state.restarting,
+            },
+            'Runner stop/restart in progress; suppressing failed-run retry',
           );
         }
       }
     } catch (err) {
       logger.error({ groupJid, err }, 'Error processing messages for group');
-      if (!state.stopRequested) {
+      if (this.canScheduleRetry(state)) {
         this.scheduleRetry(groupJid, state);
       } else {
         logger.info(
-          { groupJid },
-          'Runner stopped explicitly; suppressing exception retry',
+          {
+            groupJid,
+            stopRequested: state.stopRequested,
+            restarting: state.restarting,
+          },
+          'Runner stop/restart in progress; suppressing exception retry',
         );
       }
     } finally {
@@ -2050,10 +2123,14 @@ export class GroupQueue {
       this.waitingGroups.add(groupJid);
       return;
     }
+    // A newly-arrived conversation turn supersedes an older pending retry for
+    // the same virtual lane. Preserve retryCount until this run succeeds.
+    this.cancelRetryTimer(state);
     const isHostMode = this.isHostMode(groupJid);
     state.stopRequested = false;
     state.active = true;
     state.activeRunnerIsTask = true;
+    state.activeTask = task;
     state.lastActivityAt = Date.now();
     state.queryInFlight = groupJid.includes('#agent:');
     state.queryId = state.queryInFlight ? randomUUID() : null;
@@ -2085,7 +2162,24 @@ export class GroupQueue {
     }
 
     try {
-      await task.fn();
+      const success = await task.fn();
+      if (success === false) {
+        if (this.canScheduleRetry(state)) {
+          this.scheduleRetry(groupJid, state, task);
+        } else {
+          logger.info(
+            {
+              groupJid,
+              taskId: task.id,
+              stopRequested: state.stopRequested,
+              restarting: state.restarting,
+            },
+            'Task retry suppressed because the runner is stopping or restarting',
+          );
+        }
+      } else {
+        this.clearRetryTimer(state);
+      }
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
@@ -2105,6 +2199,7 @@ export class GroupQueue {
       }
       state.active = false;
       state.activeRunnerIsTask = false;
+      state.activeTask = null;
       state.drainSentinelWritten = false;
       state.lastActivityAt = null;
       state.queryInFlight = false;
@@ -2144,12 +2239,34 @@ export class GroupQueue {
     }
   }
 
-  private scheduleRetry(groupJid: string, state: GroupState): void {
+  private canScheduleRetry(state: GroupState): boolean {
+    return !this.shuttingDown && !state.stopRequested && !state.restarting;
+  }
+
+  private scheduleRetry(
+    groupJid: string,
+    state: GroupState,
+    retryTask: QueuedTask | null = null,
+  ): void {
+    if (!this.canScheduleRetry(state)) {
+      logger.info(
+        {
+          groupJid,
+          stopRequested: state.stopRequested,
+          restarting: state.restarting,
+          shuttingDown: this.shuttingDown,
+        },
+        'Retry suppressed because the runner is stopping or restarting',
+      );
+      return;
+    }
+
     // 清除可能存在的旧定时器（不重置 retryCount，因为这里在递增）
     if (state.retryTimer !== null) {
       clearTimeout(state.retryTimer);
       state.retryTimer = null;
     }
+    state.retryTask = null;
 
     // 检查是否为上下文溢出错误，如果是则跳过重试
     if (this.contextOverflowGroups.has(groupJid)) {
@@ -2158,6 +2275,7 @@ export class GroupQueue {
         'Skipping retry for context overflow error (agent already retried 3 times)',
       );
       state.retryCount = 0;
+      state.retryTask = null;
       this.contextOverflowGroups.delete(groupJid); // 清除标记
       return;
     }
@@ -2169,6 +2287,7 @@ export class GroupQueue {
         'Max retries exceeded, dropping messages (will retry on next incoming message)',
       );
       state.retryCount = 0;
+      state.retryTask = null;
       try {
         this.onMaxRetriesExceededFn?.(groupJid);
       } catch (err) {
@@ -2179,13 +2298,37 @@ export class GroupQueue {
 
     const delayMs = BASE_RETRY_MS * Math.pow(2, state.retryCount - 1);
     logger.info(
-      { groupJid, retryCount: state.retryCount, delayMs },
+      {
+        groupJid,
+        taskId: retryTask?.id,
+        retryCount: state.retryCount,
+        delayMs,
+      },
       'Scheduling retry with backoff',
     );
+    state.retryTask = retryTask;
     state.retryTimer = setTimeout(() => {
       state.retryTimer = null;
-      if (!this.shuttingDown) {
-        this.enqueueMessageCheck(groupJid);
+      state.retryTask = null;
+      if (this.canScheduleRetry(state)) {
+        if (retryTask) {
+          this.enqueueTask(groupJid, retryTask.id, retryTask.fn, {
+            allowInactive: retryTask.allowInactive,
+            onDropped: retryTask.onDropped,
+          });
+        } else {
+          this.enqueueMessageCheck(groupJid);
+        }
+      } else {
+        logger.info(
+          {
+            groupJid,
+            stopRequested: state.stopRequested,
+            restarting: state.restarting,
+            shuttingDown: this.shuttingDown,
+          },
+          'Scheduled retry cancelled because the runner is stopping or restarting',
+        );
       }
     }, delayMs);
   }

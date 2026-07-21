@@ -61,6 +61,11 @@ import {
   isUnauthorizedHostClaudeContext,
   validateRuntimePolicyReferences,
 } from '../agent-profile-policy.js';
+import {
+  classifyRunContextSnapshot,
+  getRunContextSnapshot,
+  hashRuntimePolicy,
+} from '../run-context-snapshot.js';
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
@@ -255,11 +260,24 @@ agentProfileRoutes.post(
       workspace = { jid: workspaceJid, group };
     }
 
+    const preview = buildAgentCapabilityPreview({
+      profile: previewProfile,
+      workspace,
+      ownerRole: user.role,
+    });
+    const runContext = workspace ? getRunContextSnapshot(workspace.jid) : null;
     return c.json({
-      preview: buildAgentCapabilityPreview({
-        profile: previewProfile,
-        workspace,
-        ownerRole: user.role,
+      preview,
+      run_context: runContext,
+      run_context_status: classifyRunContextSnapshot(runContext, {
+        agentProfile: {
+          id: existing.id,
+          version: existing.version,
+          identityHash: existing.identity_hash,
+          runtimePolicyHash: hashRuntimePolicy(previewProfile.runtime_policy),
+        },
+        skillManifestHash: preview.skills.manifestHash,
+        mcpManifestHash: preview.mcp.manifestHash,
       }),
     });
   },

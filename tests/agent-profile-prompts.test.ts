@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+  AGENT_PROMPT_SECTION_MAX_LENGTH,
   agentProfilePromptsFromLegacy,
   buildAgentProfilePrompt,
   normalizeAgentProfilePrompts,
@@ -50,5 +51,13 @@ describe('AgentProfile four-part prompt contract', () => {
       tools_prompt: '',
       prompt_mode: 'replace',
     });
+  });
+
+  test('never silently truncates an existing prompt document', () => {
+    const oversized = 'x'.repeat(AGENT_PROMPT_SECTION_MAX_LENGTH + 1);
+    expect(
+      normalizeAgentProfilePrompts({ identity_prompt: oversized })
+        .identity_prompt,
+    ).toBe(oversized);
   });
 });

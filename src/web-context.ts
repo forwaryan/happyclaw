@@ -128,7 +128,7 @@ export interface WebDeps {
   processAgentConversation?: (
     chatJid: string,
     agentId: string,
-  ) => Promise<void>;
+  ) => Promise<void | boolean>;
   getFeishuChatInfo?: (
     userId: string,
     chatId: string,

@@ -131,13 +131,14 @@ RUN npm ci \
 RUN pip install "headroom-ai[code,mcp]==0.27.0" \
     && headroom --version
 
-# Install the verified feishu-cli release (binary + matching builtin skills).
+# Install the verified feishu-cli release. Its matching Skills are materialized
+# on the host by scripts/install-host-tools.sh and then governed by the same
+# EffectiveSkillManifest as every other runtime Skill.
 # Checksums prevent a replaced or truncated download from entering the image.
 ARG TARGETARCH
 ARG FEISHU_CLI_VERSION=v1.35.0
 ARG FEISHU_CLI_SHA256_AMD64=2bfd4e973add5674be92ec67c2f4948b656537a58ba6d04630c1ecda35121695
 ARG FEISHU_CLI_SHA256_ARM64=9d7214916815242b9ea65984984b82f6ad215a52328968e4e799bcf136b795d6
-ARG FEISHU_CLI_SOURCE_SHA256=91b5575833f003527c7b60a26f08703ebfdb348098deecfa9ceed1dcf230f253
 RUN set -eu && \
     ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
@@ -153,15 +154,7 @@ RUN set -eu && \
     echo "$BINARY_SHA256  $DOWNLOAD_TMP/feishu-cli.tar.gz" | sha256sum -c - && \
     tar -xzf "$DOWNLOAD_TMP/feishu-cli.tar.gz" --strip-components=1 -C /usr/local/bin && \
     feishu-cli --version && \
-    mkdir -p /opt/builtin-skills && \
-    curl -fsSL --retry 3 \
-      -o "$DOWNLOAD_TMP/feishu-cli-source.tar.gz" \
-      "https://github.com/riba2534/feishu-cli/archive/refs/tags/${FEISHU_CLI_VERSION}.tar.gz" && \
-    echo "$FEISHU_CLI_SOURCE_SHA256  $DOWNLOAD_TMP/feishu-cli-source.tar.gz" | sha256sum -c - && \
-    tar -xzf "$DOWNLOAD_TMP/feishu-cli-source.tar.gz" -C "$DOWNLOAD_TMP" && \
-    cp -r "$DOWNLOAD_TMP"/*/skills/. /opt/builtin-skills/ && \
-    rm -rf "$DOWNLOAD_TMP" && \
-    ls /opt/builtin-skills/
+    rm -rf "$DOWNLOAD_TMP"
 
 # Copy source code
 COPY agent-runner/ ./

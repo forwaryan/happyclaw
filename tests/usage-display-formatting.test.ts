@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import {
   getAuthoritativeTokenBreakdown,
+  getDisplayedTokenTotal,
   getPrimaryModelUsage,
   parseTokenUsage,
 } from '../web/src/lib/token-usage-presentation.js';
@@ -66,6 +67,14 @@ describe('web token usage presentation', () => {
       reasoningTokens: 750,
       totalTokens: 1_000,
     });
+  });
+
+  test('supplements a zero main-message ledger with Workflow subagent usage', () => {
+    const usage = parseTokenUsage(
+      JSON.stringify({ inputTokens: 0, outputTokens: 0, durationMs: 296_100 }),
+    );
+
+    expect(getDisplayedTokenTotal(usage!, [251_749])).toBe(251_749);
   });
 });
 

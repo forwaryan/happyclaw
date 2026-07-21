@@ -64,6 +64,17 @@ describe('ClaudeContextResolver', () => {
     });
     const sync = syncHostClaudeContext(plan, sessionDir);
 
+    expect(plan.audit.skills.includedSkills).toBe(4);
+    expect(plan.audit.skills.sources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'builtin', count: 1 }),
+        expect.objectContaining({ name: 'external', count: 1 }),
+        expect.objectContaining({ name: 'project', count: 1 }),
+        expect.objectContaining({ name: 'managed', count: 1 }),
+        expect.objectContaining({ name: 'workspace', count: 0 }),
+      ]),
+    );
+
     expect(sync.claudeMdStatus).toBe('linked');
     expect(fs.readlinkSync(path.join(sessionDir, 'CLAUDE.md'))).toBe(
       path.join(external, 'CLAUDE.md'),
@@ -204,6 +215,13 @@ describe('ClaudeContextResolver', () => {
     expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'dup-skill'))).toBe(
       path.join(selectedUserSkills, 'dup-skill'),
     );
+    expect(plan.audit.skills.sources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'builtin', count: 0 }),
+        expect.objectContaining({ name: 'external', count: 0 }),
+        expect.objectContaining({ name: 'managed', count: 1 }),
+      ]),
+    );
   });
 
   test('plan warns when native CLAUDE.md and HappyClaw memory layer are both active', () => {
@@ -265,7 +283,8 @@ describe('ClaudeContextResolver', () => {
     expect(plan.audit.skills.sources.map((source) => source.name)).toEqual([
       'builtin',
       'project',
-      'user',
+      'managed',
+      'workspace',
     ]);
   });
 

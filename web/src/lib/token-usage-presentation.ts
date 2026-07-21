@@ -70,6 +70,22 @@ export function getAuthoritativeTokenBreakdown(
   };
 }
 
+/**
+ * Claude Code Workflow subagents report usage in the SDK task/session record,
+ * outside the main assistant-message payload. Combine the two non-overlapping
+ * authorities for the user-facing total.
+ */
+export function getDisplayedTokenTotal(
+  usage: TokenUsagePayload,
+  workflowTokenTotals: readonly (number | undefined)[] = [],
+): number {
+  const workflowTokens = workflowTokenTotals.reduce<number>(
+    (total, value) => total + tokenCount(value),
+    0,
+  );
+  return getAuthoritativeTokenBreakdown(usage).totalTokens + workflowTokens;
+}
+
 export function getPrimaryModelUsage(
   usage: TokenUsagePayload,
 ): [string, ModelTokenUsage] | null {

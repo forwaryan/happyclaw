@@ -91,32 +91,35 @@ function message(id: string, timestamp: string): Message {
 }
 
 function resetChatStore(): void {
-  useChatStore.setState({
-    ...initialState,
-    groups: {},
-    currentGroup: null,
-    messages: {},
-    waiting: {},
-    hasMore: {},
-    loading: false,
-    error: null,
-    streaming: {},
-    thinkingCache: {},
-    thinkingDurationCache: {},
-    pendingThinking: {},
-    pendingThinkingDuration: {},
-    clearing: {},
-    agents: {},
-    agentStreaming: {},
-    activeAgentTab: {},
-    sdkTasks: {},
-    sdkTaskAliases: {},
-    agentMessages: {},
-    agentWaiting: {},
-    agentHasMore: {},
-    drafts: {},
-    unreadReplies: {},
-  }, true);
+  useChatStore.setState(
+    {
+      ...initialState,
+      groups: {},
+      currentGroup: null,
+      messages: {},
+      waiting: {},
+      hasMore: {},
+      loading: false,
+      error: null,
+      streaming: {},
+      thinkingCache: {},
+      thinkingDurationCache: {},
+      pendingThinking: {},
+      pendingThinkingDuration: {},
+      clearing: {},
+      agents: {},
+      agentStreaming: {},
+      activeAgentTab: {},
+      sdkTasks: {},
+      sdkTaskAliases: {},
+      agentMessages: {},
+      agentWaiting: {},
+      agentHasMore: {},
+      drafts: {},
+      unreadReplies: {},
+    },
+    true,
+  );
 }
 
 describe('loadAgentMessages', () => {
@@ -200,7 +203,10 @@ describe('loadAgentMessages', () => {
   it('clears hydrated messages and deletes the snapshot when the server latest page is empty', async () => {
     const jid = 'web:main';
     const agentId = 'agent-1';
-    const staleHydrated = message('deleted-stale-snapshot', '2026-01-02T09:30:00.000Z');
+    const staleHydrated = message(
+      'deleted-stale-snapshot',
+      '2026-01-02T09:30:00.000Z',
+    );
 
     useChatStore.setState({
       agentMessages: { [agentId]: [staleHydrated] },
@@ -217,5 +223,143 @@ describe('loadAgentMessages', () => {
     expect(useChatStore.getState().agentHasMore[agentId]).toBe(false);
     expect(saveAgentMessageSnapshotMock).not.toHaveBeenCalled();
     expect(deleteAgentMessageSnapshotMock).toHaveBeenCalledWith(jid, agentId);
+  });
+});
+
+describe('conversation Agent usage events', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    saveAgentMessageSnapshotMock.mockResolvedValue(undefined);
+    resetChatStore();
+  });
+
+  it('patches the completed Agent reply even after streaming was cleared', async () => {
+    const jid = 'web:main';
+    const agentId = 'agent-1';
+    const turnId = 'turn-workflow-1';
+    const finalReply: Message = {
+      id: 'reply-workflow-1',
+      chat_jid: `${jid}#agent:${agentId}`,
+      sender: 'happyclaw-agent',
+      sender_name: 'HappyClaw',
+      content: '13×17=221，19×23=437。',
+      timestamp: '2026-07-21T15:22:58.000Z',
+      is_from_me: true,
+      turn_id: turnId,
+      source_kind: 'sdk_final',
+    };
+
+    useChatStore.setState({
+      agentMessages: { [agentId]: [finalReply] },
+      agentHasMore: { [agentId]: false },
+      agentStreaming: {},
+      agentWaiting: { [agentId]: false },
+    });
+
+    useChatStore.getState().handleStreamEvent(
+      jid,
+      {
+        eventType: 'usage',
+        turnId,
+        usage: {
+          inputTokens: 74_924,
+          outputTokens: 583,
+          cacheReadInputTokens: 147_008,
+          cacheCreationInputTokens: 0,
+          reasoningTokens: 0,
+          costUSD: 0,
+          durationMs: 72_776,
+          numTurns: 3,
+        },
+      },
+      agentId,
+    );
+
+    const updated = useChatStore.getState().agentMessages[agentId][0];
+    expect(JSON.parse(updated.token_usage ?? '{}')).toMatchObject({
+      inputTokens: 74_924,
+      outputTokens: 583,
+      cacheReadInputTokens: 147_008,
+      durationMs: 72_776,
+    });
+    await Promise.resolve();
+    expect(saveAgentMessageSnapshotMock).toHaveBeenCalledWith(
+      jid,
+      agentId,
+      [expect.objectContaining({ id: finalReply.id })],
+      false,
+    );
+  });
+});
+
+describe('held Workflow acknowledgements', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    saveAgentMessageSnapshotMock.mockResolvedValue(undefined);
+    resetChatStore();
+  });
+
+  const runningWorkflow = {
+    taskId: 'wkk0k70oj',
+    workflowName: 'test-dynamic-workflow',
+    summary: '动态工作流测试',
+    status: 'running' as const,
+    phases: [
+      { index: 1, title: 'Discover' },
+      { index: 2, title: 'Research' },
+      { index: 3, title: 'Synthesize' },
+    ],
+    agents: [],
+  };
+
+  it('keeps a conversation Agent Workflow card live after the held sdk_final', () => {
+    const jid = 'web:main';
+    const agentId = 'agent-1';
+
+    useChatStore.getState().handleWsNewMessage(
+      jid,
+      {
+        id: 'held-agent-reply',
+        chat_jid: `${jid}#agent:${agentId}`,
+        sender: 'happyclaw-agent',
+        sender_name: 'HappyClaw',
+        content: '工作流已启动',
+        timestamp: '2026-07-21T15:32:53.000Z',
+        is_from_me: true,
+        source_kind: 'sdk_final',
+        workflow_runs: [runningWorkflow],
+      },
+      agentId,
+    );
+
+    const state = useChatStore.getState();
+    expect(state.agentWaiting[agentId]).toBe(true);
+    expect(
+      state.agentStreaming[agentId].taskStates.wkk0k70oj.workflowRun,
+    ).toMatchObject({ status: 'running', phases: runningWorkflow.phases });
+    expect(state.agentMessages[agentId][0].workflow_runs).toBeUndefined();
+  });
+
+  it('keeps the main-conversation Workflow card live after the held sdk_final', () => {
+    const jid = 'web:main';
+
+    useChatStore.getState().handleWsNewMessage(jid, {
+      id: 'held-main-reply',
+      chat_jid: jid,
+      sender: 'happyclaw-agent',
+      sender_name: 'HappyClaw',
+      content: '工作流已启动',
+      timestamp: '2026-07-21T15:32:53.000Z',
+      is_from_me: true,
+      source_kind: 'sdk_final',
+      workflow_runs: [runningWorkflow],
+    });
+
+    const state = useChatStore.getState();
+    expect(state.waiting[jid]).toBe(true);
+    expect(state.streaming[jid].taskStates.wkk0k70oj.workflowRun).toMatchObject(
+      { status: 'running', phases: runningWorkflow.phases },
+    );
+    expect(state.messages[jid][0].workflow_runs).toBeUndefined();
   });
 });

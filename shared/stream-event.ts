@@ -38,6 +38,51 @@ export type StreamEventType =
 export type StreamAgentScope = 'main' | 'task' | 'subagent' | 'system';
 export type StreamDisplayLevel = 'primary' | 'detail' | 'debug';
 
+export interface WorkflowPhaseSnapshot {
+  index: number;
+  title: string;
+  detail?: string;
+}
+
+export interface WorkflowAgentSnapshot {
+  index: number;
+  label: string;
+  phaseIndex?: number;
+  phaseTitle?: string;
+  agentId?: string;
+  model?: string;
+  fallbackModel?: string;
+  state: 'queued' | 'running' | 'done' | 'failed' | 'stopped' | 'unknown';
+  queuedAt?: number;
+  startedAt?: number;
+  completedAt?: number;
+  attempt?: number;
+  lastToolName?: string;
+  lastToolSummary?: string;
+  promptPreview?: string;
+  resultPreview?: string;
+  tokens?: number;
+  toolCalls?: number;
+  durationMs?: number;
+}
+
+/** Persistable, user-facing projection of one Claude Code dynamic Workflow. */
+export interface WorkflowRunSnapshot {
+  taskId: string;
+  runId?: string;
+  workflowName?: string;
+  summary: string;
+  status: 'running' | 'completed' | 'failed' | 'stopped' | 'unknown';
+  startTime?: number;
+  completedAt?: number;
+  durationMs?: number;
+  agentCount?: number;
+  totalTokens?: number;
+  totalToolCalls?: number;
+  phases: WorkflowPhaseSnapshot[];
+  agents: WorkflowAgentSnapshot[];
+}
+
 export interface ClaudeContextFileAudit {
   sourcePath?: string;
   runtimePath?: string;
@@ -62,7 +107,15 @@ export interface ClaudeContextRulesAudit {
 }
 
 export interface ClaudeContextSkillsSourceAudit {
-  name: 'builtin' | 'external' | 'project' | 'user' | 'plugin' | 'unknown';
+  name:
+    | 'builtin'
+    | 'external'
+    | 'project'
+    | 'managed'
+    | 'workspace'
+    | 'user'
+    | 'plugin'
+    | 'unknown';
   sourcePath?: string;
   runtimePath?: string;
   count?: number;
@@ -73,23 +126,139 @@ export interface ClaudeContextSkillsAudit {
   totalSkills?: number;
   includedSkills?: number;
   tokens?: number;
+  manifestHash?: string;
+  selectedSkillIds?: string[];
   sources: ClaudeContextSkillsSourceAudit[];
 }
 
 export interface ClaudeContextPromptAudit {
   totalBytes: number;
-  files: Array<{ name: string; bytes: number }>;
+  estimatedTokens?: number;
+  planHash?: string;
+  files: Array<{
+    name: string;
+    bytes: number;
+    id?: string;
+    version?: number;
+    scope?: 'main' | 'subagent' | 'both';
+    owner?: 'platform' | 'agent_profile' | 'workspace' | 'channel';
+    required?: boolean;
+    condition?: string;
+    hash?: string;
+    estimatedTokens?: number;
+  }>;
+}
+
+export interface ClaudeSdkContextUsageAudit {
+  categories: Array<{
+    name: string;
+    tokens: number;
+    color: string;
+    isDeferred?: boolean;
+  }>;
+  totalTokens: number;
+  maxTokens: number;
+  rawMaxTokens: number;
+  percentage: number;
+  gridRows: Array<
+    Array<{
+      color: string;
+      isFilled: boolean;
+      categoryName: string;
+      tokens: number;
+      percentage: number;
+      squareFullness: number;
+    }>
+  >;
+  model: string;
+  memoryFiles: Array<{ path: string; type: string; tokens: number }>;
+  mcpTools: Array<{
+    name: string;
+    serverName: string;
+    tokens: number;
+    isLoaded?: boolean;
+  }>;
+  deferredBuiltinTools?: Array<{
+    name: string;
+    tokens: number;
+    isLoaded: boolean;
+  }>;
+  systemTools?: Array<{ name: string; tokens: number }>;
+  systemPromptSections?: Array<{ name: string; tokens: number }>;
+  agents: Array<{ agentType: string; source: string; tokens: number }>;
+  slashCommands?: {
+    totalCommands: number;
+    includedCommands: number;
+    tokens: number;
+  };
+  skills?: {
+    totalSkills: number;
+    includedSkills: number;
+    tokens: number;
+    skillFrontmatter: Array<{
+      name: string;
+      source: string;
+      tokens: number;
+    }>;
+  };
+  autoCompactThreshold?: number;
+  isAutoCompactEnabled: boolean;
+  messageBreakdown?: {
+    toolCallTokens: number;
+    toolResultTokens: number;
+    attachmentTokens: number;
+    assistantMessageTokens: number;
+    userMessageTokens: number;
+    redirectedContextTokens: number;
+    unattributedTokens: number;
+    toolCallsByType: Array<{
+      name: string;
+      callTokens: number;
+      resultTokens: number;
+    }>;
+    attachmentsByType: Array<{ name: string; tokens: number }>;
+  };
+  apiUsage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  } | null;
 }
 
 export interface ClaudeContextAudit {
   executionMode: 'host' | 'container';
+  agentProfile?: {
+    id: string;
+    version: number;
+    identityHash: string;
+    runtimePolicyHash?: string;
+  };
   cwd?: string;
   claudeConfigDir?: string;
   externalClaudeDir?: string;
   claudeMd: ClaudeContextFileAudit;
   rules: ClaudeContextRulesAudit;
   skills: ClaudeContextSkillsAudit;
+  mcp?: { manifestHash: string; serverIds: string[] };
   happyclawPrompt: ClaudeContextPromptAudit;
+  sdkContextUsage?: ClaudeSdkContextUsageAudit;
+  contextBudget?: {
+    status: 'unavailable' | 'ok' | 'warning' | 'hard_exceeded';
+    startupTokens?: number;
+    totalTokens?: number;
+    maxTokens?: number;
+    warningThreshold?: number;
+    hardThreshold?: number;
+    warning?: string;
+    error?: string;
+  };
+  subagentContract?: {
+    enabled: boolean;
+    hash: string;
+    sdkCompatibility: string;
+    cliCompatibility: string;
+  };
   warnings: string[];
 }
 
@@ -131,6 +300,12 @@ export interface StreamEvent {
   taskId?: string;
   taskStatus?: string;
   taskSummary?: string;
+  /** SDK task discriminant, e.g. `local_workflow` or `subagent`. */
+  taskType?: string;
+  /** Claude Code Workflow meta.name (only present for workflow tasks). */
+  workflowName?: string;
+  /** Live/completed dynamic Workflow projection for first-class UI rendering. */
+  workflowRun?: WorkflowRunSnapshot;
   taskPatch?: {
     status?: string;
     description?: string;

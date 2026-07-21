@@ -2,7 +2,7 @@
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
        backup restore help _ensure-docker-image logs status stop \
-       _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
+       _check-sync _ensure-builtin-skills _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
 
 # ─── Runtime ────────────────────────────────────────────────
 # 本项目只用原生 Node 工具链运行（npm / npx / tsx / node），不使用 bun。
@@ -21,6 +21,7 @@ BACKUP_DIR ?= .
 
 dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
 	@echo "🚀 使用 $(PKG) 启动..."
@@ -56,6 +57,7 @@ start: ## 一键启动生产环境（前台阻塞运行）
 	  exit 1; \
 	fi
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(MAKE) _check-sync
 	@$(MAKE) _build-backend-if-stale
@@ -72,6 +74,14 @@ _check-sync: ## (内部) 检测 shared/ 类型变更并同步
 	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
+
+_ensure-builtin-skills: ## (内部) 物化固定版本、Host/Container 共用的内置 Skills
+	@if ! node scripts/builtin-skill-catalog.mjs validate data/builtin-skills; then \
+	  echo "📚 固定版本内置 Skills 缺失，正在物化..."; \
+	  ./scripts/install-host-tools.sh skills; \
+	else \
+	  echo "✅ 内置 Skills catalog 已就绪"; \
+	fi
 
 _build-web-if-stale: ## (内部) 前端变更时重新编译
 	@NEED_WEB=0; \
@@ -220,7 +230,7 @@ ensure-latest-sdk: ## 只读检查 SDK/CLI 最新版本（兼容旧工作流）
 
 # ─── Setup ───────────────────────────────────────────────────
 
-install-host-tools: ## 安装宿主机模式所需的外部工具（feishu-cli、agent-browser、uv）+ 刷新 builtin-skills 缓存
+install-host-tools: ## 安装宿主工具 + 刷新 Host/Container 共用的固定版本 builtin-skills Manifest 源
 	@./scripts/install-host-tools.sh
 
 install: ## 安装全部依赖并编译 agent-runner
@@ -230,6 +240,7 @@ install: ## 安装全部依赖并编译 agent-runner
 	cd container/agent-runner && $(PKG) ci
 	cd container/agent-runner && $(PKG) run build
 	cd web && $(PKG) ci
+	@$(MAKE) _ensure-builtin-skills
 	@# 更新目录 mtime 以配合 start 中的依赖变更检测（[ package.json -nt node_modules ]）
 	@touch node_modules web/node_modules container/agent-runner/node_modules
 

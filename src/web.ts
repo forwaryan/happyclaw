@@ -113,6 +113,7 @@ import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
+import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import {
   executeSessionReset,
   isClearCommand,
@@ -1182,7 +1183,7 @@ async function handleAgentConversationMessage(
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
       deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
-        await deps!.processAgentConversation!(chatJid, agentId);
+        return deps!.processAgentConversation!(chatJid, agentId);
       });
     }
   }
@@ -2260,6 +2261,10 @@ interface StreamingSnapshotEntry {
       title: string;
       status: 'running' | 'completed' | 'error' | 'backgrounded';
       subagentType?: string;
+      taskType?: string;
+      workflowName?: string;
+      workflowRun?: StreamEvent['workflowRun'];
+      usage?: StreamEvent['sdkTaskUsage'];
       latestSummary?: string;
       lastToolName?: string;
       thinkingTail: string;
@@ -2412,6 +2417,10 @@ function updateSnapshotTask(
       'Task',
     status: 'running' as const,
     subagentType: event.subagentType,
+    taskType: event.taskType,
+    workflowName: event.workflowName,
+    workflowRun: event.workflowRun,
+    usage: event.sdkTaskUsage,
     thinkingTail: '',
     textTail: '',
     activeTools: [],
@@ -2422,6 +2431,23 @@ function updateSnapshotTask(
   if (event.taskDescription && (!task.title || task.title === 'Task'))
     task.title = event.taskDescription;
   if (event.subagentType) task.subagentType = event.subagentType;
+  if (event.taskType) task.taskType = event.taskType;
+  if (event.workflowName) task.workflowName = event.workflowName;
+  if (event.sdkTaskUsage) task.usage = event.sdkTaskUsage;
+  if (event.workflowRun) {
+    task.workflowRun = {
+      ...(task.workflowRun ?? {}),
+      ...event.workflowRun,
+      phases:
+        event.workflowRun.phases.length > 0
+          ? event.workflowRun.phases
+          : (task.workflowRun?.phases ?? []),
+      agents:
+        event.workflowRun.agents.length > 0
+          ? event.workflowRun.agents
+          : (task.workflowRun?.agents ?? []),
+    };
+  }
   if (event.eventType === 'text_delta') {
     task.textTail = tailText(
       task.textTail + (event.text || ''),
@@ -2440,6 +2466,15 @@ function updateSnapshotTask(
       task.latestSummary;
     task.lastToolName = event.lastToolName || task.lastToolName;
     task.status = 'running';
+    if (task.workflowRun && event.sdkTaskUsage) {
+      task.workflowRun = {
+        ...task.workflowRun,
+        status: 'running',
+        totalTokens: event.sdkTaskUsage.totalTokens,
+        totalToolCalls: event.sdkTaskUsage.toolUses,
+        durationMs: event.sdkTaskUsage.durationMs,
+      };
+    }
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
@@ -2452,6 +2487,13 @@ function updateSnapshotTask(
     task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
     task.latestSummary =
       event.taskSummary || event.summary || task.latestSummary;
+    if (task.workflowRun) {
+      task.workflowRun = {
+        ...task.workflowRun,
+        status: event.taskStatus === 'completed' ? 'completed' : 'failed',
+        completedAt: task.workflowRun.completedAt ?? Date.now(),
+      };
+    }
   } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
     const tool = {
       toolName: event.toolName || 'unknown',
@@ -2714,6 +2756,15 @@ export function broadcastStreamEvent(
   // Keep runtime context audits on the server side. Sending them over the
   // user WebSocket exposes paths, prompt wiring, and framework terminology.
   if (event.eventType === 'context_audit') {
+    if (event.contextAudit) {
+      recordRunContextSnapshot({
+        chatJid,
+        agentId,
+        turnId: event.turnId,
+        sessionId: event.sessionId,
+        audit: event.contextAudit,
+      });
+    }
     if (event.contextAudit?.warnings?.length) {
       logger.warn(
         { chatJid, warnings: event.contextAudit.warnings },

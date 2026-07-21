@@ -24,7 +24,10 @@ import {
 } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { resolveSystemMessage } from '../../lib/system-message-registry';
-import { getPresentedMessageContent } from '../../lib/message-presentation';
+import {
+  getPresentedMessageContent,
+  isHeldBackgroundAcknowledgement,
+} from '../../lib/message-presentation';
 import {
   getMessageDisplayTimestamp,
   orderMessagesForTimeline,
@@ -99,6 +102,14 @@ export function MessageList({
   const thinkingDurationCache = useChatStore(
     (s) => s.thinkingDurationCache ?? {},
   );
+  const hasWorkflowCard = useChatStore((state) => {
+    const current = agentId
+      ? state.agentStreaming[agentId]
+      : state.streaming[groupJid ?? ''];
+    return Object.values(current?.taskStates ?? {}).some(
+      (task) => task.taskType === 'local_workflow' && task.workflowRun,
+    );
+  });
   // Spawn agents: selector returns stable reference (the agents array itself),
   // then useMemo filters for spawn kind. Direct .filter() in selector causes
   // infinite re-render because Zustand sees a new array reference every time.
@@ -184,6 +195,19 @@ export function MessageList({
     Object.entries(grouped).forEach(([date, msgs]) => {
       items.push({ type: 'date', content: date });
       msgs.forEach((msg) => {
+        const messageHasRunningWorkflow = msg.workflow_runs?.some(
+          (run) => run.status === 'running',
+        );
+        if (
+          msg.is_from_me &&
+          (hasWorkflowCard || messageHasRunningWorkflow) &&
+          isHeldBackgroundAcknowledgement(msg.content)
+        ) {
+          // While the SDK Workflow is live, its structured card is the single
+          // source of truth. The acknowledgement is restored automatically if
+          // the card disappears because of an interruption or failed restore.
+          return;
+        }
         if (
           msg.source_kind === 'interrupt_partial' &&
           msg.finalization_reason === 'interrupted' &&
@@ -211,7 +235,7 @@ export function MessageList({
       });
     });
     return items;
-  }, [timelineMessages]);
+  }, [timelineMessages, hasWorkflowCard]);
 
   // Chat always starts at bottom — no scroll position restoration.
   // key={...} on <MessageList> guarantees a fresh mount on group/tab switch.
@@ -453,7 +477,7 @@ export function MessageList({
     <div className="relative flex-1 overflow-hidden overflow-x-hidden">
       <div
         ref={parentRef}
-        className="h-full overflow-y-auto overflow-x-hidden py-6"
+        className="h-full overflow-y-auto overflow-x-hidden pb-10 pt-6"
       >
         <div
           className={

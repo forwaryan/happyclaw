@@ -10,6 +10,7 @@ import { TodoProgressPanel } from './TodoProgressPanel';
 import { ToolActivityCard } from './ToolActivityCard';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
+import { WorkflowRunCard } from './WorkflowRunCard';
 
 /** Render AskUserQuestion options as a visual card (read-only). */
 function AskUserQuestionCard({
@@ -351,9 +352,15 @@ function TracePanel({
   streaming: import('../../stores/chat').StreamingState;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const visibleTrace = streaming.traceEvents.filter(
-    (e) => e.displayLevel !== 'debug' && e.kind !== 'context',
-  );
+  const seenTrace = new Set<string>();
+  const visibleTrace = streaming.traceEvents
+    .filter((e) => e.displayLevel !== 'debug' && e.kind !== 'context')
+    .filter((event) => {
+      const key = `${event.kind}\u0000${event.taskId ?? ''}\u0000${event.title}\u0000${event.summary ?? ''}\u0000${event.detail ?? ''}`;
+      if (seenTrace.has(key)) return false;
+      seenTrace.add(key);
+      return true;
+    });
   if (
     visibleTrace.length === 0 &&
     Object.keys(streaming.taskStates).length === 0
@@ -402,7 +409,7 @@ function TracePanel({
         className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-muted/40 transition-colors"
       >
         <span className="text-xs font-medium text-muted-foreground">
-          运行轨迹
+          执行详情
         </span>
         <span className="text-[11px] text-muted-foreground">
           {visibleTrace.length} 条
@@ -541,11 +548,22 @@ function StreamingContent({
   const askUserTools = streaming.activeTools.filter(
     (t) => t.toolName === 'AskUserQuestion' && t.toolInput,
   );
+  const hasWorkflowTasks = Object.values(streaming.taskStates).some(
+    (task) => task.workflowRun || task.taskType === 'local_workflow',
+  );
+  const showSystemStatus =
+    streaming.systemStatus &&
+    !(
+      hasWorkflowTasks &&
+      /后台任务运行中|完成后将继续汇总/u.test(streaming.systemStatus)
+    )
+      ? streaming.systemStatus
+      : null;
 
   return (
     <>
       {/* System status */}
-      {streaming.systemStatus && (
+      {showSystemStatus && (
         <div className="flex items-center gap-2 text-[13px] text-muted-foreground mb-2">
           <svg
             className="w-3.5 h-3.5 animate-spin text-primary"
@@ -566,7 +584,7 @@ function StreamingContent({
               d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
             />
           </svg>
-          <span>{formatSystemStatus(streaming.systemStatus)}</span>
+          <span>{formatSystemStatus(showSystemStatus)}</span>
         </div>
       )}
 
@@ -657,13 +675,37 @@ function StreamingContent({
         <div className="mb-2 space-y-1.5">
           {Object.values(streaming.taskStates)
             .sort((a, b) => a.updatedAt - b.updatedAt)
-            .map((task) => (
-              <SdkTaskRuntimeBlock
-                key={task.id}
-                task={task}
-                groupJid={groupJid}
-              />
-            ))}
+            .map((task) =>
+              task.workflowRun || task.taskType === 'local_workflow' ? (
+                <WorkflowRunCard
+                  key={task.id}
+                  run={
+                    task.workflowRun ?? {
+                      taskId: task.id,
+                      workflowName: task.workflowName,
+                      summary: task.title,
+                      status:
+                        task.status === 'completed'
+                          ? 'completed'
+                          : task.status === 'error'
+                            ? 'failed'
+                            : 'running',
+                      durationMs: task.usage?.durationMs,
+                      totalTokens: task.usage?.totalTokens,
+                      totalToolCalls: task.usage?.toolUses,
+                      phases: [],
+                      agents: [],
+                    }
+                  }
+                />
+              ) : (
+                <SdkTaskRuntimeBlock
+                  key={task.id}
+                  task={task}
+                  groupJid={groupJid}
+                />
+              ),
+            )}
         </div>
       )}
 
@@ -672,25 +714,6 @@ function StreamingContent({
 
       {/* Full trace */}
       <TracePanel streaming={streaming} />
-
-      {/* Recent events timeline */}
-      {streaming.recentEvents.length > 0 && (
-        <div className="rounded-lg border border-border bg-muted/30 p-2 mb-2">
-          <div className="text-xs font-medium text-muted-foreground mb-1">
-            调用轨迹
-          </div>
-          <div className="space-y-0.5 max-h-28 overflow-y-auto">
-            {streaming.recentEvents.map((item) => (
-              <div
-                key={item.id}
-                className="text-[13px] text-foreground/70 break-words"
-              >
-                {item.text}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Hook */}
       {streaming.activeHook && (
@@ -932,11 +955,16 @@ export function StreamingDisplay({
         streaming.activeTools.length > 0 ||
         streaming.activeHook ||
         streaming.systemStatus ||
-        streaming.recentEvents.length > 0 ||
         streaming.traceEvents.length > 0 ||
         Object.keys(streaming.taskStates).length > 0 ||
         (streaming.todos && streaming.todos.length > 0))) ||
     hasTaskAgents;
+  const hasWorkflowCards = Boolean(
+    streaming &&
+    Object.values(streaming.taskStates).some(
+      (task) => task.workflowRun || task.taskType === 'local_workflow',
+    ),
+  );
 
   // 仅在既不等待也无冻结数据时才隐藏
   if (!isWaiting && !hasStreamData) return null;
@@ -1107,8 +1135,15 @@ export function StreamingDisplay({
             )}
           </div>
 
-          {/* Card */}
-          <div className="bg-surface rounded-xl border border-border/60 px-5 py-4 overflow-hidden font-serif shadow-card">
+          {/* Workflow already provides the primary card surface. Keep the
+              streaming shell flat so the UI never nests one card in another. */}
+          <div
+            className={
+              hasWorkflowCards
+                ? 'overflow-hidden font-serif'
+                : 'bg-surface rounded-xl border border-border/60 px-5 py-4 overflow-hidden font-serif shadow-card'
+            }
+          >
             {streaming && (
               <StreamingContent
                 streaming={streaming}

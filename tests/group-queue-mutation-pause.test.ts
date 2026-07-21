@@ -105,6 +105,7 @@ describe('GroupQueue mutation pause', () => {
     ).toBe(true);
 
     await stopFirst;
+    expect(queue.getRecentStopDisposition(FOLDER)).toBe('preserve');
     await queue.stopGroup(IM_JID, {
       force: true,
       preserveQueuedWork: true,
@@ -128,9 +129,65 @@ describe('GroupQueue mutation pause', () => {
     await tick();
     await tick();
 
+    expect(messageRuns.get(WEB_JID)).toBe(2);
     expect(messageRuns.get(IM_JID)).toBe(1);
     expect(taskRuns).toBe(1);
     expect(dropped).toBe(0);
+  });
+
+  test('mutation stop resumes an interrupted conversation on its task lane', async () => {
+    const agentJid = `${WEB_JID}#agent:conversation`;
+    queue.setSerializationKeyResolver((jid: string) =>
+      jid === WEB_JID || jid.startsWith(`${WEB_JID}#`) ? FOLDER : jid,
+    );
+
+    let taskRuns = 0;
+    let messageRuns = 0;
+    let releaseFirst!: () => void;
+    const firstRunStopped = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    queue.setProcessMessagesFn(async () => {
+      messageRuns += 1;
+      return true;
+    });
+    queue.enqueueTask(agentJid, 'agent-conversation', async () => {
+      taskRuns += 1;
+      if (taskRuns === 1) {
+        await firstRunStopped;
+        return false;
+      }
+      return true;
+    });
+    await tick();
+    queue.registerProcess(
+      agentJid,
+      {
+        killed: false,
+        kill: () => {
+          releaseFirst();
+          return true;
+        },
+      } as never,
+      { containerName: null, groupFolder: FOLDER, agentId: 'conversation' },
+    );
+
+    const token = queue.pauseGroupsForMutation([WEB_JID]);
+    await queue.stopGroup(agentJid, {
+      force: true,
+      preserveQueuedWork: true,
+    });
+    expect(taskRuns).toBe(1);
+    expect(messageRuns).toBe(0);
+    expect(
+      queue.getStatus().groups.find((group) => group.jid === agentJid),
+    ).toMatchObject({ pendingMessages: false, pendingTasks: 1 });
+
+    queue.resumeGroupsAfterMutation(token);
+    await tick();
+    await tick();
+    expect(taskRuns).toBe(2);
+    expect(messageRuns).toBe(0);
   });
 
   test('overlapping mutation tokens keep work parked until the last release', async () => {
@@ -202,6 +259,13 @@ describe('GroupQueue mutation pause', () => {
     ).groups.get(WEB_JID);
     expect(state?.retryTimer).toBeNull();
     expect(state?.teardownWaiters.size).toBe(0);
+    expect(queue.getRecentStopDisposition(FOLDER)).toBe('discard');
+
+    // The next user request is a fresh lifecycle, not another discarded turn.
+    queue.setProcessMessagesFn(async () => true);
+    queue.enqueueMessageCheck(WEB_JID);
+    await tick();
+    expect(queue.getRecentStopDisposition(FOLDER)).toBe('none');
   });
 
   test('terminal discard drops parked work while preserving overlapping pause semantics', async () => {

@@ -430,7 +430,10 @@ export function AgentProfilesPage() {
       avatarEmoji !== null ||
       avatarColor !== null ||
       !sameRuntimePolicy(currentRuntimePolicy, DEFAULT_RUNTIME_POLICY));
-  const hasUnsavedChanges = dirty || draftDirty;
+  const createDirty =
+    createPanelOpen && !draftMode && createDescription.trim().length > 0;
+  const editorUnsavedChanges = dirty || draftDirty;
+  const hasUnsavedChanges = editorUnsavedChanges || createDirty;
   const shouldBlockNavigation = useCallback<BlockerFunction>(
     ({ currentLocation, nextLocation }) =>
       navigationGuardRef.current.shouldBlock(
@@ -466,23 +469,8 @@ export function AgentProfilesPage() {
     if (searchParams.get('create') !== '1') return;
     const next = new URLSearchParams(searchParams);
     next.delete('create');
-    setDraftMode(true);
-    setDraftStep(1);
-    setSelectedId(null);
-    setName('');
-    setCurrentPrompts({
-      identity_prompt: '',
-      soul_prompt: '',
-      agents_prompt: '',
-      tools_prompt: '',
-    });
-    setPromptMode('append');
-    setAvatarEmoji(null);
-    setAvatarColor(null);
-    setAvatarUrl(null);
-    setAvatarStyleOpen(false);
-    applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
-    setCreatePanelOpen(false);
+    setDraftMode(false);
+    setCreatePanelOpen(true);
     setAllowedSearchParams(next, { replace: true });
   }, [searchParams, setAllowedSearchParams]);
 
@@ -529,13 +517,26 @@ export function AgentProfilesPage() {
   const confirmDiscardUnsavedChanges = () =>
     !hasUnsavedChanges ||
     confirm('当前 Agent 有未保存修改，继续会丢失。是否继续？');
+  const confirmDiscardEditorChanges = () =>
+    !editorUnsavedChanges ||
+    confirm('当前 Agent 有未保存修改，继续会丢失。是否继续？');
 
   const handleSelectProfile = (profileId: string) => {
-    if (profileId === selectedId && !draftMode) return;
+    if (profileId === selectedId && !draftMode) {
+      setCreatePanelOpen(false);
+      return;
+    }
     if (!confirmDiscardUnsavedChanges()) return;
     setDraftMode(false);
+    setCreatePanelOpen(false);
     setSelectedId(profileId);
     setAllowedSearchParams({ agent: profileId }, { replace: true });
+  };
+
+  const handleOpenCreatePanel = () => {
+    if (draftMode && !confirmDiscardUnsavedChanges()) return;
+    setDraftMode(false);
+    setCreatePanelOpen(true);
   };
 
   const handleRefreshProfiles = () => {
@@ -546,7 +547,8 @@ export function AgentProfilesPage() {
   const handleGenerateDraft = async () => {
     const description = createDescription.trim();
     if (!description) return;
-    if (!confirmDiscardUnsavedChanges()) return;
+    // The creation description is consumed by this action, not discarded.
+    if (!confirmDiscardEditorChanges()) return;
     setGeneratingDraft(true);
     try {
       const draft = await generateProfileDraft(description);
@@ -566,6 +568,7 @@ export function AgentProfilesPage() {
       setAvatarUrl(null);
       setAvatarStyleOpen(false);
       applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
+      setCreateDescription('');
       setCreatePanelOpen(false);
       toast.success('已生成 Agent 配置');
     } catch (err) {
@@ -576,7 +579,7 @@ export function AgentProfilesPage() {
   };
 
   const handleBlankDraft = () => {
-    if (!confirmDiscardUnsavedChanges()) return;
+    if (!confirmDiscardEditorChanges()) return;
     setDraftMode(true);
     setDraftStep(1);
     setSelectedId(null);
@@ -591,6 +594,7 @@ export function AgentProfilesPage() {
     setAvatarEmoji(null);
     setAvatarColor(null);
     setAvatarUrl(null);
+    setCreateDescription('');
     setAvatarStyleOpen(false);
     applyRuntimePolicyToForm(DEFAULT_RUNTIME_POLICY);
     setCreatePanelOpen(false);
@@ -599,6 +603,7 @@ export function AgentProfilesPage() {
   const handleDiscardDraft = () => {
     if (draftDirty && !confirm('确认放弃当前 Agent 草稿？')) return;
     setDraftMode(false);
+    setCreatePanelOpen(true);
     const fallback = customProfiles[0];
     setSelectedId(fallback?.id ?? null);
   };
@@ -618,6 +623,7 @@ export function AgentProfilesPage() {
       });
       setCreateDescription('');
       setDraftMode(false);
+      setCreatePanelOpen(false);
       setSelectedId(profile.id);
       setAllowedSearchParams({ agent: profile.id }, { replace: true });
       toast.success('已创建 Agent');
@@ -838,56 +844,15 @@ export function AgentProfilesPage() {
           </Button>
           <Button
             size="sm"
-            onClick={() => setCreatePanelOpen((open) => !open)}
+            variant={createPanelOpen ? 'secondary' : 'default'}
+            onClick={handleOpenCreatePanel}
             aria-expanded={createPanelOpen}
+            aria-current={createPanelOpen ? 'page' : undefined}
           >
             <Plus className="h-4 w-4" />
             新建
           </Button>
         </div>
-
-        {createPanelOpen && (
-          <div className="mx-3 mb-3 space-y-3 rounded-xl border border-border bg-background p-3 lg:mx-4">
-            <div>
-              <div className="text-sm font-medium text-foreground">
-                创建 Agent
-              </div>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                描述它的角色，AI 会生成名称和身份提示词。
-              </p>
-            </div>
-            <label className="block">
-              <span className="sr-only">Agent 角色描述</span>
-              <Textarea
-                value={createDescription}
-                onChange={(event) => setCreateDescription(event.target.value)}
-                className="min-h-[88px] resize-y text-sm leading-5"
-                placeholder="例如：帮我做代码评审，重点关注架构风险和测试缺口。"
-              />
-            </label>
-            <div className="grid grid-cols-2 gap-2">
-              <Button
-                className="justify-center"
-                onClick={handleGenerateDraft}
-                disabled={generatingDraft || !createDescription.trim()}
-              >
-                {generatingDraft ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Wand2 className="h-4 w-4" />
-                )}
-                AI 生成
-              </Button>
-              <Button
-                variant="outline"
-                className="justify-center"
-                onClick={handleBlankDraft}
-              >
-                空白创建
-              </Button>
-            </div>
-          </div>
-        )}
 
         <nav
           aria-label="自定义 Agent 列表"
@@ -926,7 +891,7 @@ export function AgentProfilesPage() {
             </div>
           ) : (
             customProfiles.map((profile) => {
-              const active = profile.id === selectedId;
+              const active = profile.id === selectedId && !createPanelOpen;
               return (
                 <button
                   key={profile.id}
@@ -955,7 +920,111 @@ export function AgentProfilesPage() {
 
       <main className="min-w-0 flex-1">
         <div className="mx-auto max-w-5xl p-4 pb-24 sm:p-6 sm:pb-24 lg:p-8">
-          {!selected && !draftMode ? (
+          {createPanelOpen && !draftMode ? (
+            <section
+              className="min-h-[calc(100dvh-8rem)]"
+              aria-labelledby="create-agent-title"
+            >
+              <header className="flex flex-col gap-5 border-b border-border pb-6 sm:flex-row sm:items-start sm:justify-between">
+                <div className="max-w-2xl">
+                  <div className="mb-3 inline-flex items-center gap-2 text-sm font-medium text-primary">
+                    <Wand2 className="h-4 w-4" />
+                    新建自定义 Agent
+                  </div>
+                  <h1
+                    id="create-agent-title"
+                    className="text-3xl font-semibold tracking-tight text-foreground sm:text-4xl"
+                  >
+                    先说说它要帮你做什么
+                  </h1>
+                  <p className="mt-3 max-w-xl text-sm leading-6 text-muted-foreground sm:text-base">
+                    描述角色、任务和关注重点，AI
+                    会生成一份可继续编辑的完整配置；你也可以直接从空白配置开始。
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="min-h-11 self-start"
+                  onClick={() => setCreatePanelOpen(false)}
+                >
+                  <X className="h-4 w-4" />
+                  返回 Agent
+                </Button>
+              </header>
+
+              <div className="max-w-3xl py-8 sm:py-10">
+                <label
+                  htmlFor="new-agent-description"
+                  className="text-sm font-semibold text-foreground"
+                >
+                  Agent 角色描述
+                </label>
+                <p
+                  id="new-agent-description-help"
+                  className="mt-1 text-sm leading-6 text-muted-foreground"
+                >
+                  写清楚主要任务、输出方式或需要特别关注的事项，生成结果会更贴合预期。
+                </p>
+                <Textarea
+                  id="new-agent-description"
+                  aria-describedby="new-agent-description-help"
+                  autoFocus
+                  value={createDescription}
+                  onChange={(event) => setCreateDescription(event.target.value)}
+                  className="mt-4 min-h-[180px] resize-y bg-card p-4 text-base leading-7 shadow-sm"
+                  placeholder="例如：帮我做代码评审，重点关注架构风险、并发问题和测试缺口。输出时先给结论，再按严重程度列出问题和修改建议。"
+                />
+
+                <div className="mt-5">
+                  <div className="text-xs font-medium text-muted-foreground">
+                    可以从这些例子开始
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {[
+                      '做代码评审，关注架构风险和测试缺口',
+                      '整理调研资料，给出有依据的结论和来源',
+                      '把产品想法拆成清晰、可执行的研发任务',
+                    ].map((example) => (
+                      <button
+                        key={example}
+                        type="button"
+                        onClick={() => setCreateDescription(example)}
+                        className="min-h-11 rounded-full border border-border bg-background px-4 py-2 text-left text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        {example}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="mt-8 flex flex-col gap-3 border-t border-border pt-6 sm:flex-row">
+                  <Button
+                    size="lg"
+                    className="min-h-11 justify-center sm:min-w-40"
+                    onClick={handleGenerateDraft}
+                    disabled={generatingDraft || !createDescription.trim()}
+                  >
+                    {generatingDraft ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Wand2 className="h-4 w-4" />
+                    )}
+                    AI 生成配置
+                  </Button>
+                  <Button
+                    size="lg"
+                    variant="outline"
+                    className="min-h-11 justify-center sm:min-w-40"
+                    onClick={handleBlankDraft}
+                  >
+                    <Plus className="h-4 w-4" />
+                    空白创建
+                  </Button>
+                </div>
+              </div>
+            </section>
+          ) : !selected && !draftMode ? (
             <div className="flex min-h-[420px] flex-col items-center justify-center rounded-xl border border-dashed border-border px-6 text-center">
               <div className="grid h-12 w-12 place-items-center rounded-full bg-muted text-muted-foreground">
                 <Bot className="h-5 w-5" />

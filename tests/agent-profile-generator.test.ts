@@ -65,4 +65,20 @@ describe('AgentProfile AI generation', () => {
       tools_prompt: 'Ask before destructive writes',
     });
   });
+
+  test('rejects an oversized generated section instead of silently truncating it', async () => {
+    sdkQuery.mockResolvedValueOnce(
+      JSON.stringify({
+        name: 'Oversized Agent',
+        identity_prompt: 'x'.repeat(20_001),
+        soul_prompt: 'Evidence first',
+        agents_prompt: 'Review diffs',
+        tools_prompt: 'Read before write',
+      }),
+    );
+
+    await expect(generateAgentProfileDraft('make it huge')).rejects.toThrow(
+      '单段提示词超过 20000 字符限制',
+    );
+  });
 });

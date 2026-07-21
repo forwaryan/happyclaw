@@ -19,6 +19,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import type { AgentInfo } from '../../types';
+import { getPresentedMessageContent } from '../../lib/message-presentation';
 
 const RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -79,7 +80,14 @@ function formatSessionTime(value: string): string {
 }
 
 function messagePreview(session: AgentInfo): string {
-  return (session.latest_message?.content || '').replace(/\s+/g, ' ').trim();
+  const content = session.latest_message?.content || '';
+  return getPresentedMessageContent({
+    content,
+    source_kind: null,
+    finalization_reason: null,
+  })
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function isNativeManagedSession(session: AgentInfo): boolean {

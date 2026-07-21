@@ -3,6 +3,13 @@ import path from 'path';
 
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { RegisteredGroup } from './types.js';
+import {
+  reconcileSessionSkills,
+  resolveEffectiveSkills,
+  type EffectiveSkillManifest,
+  type EffectiveSkillLayer,
+  type ManagedSkillPolicy,
+} from './effective-skill-resolver.js';
 
 export interface ClaudeContextPlanArgs {
   executionMode: 'host' | 'container';
@@ -19,6 +26,9 @@ export interface ClaudeContextPlanArgs {
   includeHostClaudeContext?: boolean;
   mountUserSkills?: boolean;
   userSkillsDirOverride?: string;
+  managedSkillPolicy?: ManagedSkillPolicy;
+  workspaceSkillsDirOverride?: string;
+  pluginSkillLayers?: EffectiveSkillLayer[];
   // true 且 admin 原生 ~/.claude/CLAUDE.md 存在时，两套全局记忆并存，触发 audit 告警。
   happyclawMemoryActive?: boolean;
 }
@@ -33,6 +43,8 @@ export interface ClaudeContextPlan {
   builtinSkillsDir: string;
   projectSkillsDir: string;
   userSkillsDir?: string;
+  workspaceSkillsDir: string;
+  effectiveSkills: EffectiveSkillManifest;
   audit: ClaudeContextAudit;
 }
 
@@ -52,17 +64,6 @@ function lexists(p: string): boolean {
     return true;
   } catch {
     return false;
-  }
-}
-
-function countChildDirs(dir: string | undefined): number {
-  if (!exists(dir)) return 0;
-  try {
-    return fs
-      .readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink()).length;
-  } catch {
-    return 0;
   }
 }
 
@@ -138,17 +139,16 @@ export function buildClaudeContextPlan(
   const externalSkillsDir = includeHostClaudeContext
     ? path.join(args.externalClaudeDir, 'skills')
     : undefined;
-  const builtinSkillsDir =
-    args.executionMode === 'container'
-      ? '/opt/builtin-skills'
-      : path.join(args.dataDir, 'builtin-skills');
+  const builtinSkillsDir = path.join(args.dataDir, 'builtin-skills');
   const projectSkillsDir = path.join(args.projectRoot, 'container', 'skills');
   const userSkillsDir =
     args.mountUserSkills !== false && ownerId
       ? (args.userSkillsDirOverride ??
         path.join(args.dataDir, 'skills', ownerId))
       : undefined;
-
+  const workspaceSkillsDir =
+    args.workspaceSkillsDirOverride ??
+    path.join(args.dataDir, 'groups', args.group.folder, '.claude', 'skills');
   const hostClaudeRuntime = args.groupSessionsDir
     ? path.join(args.groupSessionsDir, 'CLAUDE.md')
     : undefined;
@@ -158,6 +158,71 @@ export function buildClaudeContextPlan(
   const hostSkillsRuntime = args.groupSessionsDir
     ? path.join(args.groupSessionsDir, 'skills')
     : undefined;
+  const effectiveSkills = resolveEffectiveSkills({
+    layers: [
+      { source: 'builtin', root: builtinSkillsDir },
+      ...(externalSkillsDir
+        ? [{ source: 'host' as const, root: externalSkillsDir }]
+        : []),
+      { source: 'project', root: projectSkillsDir },
+      ...(userSkillsDir
+        ? [{ source: 'managed' as const, root: userSkillsDir }]
+        : []),
+      { source: 'workspace', root: workspaceSkillsDir },
+      ...(args.pluginSkillLayers ?? []),
+    ],
+    managedPolicy: args.managedSkillPolicy,
+  });
+  const skillAuditNames = {
+    builtin: 'builtin',
+    host: 'external',
+    project: 'project',
+    managed: 'managed',
+    workspace: 'workspace',
+    plugin: 'plugin',
+  } as const;
+  const skillSourceRoots = new Map<keyof typeof skillAuditNames, Set<string>>();
+  for (const candidate of effectiveSkills.candidates) {
+    const roots = skillSourceRoots.get(candidate.source) ?? new Set<string>();
+    roots.add(path.dirname(candidate.path));
+    skillSourceRoots.set(candidate.source, roots);
+  }
+  const configuredSkillRoots: Partial<
+    Record<keyof typeof skillAuditNames, string[]>
+  > = {
+    builtin: [builtinSkillsDir],
+    ...(externalSkillsDir ? { host: [externalSkillsDir] } : {}),
+    project: [projectSkillsDir],
+    ...(userSkillsDir ? { managed: [userSkillsDir] } : {}),
+    workspace: [workspaceSkillsDir],
+    ...(args.pluginSkillLayers?.length
+      ? {
+          plugin: args.pluginSkillLayers.flatMap((layer) =>
+            layer.root ? [layer.root] : [],
+          ),
+        }
+      : {}),
+  };
+  const skillAuditSources = (
+    Object.keys(configuredSkillRoots) as Array<keyof typeof skillAuditNames>
+  ).map((source) => {
+    const roots = [
+      ...(skillSourceRoots.get(source) ?? []),
+      ...(configuredSkillRoots[source] ?? []),
+    ].filter((root, index, all) => all.indexOf(root) === index);
+    return {
+      name: skillAuditNames[source],
+      ...(roots.length === 1 ? { sourcePath: roots[0] } : {}),
+      runtimePath:
+        args.executionMode === 'container'
+          ? source === 'plugin'
+            ? 'options.plugins'
+            : '/workspace/effective-skills'
+          : hostSkillsRuntime,
+      count: effectiveSkills.selected.filter((skill) => skill.source === source)
+        .length,
+    };
+  });
 
   const warnings: string[] = [];
   if (includeHostClaudeContext && !exists(claudeMdSource))
@@ -213,54 +278,11 @@ export function buildClaudeContextPlan(
       fileCount: countRuleFiles(rulesSourceDir),
     },
     skills: {
-      sources: [
-        {
-          name: 'builtin',
-          sourcePath: builtinSkillsDir,
-          runtimePath:
-            args.executionMode === 'container'
-              ? '/home/node/.claude/skills'
-              : hostSkillsRuntime,
-          count: countChildDirs(
-            args.executionMode === 'container' ? undefined : builtinSkillsDir,
-          ),
-        },
-        ...(externalSkillsDir
-          ? [
-              {
-                name: 'external' as const,
-                sourcePath: externalSkillsDir,
-                runtimePath:
-                  args.executionMode === 'container'
-                    ? '/workspace/external-skills'
-                    : hostSkillsRuntime,
-                count: countChildDirs(externalSkillsDir),
-              },
-            ]
-          : []),
-        {
-          name: 'project',
-          sourcePath: projectSkillsDir,
-          runtimePath:
-            args.executionMode === 'container'
-              ? '/workspace/project-skills'
-              : hostSkillsRuntime,
-          count: countChildDirs(projectSkillsDir),
-        },
-        ...(userSkillsDir
-          ? [
-              {
-                name: 'user' as const,
-                sourcePath: userSkillsDir,
-                runtimePath:
-                  args.executionMode === 'container'
-                    ? '/workspace/user-skills'
-                    : hostSkillsRuntime,
-                count: countChildDirs(userSkillsDir),
-              },
-            ]
-          : []),
-      ],
+      totalSkills: effectiveSkills.candidates.length,
+      includedSkills: effectiveSkills.selected.length,
+      manifestHash: effectiveSkills.hash,
+      selectedSkillIds: effectiveSkills.selected.map((skill) => skill.id),
+      sources: skillAuditSources,
     },
     happyclawPrompt: { totalBytes: 0, files: [] },
     warnings,
@@ -276,6 +298,8 @@ export function buildClaudeContextPlan(
     builtinSkillsDir,
     projectSkillsDir,
     userSkillsDir,
+    workspaceSkillsDir,
+    effectiveSkills,
     audit,
   };
 }
@@ -285,25 +309,18 @@ export function syncHostClaudeContext(
   groupSessionsDir: string,
 ): HostClaudeContextSyncResult {
   const warnings = [...plan.audit.warnings];
-  const skillsDir = path.join(groupSessionsDir, 'skills');
-  fs.mkdirSync(skillsDir, { recursive: true });
-  for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
-    if (entry.isSymbolicLink() || entry.isDirectory()) {
-      removePath(path.join(skillsDir, entry.name));
-    }
-  }
-  const includeSkill = (entry: fs.Dirent) =>
-    entry.isDirectory() || entry.isSymbolicLink();
-  // skill 四来源（builtin→external→project→user）合并进同一目录，后序覆盖前序。
-  // 收集同名冲突并写入 warnings，避免静默覆盖（前端 AgentContextPanel 会展示）。
-  const skillConflicts = new Set<string>();
-  const onSkillConflict = (name: string) => skillConflicts.add(name);
-  linkEntries(plan.builtinSkillsDir, skillsDir, includeSkill, onSkillConflict);
-  linkEntries(plan.externalSkillsDir, skillsDir, includeSkill, onSkillConflict);
-  linkEntries(plan.projectSkillsDir, skillsDir, includeSkill, onSkillConflict);
-  linkEntries(plan.userSkillsDir, skillsDir, includeSkill, onSkillConflict);
-  for (const name of skillConflicts) {
+  const skillSync = reconcileSessionSkills(
+    groupSessionsDir,
+    plan.effectiveSkills,
+    { materializeLinks: true },
+  );
+  for (const name of plan.effectiveSkills.conflicts) {
     warnings.push(`skill name conflict: ${name}（后序来源覆盖前序）`);
+  }
+  if (skillSync.quarantined.length > 0) {
+    warnings.push(
+      `quarantined unmanaged session skills: ${skillSync.quarantined.join(', ')}`,
+    );
   }
 
   const rulesDir = path.join(groupSessionsDir, 'rules');

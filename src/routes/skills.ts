@@ -40,6 +40,7 @@ import {
   listFiles,
   scanSkillDirectory,
 } from '../skill-utils.js';
+import { resolveEffectiveSkills } from '../effective-skill-resolver.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_SKILL_INSTALL_BYTES = 64 * 1024 * 1024;
@@ -252,6 +253,24 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
   // Runtime order is host → project → managed-user. Disabled definitions
   // remain inspectable, but cannot shadow an enabled lower-precedence source.
   const result = [...externalSkills, ...projectSkills, ...userSkills];
+  const effectiveManifest = resolveEffectiveSkills({
+    layers: [
+      ...(userRole === 'admin'
+        ? [
+            {
+              source: 'host' as const,
+              root: path.join(getEffectiveExternalDir(), 'skills'),
+            },
+          ]
+        : []),
+      { source: 'project', root: getProjectSkillsDir() },
+      { source: 'managed', root: getUserSkillsDir(userId) },
+    ],
+    managedPolicy: { mode: 'inherit' },
+  });
+  const selectedById = new Map(
+    effectiveManifest.selected.map((skill) => [skill.id, skill]),
+  );
   const sourcesById = new Map<string, Skill['source'][]>();
   for (const skill of result) {
     const sources = sourcesById.get(skill.id) ?? [];
@@ -261,10 +280,17 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
   for (const skill of result) {
     const sources = sourcesById.get(skill.id) ?? [];
     skill.conflictSources = sources.filter((source) => source !== skill.source);
-    const sameId = result.filter((candidate) => candidate.id === skill.id);
-    const effective = sameId.filter((candidate) => candidate.enabled).at(-1);
-    skill.effectiveSource = effective?.source ?? null;
-    skill.effective = effective?.sourceKey === skill.sourceKey;
+    const effective = selectedById.get(skill.id);
+    const effectiveSource =
+      effective?.source === 'managed'
+        ? 'user'
+        : effective?.source === 'host'
+          ? 'external'
+          : effective?.source === 'project'
+            ? 'project'
+            : null;
+    skill.effectiveSource = effectiveSource;
+    skill.effective = effectiveSource === skill.source && skill.enabled;
   }
   return result;
 }

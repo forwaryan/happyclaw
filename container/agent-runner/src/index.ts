@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
@@ -25,6 +26,7 @@ import {
   PreCompactHookInput,
   createSdkMcpServer,
   type Query,
+  type SDKControlGetContextUsageResponse,
 } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
@@ -87,6 +89,9 @@ import {
   AssistantUsageCollector,
   type AssistantUsageBatch,
 } from './assistant-usage.js';
+import { buildHappyClawPromptPlan, type PromptPlan } from './prompt-plan.js';
+import { withHappyClawSubagentContract } from './sdk-compat.js';
+import { assessContextBudget } from './context-budget.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -226,27 +231,18 @@ function resolveBundledClaudeCli(): string | undefined {
 
 const SECURITY_RULES = loadPrompt('security-rules.md');
 const INTERACTION_GUIDELINES = loadPrompt('interaction.md');
-const SKILL_ROUTING_GUIDELINES = loadPrompt('skill-routing.md');
 const OUTPUT_GUIDELINES = loadPrompt('output.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
 const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
-const CONVERSATION_AGENT_GUIDELINES = loadPrompt('agent-override.md');
+const DELIVERY_CONTRACT = loadPrompt('delivery-contract.md');
 const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
 const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
 const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
-
-const GUIDELINES_BLOCK = `<guidelines>\n${OUTPUT_GUIDELINES}\n${WEB_FETCH_GUIDELINES}\n${BACKGROUND_TASK_GUIDELINES}\n</guidelines>`;
-const CONVERSATION_AGENT_BLOCK = `<agent-override>\n${CONVERSATION_AGENT_GUIDELINES}\n</agent-override>`;
 
 // 各渠道共用的格式说明：Web 端始终可看完整渲染，不因来源降级输出。
 // Mermaid 渲染说明已在 output.md（<guidelines>）讲过，此处不重复，channels/*.md 只写各自差异。
 const CHANNEL_FORMAT_COMMON =
   '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown 渲染，因此不要因为消息来源限制输出格式。';
-
-interface PromptPiece {
-  name: string;
-  text: string;
-}
 
 function escapeXmlAttribute(value: string): string {
   return value
@@ -257,59 +253,45 @@ function escapeXmlAttribute(value: string): string {
     .replace(/'/g, '&apos;');
 }
 
-function buildAgentIdentityPromptPiece(
+function buildAgentIdentityPrompt(
   containerInput: ContainerInput,
-): PromptPiece[] {
+): string | undefined {
   const agentProfile = containerInput.agentProfile;
   const profilePrompt = agentProfile?.identityPrompt;
-  if (!agentProfile || !profilePrompt?.trim()) return [];
+  if (!agentProfile || !profilePrompt?.trim()) return undefined;
   const presetBoundary = agentProfile.includeClaudePreset
     ? '、Claude Code 原生提示词'
     : '';
 
   return [
-    {
-      name: 'agent-profile.md',
-      text: [
-        `<agent-identity profile_id="${escapeXmlAttribute(agentProfile.id)}" name="${escapeXmlAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeXmlAttribute(agentProfile.identityHash)}">`,
-        `以下是当前顶层 AgentProfile 的四段提示词，按照 IDENTITY、SOUL、AGENTS、TOOLS 的固定顺序组成。你应该按它塑造身份、价值判断、工作方式和工具偏好，但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束${presetBoundary}和用户的最新明确指令。`,
-        '<profile-prompt>',
-        profilePrompt,
-        '</profile-prompt>',
-        '</agent-identity>',
-      ].join('\n'),
-    },
-  ];
-}
-
-interface SdkContextUsage {
-  memoryFiles?: Array<{ path: string; type?: string; tokens?: number }>;
-  skills?: {
-    includedSkills: number;
-    totalSkills: number;
-    tokens: number;
-    skillFrontmatter?: Array<{ name: string; source: string; tokens: number }>;
-  };
-  systemPromptSections?: Array<{ name: string; tokens: number }>;
-  totalTokens: number;
-  maxTokens: number;
-  percentage: number;
-}
-
-function byteLength(text: string): number {
-  return Buffer.byteLength(text, 'utf-8');
+    `<agent-identity profile_id="${escapeXmlAttribute(agentProfile.id)}" name="${escapeXmlAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeXmlAttribute(agentProfile.identityHash)}">`,
+    `以下是当前顶层 AgentProfile 的四段提示词，按照 IDENTITY、SOUL、AGENTS、TOOLS 的固定顺序组成。你应该按它塑造身份、价值判断、工作方式和工具偏好，但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束${presetBoundary}和用户的最新明确指令。`,
+    '<profile-prompt>',
+    profilePrompt,
+    '</profile-prompt>',
+    '</agent-identity>',
+  ].join('\n');
 }
 
 function buildPromptAudit(
-  pieces: PromptPiece[],
+  plan: PromptPlan,
 ): ClaudeContextAudit['happyclawPrompt'] {
-  const files = pieces.map((piece) => ({
-    name: piece.name,
-    bytes: byteLength(piece.text),
-  }));
   return {
-    files,
-    totalBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+    planHash: plan.hash,
+    totalBytes: plan.totalBytes,
+    estimatedTokens: plan.estimatedTokens,
+    files: plan.blocks.map((block) => ({
+      name: block.id,
+      id: block.id,
+      version: block.version,
+      scope: block.scope,
+      owner: block.owner,
+      required: block.required,
+      condition: block.condition,
+      hash: block.hash,
+      bytes: block.bytes,
+      estimatedTokens: block.estimatedTokens,
+    })),
   };
 }
 
@@ -322,6 +304,19 @@ function runtimeContextAuditBase(
 ): ClaudeContextAudit {
   return {
     executionMode: containerInput.contextAudit?.executionMode ?? 'container',
+    agentProfile: containerInput.agentProfile
+      ? {
+          id: containerInput.agentProfile.id,
+          version: containerInput.agentProfile.version,
+          identityHash: containerInput.agentProfile.identityHash,
+          runtimePolicyHash: createHash('sha256')
+            .update(
+              JSON.stringify(containerInput.agentProfile.runtimePolicy ?? null),
+              'utf8',
+            )
+            .digest('hex'),
+        }
+      : undefined,
     cwd: WORKSPACE_GROUP,
     claudeConfigDir: process.env.CLAUDE_CONFIG_DIR,
     externalClaudeDir: containerInput.contextAudit?.externalClaudeDir,
@@ -330,7 +325,21 @@ function runtimeContextAuditBase(
       status: 'unknown',
       fileCount: 0,
     },
-    skills: containerInput.contextAudit?.skills ?? { sources: [] },
+    skills: {
+      ...(containerInput.contextAudit?.skills ?? { sources: [] }),
+      manifestHash:
+        containerInput.skillManifest?.hash ??
+        containerInput.contextAudit?.skills.manifestHash,
+      selectedSkillIds:
+        containerInput.skillManifest?.selectedSkillIds ??
+        containerInput.contextAudit?.skills.selectedSkillIds,
+    },
+    mcp: containerInput.contextAudit?.mcp
+      ? {
+          manifestHash: containerInput.contextAudit.mcp.manifestHash,
+          serverIds: [...containerInput.contextAudit.mcp.serverIds],
+        }
+      : undefined,
     happyclawPrompt: containerInput.contextAudit?.happyclawPrompt ?? {
       totalBytes: 0,
       files: [],
@@ -343,15 +352,20 @@ function classifySkillSource(
   source: string,
 ): ClaudeContextAudit['skills']['sources'][number]['name'] {
   if (source.includes('/opt/builtin-skills')) return 'builtin';
-  if (source.includes('/external-skills') || source.includes('/.claude/skills'))
-    return 'external';
+  if (source.includes('/external-skills')) return 'external';
+  if (
+    source.includes('/workspace-skills') ||
+    source.includes('/workspace/group/.claude/skills')
+  )
+    return 'workspace';
   if (
     source.includes('/project-skills') ||
     source.includes('/container/skills')
   )
     return 'project';
   if (source.includes('/user-skills') || source.includes('/data/skills/'))
-    return 'user';
+    return 'managed';
+  if (source.includes('/.claude/skills')) return 'user';
   if (source.includes('/plugins/')) return 'plugin';
   return 'unknown';
 }
@@ -368,7 +382,7 @@ function pathMatches(candidate: string, expected?: string): boolean {
 function enrichContextAudit(
   baseAudit: ClaudeContextAudit,
   promptAudit: ClaudeContextAudit['happyclawPrompt'],
-  ctxUsage?: SdkContextUsage,
+  ctxUsage?: SDKControlGetContextUsageResponse,
 ): ClaudeContextAudit {
   const audit: ClaudeContextAudit = {
     ...baseAudit,
@@ -388,6 +402,8 @@ function enrichContextAudit(
     audit.warnings.push('SDK context usage unavailable');
     return audit;
   }
+
+  audit.sdkContextUsage = ctxUsage;
 
   const memoryFiles = ctxUsage.memoryFiles ?? [];
   const claudeMemory = memoryFiles.find(
@@ -1566,6 +1582,12 @@ async function runQuery(
   interruptedDuringQuery: boolean;
   cancelledIpcReceipts?: IpcDeliveryReceipt[];
   sessionResumeFailed?: boolean;
+  contextBudgetExceeded?: {
+    startupTokens: number;
+    maxTokens: number;
+    hardThreshold: number;
+    message: string;
+  };
   pipedMessagesDuringQuery: IpcInputMessage[];
   suspectTruncatedTail?: string;
 }> {
@@ -1887,60 +1909,59 @@ async function runQuery(
   const channel = getChannelFromJid(containerInput.chatJid);
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
   const memoryPromptName = isHome
-    ? 'memory-system.home.md'
-    : 'memory-system.guest.md';
-
-  const promptPieces: PromptPiece[] = [
-    // Agent identity must lead the workspace/context prompt material per
-    // docs/agent-first-architecture-plan.md's documented composition order
-    // ("Claude Code preset + Agent identity prompt + workspace/context
-    // prompt + message history") — the Agent's persona should not be
-    // subordinated to HappyClaw's own generic interaction guidance.
-    ...buildAgentIdentityPromptPiece(containerInput),
-    {
-      name: 'interaction.md',
-      text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
-    },
-    {
-      name: 'skill-routing.md',
-      text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
-    },
-    {
-      name: 'security-rules.md',
-      text: `<security>\n${buildSecurityRulesPrompt()}\n</security>`,
-    },
-    ...(memoryRecall
-      ? [
-          {
-            name: memoryPromptName,
-            text: `<memory-system>\n${memoryRecall}\n</memory-system>`,
+    ? 'memory-system.home'
+    : 'memory-system.guest';
+  const hasMemoryTools = allowedTools.some(
+    (tool) =>
+      tool === 'mcp__happyclaw__*' ||
+      tool === 'mcp__happyclaw__memory_search' ||
+      tool === 'mcp__happyclaw__memory_get' ||
+      tool === 'mcp__happyclaw__memory_append',
+  );
+  const hasWebTools = allowedTools.some(
+    (tool) => tool === 'WebSearch' || tool === 'WebFetch',
+  );
+  const hasBackgroundTaskTools =
+    allowedTools.includes('Task') && allowedTools.includes('TaskOutput');
+  const promptPlan = buildHappyClawPromptPlan({
+    // Agent identity leads platform workspace/context material per the
+    // documented Agent-first composition order.
+    agentIdentity: buildAgentIdentityPrompt(containerInput),
+    interaction: INTERACTION_GUIDELINES,
+    security: buildSecurityRulesPrompt(),
+    ...(memoryRecall && hasMemoryTools
+      ? {
+          memory: {
+            id: memoryPromptName,
+            text: memoryRecall,
           },
-        ]
-      : []),
+        }
+      : {}),
     ...(agentBuilderEnabled &&
     !containerInput.isScheduledTask &&
     !containerInput.messageTaskId
-      ? [
-          {
-            name: 'agent-builder.md',
-            text: `<agent-builder>\n${AGENT_BUILDER_GUIDELINES}\n</agent-builder>`,
-          },
-        ]
-      : []),
-    { name: 'guidelines', text: GUIDELINES_BLOCK },
+      ? { agentBuilder: AGENT_BUILDER_GUIDELINES }
+      : {}),
+    output: OUTPUT_GUIDELINES,
+    ...(hasWebTools ? { web: WEB_FETCH_GUIDELINES } : {}),
+    ...(hasBackgroundTaskTools
+      ? { backgroundTasks: BACKGROUND_TASK_GUIDELINES }
+      : {}),
     ...(channelGuidelines
-      ? [
-          {
-            name: `channels/${channel}.md`,
-            text: `<channel-format>\n${channelGuidelines}\n${CHANNEL_FORMAT_COMMON}\n</channel-format>`,
+      ? {
+          channel: {
+            id: channel,
+            text: `${channelGuidelines}\n${CHANNEL_FORMAT_COMMON}`,
           },
-        ]
-      : []),
-    ...(containerInput.agentId
-      ? [{ name: 'agent-override.md', text: CONVERSATION_AGENT_BLOCK }]
-      : []),
-  ];
-  const systemPromptAppend = promptPieces.map((piece) => piece.text).join('\n');
+        }
+      : {}),
+    ...(containerInput.agentId ? { deliveryContract: DELIVERY_CONTRACT } : {}),
+  });
+  for (const warning of promptPlan.warnings) log(`[WARN] ${warning}`);
+  if (promptPlan.errors.length > 0) {
+    throw new Error(`prompt_plan_invalid: ${promptPlan.errors.join('; ')}`);
+  }
+  const systemPromptAppend = promptPlan.text;
   const includeClaudePreset =
     containerInput.agentProfile?.includeClaudePreset ?? true;
   const systemPrompt = includeClaudePreset
@@ -1950,7 +1971,7 @@ async function runQuery(
         append: systemPromptAppend,
       }
     : systemPromptAppend;
-  const promptAudit = buildPromptAudit(promptPieces);
+  const promptAudit = buildPromptAudit(promptPlan);
   const contextAuditBase = runtimeContextAuditBase(containerInput);
 
   // 调试观察：HAPPYCLAW_DUMP_PROMPT=true 时把最终 system prompt 输出到 stderr
@@ -2092,61 +2113,63 @@ async function runQuery(
     : {};
 
   try {
+    const sdkCompat = withHappyClawSubagentContract({
+      ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
+      ...CLAUDE_PROVIDER_RUNTIME.queryModelOptions,
+      cwd: WORKSPACE_GROUP,
+      additionalDirectories: extraDirs,
+      resume: sessionId,
+      ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
+      systemPrompt,
+      allowedTools,
+      ...(effectiveDisallowedTools && {
+        disallowedTools: effectiveDisallowedTools,
+      }),
+      thinking: { type: 'adaptive' as const, display: 'summarized' as const },
+      permissionMode: 'bypassPermissions' as const,
+      allowDangerouslySkipPermissions: true,
+      agentProgressSummaries: true,
+      settingSources: activeAgentMcpPolicy.settingSources,
+      // New hosts pass the canonical manifest. Undefined preserves compatibility
+      // with older hosts; an explicit [] intentionally enables no Skills.
+      skills:
+        containerInput.skillManifest?.selectedSkillIds ?? ('all' as const),
+      includePartialMessages: true,
+      // Forward sub-agent (Task) text/thinking as stream events so the card's
+      // sub-agent transcript lights up live instead of only filling in when the
+      // Task completes.
+      forwardSubagentText: true,
+      ...(Object.keys(flagSettings).length > 0
+        ? { settings: flagSettings as any }
+        : {}),
+      ...(userPlugins && { plugins: userPlugins }),
+      ...(activeAgentMcpPolicy.strictMcpConfig
+        ? { strictMcpConfig: true }
+        : {}),
+      mcpServers: {
+        ...userMcpServers,
+        happyclaw: mcpServerConfig,
+      },
+      hooks: {
+        PreCompact: [
+          {
+            hooks: [
+              createPreCompactHook(isHome, isAdminHome, {
+                emit,
+                getFullText: () => processor.getFullText(),
+                resetFullText: () => processor.resetFullTextAccumulator(),
+              }),
+            ],
+          },
+        ],
+      },
+    });
+    log(
+      `Subagent runtime contract: ${sdkCompat.audit.enabled ? 'enabled' : 'disabled'} (${sdkCompat.audit.hash.slice(0, 12)})`,
+    );
     const q = query({
       prompt: stream,
-      options: {
-        ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
-        ...CLAUDE_PROVIDER_RUNTIME.queryModelOptions,
-        cwd: WORKSPACE_GROUP,
-        additionalDirectories: extraDirs,
-        resume: sessionId,
-        ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
-        systemPrompt,
-        allowedTools,
-        ...(effectiveDisallowedTools && {
-          disallowedTools: effectiveDisallowedTools,
-        }),
-        thinking: { type: 'adaptive' as const, display: 'summarized' as const },
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        agentProgressSummaries: true,
-        settingSources: activeAgentMcpPolicy.settingSources,
-        // 启用全部已发现的技能到主会话。SDK 0.3.x 起 skills 是"打开技能的唯一正确位置"
-        // （用了它就无需再往 allowedTools 塞已废弃的 'Skill'）。'all' = 启用所有发现的技能，
-        // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
-        skills: 'all',
-        includePartialMessages: true,
-        // Forward sub-agent (Task) text/thinking as stream events so the card's
-        // sub-agent transcript lights up live instead of only filling in when the
-        // Task completes. The stream-processor already renders these
-        // (agentScope:'subagent' deltas, stream-processor.ts ~979); this flag is
-        // what actually makes the SDK emit them.
-        forwardSubagentText: true,
-        ...(Object.keys(flagSettings).length > 0
-          ? { settings: flagSettings as any }
-          : {}),
-        ...(userPlugins && { plugins: userPlugins }),
-        ...(activeAgentMcpPolicy.strictMcpConfig
-          ? { strictMcpConfig: true }
-          : {}),
-        mcpServers: {
-          ...userMcpServers, // 用户配置的 MCP（stdio/http/sse），SDK 原生支持
-          happyclaw: mcpServerConfig, // 内置 SDK MCP 放最后，确保不被同名覆盖
-        },
-        hooks: {
-          PreCompact: [
-            {
-              hooks: [
-                createPreCompactHook(isHome, isAdminHome, {
-                  emit,
-                  getFullText: () => processor.getFullText(),
-                  resetFullText: () => processor.resetFullTextAccumulator(),
-                }),
-              ],
-            },
-          ],
-        },
-      },
+      options: sdkCompat.options,
     });
     queryRef = q;
     if (shouldInterrupt()) {
@@ -2379,9 +2402,11 @@ async function runQuery(
         // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
         // error logs on older SDK versions where the method is absent.
         const getCtxUsage = (
-          q as unknown as { getContextUsage?: () => Promise<SdkContextUsage> }
+          q as unknown as {
+            getContextUsage?: () => Promise<SDKControlGetContextUsageResponse>;
+          }
         ).getContextUsage;
-        let contextUsage: SdkContextUsage | undefined;
+        let contextUsage: SDKControlGetContextUsageResponse | undefined;
         if (typeof getCtxUsage === 'function') {
           try {
             contextUsage = await getCtxUsage.call(q);
@@ -2404,6 +2429,13 @@ async function runQuery(
           promptAudit,
           contextUsage,
         );
+        contextAudit.subagentContract = sdkCompat.audit;
+        const contextBudget = assessContextBudget(contextUsage);
+        contextAudit.contextBudget = contextBudget;
+        if (contextBudget.warning) {
+          contextAudit.warnings.push(contextBudget.warning);
+          log(`[WARN] ${contextBudget.warning}`);
+        }
         // 1M 上下文缩水告警：带 [1m] 后缀的模型期望约 1M 上下文窗口，若 SDK / 模型资格判定
         // 静默退回（例如 200K），在此立即暴露而非等到溢出。push 进 warnings 会让下方
         // emit 的 displayLevel 自动升为 'primary'，在前端醒目展示。
@@ -2433,6 +2465,31 @@ async function runQuery(
             contextAudit,
           },
         });
+        if (
+          contextBudget.status === 'hard_exceeded' &&
+          contextBudget.startupTokens !== undefined &&
+          contextBudget.maxTokens !== undefined &&
+          contextBudget.hardThreshold !== undefined
+        ) {
+          const message =
+            contextBudget.error ?? 'startup context budget exceeded';
+          log(`[ERROR] ${message}`);
+          stream.end();
+          return {
+            newSessionId,
+            lastAssistantUuid,
+            closedDuringQuery,
+            interruptedDuringQuery,
+            cancelledIpcReceipts,
+            pipedMessagesDuringQuery,
+            contextBudgetExceeded: {
+              startupTokens: contextBudget.startupTokens,
+              maxTokens: contextBudget.maxTokens,
+              hardThreshold: contextBudget.hardThreshold,
+              message,
+            },
+          };
+        }
       }
 
       if (message.type === 'result') {
@@ -3048,6 +3105,19 @@ async function main(): Promise<void> {
       }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
+      }
+
+      // A startup-context hard limit is a deterministic configuration error,
+      // not a transient provider/context-overflow failure. Surface the stable
+      // code once so the host can avoid retrying the same immutable snapshot.
+      if (queryResult.contextBudgetExceeded) {
+        writeOutput({
+          status: 'error',
+          result: null,
+          error: `context_budget_exceeded: ${queryResult.contextBudgetExceeded.message}`,
+          newSessionId: sessionId,
+        });
+        process.exit(1);
       }
 
       // Session resume 失败（SDK 无法恢复旧会话）：清除 session，以新会话重试

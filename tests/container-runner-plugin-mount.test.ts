@@ -261,8 +261,8 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'skills'),
-      containerPath: '/workspace/external-skills',
+      hostPath: path.join(external, 'skills', 'admin-skill'),
+      containerPath: '/workspace/effective-skills/admin-skill',
       readonly: true,
     });
   });
@@ -323,10 +323,10 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       mounts.some(
         (mount) => mount.containerPath === '/workspace/project-skills',
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       mounts.some((mount) => mount.containerPath === '/workspace/user-skills'),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 
@@ -394,19 +394,70 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       },
     );
 
-    const userSkillsMount = mounts.find(
-      (mount) => mount.containerPath === '/workspace/user-skills',
-    );
-    expect(userSkillsMount).toBeTruthy();
-    expect(fs.existsSync(path.join(userSkillsMount!.hostPath, 'review'))).toBe(
-      true,
-    );
     expect(
-      fs.existsSync(path.join(userSkillsMount!.hostPath, 'research')),
+      mounts.find(
+        (mount) => mount.containerPath === '/workspace/effective-skills/review',
+      ),
+    ).toMatchObject({
+      hostPath: path.join(sourceRoot, 'review'),
+      readonly: true,
+    });
+    expect(
+      mounts.some(
+        (mount) =>
+          mount.containerPath === '/workspace/effective-skills/research',
+      ),
     ).toBe(false);
   });
 
-  test('custom skill runtimes are immutable and isolated by profile version', () => {
+  test('container startup quarantines a persistent session Skill ghost', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    fs.mkdirSync(path.join(sourceRoot, 'selected'), { recursive: true });
+    fs.writeFileSync(
+      path.join(sourceRoot, 'selected', 'SKILL.md'),
+      '# selected',
+    );
+    const folder = 'grp-session-ghost';
+    const sessionClaudeDir = path.join(
+      tmpDataDir,
+      'sessions',
+      folder,
+      '.claude',
+    );
+    fs.mkdirSync(path.join(sessionClaudeDir, 'skills', 'ghost'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(sessionClaudeDir, 'skills', 'ghost', 'SKILL.md'),
+      '# ghost',
+    );
+
+    const mounts = buildVolumeMounts(
+      fakeGroup(folder, USER) as any,
+      false,
+      true,
+    );
+
+    expect(fs.existsSync(path.join(sessionClaudeDir, 'skills', 'ghost'))).toBe(
+      false,
+    );
+    const quarantined = fs
+      .readdirSync(path.join(sessionClaudeDir, 'orphaned-skills'))
+      .flatMap((timestamp) =>
+        fs.readdirSync(
+          path.join(sessionClaudeDir, 'orphaned-skills', timestamp),
+        ),
+      );
+    expect(quarantined).toContain('ghost');
+    expect(
+      mounts.find(
+        (mount) =>
+          mount.containerPath === '/workspace/effective-skills/selected',
+      ),
+    ).toMatchObject({ hostPath: path.join(sourceRoot, 'selected') });
+  });
+
+  test('custom Skill profiles expose only the selected per-Skill mount', () => {
     const sourceRoot = path.join(tmpDataDir, 'skills', USER);
     fs.mkdirSync(path.join(sourceRoot, 'review'), { recursive: true });
     fs.writeFileSync(path.join(sourceRoot, 'review', 'SKILL.md'), '# review');
@@ -446,18 +497,19 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       undefined,
       profile(2),
     );
-    const v1 = v1Mounts.find(
-      (mount) => mount.containerPath === '/workspace/user-skills',
-    )!;
-    const v2 = v2Mounts.find(
-      (mount) => mount.containerPath === '/workspace/user-skills',
-    )!;
-
-    expect(v1.hostPath).not.toBe(v2.hostPath);
-    expect(v1.hostPath).toContain(`${path.sep}v1${path.sep}`);
-    expect(v2.hostPath).toContain(`${path.sep}v2${path.sep}`);
-    expect(fs.existsSync(path.join(v1.hostPath, 'review'))).toBe(true);
-    expect(fs.existsSync(path.join(v2.hostPath, 'review'))).toBe(true);
+    for (const mounts of [v1Mounts, v2Mounts]) {
+      expect(
+        mounts.find(
+          (mount) =>
+            mount.containerPath === '/workspace/effective-skills/review',
+        ),
+      ).toMatchObject({ hostPath: path.join(sourceRoot, 'review') });
+      expect(
+        mounts.some(
+          (mount) => mount.containerPath === '/workspace/user-skills',
+        ),
+      ).toBe(false);
+    }
   });
 
   test('custom skill policy fails closed when a selected skill is deleted', () => {
@@ -676,20 +728,20 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
       },
     );
 
+    for (const id of ['native-a', 'native-b', 'managed-a']) {
+      expect(
+        mounts.find(
+          (mount) =>
+            mount.containerPath === `/workspace/effective-skills/${id}`,
+        ),
+      ).toBeTruthy();
+    }
     expect(
-      mounts.find(
-        (mount) => mount.containerPath === '/workspace/external-skills',
-      )?.hostPath,
-    ).toBe(path.join(external, 'skills'));
-    const managedMount = mounts.find(
-      (mount) => mount.containerPath === '/workspace/user-skills',
-    )!;
-    expect(fs.existsSync(path.join(managedMount.hostPath, 'managed-a'))).toBe(
-      true,
-    );
-    expect(fs.existsSync(path.join(managedMount.hostPath, 'managed-b'))).toBe(
-      false,
-    );
+      mounts.some(
+        (mount) =>
+          mount.containerPath === '/workspace/effective-skills/managed-b',
+      ),
+    ).toBe(false);
     const settings = JSON.parse(
       fs.readFileSync(
         path.join(

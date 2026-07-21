@@ -22,6 +22,8 @@ import type {
   AgentProfileRuntimePolicy,
   AgentProfileWorkspace,
   EffectiveCapabilityEntry,
+  RunContextSnapshot,
+  RunContextStatus,
 } from '@/types';
 import { capabilitySourceLabel } from '@/utils/capability-sources';
 
@@ -36,6 +38,9 @@ export function EffectiveCapabilitiesPreview({
 }) {
   const [workspaceJid, setWorkspaceJid] = useState('none');
   const [preview, setPreview] = useState<AgentCapabilityPreview | null>(null);
+  const [runContext, setRunContext] = useState<RunContextSnapshot | null>(null);
+  const [runContextStatus, setRunContextStatus] =
+    useState<RunContextStatus>('none');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSequence = useRef(0);
@@ -58,14 +63,22 @@ export function EffectiveCapabilitiesPreview({
     setLoading(true);
     setError(null);
     try {
-      const result = await api.post<{ preview: AgentCapabilityPreview }>(
+      const result = await api.post<{
+        preview: AgentCapabilityPreview;
+        run_context: RunContextSnapshot | null;
+        run_context_status: RunContextStatus;
+      }>(
         `/api/agent-profiles/${encodeURIComponent(profileId)}/effective-capabilities`,
         {
           runtime_policy: runtimePolicy,
           workspace_jid: workspaceJid === 'none' ? undefined : workspaceJid,
         },
       );
-      if (sequence === requestSequence.current) setPreview(result.preview);
+      if (sequence === requestSequence.current) {
+        setPreview(result.preview);
+        setRunContext(result.run_context);
+        setRunContextStatus(result.run_context_status);
+      }
     } catch (cause) {
       if (sequence === requestSequence.current) {
         setError(
@@ -160,6 +173,11 @@ export function EffectiveCapabilitiesPreview({
               entries={preview.mcp.entries}
               conflicts={preview.mcp.conflicts}
             />
+            <RunContextRow
+              snapshot={runContext}
+              status={runContextStatus}
+              workspaceSelected={workspaceJid !== 'none'}
+            />
             <div className="space-y-1 py-3">
               {preview.notes.map((note) => (
                 <p
@@ -174,6 +192,171 @@ export function EffectiveCapabilitiesPreview({
         ) : null}
       </div>
     </section>
+  );
+}
+
+function compactNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '未知';
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(
+    value,
+  );
+}
+
+function RunContextRow({
+  snapshot,
+  status,
+  workspaceSelected,
+}: {
+  snapshot: RunContextSnapshot | null;
+  status: RunContextStatus;
+  workspaceSelected: boolean;
+}) {
+  if (!snapshot) {
+    return (
+      <PreviewRow label="最近真实运行">
+        <span className="text-xs leading-5 text-muted-foreground">
+          {workspaceSelected
+            ? '这个工作区还没有可用的运行快照；发送一条消息后刷新即可查看。'
+            : '选择一个工作区后，可查看真实请求实际加载的提示词、Skill 和上下文总预算。'}
+        </span>
+      </PreviewRow>
+    );
+  }
+
+  const usage = snapshot.sdkContext;
+  const isStale = status === 'stale_profile' || status === 'stale_config';
+  const budgetLabel =
+    snapshot.budget?.status === 'hard_exceeded'
+      ? '超过硬限制'
+      : snapshot.budget?.status === 'warning'
+        ? '接近预算'
+        : snapshot.budget?.status === 'ok'
+          ? '预算正常'
+          : '预算未知';
+
+  return (
+    <PreviewRow label="最近真实运行">
+      <div className="min-w-0 flex-1 space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          {isStale && (
+            <Badge variant="destructive">
+              {status === 'stale_profile'
+                ? '来自旧 Agent 配置'
+                : '来自旧能力配置'}
+            </Badge>
+          )}
+          <Badge
+            variant={
+              snapshot.budget?.status === 'hard_exceeded'
+                ? 'destructive'
+                : 'secondary'
+            }
+          >
+            {budgetLabel}
+          </Badge>
+          <span className="text-xs text-muted-foreground">
+            {usage
+              ? `总上下文 ${compactNumber(usage.totalTokens)} / ${compactNumber(usage.maxTokens)} tokens（${usage.percentage.toFixed(1)}%）`
+              : 'SDK 未返回总上下文用量'}
+          </span>
+          {usage && (
+            <span className="text-xs text-muted-foreground">
+              MCP {usage.mcpTools.length} 个 ·{' '}
+              {compactNumber(
+                usage.mcpTools.reduce((sum, tool) => sum + tool.tokens, 0),
+              )}{' '}
+              tokens
+            </span>
+          )}
+          {snapshot.budget?.startupTokens !== undefined && (
+            <span className="text-xs text-muted-foreground">
+              静态启动 {compactNumber(snapshot.budget.startupTokens)} /{' '}
+              {compactNumber(snapshot.budget.hardThreshold)} tokens
+            </span>
+          )}
+          <span className="text-xs text-muted-foreground">
+            {new Date(snapshot.capturedAt).toLocaleString('zh-CN')}
+          </span>
+        </div>
+
+        <dl className="grid gap-2 sm:grid-cols-3">
+          <div className="rounded-lg bg-muted/50 px-3 py-2">
+            <dt className="text-[11px] text-muted-foreground">平台提示词</dt>
+            <dd className="mt-1 text-xs font-medium text-foreground">
+              {compactNumber(snapshot.prompt.estimatedTokens)} tokens ·{' '}
+              {snapshot.prompt.blocks.length} 个区块
+            </dd>
+          </div>
+          <div className="rounded-lg bg-muted/50 px-3 py-2">
+            <dt className="text-[11px] text-muted-foreground">Skills</dt>
+            <dd className="mt-1 text-xs font-medium text-foreground">
+              {compactNumber(snapshot.skills.included)} /{' '}
+              {compactNumber(snapshot.skills.total)} 已加载 ·{' '}
+              {compactNumber(snapshot.skills.tokens)} tokens
+            </dd>
+            {snapshot.skills.manifestHash && (
+              <div className="mt-1 text-[10px] text-muted-foreground">
+                Manifest {snapshot.skills.manifestHash.slice(0, 10)} ·{' '}
+                {snapshot.skills.selectedSkillIds.length} IDs
+              </div>
+            )}
+          </div>
+          <div className="rounded-lg bg-muted/50 px-3 py-2">
+            <dt className="text-[11px] text-muted-foreground">Rules</dt>
+            <dd className="mt-1 text-xs font-medium text-foreground">
+              {compactNumber(snapshot.rules.loaded)} /{' '}
+              {compactNumber(snapshot.rules.discovered)} 已加载
+            </dd>
+          </div>
+        </dl>
+
+        {snapshot.prompt.blocks.length > 0 && (
+          <div>
+            <div className="text-[11px] font-medium text-muted-foreground">
+              Prompt Plan
+              {snapshot.prompt.planHash
+                ? ` · ${snapshot.prompt.planHash.slice(0, 10)}`
+                : ''}
+            </div>
+            <div className="mt-1 flex max-h-28 flex-wrap gap-1.5 overflow-y-auto">
+              {snapshot.prompt.blocks.map((block) => (
+                <Badge
+                  key={`${block.id}-${block.hash ?? block.version ?? 0}`}
+                  variant="outline"
+                  title={
+                    [block.condition, block.hash ? `hash ${block.hash}` : null]
+                      .filter(Boolean)
+                      .join(' · ') || undefined
+                  }
+                >
+                  {block.id} · {block.owner ?? 'unknown'} ·{' '}
+                  {compactNumber(block.estimatedTokens)} tokens
+                </Badge>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {snapshot.subagentContract?.enabled && (
+          <p className="text-[11px] leading-5 text-muted-foreground">
+            Subagent 运行契约已启用 ·{' '}
+            {snapshot.subagentContract.hash.slice(0, 10)} · SDK{' '}
+            {snapshot.subagentContract.sdkCompatibility}
+          </p>
+        )}
+        {snapshot.mcp.manifestHash && (
+          <p className="text-[11px] leading-5 text-muted-foreground">
+            MCP Manifest · {snapshot.mcp.manifestHash.slice(0, 10)} ·{' '}
+            {snapshot.mcp.serverIds.length} servers
+          </p>
+        )}
+        {snapshot.warnings.length > 0 && (
+          <p className="text-[11px] leading-5 text-warning">
+            {snapshot.warnings.join('；')}
+          </p>
+        )}
+      </div>
+    </PreviewRow>
   );
 }
 

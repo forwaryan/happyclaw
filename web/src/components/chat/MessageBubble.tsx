@@ -28,9 +28,12 @@ import { getPresentedMessageContent } from '../../lib/message-presentation';
 import { getMessageDisplayTimestamp } from '../../lib/message-timeline';
 import {
   getAuthoritativeTokenBreakdown,
+  getDisplayedTokenTotal,
   getPrimaryModelUsage,
   parseTokenUsage,
 } from '../../lib/token-usage-presentation';
+import { WorkflowRunCard } from './WorkflowRunCard';
+import type { WorkflowRunSnapshot } from '../../stream-event.types';
 
 const ShareImageDialog = lazy(() =>
   import('./ShareImageDialog').then((m) => ({ default: m.ShareImageDialog })),
@@ -107,7 +110,13 @@ function ReasoningBlock({
 }
 
 /** Parse and display token usage for AI messages */
-function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
+function TokenUsageDisplay({
+  tokenUsageJson,
+  workflowRuns = [],
+}: {
+  tokenUsageJson: string;
+  workflowRuns?: WorkflowRunSnapshot[];
+}) {
   const usage = parseTokenUsage(tokenUsageJson);
 
   if (!usage) return null;
@@ -115,6 +124,16 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
   // 主模型 = 费用最高的（即用户指定的模型），内部模型不向用户展示
   const primary = getPrimaryModelUsage(usage);
   const breakdown = getAuthoritativeTokenBreakdown(usage);
+  const workflowTokens = workflowRuns.reduce(
+    (total, run) => total + (run.totalTokens || 0),
+    0,
+  );
+  // Workflow subagents are billed outside the main assistant-message usage
+  // payload. Present both authorities together instead of showing a false 0.
+  const displayTotal = getDisplayedTokenTotal(
+    usage,
+    workflowRuns.map((run) => run.totalTokens),
+  );
 
   const formatNum = (n: number): string => {
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -124,17 +143,19 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
 
   const summaryContent = (
     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
-      <span>{formatNum(breakdown.totalTokens)} tokens</span>
+      {displayTotal > 0 && <span>{formatNum(displayTotal)} tokens</span>}
       {usage.durationMs ? (
         <>
-          <span className="opacity-40">·</span>
+          {displayTotal > 0 && <span className="opacity-40">·</span>}
           <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
         </>
       ) : null}
     </span>
   );
 
-  const hasDetails = breakdown.totalTokens > 0 || primary !== null;
+  if (displayTotal === 0 && !usage.durationMs) return null;
+
+  const hasDetails = displayTotal > 0 || primary !== null;
 
   if (!hasDetails) {
     return <div className="mt-1.5">{summaryContent}</div>;
@@ -152,10 +173,17 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
                   主模型：{primary[0]}
                 </div>
               )}
-              <div>
-                输入 {formatNum(breakdown.inputTokens)} / 输出{' '}
-                {formatNum(breakdown.outputTokens)}
-              </div>
+              {breakdown.totalTokens > 0 && (
+                <div>
+                  输入 {formatNum(breakdown.inputTokens)} / 输出{' '}
+                  {formatNum(breakdown.outputTokens)}
+                </div>
+              )}
+              {workflowTokens > 0 && (
+                <div className="opacity-70">
+                  Workflow Agent 合计 {formatNum(workflowTokens)}
+                </div>
+              )}
               {(breakdown.cacheReadInputTokens > 0 ||
                 breakdown.cacheCreationInputTokens > 0 ||
                 breakdown.reasoningTokens > 0) && (
@@ -221,6 +249,9 @@ export const MessageBubble = memo(
     const { mode: displayMode } = useDisplayMode();
     const isUser = !message.is_from_me;
     const presentedContent = getPresentedMessageContent(message);
+    const completedWorkflowRuns = message.workflow_runs?.filter(
+      (run) => run.status !== 'running',
+    );
     const presentedMessage =
       presentedContent === message.content
         ? message
@@ -430,6 +461,11 @@ export const MessageBubble = memo(
             )}
           </div>
 
+          {/* Dynamic Workflow */}
+          {completedWorkflowRuns?.map((run) => (
+            <WorkflowRunCard key={run.taskId} run={run} />
+          ))}
+
           {/* Reasoning */}
           {thinkingContent && (
             <ReasoningBlock
@@ -474,7 +510,10 @@ export const MessageBubble = memo(
 
           {/* Token usage (compact mode) */}
           {isAI && message.token_usage && (
-            <TokenUsageDisplay tokenUsageJson={message.token_usage} />
+            <TokenUsageDisplay
+              tokenUsageJson={message.token_usage}
+              workflowRuns={completedWorkflowRuns}
+            />
           )}
 
           {lightboxState && (
@@ -623,6 +662,10 @@ export const MessageBubble = memo(
 
             {/* Claude-style: no card container, direct content */}
             <div className="overflow-hidden font-serif">
+              {completedWorkflowRuns?.map((run) => (
+                <WorkflowRunCard key={run.taskId} run={run} />
+              ))}
+
               {/* Reasoning block — muted left border style */}
               {thinkingContent && (
                 <ReasoningBlock
@@ -661,7 +704,10 @@ export const MessageBubble = memo(
 
               {/* Token usage */}
               {message.is_from_me && message.token_usage && (
-                <TokenUsageDisplay tokenUsageJson={message.token_usage} />
+                <TokenUsageDisplay
+                  tokenUsageJson={message.token_usage}
+                  workflowRuns={completedWorkflowRuns}
+                />
               )}
             </div>
 

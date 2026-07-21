@@ -31,8 +31,10 @@ import {
   buildInterruptedReply,
   buildSteeredReply,
   buildStoppedReply,
+  stripRedundantCompletionPreamble,
 } from './reply-finalization.js';
 export { buildInterruptedReply } from './reply-finalization.js';
+import { resolveTurnOutcome } from './turn-outcome.js';
 import { SteeringTransitionRegistry } from './steering-transition.js';
 import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
@@ -1208,7 +1210,7 @@ function enqueueReleasedFollowUp(item: QueuedFollowUp): void {
   const runtime = resolveFollowUpRuntime(item.chat_jid);
   if (runtime?.agentId) {
     queue.enqueueTask(item.chat_jid, `follow-up:${item.id}`, async () => {
-      await processAgentConversation(runtime.baseChatJid, runtime.agentId!);
+      return processAgentConversation(runtime.baseChatJid, runtime.agentId!);
     });
     return;
   }
@@ -3402,7 +3404,7 @@ async function handleSpawnCommand(
   // Enqueue task to start the agent
   const taskId = `spawn:${agentId}:${Date.now()}`;
   queue.enqueueTask(virtualChatJid, taskId, async () => {
-    await processAgentConversation(homeChatJid, agentId);
+    return processAgentConversation(homeChatJid, agentId);
   });
 
   logger.info(
@@ -3443,6 +3445,8 @@ interface SendMessageOptions {
   localImagePaths?: string[];
   /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
   source?: string;
+  /** Completed Claude Code Workflow snapshots associated with this reply. */
+  workflowRuns?: NonNullable<StreamEvent['workflowRun']>[];
   /** Metadata used to preserve Claude SDK turn semantics for persisted messages. */
   messageMeta?: {
     turnId?: string;
@@ -4245,6 +4249,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // 任务 settle 后的 healthy result 才用累积全文定稿「已完成」——对齐
   // Claude Code "一次委托 = 一个完整回合" 的体验，不再分段发多张卡。
   let heldCardParts: string[] = [];
+  // All Workflow snapshots for the current logical turn. Running snapshots
+  // must survive the first held sdk_final so Web can keep rendering the live
+  // Workflow card while Claude waits for the background task notification.
+  let activeWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
+  let completedWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   // 挂起期间各 turn 的 usage 增量累计，定稿后与最终 turn 的 usage 合并
   // 补到卡片 usage note（否则卡片只显示最后一个 turn 的用量）。
   let heldCardUsage: HeldUsageTotals | null = null;
@@ -4578,6 +4587,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
           if (result.status === 'stream' && result.streamEvent) {
+            if (result.streamEvent.workflowRun) {
+              const run = result.streamEvent.workflowRun;
+              activeWorkflowRuns = [
+                ...activeWorkflowRuns.filter(
+                  (item) => item.taskId !== run.taskId,
+                ),
+                run,
+              ];
+              if (run.status !== 'running') {
+                completedWorkflowRuns = [
+                  ...completedWorkflowRuns.filter(
+                    (item) => item.taskId !== run.taskId,
+                  ),
+                  run,
+                ];
+              }
+            }
             // ── 截断续写触顶信号（机器标记，不广播不展示）──
             // runner 连续续写仍被断流、放弃后发出。挂起中的卡片不能再等一个
             // 永远不会来的 healthy result，就地收口为「已中断」。
@@ -5119,6 +5145,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               } else if ((result.pendingBgTasks ?? 0) > 0) {
                 text += `\n\n> ⏳ ${result.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
               }
+              if (!holdReason) text = stripRedundantCompletionPreamble(text);
               const localImagePaths = extractLocalImImagePaths(
                 text,
                 effectiveGroup.folder,
@@ -5165,7 +5192,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 );
               } else if (streamingSession?.isActive()) {
                 try {
-                  await streamingSession.complete(heldCardBaseText() + text);
+                  await streamingSession.complete(text);
                   streamingCardHandledIM = true;
                   // 定稿后 session 即将轮换；留住引用供随后到达的 usage 事件
                   // 打合并 usage note（挂起期累计 + 最终 turn）。
@@ -5279,7 +5306,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               if (holdReason || wasInHeldSeq) {
                 if (!heldDbTurnId) heldDbTurnId = effectiveTurnId;
                 turnIdForDb = heldDbTurnId;
-                dbText = heldBaseForDb + text;
+                // Intermediate held turns remain visible while running. The
+                // healthy completion replaces them with the authoritative
+                // final answer; WorkflowRunCard preserves the execution trace.
+                dbText = holdReason ? heldBaseForDb + text : text;
                 if (!holdReason) heldDbTurnId = null; // healthy 收尾，序列结束
               } else {
                 turnIdForDb =
@@ -5292,6 +5322,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 sendToIM: directImReply && !skipImSend,
                 imTextOverride: dbText !== text ? text : undefined,
                 localImagePaths,
+                workflowRuns: holdReason
+                  ? activeWorkflowRuns
+                  : completedWorkflowRuns,
                 messageMeta: {
                   turnId: turnIdForDb,
                   sessionId: result.sessionId || activeSessionId,
@@ -5300,6 +5333,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   finalizationReason: result.finalizationReason || 'completed',
                 },
               });
+              if (!holdReason) {
+                activeWorkflowRuns = [];
+                completedWorkflowRuns = [];
+              }
               lastSavedTurnId = effectiveTurnId;
 
               // For routed IM (web JID with IM source), only send the FIRST
@@ -5351,9 +5388,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Clear streaming snapshot so the next turn starts fresh.
               // Without this, saveInterruptedStreamingMessages() would merge
               // text from multiple turns into one message on shutdown.
-              clearStreamingSnapshot(chatJid);
-              streamingAccumulatedText = '';
-              streamingAccumulatedThinking = '';
+              // A held result is only an intermediate acknowledgement. Keep
+              // the Workflow task snapshot alive across the background wait;
+              // the authoritative completion result will clear it later.
+              if (!holdReason) {
+                clearStreamingSnapshot(chatJid);
+                streamingAccumulatedText = '';
+                streamingAccumulatedThinking = '';
+              }
               // Persist cursor as soon as a visible reply is emitted.
               // Long-lived runners may stay alive for idleTimeout, and waiting
               // until process exit would cause duplicate replay after restart.
@@ -5542,7 +5584,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // If a reply was already sent, commit the cursor so we don't re-process.
   // Otherwise return false to allow retry (H-1 audit fix).
   if (!output) {
+    if (queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard') {
+      commitCursor();
+      return true;
+    }
+    // A runner may throw after the final SDK reply (or an acknowledged
+    // send_message delivery) but before returning its terminal output. Those
+    // narrow delivery signals complete the turn; DB-only interrupt partials
+    // deliberately do not set either signal and therefore remain retryable.
+    if (genuineReplyDelivered || ipcReplyTurnTracker.delivered) {
+      commitCursor();
+      return true;
+    }
     return cursorCommitted;
+  }
+
+  const stopDisposition = queue.getRecentStopDisposition(effectiveGroup.folder);
+  if (stopDisposition === 'discard') {
+    const turnOutcome = resolveTurnOutcome({
+      status: output.status,
+      healthyInputTurnCompleted,
+      cursorCommitted,
+      replyDelivered: genuineReplyDelivered || ipcReplyTurnTracker.delivered,
+      stopRequested: true,
+    });
+    if (turnOutcome.cursor === 'commit') commitCursor();
+    logger.info(
+      { group: group.name, chatJid, turnOutcome },
+      'Explicit stop discarded the interrupted input without replay',
+    );
+    return true;
   }
 
   // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）：无论是否已有回复，都必须重置会话
@@ -5579,13 +5650,42 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  // Container closed during query (e.g. home folder drain) without sending a reply:
-  // don't commit cursor so the message gets retried on the next poll cycle.
-  // If sentReply is true the cursor was already committed at line 722, no action needed.
-  if (output.status === 'closed' && !sentReply) {
-    logger.warn(
-      { group: group.name, chatJid },
-      'Container closed during query without reply, keeping cursor for retry',
+  if (output.status === 'closed') {
+    const turnOutcome = resolveTurnOutcome({
+      status: output.status,
+      healthyInputTurnCompleted,
+      cursorCommitted,
+      // `sentReply` also includes DB-only interrupt/error partials that were
+      // never delivered to the user's channel. Only a genuine SDK final or an
+      // acknowledged send_message for this exact input turn may suppress
+      // replay after `_close`.
+      replyDelivered: genuineReplyDelivered || ipcReplyTurnTracker.delivered,
+      // A mutation-preserve stop must keep/replay the cursor after the pause;
+      // ordinary discard stops returned above.
+      stopRequested: false,
+    });
+
+    if (turnOutcome.cursor === 'commit') commitCursor();
+
+    if (turnOutcome.kind === 'retryable') {
+      logger.warn(
+        { group: group.name, chatJid, turnOutcome },
+        'Container closed during an unfinished input turn; scheduling replay',
+      );
+      // The retry runs after GroupQueue's backoff without requiring another
+      // incoming message. Close the current Web streaming state while waiting.
+      broadcastStreamEvent(chatJid, {
+        eventType: 'status',
+        statusText: 'idle',
+        turnId: lastProcessed.id,
+        sessionId: activeSessionId,
+      });
+      return false;
+    }
+
+    logger.info(
+      { group: group.name, chatJid, turnOutcome },
+      'Container close resolved without replay',
     );
     return true;
   }
@@ -5695,6 +5795,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
     const errorDetail = output.error || lastError || '未知错误';
+
+    // Prompt/context startup budget is derived from the immutable context
+    // snapshot for this turn. Retrying cannot change it, so classify it as a
+    // deterministic failure and commit exactly once instead of entering the
+    // transient-error backoff loop.
+    if (
+      errorDetail.startsWith('context_budget_exceeded:') ||
+      errorDetail.startsWith('prompt_plan_invalid:')
+    ) {
+      const budgetMsg = errorDetail.replace(
+        /^(?:context_budget_exceeded|prompt_plan_invalid):\s*/,
+        '',
+      );
+      const turnOutcome = resolveTurnOutcome({
+        status: output.status,
+        healthyInputTurnCompleted,
+        cursorCommitted,
+        replyDelivered: sentReply,
+        deterministicFailure: true,
+      });
+      sendSystemMessage(chatJid, 'context_overflow', budgetMsg);
+      logger.warn(
+        { group: group.name, error: budgetMsg, turnOutcome },
+        'Static prompt/context budget is invalid; skipping retry',
+      );
+      if (turnOutcome.cursor === 'commit') commitCursor();
+      return true;
+    }
 
     // 上下文溢出错误：跳过重试，提交游标，通知用户
     if (errorDetail.startsWith('context_overflow:')) {
@@ -6233,6 +6361,7 @@ async function sendMessageWithOutcome(
         sdk_message_uuid: options.messageMeta?.sdkMessageUuid ?? null,
         source_kind: options.messageMeta?.sourceKind ?? null,
         finalization_reason: options.messageMeta?.finalizationReason ?? null,
+        workflow_runs: options.workflowRuns,
       },
       undefined,
       options.source,
@@ -9215,7 +9344,7 @@ async function handleDiscordIpcRequest(
 async function processAgentConversation(
   chatJid: string,
   agentId: string,
-): Promise<void> {
+): Promise<void | boolean> {
   const agent = getAgent(agentId);
   if (!agent || (agent.kind !== 'conversation' && agent.kind !== 'spawn')) {
     logger.warn(
@@ -9498,6 +9627,12 @@ async function processAgentConversation(
   // Sub-Agent 路径首条回复后本就不再向 IM 发消息（isFirstReply 门控），挂起
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
   let heldAgentParts: string[] = [];
+  // Keep the running Workflow projection across the held acknowledgement
+  // turn. Otherwise sdk_final clears the browser's live task card while the
+  // actual SDK Workflow continues in the background.
+  let activeAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
+  let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] =
+    [];
   let heldAgentUsage: HeldUsageTotals | null = null;
   let pendingAgentLedgerUsageBatch: HeldUsageTotals | null = null;
   // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
@@ -9626,6 +9761,7 @@ async function processAgentConversation(
 
   let cursorCommitted = false;
   let healthyAgentInputTurnCompleted = false;
+  let retryUnfinishedTurn = false;
   let hadError = false;
   let lastError = '';
   let lastAgentReplyMsgId: string | undefined;
@@ -9738,6 +9874,23 @@ async function processAgentConversation(
 
     // Stream events
     if (output.status === 'stream' && output.streamEvent) {
+      if (output.streamEvent.workflowRun) {
+        const run = output.streamEvent.workflowRun;
+        activeAgentWorkflowRuns = [
+          ...activeAgentWorkflowRuns.filter(
+            (item) => item.taskId !== run.taskId,
+          ),
+          run,
+        ];
+        if (run.status !== 'running') {
+          completedAgentWorkflowRuns = [
+            ...completedAgentWorkflowRuns.filter(
+              (item) => item.taskId !== run.taskId,
+            ),
+            run,
+          ];
+        }
+      }
       // ── 截断续写触顶信号（机器标记，不广播不展示）──
       if (
         output.streamEvent.eventType === 'status' &&
@@ -10055,6 +10208,7 @@ async function processAgentConversation(
         } else if ((output.pendingBgTasks ?? 0) > 0) {
           text += `\n\n> ⏳ ${output.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
         }
+        if (!holdReason) text = stripRedundantCompletionPreamble(text);
         heldAgentUsagePatchPending = false;
         const isFirstReply = !lastAgentReplyMsgId;
         // ── 挂起序列 DB 合并：全渠道一条回复 ──
@@ -10064,7 +10218,9 @@ async function processAgentConversation(
         const heldBaseForDb = heldAgentBaseText();
         const inHeldSeq = holdReason !== null || heldAgentDbMsgId !== null;
         const msgId = heldAgentDbMsgId ?? crypto.randomUUID();
-        const dbText = inHeldSeq ? heldBaseForDb + text : text;
+        // Keep progress visible while held, then replace it with the final
+        // answer so process narration never becomes part of the conclusion.
+        const dbText = holdReason ? heldBaseForDb + text : text;
         const dbTurnId = inHeldSeq
           ? heldAgentDbTurnId || output.turnId || lastProcessed.id
           : output.turnId || lastProcessed.id;
@@ -10112,9 +10268,16 @@ async function processAgentConversation(
             sdk_message_uuid: output.sdkMessageUuid ?? null,
             source_kind: output.sourceKind || 'sdk_final',
             finalization_reason: output.finalizationReason || 'completed',
+            workflow_runs: holdReason
+              ? activeAgentWorkflowRuns
+              : completedAgentWorkflowRuns,
           },
           agentId,
         );
+        if (!holdReason) {
+          activeAgentWorkflowRuns = [];
+          completedAgentWorkflowRuns = [];
+        }
 
         // Async LLM title upgrade after the first substantive reply.
         if (isFirstReply && agent.kind === 'conversation') {
@@ -10165,7 +10328,7 @@ async function processAgentConversation(
           );
         } else if (agentStreamingSession?.isActive()) {
           try {
-            await agentStreamingSession.complete(heldAgentBaseText() + text);
+            await agentStreamingSession.complete(text);
             streamingCardHandledIM = true;
             // 定稿后等最终 usage 事件做合并补丁（挂起期累计 + 最终 turn）
             heldAgentUsagePatchPending = true;
@@ -10270,6 +10433,7 @@ async function processAgentConversation(
         // restores a zombie「生成中」spinner from the stale agent snapshot. Skip
         // partials (intermediate compression outputs, not the final reply).
         if (
+          !holdReason &&
           output.sourceKind !== 'overflow_partial' &&
           output.sourceKind !== 'compact_partial'
         ) {
@@ -10455,9 +10619,48 @@ async function processAgentConversation(
     if (lastAgentReplyMsgId && healthyAgentInputTurnCompleted) {
       commitCursor();
     }
+
+    const stopDisposition = queue.getRecentStopDisposition(
+      effectiveGroup.folder,
+    );
+    if (stopDisposition === 'discard') {
+      const turnOutcome = resolveTurnOutcome({
+        status: output.status,
+        healthyInputTurnCompleted: healthyAgentInputTurnCompleted,
+        cursorCommitted,
+        replyDelivered: !!lastAgentReplyMsgId,
+        stopRequested: true,
+      });
+      if (turnOutcome.cursor === 'commit') commitCursor();
+      logger.info(
+        { chatJid, agentId, turnOutcome },
+        'Explicit stop discarded the interrupted agent input without replay',
+      );
+    } else if (output.status === 'closed') {
+      const turnOutcome = resolveTurnOutcome({
+        status: output.status,
+        healthyInputTurnCompleted: healthyAgentInputTurnCompleted,
+        cursorCommitted,
+        replyDelivered: !!lastAgentReplyMsgId,
+      });
+      if (turnOutcome.cursor === 'commit') commitCursor();
+      retryUnfinishedTurn = turnOutcome.kind === 'retryable';
+      logger[retryUnfinishedTurn ? 'warn' : 'info'](
+        { chatJid, agentId, turnOutcome },
+        retryUnfinishedTurn
+          ? 'Conversation agent closed during an unfinished turn; scheduling replay'
+          : 'Conversation agent close resolved without replay',
+      );
+    }
   } catch (err) {
     hadError = true;
     logger.error({ agentId, chatJid, err }, 'Agent conversation error');
+    // stopGroup may terminate the child before runContainerAgent can return a
+    // terminal ContainerOutput. Preserve ordinary Stop's discard contract even
+    // on that throw path; mutation-preserve stops deliberately keep the cursor.
+    if (queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard') {
+      commitCursor();
+    }
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
 
@@ -10737,6 +10940,8 @@ async function processAgentConversation(
     activeAgentBuilderTurns.delete(agentBuilderScope);
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
   }
+
+  return !retryUnfinishedTurn;
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -11234,7 +11439,7 @@ function recoverConversationAgents(): void {
         // Enqueue the agent conversation for processing
         const taskId = `agent-recover:${agentId}:${Date.now()}`;
         queue.enqueueTask(virtualChatJid, taskId, async () => {
-          await processAgentConversation(chatJid, agentId);
+          return processAgentConversation(chatJid, agentId);
         });
       }
     } catch (err) {
@@ -12258,7 +12463,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
           'sub-agent task IPC received',
         );
         try {
-          await processAgentConversation(homeChatJid, agentId);
+          return await processAgentConversation(homeChatJid, agentId);
         } catch (err) {
           logger.error(
             { err, homeChatJid, agentId },
@@ -12322,7 +12527,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
       if (sendResult === 'no_active') {
         const taskId = `agent-conv:${agentId}:${Date.now()}`;
         queue.enqueueTask(virtualChatJid, taskId, async () => {
-          await processAgentConversation(homeChatJid, agentId);
+          return processAgentConversation(homeChatJid, agentId);
         });
       }
     }
@@ -14072,7 +14277,7 @@ async function main(): Promise<void> {
     const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
     const taskId = `agent-ipc-recovery:${agentId}:${Date.now()}`;
     queue.enqueueTask(virtualChatJid, taskId, async () => {
-      await processAgentConversation(homeChatJid, agentId);
+      return processAgentConversation(homeChatJid, agentId);
     });
   });
   queue.setOnUnacknowledgedIpcDeliveries(
@@ -14096,7 +14301,7 @@ async function main(): Promise<void> {
           virtualChatJid,
           `agent-delivery-recovery:${agentId}`,
           async () => {
-            await processAgentConversation(homeChatJid, agentId);
+            return processAgentConversation(homeChatJid, agentId);
           },
         );
       }

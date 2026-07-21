@@ -1,13 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR, GROUPS_DIR } from './config.js';
+import {
+  buildEffectiveMcpManifest,
+  loadPluginMcpDefinitions,
+} from './effective-mcp-manifest.js';
 import { getEffectiveExternalDir } from './runtime-config.js';
-import { loadManagedMcpLayers, parseManagedMcpReference } from './mcp-utils.js';
+import {
+  loadManagedMcpLayers,
+  parseManagedMcpReference,
+  resolveManagedMcpPolicy,
+} from './mcp-utils.js';
 import {
   getHostClaudeMcpSourcePaths,
+  loadClaudeContextMcpServers,
+  loadHostClaudeMcpServers,
+  mergeMcpServerLayers,
   readMcpServersFile,
 } from './mcp-context.js';
-import { scanSkillDirectory } from './skill-utils.js';
+import { resolveEffectiveSkills } from './effective-skill-resolver.js';
+import { pluginSkillLayers } from './effective-skill-resolver.js';
+import { loadUserPlugins } from './plugin-utils.js';
 import type { AgentProfile, RegisteredGroup } from './types.js';
 
 export type CapabilityLayerSource =
@@ -16,6 +29,7 @@ export type CapabilityLayerSource =
   | 'project'
   | 'workspace'
   | 'managed'
+  | 'plugin'
   | 'system'
   | 'user';
 
@@ -36,22 +50,17 @@ export interface AgentCapabilityPreview {
   };
   skills: {
     mode: AgentProfile['runtime_policy']['skills']['mode'];
+    manifestHash: string;
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
   };
   mcp: {
     mode: AgentProfile['runtime_policy']['mcp']['mode'];
+    manifestHash: string;
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
   };
   notes: string[];
-}
-
-function listSkillIds(root: string): string[] {
-  return scanSkillDirectory(root, 'preview')
-    .filter((skill) => skill.enabled)
-    .map((skill) => skill.id)
-    .sort();
 }
 
 function countEntries(root: string): number {
@@ -120,44 +129,50 @@ export function buildAgentCapabilityPreview(options: {
     ? path.join(GROUPS_DIR, workspace.group.folder)
     : undefined;
   const hostContext = policy.context.source === 'host_claude';
+  const enabledPlugins = loadUserPlugins(profile.owner_user_id, {
+    runtime: 'host',
+  });
 
-  const allManagedSkills = listSkillIds(
-    path.join(DATA_DIR, 'skills', profile.owner_user_id),
-  );
-  const managedSkills =
-    policy.skills.mode === 'disabled'
-      ? []
-      : policy.skills.mode === 'custom'
-        ? allManagedSkills.filter((id) => policy.skills.ids.includes(id))
-        : allManagedSkills;
-  const skillLayers: Array<{ source: CapabilityLayerSource; ids: string[] }> = [
-    {
-      source: 'builtin',
-      ids: listSkillIds(path.join(DATA_DIR, 'builtin-skills')),
-    },
-    ...(hostContext
-      ? [
-          {
-            source: 'host' as const,
-            ids: listSkillIds(path.join(externalClaudeDir, 'skills')),
-          },
-        ]
-      : []),
-    {
-      source: 'project',
-      ids: listSkillIds(path.resolve(process.cwd(), 'container', 'skills')),
-    },
-    { source: 'managed', ids: managedSkills },
-    ...(workspaceDir
-      ? [
-          {
-            source: 'workspace' as const,
-            ids: listSkillIds(path.join(workspaceDir, '.claude', 'skills')),
-          },
-        ]
-      : []),
-  ];
-  const skills = mergeLayers(skillLayers);
+  const skillManifest = resolveEffectiveSkills({
+    layers: [
+      { source: 'builtin', root: path.join(DATA_DIR, 'builtin-skills') },
+      ...(hostContext
+        ? [
+            {
+              source: 'host' as const,
+              root: path.join(externalClaudeDir, 'skills'),
+            },
+          ]
+        : []),
+      {
+        source: 'project',
+        root: path.resolve(process.cwd(), 'container', 'skills'),
+      },
+      {
+        source: 'managed',
+        root: path.join(DATA_DIR, 'skills', profile.owner_user_id),
+      },
+      ...(workspaceDir
+        ? [
+            {
+              source: 'workspace' as const,
+              root: path.join(workspaceDir, '.claude', 'skills'),
+            },
+          ]
+        : []),
+      ...pluginSkillLayers(enabledPlugins),
+    ],
+    managedPolicy: policy.skills,
+  });
+  const skills = {
+    entries: skillManifest.selected.map((skill) => ({
+      id: skill.id,
+      source: skill.source as CapabilityLayerSource,
+      overrides: skill.overrides as CapabilityLayerSource[],
+      available: true,
+    })),
+    conflicts: skillManifest.conflicts,
+  };
 
   const allowAdminOnlySystemMcp = options.ownerRole === 'admin';
   const managedMcpLayers = loadManagedMcpLayers(profile.owner_user_id, {
@@ -220,7 +235,39 @@ export function buildAgentCapabilityPreview(options: {
     unavailableReason: 'system_admin_only',
   });
   mcpLayers.push({ source: 'user', ids: selectedUserMcpIds });
+  const pluginMcpDefinitions =
+    policy.mcp.mode === 'inherit'
+      ? loadPluginMcpDefinitions(enabledPlugins)
+      : {};
+  mcpLayers.push({ source: 'plugin', ids: Object.keys(pluginMcpDefinitions) });
   const mcp = mergeLayers(mcpLayers);
+  const runtimeManagedLayers = allowAdminOnlySystemMcp
+    ? managedMcpLayers
+    : {
+        ...managedMcpLayers,
+        system: Object.fromEntries(
+          Object.entries(managedMcpLayers.system).filter(
+            ([id]) => !restrictedSystemIds.has(id),
+          ),
+        ),
+      };
+  const runtimeManagedServers = resolveManagedMcpPolicy(
+    runtimeManagedLayers,
+    policy.mcp,
+  ).servers;
+  const contextMcpServers = workspaceDir
+    ? loadClaudeContextMcpServers({
+        workspaceDir,
+        externalClaudeDir,
+        includeHostClaudeContext: hostContext,
+      })
+    : hostContext
+      ? loadHostClaudeMcpServers(externalClaudeDir)
+      : {};
+  const mcpManifest = buildEffectiveMcpManifest({
+    ...mergeMcpServerLayers(contextMcpServers, runtimeManagedServers),
+    ...pluginMcpDefinitions,
+  });
 
   const notes = [
     '系统附加能力与宿主机、项目上下文是叠加关系，不会因继承宿主机配置而被替换。',
@@ -229,9 +276,12 @@ export function buildAgentCapabilityPreview(options: {
     notes.push('选择一个工作区后可检查该工作区的项目级 Skills 与 MCP。');
   if (skills.conflicts.length > 0) {
     notes.push(
-      '同名 Skill 按内置 → 宿主机 → HappyClaw 项目 → 系统附加 → 工作区项目的顺序覆盖。',
+      '同名 Skill 按内置 → 宿主机 → HappyClaw 项目 → 系统附加 → 工作区项目 → 插件的顺序解析；插件 Skill 使用 plugin:skill 限定名。',
     );
   }
+  notes.push(
+    'Agent 的 disabled/custom 策略仅筛选用户安装的 managed Skills；内置、宿主机、项目和工作区 Skills 仍按来源优先级解析。',
+  );
   if (mcp.conflicts.length > 0)
     notes.push(
       '同名 MCP 按宿主机 → 工作区 → 系统 MCP → 用户 MCP 的稳定顺序覆盖。',
@@ -258,8 +308,12 @@ export function buildAgentCapabilityPreview(options: {
         ? countEntries(path.join(externalClaudeDir, 'rules'))
         : 0,
     },
-    skills: { mode: policy.skills.mode, ...skills },
-    mcp: { mode: policy.mcp.mode, ...mcp },
+    skills: {
+      mode: policy.skills.mode,
+      manifestHash: skillManifest.hash,
+      ...skills,
+    },
+    mcp: { mode: policy.mcp.mode, manifestHash: mcpManifest.hash, ...mcp },
     notes,
   };
 }

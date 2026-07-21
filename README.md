@@ -229,16 +229,16 @@ make dev
 
 ### 常用运行命令
 
-| 命令                                            | 说明                                           |
-| ----------------------------------------------- | ---------------------------------------------- |
-| `make start`                                    | 构建必要产物并以前台生产模式启动               |
-| `WEB_PORT=8080 make start`                      | 使用自定义端口启动                             |
-| `make status`                                   | 查看端口、健康状态、日志文件和 Docker 容器     |
-| `make stop`                                     | 停止当前端口上的 HappyClaw 服务                |
-| `make install-host-tools`                       | 安装 Host 模式的可选工具与刷新内置 Skills 缓存 |
-| `make backup`                                   | 创建一致性运行数据备份                         |
-| `make restore FILE=happyclaw-backup-xxx.tar.gz` | 停止服务后恢复指定备份                         |
-| `make help`                                     | 查看完整命令列表                               |
+| 命令                                            | 说明                                                  |
+| ----------------------------------------------- | ----------------------------------------------------- |
+| `make start`                                    | 构建必要产物并以前台生产模式启动                      |
+| `WEB_PORT=8080 make start`                      | 使用自定义端口启动                                    |
+| `make status`                                   | 查看端口、健康状态、日志文件和 Docker 容器            |
+| `make stop`                                     | 停止当前端口上的 HappyClaw 服务                       |
+| `make install-host-tools`                       | 安装 Host 工具并刷新 Host/Container 共用的内置 Skills |
+| `make backup`                                   | 创建一致性运行数据备份                                |
+| `make restore FILE=happyclaw-backup-xxx.tar.gz` | 停止服务后恢复指定备份                                |
+| `make help`                                     | 查看完整命令列表                                      |
 
 ## 配置与数据
 
@@ -411,7 +411,7 @@ happyclaw/
 <details>
 <summary><strong>需要另外安装 Claude Code CLI 吗？</strong></summary>
 
-不需要。HappyClaw 锁定的 Claude Agent SDK 依赖已经包含对应 Claude Code 运行时。Host 模式的其他可选工具可以通过 `make install-host-tools` 安装。
+不需要。HappyClaw 锁定的 Claude Agent SDK 依赖已经包含对应 Claude Code 运行时。固定版本的内置 Skills 会在 `make install`、`make dev` 和 `make start` 时自动物化，并由 Host/Container 共用同一 Manifest；其他 Host 工具可通过 `make install-host-tools` 安装。
 
 </details>
 

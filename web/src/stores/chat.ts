@@ -31,6 +31,7 @@ export interface Message {
   is_from_me: boolean;
   attachments?: string;
   token_usage?: string;
+  workflow_runs?: import('../stream-event.types').WorkflowRunSnapshot[];
   turn_id?: string | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
@@ -117,6 +118,10 @@ export interface StreamingTaskRuntimeState {
   title: string;
   status: 'running' | 'completed' | 'error' | 'backgrounded';
   subagentType?: string;
+  taskType?: string;
+  workflowName?: string;
+  workflowRun?: StreamEvent['workflowRun'];
+  usage?: StreamEvent['sdkTaskUsage'];
   latestSummary?: string;
   lastToolName?: string;
   thinkingTail: string;
@@ -204,6 +209,8 @@ function mergeMessagesChronologically(
       old.content !== m.content ||
       old.timestamp !== m.timestamp ||
       old.token_usage !== m.token_usage ||
+      JSON.stringify(old.workflow_runs ?? []) !==
+        JSON.stringify(m.workflow_runs ?? []) ||
       old.turn_id !== m.turn_id ||
       old.session_id !== m.session_id ||
       old.sdk_message_uuid !== m.sdk_message_uuid ||
@@ -472,6 +479,41 @@ const DEFAULT_STREAMING_STATE: StreamingState = {
   traceEvents: [],
   taskStates: {},
 };
+
+/**
+ * Transfer SDK Workflow ownership from a finishing Claude turn to the
+ * background-wait UI. The acknowledgement is a held result, not the logical
+ * end of the user's request, so the Workflow card must remain live while the
+ * runner waits for task_notification.
+ */
+function streamingStateFromWorkflowRuns(
+  runs: import('../stream-event.types').WorkflowRunSnapshot[],
+): StreamingState {
+  const now = Date.now();
+  const taskStates: Record<string, StreamingTaskRuntimeState> = {};
+  for (const run of runs) {
+    taskStates[run.taskId] = {
+      id: run.taskId,
+      title: run.summary || run.workflowName || '动态工作流',
+      status: 'backgrounded',
+      taskType: 'local_workflow',
+      workflowName: run.workflowName,
+      workflowRun: run,
+      thinkingTail: '',
+      textTail: '',
+      activeTools: [],
+      recentTools: [],
+      updatedAt: now,
+    };
+  }
+  return {
+    ...DEFAULT_STREAMING_STATE,
+    activeTools: [],
+    recentEvents: [],
+    traceEvents: [],
+    taskStates,
+  };
+}
 
 /**
  * Sort items by a given ID order. Items not in the order list are appended at the end.
@@ -1077,6 +1119,10 @@ function ensureTaskRuntime(
         'Task',
       status: 'running',
       subagentType: event.subagentType,
+      taskType: event.taskType,
+      workflowName: event.workflowName,
+      workflowRun: event.workflowRun,
+      usage: event.sdkTaskUsage,
       thinkingTail: '',
       textTail: '',
       activeTools: [],
@@ -1099,6 +1145,23 @@ function updateTaskRuntime(
   if (event.taskDescription && (!task.title || task.title === 'Task'))
     task.title = event.taskDescription;
   if (event.subagentType) task.subagentType = event.subagentType;
+  if (event.taskType) task.taskType = event.taskType;
+  if (event.workflowName) task.workflowName = event.workflowName;
+  if (event.sdkTaskUsage) task.usage = event.sdkTaskUsage;
+  if (event.workflowRun) {
+    task.workflowRun = {
+      ...(task.workflowRun ?? {}),
+      ...event.workflowRun,
+      phases:
+        event.workflowRun.phases.length > 0
+          ? event.workflowRun.phases
+          : (task.workflowRun?.phases ?? []),
+      agents:
+        event.workflowRun.agents.length > 0
+          ? event.workflowRun.agents
+          : (task.workflowRun?.agents ?? []),
+    };
+  }
 
   if (event.eventType === 'text_delta') {
     task.textTail = tail(task.textTail + (event.text || ''), MAX_TASK_TAIL);
@@ -1115,6 +1178,15 @@ function updateTaskRuntime(
       event.taskDescription ||
       task.latestSummary;
     task.lastToolName = event.lastToolName || task.lastToolName;
+    if (task.workflowRun && event.sdkTaskUsage) {
+      task.workflowRun = {
+        ...task.workflowRun,
+        status: 'running',
+        totalTokens: event.sdkTaskUsage.totalTokens,
+        totalToolCalls: event.sdkTaskUsage.toolUses,
+        durationMs: event.sdkTaskUsage.durationMs,
+      };
+    }
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
@@ -1129,6 +1201,13 @@ function updateTaskRuntime(
     task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
     task.latestSummary =
       event.taskSummary || event.summary || task.latestSummary;
+    if (task.workflowRun) {
+      task.workflowRun = {
+        ...task.workflowRun,
+        status: event.taskStatus === 'completed' ? 'completed' : 'failed',
+        completedAt: task.workflowRun.completedAt ?? Date.now(),
+      };
+    }
   } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
     const tool = {
       toolName: event.toolName || 'unknown',
@@ -2368,6 +2447,75 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }, 10_000);
         return;
       }
+
+      // Agent usage is emitted after the sdk_final message. At that point the
+      // final-message handler has already cleared agentStreaming and marked the
+      // Agent idle, so the generic late-event guard below would otherwise drop
+      // the usage event. Patch the persisted final bubble directly before that
+      // guard so token totals appear immediately without requiring a reload.
+      if (event.eventType === 'usage' && event.usage) {
+        const usage = event.usage;
+        const tokenUsageJson = JSON.stringify({
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          cacheReadInputTokens: usage.cacheReadInputTokens,
+          cacheCreationInputTokens: usage.cacheCreationInputTokens,
+          reasoningTokens: usage.reasoningTokens,
+          costUSD: usage.costUSD,
+          durationMs: usage.durationMs,
+          numTurns: usage.numTurns,
+          modelUsage: usage.modelUsage,
+        });
+        let snapshotMessages: Message[] | null = null;
+        let snapshotHasMore = false;
+        set((s) => {
+          const messages = s.agentMessages[agentId] || [];
+          let targetIdx = -1;
+          if (event.turnId) {
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if (
+                messages[i].is_from_me &&
+                messages[i].turn_id === event.turnId &&
+                messages[i].source_kind !== 'sdk_send_message'
+              ) {
+                targetIdx = i;
+                break;
+              }
+            }
+          } else {
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if (
+                messages[i].is_from_me &&
+                messages[i].source_kind !== 'sdk_send_message'
+              ) {
+                targetIdx = i;
+                break;
+              }
+            }
+          }
+          if (targetIdx < 0) return s;
+          const updated = [...messages];
+          updated[targetIdx] = {
+            ...updated[targetIdx],
+            token_usage: tokenUsageJson,
+          };
+          snapshotMessages = updated;
+          snapshotHasMore = !!s.agentHasMore[agentId];
+          return {
+            agentMessages: { ...s.agentMessages, [agentId]: updated },
+          };
+        });
+        if (snapshotMessages) {
+          void saveAgentMessageSnapshot(
+            chatJid,
+            agentId,
+            snapshotMessages,
+            snapshotHasMore,
+          );
+        }
+        return;
+      }
+
       set((s) => {
         // Guard: if streaming was already cleared (agent reply received),
         // ignore late-arriving stream events to prevent "thinking" reappearing.
@@ -2742,6 +2890,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Skip while clearHistory is in-flight to prevent race re-injection
     if (get().clearing[chatJid]) return;
 
+    const incomingWorkflowRuns = (wsMsg.workflow_runs || []) as NonNullable<
+      Message['workflow_runs']
+    >;
+    const runningWorkflowRuns = incomingWorkflowRuns.filter(
+      (run) => run.status === 'running',
+    );
+    const completedWorkflowRuns = incomingWorkflowRuns.filter(
+      (run) => run.status !== 'running',
+    );
+    const holdsRunningWorkflow = runningWorkflowRuns.length > 0;
+
     const msg: Message = {
       id: wsMsg.id,
       chat_jid: wsMsg.chat_jid || chatJid,
@@ -2752,6 +2911,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       is_from_me: wsMsg.is_from_me ?? false,
       attachments: wsMsg.attachments,
       token_usage: wsMsg.token_usage,
+      // Running runs are rendered by StreamingDisplay so progress events can
+      // keep mutating the same card. Completed runs belong to MessageBubble.
+      workflow_runs:
+        completedWorkflowRuns.length > 0 ? completedWorkflowRuns : undefined,
       turn_id: wsMsg.turn_id ?? null,
       session_id: wsMsg.session_id ?? null,
       sdk_message_uuid: wsMsg.sdk_message_uuid ?? null,
@@ -2778,18 +2941,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
           msg.source_kind !== 'sdk_send_message';
 
         const nextAgentStreaming = isAgentReply
-          ? (() => {
-              const n = { ...s.agentStreaming };
-              delete n[agentId];
-              return n;
-            })()
+          ? holdsRunningWorkflow
+            ? {
+                ...s.agentStreaming,
+                [agentId]: streamingStateFromWorkflowRuns(runningWorkflowRuns),
+              }
+            : (() => {
+                const n = { ...s.agentStreaming };
+                delete n[agentId];
+                return n;
+              })()
           : s.agentStreaming;
 
         // For user messages (non-reply), set agentWaiting=true so subsequent
         // streaming events are accepted.  This handles messages injected from
         // Feishu/Telegram which don't go through sendAgentMessage().
         const nextAgentWaiting = isAgentReply
-          ? { ...s.agentWaiting, [agentId]: false }
+          ? { ...s.agentWaiting, [agentId]: holdsRunningWorkflow }
           : !msg.is_from_me
             ? { ...s.agentWaiting, [agentId]: true }
             : s.agentWaiting;
@@ -2848,7 +3016,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           msg.source_kind === 'legacy');
 
       if (shouldFinalizeAssistant || isSystemError) {
-        if (shouldFinalizeAssistant) didFinalizeAssistant = true;
+        if (shouldFinalizeAssistant && !holdsRunningWorkflow)
+          didFinalizeAssistant = true;
 
         // Agent 回复或系统错误：立即清除流式状态和等待标志，转移 thinking 缓存
         const streamState = s.streaming[chatJid];
@@ -2860,7 +3029,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
             s.pendingThinkingDuration[chatJid])
           : undefined;
         const nextStreaming = { ...s.streaming };
-        delete nextStreaming[chatJid];
+        if (holdsRunningWorkflow) {
+          nextStreaming[chatJid] =
+            streamingStateFromWorkflowRuns(runningWorkflowRuns);
+        } else {
+          delete nextStreaming[chatJid];
+        }
         const nextPending = { ...s.pendingThinking };
         delete nextPending[chatJid];
         const nextPendingDur = { ...s.pendingThinkingDuration };
@@ -2870,7 +3044,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const isHidden = typeof document !== 'undefined' && document.hidden;
         const isOtherChat = s.currentGroup !== chatJid;
         const nextUnread =
-          (isHidden || isOtherChat) && shouldFinalizeAssistant
+          (isHidden || isOtherChat) &&
+          shouldFinalizeAssistant &&
+          !holdsRunningWorkflow
             ? {
                 ...s.unreadReplies,
                 [chatJid]: (s.unreadReplies[chatJid] || 0) + 1,
@@ -2879,7 +3055,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         return {
           messages: { ...s.messages, [chatJid]: updated },
-          waiting: { ...s.waiting, [chatJid]: false },
+          waiting: {
+            ...s.waiting,
+            [chatJid]: holdsRunningWorkflow,
+          },
           streaming: nextStreaming,
           pendingThinking: nextPending,
           pendingThinkingDuration: nextPendingDur,

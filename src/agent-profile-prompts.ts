@@ -23,9 +23,10 @@ export function includeClaudePresetForMode(
 }
 
 function normalizePrompt(value: unknown): string {
-  return typeof value === 'string'
-    ? value.slice(0, AGENT_PROMPT_SECTION_MAX_LENGTH)
-    : '';
+  // Request schemas reject over-limit edits. Preserve legacy/database content
+  // verbatim here so normalization never turns a visible validation problem
+  // into a silent prompt rewrite.
+  return typeof value === 'string' ? value : '';
 }
 
 export function normalizeAgentProfilePrompts(

@@ -93,6 +93,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
+import { attachSessionWorkflowRuns } from '../session-workflows.js';
 import {
   buildPinnedGitEnvironment,
   startPinnedHttpsProxy,
@@ -1760,12 +1761,18 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
     const virtualJid = `${jid}#agent:${agentIdParam}`;
     if (after) {
-      const messages = getMessagesAfter(virtualJid, after, limit);
+      const messages = attachSessionWorkflowRuns(
+        getMessagesAfter(virtualJid, after, limit),
+        { groupFolder: group.folder, agentId: agentIdParam },
+      );
       return c.json({ messages });
     }
     const rows = getMessagesPage(virtualJid, before, limit + 1);
     const hasMore = rows.length > limit;
-    const messages = hasMore ? rows.slice(0, limit) : rows;
+    const messages = attachSessionWorkflowRuns(
+      hasMore ? rows.slice(0, limit) : rows,
+      { groupFolder: group.folder, agentId: agentIdParam },
+    );
     return c.json({ messages, hasMore });
   }
 
@@ -1788,23 +1795,35 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   if (queryJids.length === 1) {
     // 单 JID 走原路径
     if (after) {
-      const messages = getMessagesAfter(jid, after, limit);
+      const messages = attachSessionWorkflowRuns(
+        getMessagesAfter(jid, after, limit),
+        { groupFolder: group.folder, agentId: null },
+      );
       return c.json({ messages });
     }
     const rows = getMessagesPage(jid, before, limit + 1);
     const hasMore = rows.length > limit;
-    const messages = hasMore ? rows.slice(0, limit) : rows;
+    const messages = attachSessionWorkflowRuns(
+      hasMore ? rows.slice(0, limit) : rows,
+      { groupFolder: group.folder, agentId: null },
+    );
     return c.json({ messages, hasMore });
   }
 
   // 多 JID 合并查询
   if (after) {
-    const messages = getMessagesAfterMulti(queryJids, after, limit);
+    const messages = attachSessionWorkflowRuns(
+      getMessagesAfterMulti(queryJids, after, limit),
+      { groupFolder: group.folder, agentId: null },
+    );
     return c.json({ messages });
   }
   const rows = getMessagesPageMulti(queryJids, before, limit + 1);
   const hasMore = rows.length > limit;
-  const messages = hasMore ? rows.slice(0, limit) : rows;
+  const messages = attachSessionWorkflowRuns(
+    hasMore ? rows.slice(0, limit) : rows,
+    { groupFolder: group.folder, agentId: null },
+  );
   return c.json({ messages, hasMore });
 });
 

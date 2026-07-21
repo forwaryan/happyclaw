@@ -39,6 +39,8 @@ export interface ContainerInput {
     identityHash: string;
     identityPrompt: string;
     includeClaudePreset: boolean;
+    /** Opaque host-normalized policy; retained only for runtime provenance. */
+    runtimePolicy?: unknown;
   };
   /** Host-derived capability flag. True only for an interactive session whose
    * effective top-level AgentProfile is the built-in main HappyClaw. */
@@ -54,6 +56,8 @@ export interface ContainerInput {
   plugins?: Array<{ type: 'local'; path: string }>;
   /** Runtime context audit bootstrap from the host/container launcher. */
   contextAudit?: ClaudeContextAudit;
+  /** Canonical effective Skill set resolved by the HappyClaw host. */
+  skillManifest?: { hash: string; selectedSkillIds: string[] };
 }
 
 export interface ContainerOutput {

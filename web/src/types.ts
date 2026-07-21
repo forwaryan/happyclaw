@@ -162,6 +162,7 @@ export type CapabilityLayerSource =
   | 'host'
   | 'project'
   | 'workspace'
+  | 'plugin'
   | 'managed'
   | 'system'
   | 'user';
@@ -183,16 +184,94 @@ export interface AgentCapabilityPreview {
   };
   skills: {
     mode: AgentProfileRuntimePolicy['skills']['mode'];
+    manifestHash: string;
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
   };
   mcp: {
     mode: AgentProfileRuntimePolicy['mcp']['mode'];
+    manifestHash: string;
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
   };
   notes: string[];
 }
+
+export interface RunContextSnapshot {
+  chatJid: string;
+  agentId: string | null;
+  turnId: string | null;
+  sessionId: string | null;
+  capturedAt: string;
+  executionMode: 'host' | 'container';
+  agentProfile: {
+    id: string;
+    version: number;
+    identityHash: string;
+    runtimePolicyHash: string | null;
+  } | null;
+  prompt: {
+    planHash: string | null;
+    totalBytes: number;
+    estimatedTokens: number | null;
+    blocks: Array<{
+      id: string;
+      version: number | null;
+      scope: 'main' | 'subagent' | 'both' | null;
+      owner: 'platform' | 'agent_profile' | 'workspace' | 'channel' | null;
+      required: boolean | null;
+      condition: string | null;
+      hash: string | null;
+      bytes: number;
+      estimatedTokens: number | null;
+    }>;
+  };
+  skills: {
+    manifestHash: string | null;
+    selectedSkillIds: string[];
+    total: number | null;
+    included: number | null;
+    tokens: number | null;
+    sources: Array<{
+      name: string;
+      count: number | null;
+      tokens: number | null;
+    }>;
+  };
+  mcp: { manifestHash: string | null; serverIds: string[] };
+  rules: { discovered: number; loaded: number | null };
+  claudeMd: { status: string; loaded: boolean | null; tokens: number | null };
+  sdkContext: {
+    model: string;
+    totalTokens: number;
+    maxTokens: number;
+    percentage: number;
+    mcpTools: Array<{ name: string; serverName: string; tokens: number }>;
+  } | null;
+  budget: {
+    status: 'unavailable' | 'ok' | 'warning' | 'hard_exceeded';
+    startupTokens?: number;
+    totalTokens?: number;
+    maxTokens?: number;
+    warningThreshold?: number;
+    hardThreshold?: number;
+    warning?: string;
+    error?: string;
+  } | null;
+  subagentContract: {
+    enabled: boolean;
+    hash: string;
+    sdkCompatibility: string;
+    cliCompatibility: string;
+  } | null;
+  warnings: string[];
+}
+
+export type RunContextStatus =
+  | 'none'
+  | 'current'
+  | 'stale_profile'
+  | 'stale_config';
 
 export interface AgentInfo {
   id: string;

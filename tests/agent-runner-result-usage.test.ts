@@ -90,6 +90,37 @@ describe('Kaboo-compatible assistant usage collection', () => {
     });
   });
 
+  test('accepts camelCase usage from SDK-compatible live providers', () => {
+    const collector = new AssistantUsageCollector();
+    collector.ingest({
+      type: 'assistant',
+      uuid: 'uuid-camel',
+      message: {
+        id: 'msg-camel',
+        model: 'glm-5.2',
+        usage: {
+          inputTokens: 504,
+          outputTokens: 6_182,
+          cacheReadInputTokens: 46_656,
+          cacheCreationInputTokens: 20,
+          reasoningTokens: 300,
+        },
+        content: [],
+      },
+    });
+
+    expect(collector.drain('session-camel')).toMatchObject({
+      eventId: 'claude-code:msg-camel',
+      tokens: {
+        inputTokens: 504,
+        outputTokens: 6_182,
+        cacheReadInputTokens: 46_656,
+        cacheCreationInputTokens: 20,
+        reasoningTokens: 300,
+      },
+    });
+  });
+
   test('uses the same event ID when a copied message is replayed in a fork', () => {
     const original = new AssistantUsageCollector();
     const fork = new AssistantUsageCollector();
