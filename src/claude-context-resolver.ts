@@ -253,6 +253,7 @@ export function buildClaudeContextPlan(
 
   const audit: ClaudeContextAudit = {
     executionMode: args.executionMode,
+    projectRoot: args.projectRoot,
     externalClaudeDir:
       includeHostClaudeContext || includeHostSkills
         ? args.externalClaudeDir

@@ -235,8 +235,12 @@ export interface ClaudeContextAudit {
     runtimePolicyHash?: string;
   };
   cwd?: string;
+  /** HappyClaw repository root used to distinguish platform memory from workspace memory. */
+  projectRoot?: string;
   claudeConfigDir?: string;
   externalClaudeDir?: string;
+  /** SDK memory exclusion patterns applied for this run. */
+  claudeMdExcludes?: string[];
   claudeMd: ClaudeContextFileAudit;
   rules: ClaudeContextRulesAudit;
   skills: ClaudeContextSkillsAudit;

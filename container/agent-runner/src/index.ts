@@ -92,7 +92,10 @@ import {
 import { buildHappyClawPromptPlan, type PromptPlan } from './prompt-plan.js';
 import { withHappyClawSubagentContract } from './sdk-compat.js';
 import { assessContextBudget } from './context-budget.js';
-import { resolveManagedHostClaudeMdExcludes } from './claude-memory-policy.js';
+import {
+  findClaudeMdExcludeLeaks,
+  resolveManagedHostClaudeMdExcludes,
+} from './claude-memory-policy.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -319,6 +322,7 @@ function runtimeContextAuditBase(
         }
       : undefined,
     cwd: WORKSPACE_GROUP,
+    projectRoot: containerInput.contextAudit?.projectRoot,
     claudeConfigDir: process.env.CLAUDE_CONFIG_DIR,
     externalClaudeDir: containerInput.contextAudit?.externalClaudeDir,
     claudeMd: containerInput.contextAudit?.claudeMd ?? { status: 'unknown' },
@@ -407,6 +411,15 @@ function enrichContextAudit(
   audit.sdkContextUsage = ctxUsage;
 
   const memoryFiles = ctxUsage.memoryFiles ?? [];
+  const excludedMemoryLeaks = findClaudeMdExcludeLeaks(
+    memoryFiles,
+    audit.claudeMdExcludes ?? [],
+  );
+  if (excludedMemoryLeaks.length > 0) {
+    audit.warnings.push(
+      `managed context isolation failed; SDK loaded excluded memory: ${excludedMemoryLeaks.join(', ')}`,
+    );
+  }
   const claudeMemory = memoryFiles.find(
     (file) =>
       pathMatches(file.path, audit.claudeMd.runtimePath) ||
@@ -2039,9 +2052,11 @@ async function runQuery(
     runtimePolicy: containerInput.agentProfile?.runtimePolicy,
     externalClaudeDir: contextAuditBase.externalClaudeDir,
     homeDir: process.env.HOME,
+    projectRoot: contextAuditBase.projectRoot,
   });
   if (claudeMdExcludes.length > 0) {
     flagSettings.claudeMdExcludes = claudeMdExcludes;
+    contextAuditBase.claudeMdExcludes = claudeMdExcludes;
   }
   if (percentageWindow !== undefined) {
     flagSettings.autoCompactWindow = percentageWindow;
