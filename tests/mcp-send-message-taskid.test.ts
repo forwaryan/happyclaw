@@ -11,6 +11,7 @@ function baseCtx(overrides: Partial<McpContext> = {}): McpContext {
     groupFolder: 'ws-x',
     isHome: false,
     isAdminHome: false,
+    agentBuilderEnabled: false,
     isScheduledTask: false,
     currentTaskId: null,
     workspaceIpc: '/tmp/ipc',

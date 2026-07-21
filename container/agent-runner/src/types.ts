@@ -40,6 +40,9 @@ export interface ContainerInput {
     identityPrompt: string;
     includeClaudePreset: boolean;
   };
+  /** Host-derived capability flag. True only for an interactive session whose
+   * effective top-level AgentProfile is the built-in main HappyClaw. */
+  agentBuilderEnabled?: boolean;
   agentId?: string;
   agentName?: string;
   /**

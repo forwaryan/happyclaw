@@ -83,7 +83,7 @@ Agent（身份、提示词、Skills、MCP）
 ```
 
 - **Agent** 保存长期身份和能力策略。主 HappyClaw Agent 始终存在，也可以创建代码审查、研究、运维等自定义 Agent。
-- **对话式 Agent Builder** 允许用户直接和主 HappyClaw 多轮讨论需求，保存并预览 Agent 草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新 Agent；定时任务与子 Agent 不能代替用户发布。
+- **对话式 Agent Builder** 在主 HappyClaw 名下的所有 Workspace 主会话与普通 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览 Agent 草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新 Agent；定时任务与 Sub-Agent 不能代替用户发布。
 - **Workspace** 是私有的文件与执行隔离边界。创建时必须选择 Agent，后续可以迁移归属。
 - **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层 Agent。
 - **Channel Mount** 把 IM 群聊、私聊或原生话题挂载到工作区或具体会话。

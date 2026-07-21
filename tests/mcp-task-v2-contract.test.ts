@@ -26,6 +26,7 @@ function setup() {
     groupFolder: 'workspace',
     isHome: true,
     isAdminHome: true,
+    agentBuilderEnabled: true,
     workspaceIpc: root,
     workspaceGroup: root,
     workspaceGlobal: path.join(root, 'global'),

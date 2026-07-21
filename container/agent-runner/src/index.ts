@@ -762,6 +762,16 @@ function normalizeHomeFlags(input: ContainerInput): {
   return { isHome: legacy, isAdminHome: legacy };
 }
 
+function resolveAgentBuilderEnabled(
+  input: ContainerInput,
+  isHome: boolean,
+): boolean {
+  return (
+    input.agentBuilderEnabled ??
+    (isHome && !input.agentId && !input.isScheduledTask)
+  );
+}
+
 /**
  * 检测是否为上下文溢出错误
  */
@@ -1870,6 +1880,10 @@ async function runQuery(
   const processor = new StreamEventProcessor(emit, log);
 
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const agentBuilderEnabled = resolveAgentBuilderEnabled(
+    containerInput,
+    isHome,
+  );
   const channel = getChannelFromJid(containerInput.chatJid);
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
   const memoryPromptName = isHome
@@ -1903,8 +1917,7 @@ async function runQuery(
           },
         ]
       : []),
-    ...(isHome &&
-    !containerInput.agentId &&
+    ...(agentBuilderEnabled &&
     !containerInput.isScheduledTask &&
     !containerInput.messageTaskId
       ? [
@@ -2854,6 +2867,10 @@ async function main(): Promise<void> {
   let sessionId = containerInput.sessionId;
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const agentBuilderEnabled = resolveAgentBuilderEnabled(
+    containerInput,
+    isHome,
+  );
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
@@ -2869,6 +2886,7 @@ async function main(): Promise<void> {
     groupFolder: containerInput.groupFolder,
     isHome,
     isAdminHome,
+    agentBuilderEnabled,
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,
     currentInputTurnId: containerInput.turnId,

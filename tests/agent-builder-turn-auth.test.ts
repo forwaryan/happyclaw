@@ -2,6 +2,8 @@ import { describe, expect, test } from 'vitest';
 
 import {
   AgentBuilderTurnRegistry,
+  agentBuilderTurnScope,
+  getAgentBuilderRuntimeRejection,
   isAgentBuilderOwnerInput,
   ownerImIdFromDirectConversationJid,
   resolveTrustedDirectOwnerUpgrade,
@@ -17,6 +19,29 @@ const ownerInput = {
 };
 
 describe('Agent Builder host turn authorization', () => {
+  test('isolates concurrent runtime sessions in the same workspace', () => {
+    const registry = new AgentBuilderTurnRegistry();
+    const sessionA = agentBuilderTurnScope('workspace', 'session-a');
+    const sessionB = agentBuilderTurnScope('workspace', 'session-b');
+    registry.set(sessionA, 'web:workspace#agent:session-a', 'message-a');
+    registry.set(sessionB, 'web:workspace#agent:session-b', 'message-b');
+
+    expect(
+      registry.requireOwnerHumanTurn(
+        sessionA,
+        (_chatJid, messageId) => ({ ...ownerInput, content: messageId }),
+        () => true,
+      ).content,
+    ).toBe('message-a');
+    expect(
+      registry.requireOwnerHumanTurn(
+        sessionB,
+        (_chatJid, messageId) => ({ ...ownerInput, content: messageId }),
+        () => true,
+      ).content,
+    ).toBe('message-b');
+  });
+
   test('returns only a host-recorded durable owner turn', () => {
     const registry = new AgentBuilderTurnRegistry();
     registry.set('home', 'web:home', 'human-1');
@@ -206,6 +231,61 @@ describe('Agent Builder host turn authorization', () => {
         () => true,
       ).messageId,
     ).toBe('confirmation-turn');
+  });
+});
+
+describe('Agent Builder runtime eligibility', () => {
+  const base = {
+    isScheduledTask: false,
+    isolatedTaskId: null,
+    runtimeAgentId: null,
+    runtimeAgentKind: null,
+    runtimeAgentFolder: null,
+    sourceFolder: 'workspace-a',
+    sourceProfileIsDefault: true,
+  } as const;
+
+  test('allows the main session and ordinary runtime sessions in any workspace', () => {
+    expect(getAgentBuilderRuntimeRejection(base)).toBeNull();
+    expect(
+      getAgentBuilderRuntimeRejection({
+        ...base,
+        runtimeAgentId: 'conversation-a',
+        runtimeAgentKind: 'conversation',
+        runtimeAgentFolder: 'workspace-a',
+      }),
+    ).toBeNull();
+  });
+
+  test('rejects custom profiles, task runs, spawn agents, and cross-workspace impersonation', () => {
+    expect(
+      getAgentBuilderRuntimeRejection({
+        ...base,
+        sourceProfileIsDefault: false,
+      }),
+    ).toMatch(/main HappyClaw/);
+    expect(
+      getAgentBuilderRuntimeRejection({
+        ...base,
+        isScheduledTask: true,
+      }),
+    ).toMatch(/task runs/);
+    expect(
+      getAgentBuilderRuntimeRejection({
+        ...base,
+        runtimeAgentId: 'spawn-a',
+        runtimeAgentKind: 'spawn',
+        runtimeAgentFolder: 'workspace-a',
+      }),
+    ).toMatch(/ordinary main-Agent conversations/);
+    expect(
+      getAgentBuilderRuntimeRejection({
+        ...base,
+        runtimeAgentId: 'conversation-b',
+        runtimeAgentKind: 'conversation',
+        runtimeAgentFolder: 'workspace-b',
+      }),
+    ).toMatch(/ordinary main-Agent conversations/);
   });
 });
 

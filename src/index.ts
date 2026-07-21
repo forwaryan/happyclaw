@@ -221,6 +221,8 @@ import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
   AgentBuilderTurnRegistry,
+  agentBuilderTurnScope,
+  getAgentBuilderRuntimeRejection,
   isAgentBuilderOwnerInput,
   ownerImIdFromDirectConversationJid,
   resolveTrustedDirectOwnerUpgrade,
@@ -1228,6 +1230,16 @@ function injectPreparedFollowUp(
     formatMessages(prepared.messages),
     images.length > 0 ? images : undefined,
     (receipt) => {
+      if (runtime && receipt) {
+        activeAgentBuilderTurns.enqueueBatch(
+          agentBuilderTurnScope(runtime.effectiveGroup.folder, runtime.agentId),
+          (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
+            chatJid: receipt.chatJid,
+            messageId: cursor.id,
+            scheduledTaskId: null,
+          })),
+        );
+      }
       if (runtime?.agentId) {
         activeHeldCardFinalizers.get(item.chat_jid)?.();
       } else if (runtime) {
@@ -6081,6 +6093,7 @@ async function runAgent(
           isMain: isAdminHome,
           isHome,
           isAdminHome,
+          agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
           images,
           messageTaskId,
           agentProfile: containerAgentProfile,
@@ -6102,6 +6115,7 @@ async function runAgent(
           isMain: isAdminHome,
           isHome,
           isAdminHome,
+          agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
           images,
           messageTaskId,
           agentProfile: containerAgentProfile,
@@ -7598,27 +7612,26 @@ async function processTaskIpc(
   );
 
   const requireAgentBuilderActor = (): AgentBuilderActor => {
-    if (
-      !isHome ||
-      ipcAgentId !== null ||
-      ipcTaskId !== null ||
-      data.isScheduledTask
-    ) {
-      throw new Error(
-        'Agent Builder is only available to the main HappyClaw in a user home conversation',
-      );
-    }
     const ownerId = sourceGroupEntry?.created_by;
     const user = ownerId ? getUserById(ownerId) : undefined;
     if (!user || user.status !== 'active') {
-      throw new Error('No active user owns this home workspace');
+      throw new Error('No active user owns this workspace');
     }
     const sourceProfile = getAgentProfileForWorkspace(sourceGroup, user.id);
-    if (!sourceProfile?.is_default) {
-      throw new Error('Only the main HappyClaw may use Agent Builder');
-    }
+    const runtimeAgent = ipcAgentId ? getAgent(ipcAgentId) : undefined;
+    const runtimeRejection = getAgentBuilderRuntimeRejection({
+      isScheduledTask: data.isScheduledTask === true,
+      isolatedTaskId: ipcTaskId,
+      runtimeAgentId: ipcAgentId,
+      runtimeAgentKind: runtimeAgent?.kind ?? null,
+      runtimeAgentFolder: runtimeAgent?.group_folder ?? null,
+      sourceFolder: sourceGroup,
+      sourceProfileIsDefault: sourceProfile?.is_default === true,
+    });
+    if (runtimeRejection) throw new Error(runtimeRejection);
+
     const activeTurn = activeAgentBuilderTurns.requireOwnerHumanTurn(
-      sourceGroup,
+      agentBuilderTurnScope(sourceGroup, ipcAgentId),
       getAgentBuilderInputMessage,
       (input) =>
         isAgentBuilderOwnerInput(
@@ -9223,6 +9236,10 @@ async function processAgentConversation(
 
   const virtualChatJid = `${chatJid}#agent:${agentId}`;
   const virtualJid = virtualChatJid; // used as queue key
+  const agentBuilderScope = agentBuilderTurnScope(
+    effectiveGroup.folder,
+    agentId,
+  );
 
   // Get pending messages
   const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
@@ -9344,6 +9361,15 @@ async function processAgentConversation(
       missedMessages = toSend;
     }
   }
+
+  activeAgentBuilderTurns.startBatch(
+    agentBuilderScope,
+    missedMessages.map((message) => ({
+      chatJid: virtualChatJid,
+      messageId: message.id,
+      scheduledTaskId: message.task_id ?? null,
+    })),
+  );
 
   // Update agent status → running
   updateAgentStatus(agentId, 'running');
@@ -9655,6 +9681,18 @@ async function processAgentConversation(
     }
     if (output.inputTurnCompleted) {
       healthyAgentInputTurnCompleted = true;
+      const completedInputs = output.ipcReceipts?.length
+        ? output.ipcReceipts.flatMap((receipt) =>
+            (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
+              chatJid: receipt.chatJid,
+              messageId: cursor.id,
+            })),
+          )
+        : [{ chatJid: virtualChatJid, messageId: lastProcessed.id }];
+      activeAgentBuilderTurns.clearCompleted(
+        agentBuilderScope,
+        completedInputs,
+      );
     }
     if (
       output.queryIdle === true ||
@@ -10298,6 +10336,8 @@ async function processAgentConversation(
       isMain: isAdminHome,
       isHome,
       isAdminHome,
+      agentBuilderEnabled:
+        agent.kind === 'conversation' && agentProfile?.is_default === true,
       agentId,
       agentName: agent.name,
       images: imagesForAgent,
@@ -10694,6 +10734,7 @@ async function processAgentConversation(
     );
 
     activeImReplyRoutes.delete(virtualChatJid);
+    activeAgentBuilderTurns.delete(agentBuilderScope);
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
   }
 }
@@ -12251,9 +12292,24 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             virtualChatJid,
             formatted,
             imagesForAgent,
-            () => {
+            (receipt) => {
               // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
               activeHeldCardFinalizers.get(virtualChatJid)?.();
+              if (receipt) {
+                activeAgentBuilderTurns.enqueueBatch(
+                  agentBuilderTurnScope(
+                    agent?.group_folder ?? group.folder,
+                    agentId,
+                  ),
+                  (receipt.coveredCursors ?? [receipt.cursor]).map(
+                    (cursor) => ({
+                      chatJid: receipt.chatJid,
+                      messageId: cursor.id,
+                      scheduledTaskId: null,
+                    }),
+                  ),
+                );
+              }
             },
             lastAgentSourceJid,
             undefined,
@@ -13810,16 +13866,21 @@ async function main(): Promise<void> {
       inputCursor?: MessageCursor,
       inputChatJid?: string,
       inputTaskId?: string,
+      runtimeAgentId?: string,
     ) => {
       if (inputCursor && inputChatJid) {
-        activeAgentBuilderTurns.enqueueBatch(folder, [
-          {
-            chatJid: inputChatJid,
-            messageId: inputCursor.id,
-            scheduledTaskId: inputTaskId ?? null,
-          },
-        ]);
+        activeAgentBuilderTurns.enqueueBatch(
+          agentBuilderTurnScope(folder, runtimeAgentId),
+          [
+            {
+              chatJid: inputChatJid,
+              messageId: inputCursor.id,
+              scheduledTaskId: inputTaskId ?? null,
+            },
+          ],
+        );
       }
+      if (runtimeAgentId) return;
       activeRouteUpdaters.get(folder)?.(sourceJid, inputTurnId, inputCursor);
     },
     finalizeHeldCard: (key: string) => {

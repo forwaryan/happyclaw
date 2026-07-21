@@ -32,13 +32,18 @@ function cleanEnv(): Record<string, string> {
 
 function toolNames(
   isHome: boolean,
-  options: { isScheduledTask?: boolean; currentTaskId?: string | null } = {},
+  options: {
+    isScheduledTask?: boolean;
+    currentTaskId?: string | null;
+    agentBuilderEnabled?: boolean;
+  } = {},
 ): string[] {
   return createMcpTools({
     chatJid: 'web:tool-init',
     groupFolder: 'tool-init',
     isHome,
     isAdminHome: true,
+    agentBuilderEnabled: options.agentBuilderEnabled ?? isHome,
     isScheduledTask: options.isScheduledTask ?? false,
     currentTaskId: options.currentTaskId ?? null,
     currentInputTurnId: 'turn-1',
@@ -112,7 +117,7 @@ describe('HappyClaw tool initialization', () => {
     );
   });
 
-  test('home runtime exposes the complete tool set and Agent Builder', () => {
+  test('main-Agent runtime exposes the complete tool set and Agent Builder', () => {
     const names = toolNames(true);
     expect(names).toEqual(
       expect.arrayContaining([
@@ -130,8 +135,14 @@ describe('HappyClaw tool initialization', () => {
     );
   });
 
-  test('non-home runtime keeps ordinary tools but does not advertise owner tools', () => {
-    const names = toolNames(false);
+  test('main Agent exposes Agent Builder in every workspace', () => {
+    const names = toolNames(false, { agentBuilderEnabled: true });
+    expect(names).toContain('agent_profile_prepare');
+    expect(names).toContain('agent_profile_publish');
+  });
+
+  test('custom Agent runtime keeps ordinary tools but does not advertise Agent Builder', () => {
+    const names = toolNames(false, { agentBuilderEnabled: false });
     expect(names).toContain('schedule_task');
     expect(names).not.toContain('install_skill');
     expect(names).not.toContain('agent_profile_prepare');
@@ -152,6 +163,7 @@ describe('HappyClaw tool initialization', () => {
       groupFolder: 'tool-init-real',
       isHome: true,
       isAdminHome: true,
+      agentBuilderEnabled: true,
       isScheduledTask: false,
       currentTaskId: null,
       currentInputTurnId: 'turn-real',

@@ -168,6 +168,7 @@ export interface WebDeps {
     inputCursor?: { timestamp: string; id: string },
     inputChatJid?: string,
     inputTaskId?: string,
+    runtimeAgentId?: string,
   ) => void;
   /** 用户消息注入运行中 Sub-Agent 时，先把该 agent 挂起中的流式卡片定稿轮换。
    * key 为 virtualChatJid（`web:{folder}#agent:{id}`）。主会话路径无需调用

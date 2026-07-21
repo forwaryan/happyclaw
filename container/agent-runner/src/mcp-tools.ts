@@ -22,6 +22,8 @@ export interface McpContext {
   groupFolder: string;
   isHome: boolean;
   isAdminHome: boolean;
+  /** Whether this runtime is an interactive session of the main HappyClaw. */
+  agentBuilderEnabled: boolean;
   isScheduledTask?: boolean;
   /** Mutable: set when the current IPC turn was triggered by a task prompt.
    * Cleared between turns by the agent-runner main loop so that regular
@@ -1689,9 +1691,9 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
     ),
   ];
 
-  // Agent Builder tools are visible in home runtimes. The host additionally
-  // rejects conversation agents, scheduled tasks, and non-default profiles.
-  if (ctx.isHome) {
+  // Agent Builder follows the effective top-level AgentProfile, not the
+  // workspace type. The host independently revalidates every operation.
+  if (ctx.agentBuilderEnabled) {
     const capabilityPolicySchema = z.object({
       mode: z.enum(['inherit', 'custom', 'disabled']),
       ids: z.array(z.string()).max(100),

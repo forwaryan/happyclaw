@@ -265,6 +265,8 @@ export interface ContainerInput {
     includeClaudePreset: boolean;
     runtimePolicy?: AgentProfileRuntimePolicy;
   };
+  /** Host-derived capability flag for main-HappyClaw interactive sessions. */
+  agentBuilderEnabled?: boolean;
   agentId?: string;
   agentName?: string;
   /**

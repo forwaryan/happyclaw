@@ -11,6 +11,45 @@ export interface AgentBuilderTurnContext {
   scheduledTaskId: string | null;
 }
 
+/**
+ * Keep owner-turn authorization isolated per workspace runtime session.
+ * The main session retains the historical folder key; conversation sessions
+ * get their own namespace so concurrent chats cannot borrow confirmations.
+ */
+export function agentBuilderTurnScope(
+  folder: string,
+  runtimeAgentId?: string | null,
+): string {
+  return runtimeAgentId
+    ? `${folder}\u0000conversation:${runtimeAgentId}`
+    : folder;
+}
+
+export function getAgentBuilderRuntimeRejection(input: {
+  isScheduledTask: boolean;
+  isolatedTaskId?: string | null;
+  runtimeAgentId?: string | null;
+  runtimeAgentKind?: 'task' | 'conversation' | 'spawn' | null;
+  runtimeAgentFolder?: string | null;
+  sourceFolder: string;
+  sourceProfileIsDefault: boolean;
+}): string | null {
+  if (input.isScheduledTask || input.isolatedTaskId) {
+    return 'Agent Builder is unavailable for scheduled or isolated task runs';
+  }
+  if (
+    input.runtimeAgentId &&
+    (input.runtimeAgentKind !== 'conversation' ||
+      input.runtimeAgentFolder !== input.sourceFolder)
+  ) {
+    return 'Agent Builder is only available to ordinary main-Agent conversations';
+  }
+  if (!input.sourceProfileIsDefault) {
+    return 'Only the main HappyClaw may use Agent Builder';
+  }
+  return null;
+}
+
 function isCanonicalImOwnerSender(
   sourceJid: string,
   ownerImId: string,
