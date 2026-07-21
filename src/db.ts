@@ -8156,9 +8156,12 @@ type ChannelAccountRow = {
 };
 
 function parseChannelAccountRow(row: ChannelAccountRow): ChannelAccount {
-  const transportStatus = ['connecting', 'connected', 'error'].includes(
-    row.transport_status || row.status,
-  )
+  const transportStatus = [
+    'connecting',
+    'reconnecting',
+    'connected',
+    'error',
+  ].includes(row.transport_status || row.status)
     ? ((row.transport_status ||
         row.status) as ChannelAccount['transport_status'])
     : 'disconnected';
@@ -8384,16 +8387,16 @@ export function updateChannelAccountStatus(
 ): void {
   const now = new Date().toISOString();
   db.prepare(
-    `UPDATE channel_accounts SET transport_status = ?, status = ?, last_error = ?, connected_at = ?, updated_at = ?
+    `UPDATE channel_accounts SET
+       transport_status = ?, status = ?, last_error = ?,
+       connected_at = CASE
+         WHEN ? = 'connected' THEN ?
+         WHEN ? = 'reconnecting' THEN connected_at
+         ELSE NULL
+       END,
+       updated_at = ?
      WHERE id = ?`,
-  ).run(
-    status,
-    status,
-    error ?? null,
-    status === 'connected' ? now : null,
-    now,
-    id,
-  );
+  ).run(status, status, error ?? null, status, now, status, now, id);
 }
 
 export function updateChannelAccountAuthStatus(

@@ -20,7 +20,8 @@ vi.mock('../src/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-const { broadcastWhatsAppStatus } = await import('../src/web.js');
+const { broadcastChannelAccountStatus, broadcastWhatsAppStatus } =
+  await import('../src/web.js');
 
 afterEach(() => {
   harness.clients.clear();
@@ -84,5 +85,29 @@ describe('account-scoped channel status WebSocket event', () => {
       status: 'connected',
       meJid: 'bot-b@s.whatsapp.net',
     });
+  });
+
+  test('generic reconnect state includes the account and stays user-isolated', () => {
+    const owner = addClient('session-owner', 'ws-owner');
+    const other = addClient('session-other', 'ws-other');
+
+    broadcastChannelAccountStatus('ws-owner', 'wechat-account-a', {
+      transportStatus: 'reconnecting',
+      lastError: '连接微信服务超时，HappyClaw 正在自动重试',
+      errorCode: 'connect_timeout',
+      consecutiveFailures: 2,
+      nextRetryMs: 6000,
+    });
+
+    expect(JSON.parse(owner.send.mock.calls[0][0])).toMatchObject({
+      type: 'channel_account_status',
+      userId: 'ws-owner',
+      accountId: 'wechat-account-a',
+      transportStatus: 'reconnecting',
+      errorCode: 'connect_timeout',
+      consecutiveFailures: 2,
+      nextRetryMs: 6000,
+    });
+    expect(other.send).not.toHaveBeenCalled();
   });
 });

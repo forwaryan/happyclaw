@@ -2837,6 +2837,27 @@ export function broadcastWhatsAppStatus(
   safeBroadcast(msg, false, allowedUserIds);
 }
 
+export function broadcastChannelAccountStatus(
+  userId: string,
+  accountId: string,
+  state: {
+    transportStatus: import('./types.js').ChannelTransportStatus;
+    lastError?: string | null;
+    connectedAt?: string | null;
+    errorCode?: string;
+    consecutiveFailures?: number;
+    nextRetryMs?: number;
+  },
+): void {
+  const msg: WsMessageOut = {
+    type: 'channel_account_status',
+    userId,
+    accountId,
+    ...state,
+  };
+  safeBroadcast(msg, false, new Set([userId]));
+}
+
 export function broadcastAgentStatus(
   chatJid: string,
   agentId: string,

@@ -106,11 +106,11 @@ describe('channel account frontend behavior', () => {
     ).toMatchObject({ credentials: { botToken: 'must-not-send' } });
   });
 
-  test('exposes connection tests for credential protocols, not QR sessions', () => {
+  test('exposes connection tests when a provider has a non-destructive probe', () => {
     expect(supportsChannelConnectionTest('feishu')).toBe(true);
     expect(supportsChannelConnectionTest('telegram')).toBe(true);
     expect(supportsChannelConnectionTest('qq')).toBe(true);
-    expect(supportsChannelConnectionTest('wechat')).toBe(false);
+    expect(supportsChannelConnectionTest('wechat')).toBe(true);
     expect(supportsChannelConnectionTest('dingtalk')).toBe(true);
     expect(supportsChannelConnectionTest('discord')).toBe(true);
     expect(supportsChannelConnectionTest('whatsapp')).toBe(false);
@@ -276,6 +276,32 @@ describe('channel account frontend behavior', () => {
       {},
     );
     expect(useChannelAccountsStore.getState().accounts).toEqual([next]);
+  });
+
+  test('applies an account-scoped reconnect event without touching siblings', () => {
+    const target = account({
+      id: 'wechat-a',
+      provider: 'wechat',
+      transport_status: 'connected',
+    });
+    const sibling = account({ id: 'wechat-b', provider: 'wechat' });
+    useChannelAccountsStore.setState({ accounts: [target, sibling] });
+
+    useChannelAccountsStore.getState().applyStatusEvent({
+      accountId: 'wechat-a',
+      transportStatus: 'reconnecting',
+      lastError: '连接微信服务超时，HappyClaw 正在自动重试',
+    });
+
+    expect(useChannelAccountsStore.getState().accounts).toEqual([
+      expect.objectContaining({
+        id: 'wechat-a',
+        status: 'reconnecting',
+        transport_status: 'reconnecting',
+        last_error: '连接微信服务超时，HappyClaw 正在自动重试',
+      }),
+      sibling,
+    ]);
   });
 
   test('keeps account-scoped channel choices distinct and preserves legacy default', () => {

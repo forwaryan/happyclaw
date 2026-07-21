@@ -170,7 +170,7 @@ export const CHANNEL_PROVIDER_OPTIONS: ChannelProviderOption[] = [
       nextStep:
         '扫码授权只建立渠道账号；连接后还需要生成配对码，授权具体微信会话。',
     },
-    supportsTest: false,
+    supportsTest: true,
     supportsPairing: true,
   },
   {

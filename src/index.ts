@@ -15,7 +15,6 @@ import {
   POLL_INTERVAL,
   TIMEZONE,
   isDockerAvailable,
-  updateWeChatNoProxy,
 } from './config.js';
 import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
@@ -357,6 +356,7 @@ import {
   broadcastGroupCreated,
   broadcastBillingUpdate,
   broadcastWhatsAppStatus,
+  broadcastChannelAccountStatus,
   shutdownTerminals,
   shutdownWebServer,
   getActiveStreamingTexts,
@@ -12872,18 +12872,6 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
       );
     } else if (account.provider === 'wechat') {
       const bypassProxy = secret.bypassProxy !== 'false';
-      const proxyConflict = listEnabledChannelAccounts().find((candidate) => {
-        if (candidate.provider !== 'wechat' || candidate.id === account.id)
-          return false;
-        const other = loadChannelAccountSecret(candidate.secret_ref);
-        return (other?.bypassProxy !== 'false') !== bypassProxy;
-      });
-      if (proxyConflict) {
-        throw new Error(
-          'Enabled WeChat accounts must use the same proxy strategy in one HappyClaw process',
-        );
-      }
-      updateWeChatNoProxy(bypassProxy);
       connected = await imManager.connectUserWeChat(
         account.owner_user_id,
         {
@@ -12892,6 +12880,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           baseUrl: secret.baseUrl,
           cdnBaseUrl: secret.cdnBaseUrl,
           getUpdatesBuf: secret.getUpdatesBuf,
+          bypassProxy,
         },
         onNewChat,
         {
@@ -12916,6 +12905,14 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
             if (state.status === 'connected') {
               updateChannelAccountAuthStatus(account.id, 'authorized');
               updateChannelAccountStatus(account.id, 'connected');
+            } else if (state.status === 'connecting') {
+              updateChannelAccountStatus(account.id, 'connecting');
+            } else if (state.status === 'reconnecting') {
+              updateChannelAccountStatus(
+                account.id,
+                'reconnecting',
+                state.error,
+              );
             } else if (state.status === 'expired') {
               updateChannelAccountAuthStatus(
                 account.id,
@@ -12934,6 +12931,17 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
                 'disconnected',
                 state.error,
               );
+            }
+            const latest = getChannelAccount(account.id);
+            if (latest) {
+              broadcastChannelAccountStatus(account.owner_user_id, account.id, {
+                transportStatus: latest.transport_status,
+                lastError: latest.last_error,
+                connectedAt: latest.connected_at,
+                errorCode: state.errorCode,
+                consecutiveFailures: state.consecutiveFailures,
+                nextRetryMs: state.nextRetryMs,
+              });
             }
           },
           onUpdatesBuf: (cursor: string) => {
@@ -13084,6 +13092,13 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
       // source allowed to publish transport=connected.
       if (!connected) {
         updateChannelAccountStatus(account.id, 'error', 'Connection failed');
+      }
+    } else if (account.provider === 'wechat') {
+      // connectUserWeChat returns once the local poller is retained. Its
+      // connection-state callback is the sole authority for connecting,
+      // connected and reconnecting transport states.
+      if (!connected) {
+        updateChannelAccountStatus(account.id, 'error', '微信轮询启动失败');
       }
     } else {
       updateChannelAccountStatus(
@@ -13434,9 +13449,6 @@ async function main(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'Failed to mark stale spawn agents at startup');
   }
-
-  // WeChat iLink API domains bypass proxy (applied at startup, updated on config save)
-  updateWeChatNoProxy(true);
 
   // Migrate system-level IM config → admin's per-user config (one-time)
   migrateSystemIMToPerUser();
@@ -13870,6 +13882,7 @@ async function main(): Promise<void> {
             baseUrl: config.baseUrl,
             cdnBaseUrl: config.cdnBaseUrl,
             getUpdatesBuf: config.getUpdatesBuf,
+            bypassProxy: config.bypassProxy,
           },
           onNewChat,
           {
@@ -14664,6 +14677,7 @@ async function main(): Promise<void> {
           baseUrl: userWeChat.baseUrl,
           cdnBaseUrl: userWeChat.cdnBaseUrl,
           getUpdatesBuf: userWeChat.getUpdatesBuf,
+          bypassProxy: userWeChat.bypassProxy,
           enabled: userWeChat.enabled,
         };
       }

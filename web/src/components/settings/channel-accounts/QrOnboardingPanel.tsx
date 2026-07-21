@@ -73,10 +73,12 @@ export function QrOnboardingPanel({
     try {
       const result = await beginOnboarding(account.id);
       setOnboarding(result.onboarding);
-      if (result.onboarding.auth_status === 'authorized') {
+      if (result.onboarding.transport_status === 'connected') {
         toast.success(
           `${account.provider === 'wechat' ? '微信' : 'WhatsApp'} 已连接`,
         );
+      } else if (result.onboarding.auth_status === 'authorized') {
+        toast.info('授权有效，已开始连接消息服务');
       }
     } catch (err) {
       const message = getApiMessage(err, '无法发起扫码连接，请稍后重试');
@@ -137,6 +139,31 @@ export function QrOnboardingPanel({
         setOnboarding((current) =>
           mergeWhatsAppOnboardingState(current, statusEvent),
         );
+      },
+    );
+    return () => {
+      unsubscribe();
+    };
+  }, [account.id, account.provider]);
+
+  useEffect(() => {
+    if (account.provider !== 'wechat') return;
+    const unsubscribe = wsManager.on(
+      'channel_account_status',
+      (event: {
+        accountId?: string;
+        transportStatus?: ChannelOnboardingState['transport_status'];
+        lastError?: string | null;
+      }) => {
+        const transportStatus = event.transportStatus;
+        if (event.accountId !== account.id || !transportStatus) return;
+        setOnboarding((current) => ({
+          ...current,
+          transport_status: transportStatus,
+          status: transportStatus,
+          error: event.lastError ?? undefined,
+        }));
+        setError(event.lastError ?? null);
       },
     );
     return () => {
@@ -208,6 +235,9 @@ export function QrOnboardingPanel({
     account.provider === 'wechat' ? onboarding.qrcodeUrl : onboarding.qrDataUrl;
   const authorized = onboarding.auth_status === 'authorized';
   const connected = onboarding.transport_status === 'connected';
+  const transportBusy =
+    onboarding.transport_status === 'connecting' ||
+    onboarding.transport_status === 'reconnecting';
 
   return (
     <div className="space-y-4">
@@ -215,10 +245,12 @@ export function QrOnboardingPanel({
         aria-live="polite"
         className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3"
       >
-        {authorized ? (
+        {connected ? (
           <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-success" />
-        ) : loading || action === 'start' ? (
-          <Loader2 className="mt-0.5 size-5 shrink-0 animate-spin text-muted-foreground" />
+        ) : loading || action === 'start' || transportBusy ? (
+          <Loader2 className="mt-0.5 size-5 shrink-0 text-warning motion-safe:animate-spin" />
+        ) : authorized ? (
+          <PlugZap className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
         ) : (
           <QrCode className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
         )}
@@ -226,12 +258,33 @@ export function QrOnboardingPanel({
           <p className="text-sm font-medium">
             {onboardingStatusLabel(onboarding)}
           </p>
+          {account.provider === 'wechat' && (
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+              网络路径：
+              {account.options?.bypassProxy !== false
+                ? '绕过 HappyClaw HTTP(S) 代理；系统 TUN 或 VPN 仍可能接管'
+                : '使用 HappyClaw 启动环境中的 HTTP(S) 代理'}
+            </p>
+          )}
           <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
             {onboardingHelp(account, onboarding)}
           </p>
           {error && (
-            <p role="alert" className="mt-1 text-xs text-error">
-              {error}
+            <p
+              role={
+                onboarding.transport_status === 'reconnecting'
+                  ? 'status'
+                  : 'alert'
+              }
+              className={`mt-1 text-xs ${
+                onboarding.transport_status === 'reconnecting'
+                  ? 'text-warning'
+                  : 'text-error'
+              }`}
+            >
+              {onboarding.transport_status === 'reconnecting'
+                ? `最近一次连接失败：${error}`
+                : error}
             </p>
           )}
         </div>
@@ -330,7 +383,7 @@ export function QrOnboardingPanel({
         )}
 
       <div className="flex flex-wrap gap-2">
-        {!connected && (
+        {!connected && !transportBusy && (
           <Button
             type="button"
             onClick={() => void start()}
@@ -350,6 +403,14 @@ export function QrOnboardingPanel({
               : onboarding.auth_status === 'awaiting_scan'
                 ? '重新获取二维码'
                 : '扫码连接'}
+          </Button>
+        )}
+        {transportBusy && (
+          <Button type="button" variant="outline" disabled>
+            <Loader2 className="size-4 motion-safe:animate-spin" />
+            {onboarding.transport_status === 'reconnecting'
+              ? '正在自动重连'
+              : '正在连接'}
           </Button>
         )}
         {connected && (
@@ -404,7 +465,12 @@ function initialOnboarding(account: ChannelAccount): ChannelOnboardingState {
     auth_status: account.auth_status ?? 'draft',
     transport_status:
       account.transport_status ??
-      (account.status === 'connected' ? 'connected' : 'disconnected'),
+      (account.status === 'connected' ||
+      account.status === 'connecting' ||
+      account.status === 'reconnecting' ||
+      account.status === 'error'
+        ? account.status
+        : 'disconnected'),
   };
 }
 
@@ -412,6 +478,7 @@ function shouldPoll(state: ChannelOnboardingState) {
   return (
     state.auth_status === 'awaiting_scan' ||
     state.transport_status === 'connecting' ||
+    state.transport_status === 'reconnecting' ||
     state.status === 'wait' ||
     state.status === 'scaned' ||
     state.status === 'scaned_but_redirect' ||
@@ -424,10 +491,14 @@ function shouldPoll(state: ChannelOnboardingState) {
 }
 
 function onboardingStatusLabel(state: ChannelOnboardingState) {
-  if (state.auth_status === 'authorized')
-    return state.transport_status === 'connected'
-      ? '已连接'
-      : '已授权，当前离线';
+  if (state.auth_status === 'authorized') {
+    if (state.transport_status === 'connected') return '已连接';
+    if (state.transport_status === 'reconnecting')
+      return '网络异常，正在自动重连';
+    if (state.transport_status === 'connecting') return '已授权，正在连接';
+    if (state.transport_status === 'error') return '连接异常';
+    return '已授权，当前离线';
+  }
   if (state.status === 'need_verifycode') return '需要微信验证码';
   if (state.status === 'scaned_but_redirect') return '已扫码，正在切换服务';
   if (state.status === 'binded_redirect') return '检测到已绑定账号';
@@ -446,10 +517,14 @@ function onboardingHelp(
   account: ChannelAccount,
   state: ChannelOnboardingState,
 ) {
-  if (state.auth_status === 'authorized')
-    return state.transport_status === 'connected'
-      ? '授权和消息连接均正常。'
-      : '授权仍然有效，可以直接重新连接，无需再次扫码。';
+  if (state.auth_status === 'authorized') {
+    if (state.transport_status === 'connected') return '授权和消息连接均正常。';
+    if (state.transport_status === 'reconnecting')
+      return '网络暂时不可用，HappyClaw 会持续自动重试。';
+    if (state.transport_status === 'connecting')
+      return '正在建立消息连接，首次连接可能需要一个长轮询周期。';
+    return '授权仍然有效，可以直接重新连接，无需再次扫码。';
+  }
   if (state.status === 'need_verifycode')
     return '请在下方输入微信客户端显示的数字验证码。验证码只用于本次扫码确认。';
   if (state.status === 'scaned_but_redirect')

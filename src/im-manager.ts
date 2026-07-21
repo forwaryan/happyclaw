@@ -96,6 +96,7 @@ export interface WeChatConnectConfig {
   baseUrl?: string;
   cdnBaseUrl?: string;
   getUpdatesBuf?: string;
+  bypassProxy?: boolean;
   enabled?: boolean;
 }
 
@@ -1244,6 +1245,11 @@ export class IMConnectionManager {
         baseUrl: config.baseUrl,
         cdnBaseUrl: config.cdnBaseUrl,
         getUpdatesBuf: config.getUpdatesBuf,
+        bypassProxy: config.bypassProxy,
+        logContext: {
+          userId,
+          accountId: options?.accountId,
+        },
       },
       options?.onUpdatesBuf,
     );
@@ -1254,7 +1260,10 @@ export class IMConnectionManager {
       channel,
       {
         onReady: () => {
-          logger.info({ userId }, 'User WeChat bot connected');
+          logger.info(
+            { userId, accountId: options?.accountId },
+            'User WeChat poller started',
+          );
         },
         onNewChat,
         ignoreMessagesBefore: options?.ignoreMessagesBefore,
@@ -1268,6 +1277,7 @@ export class IMConnectionManager {
       },
       options?.accountId,
       options?.scopeIncomingJids,
+      config.ilinkBotId,
     );
   }
 

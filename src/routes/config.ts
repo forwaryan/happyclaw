@@ -7,7 +7,7 @@ import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
 import { Hono } from 'hono';
-import { DATA_DIR, updateWeChatNoProxy } from '../config.js';
+import { DATA_DIR } from '../config.js';
 import {
   avatarUploadBodyLimit,
   AVATAR_MAX_FILE_BYTES,
@@ -2987,9 +2987,6 @@ configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
       Object.keys(validation.data),
       { userId: user.id },
     );
-
-    // Update NO_PROXY based on bypassProxy setting
-    updateWeChatNoProxy(saved.bypassProxy ?? true);
 
     // Hot-reload: reconnect user's WeChat channel
     if (deps?.reloadUserIMConfig) {

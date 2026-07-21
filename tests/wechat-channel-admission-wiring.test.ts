@@ -16,6 +16,7 @@ vi.mock('../src/wechat.js', () => ({
     async sendImage() {},
     async sendFile() {},
     async sendTyping() {},
+    isRunning: () => true,
     isConnected: () => true,
     getUpdatesBuf: () => '',
   }),
@@ -98,6 +99,29 @@ describe('WeChat admission and lifecycle wiring', () => {
       status: 'expired',
       error: 'errcode -14',
     });
+    await manager.disconnectAll();
+  });
+
+  test('one iLink bot identity cannot be polled by two accounts', async () => {
+    const manager = new IMConnectionManager();
+    await expect(
+      manager.connectUserWeChat(
+        'owner-a',
+        { botToken: 'token-a', ilinkBotId: 'same-ilink-bot' },
+        vi.fn(),
+        { accountId: 'wechat-account-a' },
+      ),
+    ).resolves.toBe(true);
+
+    await expect(
+      manager.connectUserWeChat(
+        'owner-b',
+        { botToken: 'token-b', ilinkBotId: 'same-ilink-bot' },
+        vi.fn(),
+        { accountId: 'wechat-account-b' },
+      ),
+    ).rejects.toThrow('already connected by another channel account');
+
     await manager.disconnectAll();
   });
 });

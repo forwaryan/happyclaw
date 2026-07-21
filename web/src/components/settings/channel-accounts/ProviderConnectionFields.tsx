@@ -49,8 +49,8 @@ export function ProviderConnectionFields({
         {provider === 'wechat' && showOptions && (
           <OptionSwitch
             id={`${idPrefix}-bypass-proxy`}
-            label="直连微信服务"
-            description="适合国内网络；关闭后使用系统代理。"
+            label="绕过 HappyClaw HTTP 代理"
+            description="开启后不使用 HTTP(S)_PROXY；Clash TUN、VPN 等系统级网络仍可能接管流量。"
             checked={(values.bypassProxy ?? 'true') !== 'false'}
             disabled={disabled}
             onCheckedChange={(checked) =>

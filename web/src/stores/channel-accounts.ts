@@ -20,6 +20,7 @@ export type ChannelAuthStatus =
 export type ChannelTransportStatus =
   | 'disconnected'
   | 'connecting'
+  | 'reconnecting'
   | 'connected'
   | 'error';
 
@@ -37,6 +38,7 @@ export interface ChannelOnboardingState {
     | 'confirmed'
     | 'expired'
     | 'connecting'
+    | 'reconnecting'
     | 'qr'
     | 'connected'
     | 'disconnected'
@@ -58,7 +60,12 @@ export interface ChannelAccount {
   name: string;
   enabled: boolean;
   is_default: boolean;
-  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  status:
+    | 'disconnected'
+    | 'connecting'
+    | 'reconnecting'
+    | 'connected'
+    | 'error';
   auth_mode?: ChannelAuthMode;
   auth_status?: ChannelAuthStatus;
   transport_status?: ChannelTransportStatus;
@@ -87,6 +94,13 @@ export interface ChannelAccountCreateInput {
 export type ChannelAccountPatchInput = Partial<
   Omit<ChannelAccountCreateInput, 'provider' | 'credentials'>
 > & { credentials?: Record<string, string> };
+
+export interface ChannelAccountStatusEvent {
+  accountId: string;
+  transportStatus: ChannelTransportStatus;
+  lastError?: string | null;
+  connectedAt?: string | null;
+}
 
 interface ChannelAccountsState {
   accounts: ChannelAccount[];
@@ -117,6 +131,7 @@ interface ChannelAccountsState {
   ) => Promise<{ account: ChannelAccount; onboarding: ChannelOnboardingState }>;
   toggleAccount: (id: string) => Promise<ChannelAccount>;
   deleteAccount: (id: string) => Promise<void>;
+  applyStatusEvent: (event: ChannelAccountStatusEvent) => void;
 }
 
 export function mergeChannelAccount(
@@ -268,6 +283,28 @@ export const useChannelAccountsStore = create<ChannelAccountsState>((set) => ({
     set((state) => ({
       accounts: state.accounts.filter((account) => account.id !== id),
       error: null,
+    }));
+  },
+
+  applyStatusEvent: (event) => {
+    set((state) => ({
+      accounts: state.accounts.map((account) =>
+        account.id === event.accountId
+          ? {
+              ...account,
+              status: event.transportStatus,
+              transport_status: event.transportStatus,
+              last_error:
+                event.lastError !== undefined
+                  ? event.lastError
+                  : account.last_error,
+              connected_at:
+                event.connectedAt !== undefined
+                  ? event.connectedAt
+                  : account.connected_at,
+            }
+          : account,
+      ),
     }));
   },
 }));

@@ -136,6 +136,7 @@ export type ChannelAuthStatus =
 export type ChannelTransportStatus =
   | 'disconnected'
   | 'connecting'
+  | 'reconnecting'
   | 'connected'
   | 'error';
 
@@ -157,7 +158,12 @@ export interface ChannelAccount {
   /** Live socket/stream lifecycle. */
   transport_status: ChannelTransportStatus;
   /** @deprecated Compatibility projection of transport_status. */
-  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  status:
+    | 'disconnected'
+    | 'connecting'
+    | 'reconnecting'
+    | 'connected'
+    | 'error';
   default_agent_profile_id: string | null;
   default_workspace_jid: string | null;
   last_error: string | null;
@@ -786,6 +792,17 @@ export type WsMessageOut =
       error?: string;
       meJid?: string;
       meName?: string;
+    }
+  | {
+      type: 'channel_account_status';
+      userId: string;
+      accountId: string;
+      transportStatus: ChannelTransportStatus;
+      lastError?: string | null;
+      connectedAt?: string | null;
+      errorCode?: string;
+      consecutiveFailures?: number;
+      nextRetryMs?: number;
     }
   | {
       type: 'billing_update';

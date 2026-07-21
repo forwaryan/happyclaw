@@ -130,6 +130,7 @@ async function createPendingWeChatQr(
     // A token belongs to this account and owner only. Cross-account token
     // lists would leak identities between users in a multi-tenant deployment.
     localTokenList: secret.botToken ? [secret.botToken] : [],
+    bypassProxy: secret.bypassProxy !== 'false',
   });
   return {
     ...started,
@@ -307,7 +308,9 @@ function onboardingPayload(account: ChannelAccount) {
     ...(qr?.qrcodeUrl ? { qrcodeUrl: qr.qrcodeUrl } : {}),
     ...(qr?.status === 'need_verifycode' ? { needsVerifyCode: true } : {}),
     ...(whatsapp?.qrDataUrl ? { qrDataUrl: whatsapp.qrDataUrl } : {}),
-    ...(whatsapp?.error ? { error: whatsapp.error } : {}),
+    ...(whatsapp?.error || refreshed.last_error
+      ? { error: whatsapp?.error ?? refreshed.last_error ?? undefined }
+      : {}),
     ...(whatsapp?.meJid ? { meJid: whatsapp.meJid } : {}),
     ...(whatsapp?.meName ? { meName: whatsapp.meName } : {}),
   };
@@ -784,12 +787,11 @@ routes.post('/:id/onboarding', authMiddleware, async (c) => {
         secret.ilinkBotId
       ) {
         // "Reconnect" is a transport action, not a new QR authorization.
-        const connected = await deps.reloadChannelAccount?.(account.id);
-        updateChannelAccountStatus(
-          account.id,
-          connected === false ? 'error' : 'connected',
-          connected === false ? 'Connection failed' : null,
-        );
+        updateChannelAccountStatus(account.id, 'connecting');
+        const started = await deps.reloadChannelAccount?.(account.id);
+        if (started === false) {
+          updateChannelAccountStatus(account.id, 'error', '微信轮询启动失败');
+        }
       } else {
         const active = pendingWeChatQr.get(account.id);
         if (!active || !isFreshWeChatQr(active)) {
@@ -877,9 +879,11 @@ routes.get('/:id/onboarding/status', authMiddleware, async (c) => {
           updateChannelAccountAuthStatus(account.id, 'draft');
           updateChannelAccountStatus(account.id, 'disconnected');
         } else {
+          const secret = loadChannelAccountSecret(account.secret_ref) ?? {};
           const state = await pollWeChatQrOnboarding(pending.qrcode, {
             baseUrl: pending.currentBaseUrl,
             verifyCode: pending.verifyCode,
+            bypassProxy: secret.bypassProxy !== 'false',
           });
           pending.status = state.status;
           if (state.status === 'scaned' && pending.verifyCode) {
@@ -1169,6 +1173,7 @@ routes.post('/:id/toggle', authMiddleware, async (c) => {
   const enabled = !current.enabled;
   updateChannelAccount(id, user.id, { enabled });
   if (enabled && current.auth_status === 'authorized') {
+    updateChannelAccountStatus(id, 'connecting');
     try {
       const connected = await deps.reloadChannelAccount?.(id);
       if (connected === false) {

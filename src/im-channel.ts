@@ -623,7 +623,7 @@ export function createWeChatChannel(
     channelType: 'wechat',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
-      inner = createWeChatConnection(config);
+      inner ??= createWeChatConnection(config);
       try {
         await inner.connect({
           onReady: opts.onReady,
@@ -639,7 +639,10 @@ export function createWeChatChannel(
           onConnectionStateChange: opts.onWeChatConnectionStateChange,
           onUpdatesBuf,
         });
-        return inner.isConnected();
+        // A healthy getUpdates response may take one long-poll interval. The
+        // manager must retain the running connector while transport health is
+        // reported asynchronously through onConnectionStateChange.
+        return inner.isRunning();
       } catch (err) {
         logger.error({ err }, 'WeChat channel connect failed');
         return false;

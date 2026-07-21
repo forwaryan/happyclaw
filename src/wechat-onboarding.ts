@@ -1,4 +1,6 @@
 import QRCode from 'qrcode';
+import type { Dispatcher } from 'undici';
+import { createWeChatHttpDispatcher } from './wechat-http.js';
 
 const WECHAT_API_BASE = 'https://ilinkai.weixin.qq.com';
 const WECHAT_QR_BOT_TYPE = '3';
@@ -32,6 +34,8 @@ export interface WeChatQrStatus {
 export interface WeChatQrStartOptions {
   /** Existing token for this account only. Never include another user's token. */
   localTokenList?: string[];
+  /** Bypass HappyClaw's HTTP(S) proxy for this account. */
+  bypassProxy?: boolean;
 }
 
 export interface WeChatQrPollOptions {
@@ -39,7 +43,11 @@ export interface WeChatQrPollOptions {
   baseUrl?: string;
   /** Number shown by the WeChat client for second-factor verification. */
   verifyCode?: string;
+  /** Bypass HappyClaw's HTTP(S) proxy for this account. */
+  bypassProxy?: boolean;
 }
+
+type WeChatFetchInit = RequestInit & { dispatcher: Dispatcher };
 
 /** Encode a semver as the uint32 expected by iLink (0x00MMNNPP). */
 export function encodeWeChatClientVersion(version: string): number {
@@ -81,31 +89,39 @@ export async function startWeChatQrOnboarding(
         .filter(Boolean),
     ),
   ).slice(0, 10);
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...weChatIlinkHeaders(),
-    },
-    body: JSON.stringify({ local_token_list: localTokenList }),
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch WeChat QR code: HTTP ${response.status}`);
+  const dispatcher = createWeChatHttpDispatcher(options.bypassProxy !== false);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...weChatIlinkHeaders(),
+      },
+      body: JSON.stringify({ local_token_list: localTokenList }),
+      dispatcher,
+    } as WeChatFetchInit);
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch WeChat QR code: HTTP ${response.status}`,
+      );
+    }
+    const body = (await response.json()) as {
+      qrcode?: string;
+      qrcode_img_content?: string;
+    };
+    if (!body.qrcode)
+      throw new Error('WeChat QR response did not include qrcode');
+    const qrcodeUrl = body.qrcode_img_content
+      ? await QRCode.toDataURL(body.qrcode_img_content, {
+          width: 512,
+          margin: 2,
+          color: { dark: '#000000', light: '#ffffff' },
+        })
+      : '';
+    return { qrcode: body.qrcode, qrcodeUrl };
+  } finally {
+    await dispatcher.close();
   }
-  const body = (await response.json()) as {
-    qrcode?: string;
-    qrcode_img_content?: string;
-  };
-  if (!body.qrcode)
-    throw new Error('WeChat QR response did not include qrcode');
-  const qrcodeUrl = body.qrcode_img_content
-    ? await QRCode.toDataURL(body.qrcode_img_content, {
-        width: 512,
-        margin: 2,
-        color: { dark: '#000000', light: '#ffffff' },
-      })
-    : '';
-  return { qrcode: body.qrcode, qrcodeUrl };
 }
 
 export async function pollWeChatQrOnboarding(
@@ -120,11 +136,13 @@ export async function pollWeChatQrOnboarding(
   const url = `${baseUrl}/ilink/bot/get_qrcode_status?${query.toString()}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 35_000);
+  const dispatcher = createWeChatHttpDispatcher(options.bypassProxy !== false);
   try {
     const response = await fetch(url, {
       headers: weChatIlinkHeaders(),
       signal: controller.signal,
-    });
+      dispatcher,
+    } as WeChatFetchInit);
     if (!response.ok) {
       throw new Error(`WeChat QR status failed: HTTP ${response.status}`);
     }
@@ -163,5 +181,6 @@ export async function pollWeChatQrOnboarding(
     throw error;
   } finally {
     clearTimeout(timer);
+    await dispatcher.close();
   }
 }

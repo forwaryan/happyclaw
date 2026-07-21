@@ -2,6 +2,11 @@ import type { ChannelAccount } from './types.js';
 import type { ChannelAccountSecret } from './channel-account-secrets.js';
 import { testFeishuCredentials } from './feishu-connectivity.js';
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
+import {
+  configuredWeChatHttpProxy,
+  createWeChatHttpDispatcher,
+  isWeChatConnectTimeout,
+} from './wechat-http.js';
 
 export interface ChannelAccountCredentialTestResult {
   success: boolean;
@@ -90,6 +95,46 @@ export async function testChannelAccountCredentials(
       };
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  if (account.provider === 'wechat') {
+    const bypassProxy = secret.bypassProxy !== 'false';
+    const configuredProxy = configuredWeChatHttpProxy();
+    if (!bypassProxy && !configuredProxy) {
+      return {
+        success: false,
+        error:
+          '当前账号要求使用 HTTP(S) 代理，但 HappyClaw 启动环境中没有配置 HTTPS_PROXY 或 HTTP_PROXY',
+      };
+    }
+
+    const dispatcher = createWeChatHttpDispatcher(bypassProxy);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      // The iLink root intentionally returns 404. Any HTTP response proves
+      // DNS, TCP and TLS are working without consuming the long-poll cursor.
+      const response = await undiciFetch(
+        secret.baseUrl || 'https://ilinkai.weixin.qq.com',
+        { signal: controller.signal, dispatcher },
+      );
+      return {
+        success: response.status > 0,
+        ...(response.status > 0
+          ? {}
+          : { error: '微信服务没有返回有效 HTTP 响应' }),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: isWeChatConnectTimeout(error)
+          ? '连接微信服务超时，请检查 Clash TUN、VPN 或代理规则'
+          : `无法访问微信服务：${error instanceof Error ? error.message : String(error)}`,
+      };
+    } finally {
+      clearTimeout(timer);
+      await dispatcher.close();
     }
   }
 

@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 
+import { wsManager } from '@/api/ws';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -68,6 +69,7 @@ export function ChannelAccountsManager() {
     testAccount,
     toggleAccount,
     deleteAccount,
+    applyStatusEvent,
   } = useChannelAccountsStore();
   const groups = useChatStore((state) => state.groups);
   const loadGroups = useChatStore((state) => state.loadGroups);
@@ -82,6 +84,29 @@ export function ChannelAccountsManager() {
   useEffect(() => {
     void Promise.allSettled([loadAccounts(), loadGroups()]);
   }, [loadAccounts, loadGroups]);
+
+  useEffect(() => {
+    const unsubscribe = wsManager.on(
+      'channel_account_status',
+      (event: {
+        accountId?: string;
+        transportStatus?: ChannelAccount['transport_status'];
+        lastError?: string | null;
+        connectedAt?: string | null;
+      }) => {
+        if (!event.accountId || !event.transportStatus) return;
+        applyStatusEvent({
+          accountId: event.accountId,
+          transportStatus: event.transportStatus,
+          lastError: event.lastError,
+          connectedAt: event.connectedAt,
+        });
+      },
+    );
+    return () => {
+      unsubscribe();
+    };
+  }, [applyStatusEvent]);
 
   const workspaces = useMemo(
     () =>
@@ -316,8 +341,19 @@ function ChannelAccountRow({
           {defaultTargetLabel(account, workspaces)}
         </p>
         {account.last_error && (
-          <p role="alert" className="mt-1 line-clamp-2 text-xs text-error">
-            {account.last_error}
+          <p
+            role={
+              account.transport_status === 'reconnecting' ? 'status' : 'alert'
+            }
+            className={`mt-1 line-clamp-2 text-xs ${
+              account.transport_status === 'reconnecting'
+                ? 'text-warning'
+                : 'text-error'
+            }`}
+          >
+            {account.transport_status === 'reconnecting'
+              ? `自动重连中：${account.last_error}`
+              : account.last_error}
           </p>
         )}
       </div>
@@ -1062,9 +1098,11 @@ function AccountStateBadges({ account }: { account: ChannelAccount }) {
       ? 'connected'
       : account.status === 'connecting'
         ? 'connecting'
-        : account.status === 'error'
-          ? 'error'
-          : 'disconnected');
+        : account.status === 'reconnecting'
+          ? 'reconnecting'
+          : account.status === 'error'
+            ? 'error'
+            : 'disconnected');
   const auth = {
     draft: ['待配置', 'bg-muted text-muted-foreground'],
     awaiting_scan: ['待扫码', 'bg-warning-bg text-warning'],
@@ -1077,6 +1115,7 @@ function AccountStateBadges({ account }: { account: ChannelAccount }) {
     : {
         disconnected: ['离线', 'bg-muted text-muted-foreground'],
         connecting: ['连接中', 'bg-warning-bg text-warning'],
+        reconnecting: ['重连中', 'bg-warning-bg text-warning'],
         connected: ['在线', 'bg-success-bg text-success'],
         error: ['连接异常', 'bg-error-bg text-error'],
       }[transportStatus];
@@ -1094,6 +1133,9 @@ function AccountStateBadges({ account }: { account: ChannelAccount }) {
       >
         {transportStatus === 'connected' && account.enabled && (
           <CheckCircle2 className="size-3" />
+        )}
+        {transportStatus === 'reconnecting' && account.enabled && (
+          <RefreshCw className="size-3 motion-safe:animate-spin" />
         )}
         {transportStatus === 'error' && account.enabled && (
           <AlertCircle className="size-3" />
