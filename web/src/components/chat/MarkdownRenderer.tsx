@@ -31,7 +31,15 @@ function resolveImageSrc(src: string, groupJid?: string): string {
   if (/^(https?:\/\/|data:|\/\/)/.test(src) || src.startsWith('/')) return src;
   // Strip #agent:xxx suffix — file API uses the base group JID
   const baseJid = groupJid.replace(/#agent:.*$/, '');
-  const encoded = toBase64Url(src);
+  // Markdown parser (micromark) percent-encodes non-ASCII characters in URLs;
+  // decode first so toBase64Url encodes the actual UTF-8 filename.
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(src);
+  } catch {
+    decoded = src;
+  }
+  const encoded = toBase64Url(decoded);
   return withBasePath(`/api/groups/${encodeURIComponent(baseJid)}/files/download/${encoded}`);
 }
 
