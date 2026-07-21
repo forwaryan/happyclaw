@@ -495,6 +495,77 @@ describe('/api/agent-profiles routes', () => {
     ).toBe('managed');
   });
 
+  test('rejects member partial patches that would mutate enabled host Skills', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Downgraded Host Skills Agent',
+      runtimePolicy: {
+        skills: {
+          mode: 'inherit',
+          ids: [],
+          host: { mode: 'custom', ids: ['existing-host-skill'] },
+        },
+      },
+    });
+
+    const patchRes = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { skills: { host: { ids: ['replacement-skill'] } } },
+      }),
+    });
+    expect(patchRes.status).toBe(403);
+    expect(await patchRes.json()).toEqual({
+      error: 'host skills require an admin role',
+    });
+    expect(
+      db.getAgentProfileForUser(profile.id, 'routes-agent-user')?.runtime_policy
+        .skills.host,
+    ).toEqual({ mode: 'custom', ids: ['existing-host-skill'] });
+  });
+
+  test('rejects empty custom host Skill selections on create and patch', async () => {
+    const createRes = await routes.request('/', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-test-role': 'admin',
+      },
+      body: JSON.stringify({
+        name: 'Empty Host Skills Agent',
+        runtime_policy: {
+          skills: { host: { mode: 'custom', ids: [] } },
+        },
+      }),
+    });
+    expect(createRes.status).toBe(400);
+    expect(await createRes.json()).toEqual({
+      error: 'Custom host skills require at least one selected skill',
+    });
+
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Managed Skills Agent',
+    });
+    const patchRes = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-test-role': 'admin',
+      },
+      body: JSON.stringify({
+        runtime_policy: {
+          skills: { host: { mode: 'custom', ids: [] } },
+        },
+      }),
+    });
+    expect(patchRes.status).toBe(400);
+    expect(await patchRes.json()).toEqual({
+      error: 'Custom host skills require at least one selected skill',
+    });
+  });
+
   test('allows admins to create host agents and patch the default HappyClaw profile', async () => {
     const createRes = await routes.request('/', {
       method: 'POST',

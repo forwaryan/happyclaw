@@ -282,6 +282,12 @@ export const AgentProfileRuntimePolicySchema = z
       .object({
         mode: AgentProfileRuntimePolicyModeSchema.optional(),
         ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+        host: z
+          .object({
+            mode: AgentProfileRuntimePolicyModeSchema.optional(),
+            ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+          })
+          .optional(),
       })
       .optional(),
     mcp: z

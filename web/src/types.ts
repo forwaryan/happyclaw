@@ -86,6 +86,10 @@ export interface AgentProfileRuntimePolicy {
   skills: {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
+    host?: {
+      mode: 'inherit' | 'custom' | 'disabled';
+      ids: string[];
+    };
   };
   mcp: {
     mode: 'inherit' | 'custom' | 'disabled';
@@ -184,6 +188,7 @@ export interface AgentCapabilityPreview {
   };
   skills: {
     mode: AgentProfileRuntimePolicy['skills']['mode'];
+    host: NonNullable<AgentProfileRuntimePolicy['skills']['host']>;
     manifestHash: string;
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];

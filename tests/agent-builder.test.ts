@@ -177,6 +177,24 @@ describe('conversational Agent Builder', () => {
     ).toThrow('Agent definition is invalid');
   });
 
+  test('rejects custom host Skills without a selection', () => {
+    expect(() =>
+      builder.prepareAgentBuilderDraft(actor('turn-empty-host-skills'), {
+        definition: {
+          ...definition('Empty Host Skills'),
+          runtime_policy: {
+            ...definition('Empty Host Skills').runtime_policy,
+            skills: {
+              mode: 'inherit',
+              ids: [],
+              host: { mode: 'custom', ids: [] },
+            },
+          },
+        },
+      }),
+    ).toThrow('Custom host skills require at least one selected skill');
+  });
+
   test('handles concurrent duplicate publication idempotently', async () => {
     const prepared = builder.prepareAgentBuilderDraft(
       actor('turn-concurrent'),

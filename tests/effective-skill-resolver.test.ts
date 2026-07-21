@@ -72,6 +72,43 @@ describe('EffectiveSkillResolver', () => {
     expect(manifest.selected.map((entry) => entry.id)).toEqual(ids);
   });
 
+  test.each([
+    ['inherit', ['alpha', 'beta']],
+    ['custom', ['beta']],
+    ['disabled', []],
+  ] as const)('host %s policy selects the expected ids', (mode, ids) => {
+    const host = path.join(root, 'host');
+    skill('host', 'alpha');
+    skill('host', 'beta');
+    const manifest = resolveEffectiveSkills({
+      layers: [{ source: 'host', root: host }],
+      hostPolicy:
+        mode === 'custom' ? { mode, ids: ['beta'] } : { mode, ids: [] },
+    });
+
+    expect(manifest.selected.map((entry) => entry.id)).toEqual(ids);
+    expect(manifest.hostPolicy).toEqual({
+      mode,
+      ids: mode === 'custom' ? ['beta'] : [],
+    });
+  });
+
+  test('host policy participates in the manifest hash and reports missing selections', () => {
+    const host = path.join(root, 'host');
+    skill('host', 'available');
+    const all = resolveEffectiveSkills({
+      layers: [{ source: 'host', root: host }],
+      hostPolicy: { mode: 'inherit', ids: [] },
+    });
+    const selected = resolveEffectiveSkills({
+      layers: [{ source: 'host', root: host }],
+      hostPolicy: { mode: 'custom', ids: ['available', 'missing'] },
+    });
+
+    expect(selected.hash).not.toBe(all.hash);
+    expect(selected.missingHostSkillIds).toEqual(['missing']);
+  });
+
   test('real session ghost is quarantined and cannot survive reconciliation', () => {
     const managed = path.join(root, 'managed');
     const selected = skill('managed', 'selected');

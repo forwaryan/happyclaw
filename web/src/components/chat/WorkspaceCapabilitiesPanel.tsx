@@ -3,6 +3,7 @@ import { Bot, Cpu, FolderCog, Loader2, Puzzle, Server } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAgentProfilesStore } from '../../stores/agent-profiles';
 import type { AgentProfileRuntimePolicy } from '../../types';
+import { getHostSkillPolicy } from '../../utils/agent-runtime-policy';
 
 interface WorkspaceCapabilitiesPanelProps {
   agentProfileId?: string;
@@ -12,7 +13,11 @@ interface WorkspaceCapabilitiesPanelProps {
 }
 
 const DEFAULT_POLICY: AgentProfileRuntimePolicy = {
-  skills: { mode: 'inherit', ids: [] },
+  skills: {
+    mode: 'inherit',
+    ids: [],
+    host: { mode: 'disabled', ids: [] },
+  },
   mcp: { mode: 'inherit', ids: [] },
 };
 
@@ -89,9 +94,16 @@ export function WorkspaceCapabilitiesPanel({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <CapabilitySection
           icon={Puzzle}
-          title="Skills"
+          title="HappyClaw Skills"
           value={policyLabel(policy.skills)}
           detail={policyDetail('Skill', policy.skills)}
+        />
+
+        <CapabilitySection
+          icon={Puzzle}
+          title="宿主机 Skills"
+          value={policyLabel(getHostSkillPolicy(policy))}
+          detail={policyDetail('Skill', getHostSkillPolicy(policy))}
         />
 
         <CapabilitySection

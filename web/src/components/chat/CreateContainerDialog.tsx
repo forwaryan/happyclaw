@@ -72,6 +72,9 @@ export function CreateContainerDialog({
       selectedProfile?.effective_runtime_policy ??
         selectedProfile?.runtime_policy,
     ) === 'host_claude';
+  const hostSkillsMode =
+    selectedProfile?.runtime_policy.skills.host?.mode ??
+    (inheritsHostClaude ? 'inherit' : 'disabled');
 
   useEffect(() => {
     if (open) void loadProfiles();
@@ -263,7 +266,7 @@ export function CreateContainerDialog({
               <p className="mt-2 border-t pt-2 text-[11px] leading-5 text-muted-foreground">
                 {canHostExec
                   ? inheritsHostClaude
-                    ? '运行位置只决定命令在哪里执行。该 Agent 会自动继承宿主机提示词、Rules、全部 Skills 与 MCP，HappyClaw 能力继续叠加。'
+                    ? `运行位置只决定命令在哪里执行。该 Agent 会加载宿主机 Prompt、Rules 与 MCP；宿主机 Skills：${hostSkillsMode === 'inherit' ? '全部使用' : hostSkillsMode === 'custom' ? `选择 ${selectedProfile?.runtime_policy.skills.host?.ids.length ?? 0} 项` : '不使用'}。`
                     : '运行位置只决定命令在哪里执行。该 Agent 使用 HappyClaw 管理的上下文与附加能力。'
                   : '工作区固定在 Docker 容器中运行，并使用 HappyClaw 管理的 Agent 上下文与附加能力。'}
               </p>

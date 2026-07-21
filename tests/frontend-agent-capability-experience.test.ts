@@ -75,7 +75,7 @@ describe('Agent prompt and capability frontend contract', () => {
     );
 
     expect(page).toMatch(
-      /基本信息[\s\S]*四段提示词[\s\S]*Claude 来源[\s\S]*Skills \/ MCP[\s\S]*确认创建/,
+      /基本信息[\s\S]*四段提示词[\s\S]*宿主机配置[\s\S]*Skills \/ MCP[\s\S]*确认创建/,
     );
     expect(page).toContain('draftStep');
     expect(page).toContain('提示词完成度');
@@ -86,8 +86,11 @@ describe('Agent prompt and capability frontend contract', () => {
     expect(history).toContain('<PromptSnapshot');
   });
 
-  test('keeps host inheritance automatic and managed capabilities additive', () => {
+  test('governs host Skills independently from host Prompt and Rules', () => {
     const profiles = read('web/src/pages/AgentProfilesPage.tsx');
+    const skillEditor = read(
+      'web/src/components/agents/AgentSkillsPolicyEditor.tsx',
+    );
     const main = read(
       'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
     );
@@ -95,14 +98,14 @@ describe('Agent prompt and capability frontend contract', () => {
       'web/src/components/settings/SystemSettingsSection.tsx',
     );
 
-    expect(profiles).toMatch(/提示词、Rules、全部[\s\S]*Skills 与 MCP/);
-    expect(profiles).toMatch(/无需在这里重复选择/);
-    expect(main).toMatch(
-      /宿主机提示词、Rules、全部 Skills[\s\S]*和 MCP\s+已自动生效/,
-    );
+    expect(profiles).toMatch(/宿主机 Skills 在“能力配置”中单独设置/);
+    expect(profiles).toContain("skill.source === 'external' && skill.enabled");
+    expect(skillEditor).toMatch(/不使用[\s\S]*选择部分[\s\S]*全部使用/);
+    expect(skillEditor).toContain('来自 ~/.claude/skills，可单独启用');
+    expect(main).toContain('<AgentSkillsPolicyEditor');
     expect(main).toContain("skill.source === 'user' && skill.enabled");
-    expect(main).toMatch(/系统\s*内置\s*Skills\s*始终生效且不进入选择器/);
-    expect(system).toMatch(/无需再逐项选择/);
+    expect(main).toContain("skill.source === 'external' && skill.enabled");
+    expect(system).toContain('宿主机');
   });
 
   test('never refills or reveals stored MCP secrets', () => {

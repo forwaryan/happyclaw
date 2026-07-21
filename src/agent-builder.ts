@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { AgentProfileCreateSchema } from './schemas.js';
 import { DATA_DIR } from './config.js';
+import { getEffectiveExternalDir } from './runtime-config.js';
 import { loadManagedMcpLayers } from './mcp-utils.js';
 import { scanSkillDirectory } from './skill-utils.js';
 import {
@@ -18,8 +19,10 @@ import {
   updateAgentProfile,
 } from './db.js';
 import {
+  hasEmptyCustomHostSkillSelection,
   hasInvalidRuntimePolicyReferences,
   isUnauthorizedHostClaudeContext,
+  isUnauthorizedHostSkills,
   validateRuntimePolicyReferences,
 } from './agent-profile-policy.js';
 import {
@@ -69,6 +72,7 @@ function normalizeDefinition(input: unknown): AgentBuilderDefinition {
     throw new Error(`Agent definition is invalid: ${details}`);
   }
   const policy = normalizeAgentProfileRuntimePolicy(parsed.data.runtime_policy);
+  policy.skills.host ??= { mode: 'disabled', ids: [] };
   return {
     name: parsed.data.name,
     identity_prompt: parsed.data.identity_prompt ?? '',
@@ -89,6 +93,12 @@ function validateDefinitionForActor(
   if (actor.user.status !== 'active') throw new Error('User is not active');
   if (isUnauthorizedHostClaudeContext(actor.user, definition.runtime_policy)) {
     throw new Error('host_claude context requires an admin role');
+  }
+  if (isUnauthorizedHostSkills(actor.user, definition.runtime_policy)) {
+    throw new Error('host skills require an admin role');
+  }
+  if (hasEmptyCustomHostSkillSelection(definition.runtime_policy)) {
+    throw new Error('Custom host skills require at least one selected skill');
   }
   const invalid = validateRuntimePolicyReferences(
     actor.user.id,
@@ -164,6 +174,7 @@ export function listAgentProfilesForBuilder(ownerUserId: string): {
 
 export function getAgentCapabilityCatalogForBuilder(actor: AgentBuilderActor): {
   skills: Array<{ id: string; name: string; description: string }>;
+  host_skills: Array<{ id: string; name: string; description: string }>;
   mcp: Array<{ reference: string; scope: 'system' | 'user' }>;
 } {
   const skills = scanSkillDirectory(
@@ -176,11 +187,25 @@ export function getAgentCapabilityCatalogForBuilder(actor: AgentBuilderActor): {
       name: skill.name,
       description: skill.description,
     }));
+  const hostSkills =
+    actor.user.role === 'admin'
+      ? scanSkillDirectory(
+          path.join(getEffectiveExternalDir(), 'skills'),
+          'host',
+        )
+          .filter((skill) => skill.enabled)
+          .map((skill) => ({
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+          }))
+      : [];
   const layers = loadManagedMcpLayers(actor.user.id, {
     allowAdminOnlySystemMcp: actor.user.role === 'admin',
   });
   return {
     skills,
+    host_skills: hostSkills,
     mcp: [
       ...Object.keys(layers.system).map((id) => ({
         reference: `system:${id}`,

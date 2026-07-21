@@ -103,8 +103,8 @@ export function EffectiveCapabilitiesPreview({
             最终生效能力
           </h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            按实际运行顺序展示宿主机自动继承、项目上下文和 HappyClaw
-            附加能力，并标出同名来源冲突。系统内置能力始终生效，不进入用户选择器。
+            按来源展示 HappyClaw、宿主机和工作区能力，并标出同名来源冲突。
+            系统内置能力始终生效，不进入用户选择器。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -159,15 +159,49 @@ export function EffectiveCapabilitiesPreview({
               {preview.context.source === 'host_claude' && (
                 <span className="text-xs text-muted-foreground">
                   提示词 {preview.context.claudeMd ? '已加载' : '缺失'} ·{' '}
-                  {preview.context.rules} 项 Rules · Skills 与 MCP 全部自动继承
+                  {preview.context.rules} 项 Rules · 宿主机 Skills
+                  按独立策略加载
                 </span>
               )}
             </PreviewRow>
             <CapabilityEntriesRow
-              label="Skills"
-              entries={preview.skills.entries}
-              conflicts={preview.skills.conflicts}
+              label="HappyClaw Skills"
+              entries={preview.skills.entries.filter(
+                (entry) =>
+                  entry.source !== 'host' && entry.source !== 'workspace',
+              )}
+              emptyText="无生效项"
             />
+            <CapabilityEntriesRow
+              label="宿主机 Skills"
+              entries={preview.skills.entries.filter(
+                (entry) => entry.source === 'host',
+              )}
+              emptyText={
+                preview.skills.host.mode === 'disabled'
+                  ? '未启用'
+                  : '当前无宿主机来源胜出项'
+              }
+            />
+            <CapabilityEntriesRow
+              label="工作区 Skills"
+              entries={preview.skills.entries.filter(
+                (entry) => entry.source === 'workspace',
+              )}
+              emptyText={
+                workspaceJid === 'none'
+                  ? '选择工作区后预览'
+                  : '该工作区没有生效的 Skill'
+              }
+            />
+            {preview.skills.conflicts.length > 0 && (
+              <PreviewRow label="Skill 覆盖">
+                <span className="text-[11px] text-warning">
+                  {preview.skills.conflicts.length} 个同名覆盖：
+                  {preview.skills.conflicts.join('、')}
+                </span>
+              </PreviewRow>
+            )}
             <CapabilityEntriesRow
               label="MCP"
               entries={preview.mcp.entries}
@@ -380,16 +414,18 @@ function PreviewRow({
 function CapabilityEntriesRow({
   label,
   entries,
-  conflicts,
+  conflicts = [],
+  emptyText = '无',
 }: {
   label: string;
   entries: EffectiveCapabilityEntry[];
-  conflicts: string[];
+  conflicts?: string[];
+  emptyText?: string;
 }) {
   return (
     <PreviewRow label={label}>
       {entries.length === 0 ? (
-        <span className="text-xs text-muted-foreground">无</span>
+        <span className="text-xs text-muted-foreground">{emptyText}</span>
       ) : (
         <div className="flex max-h-28 min-w-0 flex-wrap gap-1.5 overflow-y-auto">
           {entries.map((entry) => (

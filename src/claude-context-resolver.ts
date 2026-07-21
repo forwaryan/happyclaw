@@ -24,6 +24,8 @@ export interface ClaudeContextPlanArgs {
    * context. Managed HappyClaw skills are resolved independently below.
    */
   includeHostClaudeContext?: boolean;
+  /** Host ~/.claude/skills policy, independent of CLAUDE.md/rules. */
+  hostSkillPolicy?: ManagedSkillPolicy;
   mountUserSkills?: boolean;
   userSkillsDirOverride?: string;
   managedSkillPolicy?: ManagedSkillPolicy;
@@ -129,6 +131,12 @@ export function buildClaudeContextPlan(
   // same user. Do not infer the role from folder === "main" here: additional
   // admins have owner-specific home folders and must receive the same policy.
   const includeHostClaudeContext = args.includeHostClaudeContext === true;
+  const hostSkillPolicy =
+    args.hostSkillPolicy ??
+    (includeHostClaudeContext
+      ? { mode: 'inherit' as const, ids: [] }
+      : { mode: 'disabled' as const, ids: [] });
+  const includeHostSkills = hostSkillPolicy.mode !== 'disabled';
   const isAdminOwned = includeHostClaudeContext;
   const claudeMdSource = includeHostClaudeContext
     ? path.join(args.externalClaudeDir, 'CLAUDE.md')
@@ -136,7 +144,7 @@ export function buildClaudeContextPlan(
   const rulesSourceDir = includeHostClaudeContext
     ? path.join(args.externalClaudeDir, 'rules')
     : undefined;
-  const externalSkillsDir = includeHostClaudeContext
+  const externalSkillsDir = includeHostSkills
     ? path.join(args.externalClaudeDir, 'skills')
     : undefined;
   const builtinSkillsDir = path.join(args.dataDir, 'builtin-skills');
@@ -172,6 +180,7 @@ export function buildClaudeContextPlan(
       ...(args.pluginSkillLayers ?? []),
     ],
     managedPolicy: args.managedSkillPolicy,
+    hostPolicy: hostSkillPolicy,
   });
   const skillAuditNames = {
     builtin: 'builtin',
@@ -229,7 +238,7 @@ export function buildClaudeContextPlan(
     warnings.push('CLAUDE.md missing');
   if (includeHostClaudeContext && !exists(rulesSourceDir))
     warnings.push('rules missing');
-  if (includeHostClaudeContext && !exists(externalSkillsDir))
+  if (includeHostSkills && !exists(externalSkillsDir))
     warnings.push('external skills missing');
   // 记忆层未禁用 + 原生 ~/.claude/CLAUDE.md 存在 → 两套全局记忆并存，提醒 admin。
   if (
@@ -244,9 +253,10 @@ export function buildClaudeContextPlan(
 
   const audit: ClaudeContextAudit = {
     executionMode: args.executionMode,
-    externalClaudeDir: includeHostClaudeContext
-      ? args.externalClaudeDir
-      : undefined,
+    externalClaudeDir:
+      includeHostClaudeContext || includeHostSkills
+        ? args.externalClaudeDir
+        : undefined,
     claudeMd: {
       sourcePath: claudeMdSource,
       runtimePath:

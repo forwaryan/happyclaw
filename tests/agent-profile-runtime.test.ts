@@ -23,6 +23,7 @@ vi.mock('../src/logger.js', () => ({
 const db = await import('../src/db.js');
 const runtime = await import('../src/agent-profile-runtime.js');
 const runtimeConfig = await import('../src/runtime-config.js');
+const policy = await import('../src/agent-profile-policy.js');
 
 beforeAll(() => {
   db.initDatabase();
@@ -75,7 +76,12 @@ describe('AgentProfile runtime invalidation', () => {
     const profile = db.createAgentProfile({
       ownerUserId: userId,
       name: 'Host Agent',
-      runtimePolicy: { context: { source: 'host_claude' } },
+      runtimePolicy: {
+        context: { source: 'host_claude' },
+        skills: {
+          host: { mode: 'custom', ids: ['native-review'] },
+        },
+      },
     });
     expect(
       runtime.resolveEffectiveAgentProfile(profile)?.runtime_policy.context
@@ -87,7 +93,44 @@ describe('AgentProfile runtime invalidation', () => {
     db.updateUserFields(userId, { role: 'member' });
     const memberEffective = runtime.resolveEffectiveAgentProfile(profile);
     expect(memberEffective?.runtime_policy.context.source).toBe('managed');
+    expect(memberEffective?.runtime_policy.skills.host).toEqual({
+      mode: 'disabled',
+      ids: ['native-review'],
+    });
     expect(memberEffective?.identity_hash).not.toBe(adminEffectiveHash);
+  });
+
+  test('legacy missing host Skill policy follows the effective context source', () => {
+    const userId = 'agent-profile-runtime-legacy-host-skills';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: userId,
+      username: userId,
+      password_hash: 'hash',
+      display_name: userId,
+      role: 'admin',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    runtimeConfig.saveSystemSettings({ mainAgentContextSource: 'host_claude' });
+    const main = runtime.resolveEffectiveAgentProfile(
+      db.getOrCreateDefaultAgentProfile(userId),
+    )!;
+    expect(main.runtime_policy.skills.host).toBeUndefined();
+    expect(policy.resolveHostSkillPolicy(main.runtime_policy)).toEqual({
+      mode: 'inherit',
+      ids: [],
+    });
+
+    const managed = runtime.resolveEffectiveAgentProfile(
+      db.createAgentProfile({ ownerUserId: userId, name: 'Managed legacy' }),
+    )!;
+    expect(policy.resolveHostSkillPolicy(managed.runtime_policy)).toEqual({
+      mode: 'disabled',
+      ids: [],
+    });
   });
 
   test('opposite multi-profile lock order is serialized without deadlock', async () => {

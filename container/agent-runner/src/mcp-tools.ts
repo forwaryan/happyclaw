@@ -1698,6 +1698,9 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
       mode: z.enum(['inherit', 'custom', 'disabled']),
       ids: z.array(z.string()).max(100),
     });
+    const skillsPolicySchema = capabilityPolicySchema.extend({
+      host: capabilityPolicySchema.optional(),
+    });
     const agentDefinitionSchema = z.object({
       name: z.string().min(1).max(80),
       prompt_schema_version: z.literal(2).optional().default(2),
@@ -1722,7 +1725,7 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
               auto_compact_percentage: z.number().int().min(0),
             })
             .optional(),
-          skills: capabilityPolicySchema.optional(),
+          skills: skillsPolicySchema.optional(),
           mcp: capabilityPolicySchema.optional(),
         })
         .optional(),

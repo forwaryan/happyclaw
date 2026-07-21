@@ -82,6 +82,10 @@ import type { AgentProfileRuntimePolicy } from './types.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import {
+  resolveHostSkillPolicy,
+  type HostSkillPolicy,
+} from './agent-profile-policy.js';
+import {
   attachStderrHandler,
   attachStdoutHandler,
   createStderrState,
@@ -379,6 +383,30 @@ function shouldIncludeHostClaudeContext(
   agentProfile?: RunnerAgentProfile,
 ): boolean {
   return agentProfile?.runtimePolicy?.context?.source === 'host_claude';
+}
+
+function resolveAgentProfileHostSkillPolicy(
+  agentProfile?: RunnerAgentProfile,
+): HostSkillPolicy {
+  const policy: HostSkillPolicy = agentProfile?.runtimePolicy
+    ? resolveHostSkillPolicy(agentProfile.runtimePolicy)
+    : { mode: 'disabled', ids: [] };
+  if (!agentProfile || policy.mode !== 'custom') return policy;
+
+  const sourceRoot = path.join(getEffectiveExternalDir(), 'skills');
+  for (const id of policy.ids) {
+    const source = path.join(sourceRoot, id);
+    if (
+      !validateSkillId(id) ||
+      !validateSkillPath(sourceRoot, source) ||
+      !fs.existsSync(path.join(source, 'SKILL.md'))
+    ) {
+      throw new Error(
+        `agent_profile_unavailable: AgentProfile ${agentProfile.id} requires unavailable host skill ${id}`,
+      );
+    }
+  }
+  return policy;
 }
 
 function getAgentAutoCompactWindow(agentProfile?: RunnerAgentProfile): number {
@@ -887,6 +915,7 @@ export function buildVolumeMounts(
     dataDir: DATA_DIR,
     groupSessionsDir,
     includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
+    hostSkillPolicy: resolveAgentProfileHostSkillPolicy(agentProfile),
     mountUserSkills: mountUserSkills && userSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: agentProfile?.runtimePolicy?.skills,
@@ -1353,6 +1382,9 @@ export async function runContainerAgent(
             includeHostClaudeContext: shouldIncludeHostClaudeContext(
               input.agentProfile,
             ),
+            hostSkillPolicy: resolveAgentProfileHostSkillPolicy(
+              input.agentProfile,
+            ),
             mountUserSkills:
               shouldMountUserSkills && skillsPolicy.mountUserSkills,
             userSkillsDirOverride: skillsPolicy.userSkillsDirOverride,
@@ -1399,6 +1431,9 @@ export async function runContainerAgent(
                 )
               : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
             includeHostClaudeContext: shouldIncludeHostClaudeContext(
+              input.agentProfile,
+            ),
+            hostSkillPolicy: resolveAgentProfileHostSkillPolicy(
               input.agentProfile,
             ),
             mountUserSkills:
@@ -1853,6 +1888,7 @@ export async function runHostAgent(
     includeHostClaudeContext: shouldIncludeHostClaudeContext(
       input.agentProfile,
     ),
+    hostSkillPolicy: resolveAgentProfileHostSkillPolicy(input.agentProfile),
     mountUserSkills: hostUserSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,

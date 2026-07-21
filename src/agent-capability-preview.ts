@@ -21,6 +21,7 @@ import {
 import { resolveEffectiveSkills } from './effective-skill-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
 import { loadUserPlugins } from './plugin-utils.js';
+import { resolveHostSkillPolicy } from './agent-profile-policy.js';
 import type { AgentProfile, RegisteredGroup } from './types.js';
 
 export type CapabilityLayerSource =
@@ -50,6 +51,7 @@ export interface AgentCapabilityPreview {
   };
   skills: {
     mode: AgentProfile['runtime_policy']['skills']['mode'];
+    host: NonNullable<AgentProfile['runtime_policy']['skills']['host']>;
     manifestHash: string;
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
@@ -129,6 +131,7 @@ export function buildAgentCapabilityPreview(options: {
     ? path.join(GROUPS_DIR, workspace.group.folder)
     : undefined;
   const hostContext = policy.context.source === 'host_claude';
+  const hostSkillPolicy = resolveHostSkillPolicy(policy);
   const enabledPlugins = loadUserPlugins(profile.owner_user_id, {
     runtime: 'host',
   });
@@ -136,7 +139,7 @@ export function buildAgentCapabilityPreview(options: {
   const skillManifest = resolveEffectiveSkills({
     layers: [
       { source: 'builtin', root: path.join(DATA_DIR, 'builtin-skills') },
-      ...(hostContext
+      ...(hostSkillPolicy.mode !== 'disabled'
         ? [
             {
               source: 'host' as const,
@@ -163,6 +166,7 @@ export function buildAgentCapabilityPreview(options: {
       ...pluginSkillLayers(enabledPlugins),
     ],
     managedPolicy: policy.skills,
+    hostPolicy: hostSkillPolicy,
   });
   const skills = {
     entries: skillManifest.selected.map((skill) => ({
@@ -280,7 +284,7 @@ export function buildAgentCapabilityPreview(options: {
     );
   }
   notes.push(
-    'Agent 的 disabled/custom 策略仅筛选用户安装的 managed Skills；内置、宿主机、项目和工作区 Skills 仍按来源优先级解析。',
+    'HappyClaw 用户 Skills 与宿主机 Skills 独立筛选；内置、项目和工作区 Skills 仍按来源优先级解析。',
   );
   if (mcp.conflicts.length > 0)
     notes.push(
@@ -310,6 +314,7 @@ export function buildAgentCapabilityPreview(options: {
     },
     skills: {
       mode: policy.skills.mode,
+      host: hostSkillPolicy,
       manifestHash: skillManifest.hash,
       ...skills,
     },

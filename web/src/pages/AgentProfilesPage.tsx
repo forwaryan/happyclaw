@@ -44,6 +44,7 @@ import { AgentPromptEditor } from '../components/agents/AgentPromptEditor';
 import { AgentPromptVersionHistory } from '../components/agents/AgentPromptVersionHistory';
 import { EffectiveCapabilitiesPreview } from '../components/agents/EffectiveCapabilitiesPreview';
 import { AgentGovernanceSection } from '../components/agents/AgentGovernanceSection';
+import { AgentSkillsPolicyEditor } from '../components/agents/AgentSkillsPolicyEditor';
 import { PolicyResourcePicker } from '../components/agents/PolicyResourcePicker';
 import { EmojiAvatar } from '../components/common/EmojiAvatar';
 import { EmojiPicker } from '../components/common/EmojiPicker';
@@ -69,6 +70,12 @@ import {
   type AgentPromptSection,
 } from '../utils/agent-prompts';
 import { createUnsavedNavigationGuard } from '../utils/unsaved-navigation';
+import {
+  getHostSkillPolicy,
+  skillPolicySummary,
+  skillSelectionError,
+  type RuntimePolicyMode,
+} from '../utils/agent-runtime-policy';
 
 const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   context: {
@@ -76,11 +83,13 @@ const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
     auto_compact_window: 0,
     auto_compact_percentage: 0,
   },
-  skills: { mode: 'inherit', ids: [] },
+  skills: {
+    mode: 'inherit',
+    ids: [],
+    host: { mode: 'disabled', ids: [] },
+  },
   mcp: { mode: 'inherit', ids: [] },
 };
-
-type RuntimePolicyMode = 'inherit' | 'custom' | 'disabled';
 
 function normalizeRuntimePolicy(
   policy?: Partial<AgentProfileRuntimePolicy> | null,
@@ -100,6 +109,7 @@ function normalizeRuntimePolicy(
     skills: {
       mode: policy?.skills?.mode ?? 'inherit',
       ids: policy?.skills?.ids ?? [],
+      host: getHostSkillPolicy(policy),
     },
     mcp: {
       mode: policy?.mcp?.mode ?? 'inherit',
@@ -194,6 +204,9 @@ export function AgentProfilesPage() {
   const [legacyAutoCompactWindow, setLegacyAutoCompactWindow] = useState(0);
   const [skillsMode, setSkillsMode] = useState<RuntimePolicyMode>('inherit');
   const [skillIds, setSkillIds] = useState<string[]>([]);
+  const [hostSkillsMode, setHostSkillsMode] =
+    useState<RuntimePolicyMode>('disabled');
+  const [hostSkillIds, setHostSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<RuntimePolicyMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -308,6 +321,8 @@ export function AgentProfilesPage() {
     const normalized = normalizeRuntimePolicy(policy);
     setSkillsMode(normalized.skills.mode);
     setSkillIds(normalized.skills.ids);
+    setHostSkillsMode(normalized.skills.host?.mode ?? 'disabled');
+    setHostSkillIds(normalized.skills.host?.ids ?? []);
     setMcpMode(normalized.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(normalized.mcp.ids));
     setContextSource(getAgentContextSource(normalized));
@@ -335,6 +350,24 @@ export function AgentProfilesPage() {
     return null;
   }, [autoCompactPercentage, useSdkCompactDefault]);
 
+  const managedSkillsError = useMemo(
+    () =>
+      skillSelectionError(' HappyClaw Skill', {
+        mode: skillsMode,
+        ids: skillIds,
+      }),
+    [skillIds, skillsMode],
+  );
+  const hostSkillsError = useMemo(
+    () =>
+      skillSelectionError('宿主机 Skill', {
+        mode: hostSkillsMode,
+        ids: hostSkillIds,
+      }),
+    [hostSkillIds, hostSkillsMode],
+  );
+  const capabilityError = managedSkillsError ?? hostSkillsError;
+
   const currentRuntimePolicy = useMemo(
     () =>
       normalizeRuntimePolicy({
@@ -351,12 +384,18 @@ export function AgentProfilesPage() {
               ? 0
               : Number(autoCompactPercentage),
         },
-        skills: { mode: skillsMode, ids: skillIds },
+        skills: {
+          mode: skillsMode,
+          ids: skillIds,
+          host: { mode: hostSkillsMode, ids: hostSkillIds },
+        },
         mcp: { mode: mcpMode, ids: mcpIds },
       }),
     [
       autoCompactPercentage,
       contextSource,
+      hostSkillIds,
+      hostSkillsMode,
       legacyAutoCompactWindow,
       mcpIds,
       mcpMode,
@@ -503,6 +542,29 @@ export function AgentProfilesPage() {
     ];
   }, [skillIds, skills]);
 
+  const hostSkillOptions = useMemo(() => {
+    const available = skills
+      .filter((skill) => skill.source === 'external' && skill.enabled)
+      .map((skill) => ({
+        id: skill.id,
+        name: skill.name || skill.id,
+        description: skill.description,
+        sourceLabel: '宿主机',
+      }));
+    const known = new Set(available.map((option) => option.id));
+    return [
+      ...available,
+      ...hostSkillIds
+        .filter((id) => !known.has(id))
+        .map((id) => ({
+          id,
+          name: id,
+          sourceLabel: '宿主机',
+          unavailable: true,
+        })),
+    ];
+  }, [hostSkillIds, skills]);
+
   const mcpOptions = useMemo(() => {
     const available = buildMcpPolicyOptions(mcpServers);
     const known = new Set(available.map((option) => option.id));
@@ -610,7 +672,7 @@ export function AgentProfilesPage() {
 
   const handleCreate = async () => {
     const trimmed = name.trim();
-    if (!trimmed || autoCompactError) return;
+    if (!trimmed || autoCompactError || capabilityError) return;
     setCreating(true);
     try {
       const profile = await createProfile({
@@ -635,7 +697,8 @@ export function AgentProfilesPage() {
   };
 
   const handleSave = async () => {
-    if (!selected || !name.trim() || autoCompactError) return;
+    if (!selected || !name.trim() || autoCompactError || capabilityError)
+      return;
     setSaving(true);
     try {
       const changes: Parameters<typeof updateProfile>[1] = {};
@@ -1068,7 +1131,7 @@ export function AgentProfilesPage() {
                     {[
                       [1, '基本信息'],
                       [2, '四段提示词'],
-                      [3, 'Claude 来源'],
+                      [3, '宿主机配置'],
                       [4, 'Skills / MCP'],
                       [5, '确认创建'],
                     ].map(([step, label]) => (
@@ -1238,13 +1301,12 @@ export function AgentProfilesPage() {
                         <div className="flex items-start justify-between gap-4 rounded-lg border bg-muted/20 px-3 py-3">
                           <div className="min-w-0">
                             <div className="text-sm font-medium text-foreground">
-                              继承宿主机 Claude Code 配置
+                              加载宿主机 Prompt、Rules 与 MCP
                             </div>
                             <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                              自动继承宿主机 ~/.claude 中的提示词、Rules、全部
-                              Skills 与 MCP，无需再次选择。无论工作区运行在容器
-                              还是宿主机都会生效；下面选择的 HappyClaw Skills 与
-                              MCP 会继续作为附加能力加载。
+                              复用宿主机 ~/.claude 中的提示词、Rules 与 MCP。
+                              宿主机 Skills
+                              在“能力配置”中单独设置，不会被这个开关隐式启用。
                             </div>
                           </div>
                           <Switch
@@ -1254,7 +1316,7 @@ export function AgentProfilesPage() {
                                 checked ? 'host_claude' : 'managed',
                               )
                             }
-                            aria-label="继承宿主机 Claude Code 配置"
+                            aria-label="加载宿主机 Prompt、Rules 与 MCP"
                           />
                         </div>
                       )}
@@ -1264,18 +1326,16 @@ export function AgentProfilesPage() {
                   {draftMode && draftStep === 3 && (
                     <section className="overflow-hidden rounded-xl border border-border bg-card">
                       <div className="border-b px-5 py-4">
-                        <h2 className="text-sm font-semibold">
-                          Claude 配置来源
-                        </h2>
+                        <h2 className="text-sm font-semibold">宿主机配置</h2>
                         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                          决定 Agent 使用 HappyClaw
-                          托管配置，还是复用管理员宿主机 ~/.claude。
+                          决定是否加载管理员宿主机的 Prompt、Rules 与 MCP；
+                          宿主机 Skills 在“能力配置”中单独设置。
                         </p>
                       </div>
                       <div
                         className="grid gap-3 p-5 sm:grid-cols-2"
                         role="radiogroup"
-                        aria-label="Claude 配置来源"
+                        aria-label="宿主机配置"
                       >
                         <button
                           type="button"
@@ -1288,7 +1348,8 @@ export function AgentProfilesPage() {
                             HappyClaw 托管
                           </span>
                           <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                            使用系统配置，并叠加本 Agent 选择的 Skills 与 MCP。
+                            不加载宿主机 Prompt、Rules 与 MCP。Skills
+                            仍按下一步的来源策略加载。
                           </span>
                         </button>
                         <button
@@ -1300,11 +1361,11 @@ export function AgentProfilesPage() {
                           className={`rounded-lg border p-4 text-left disabled:cursor-not-allowed disabled:opacity-50 ${contextSource === 'host_claude' ? 'border-primary bg-primary/5' : 'hover:bg-muted'}`}
                         >
                           <span className="block text-sm font-medium">
-                            继承宿主机 ~/.claude
+                            加载宿主机 ~/.claude
                           </span>
                           <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                            自动继承提示词、Rules、全部 Skills 与 MCP；HappyClaw
-                            能力继续叠加。
+                            加载提示词、Rules 与 MCP；宿主机 Skills
+                            仍由下一步单独控制。
                           </span>
                         </button>
                       </div>
@@ -1379,11 +1440,11 @@ export function AgentProfilesPage() {
                           }
                         />
                         <SummaryItem
-                          label="Claude 配置来源"
+                          label="宿主机配置"
                           value={
                             contextSource === 'host_claude'
-                              ? '继承宿主机 ~/.claude'
-                              : 'HappyClaw 托管'
+                              ? '加载 Prompt、Rules 与 MCP'
+                              : '不加载'
                           }
                         />
                         <SummaryItem
@@ -1395,6 +1456,13 @@ export function AgentProfilesPage() {
                                 ? '关闭'
                                 : `所选 ${skillIds.length} 项`
                           }
+                        />
+                        <SummaryItem
+                          label="宿主机 Skills"
+                          value={skillPolicySummary(
+                            { mode: hostSkillsMode, ids: hostSkillIds },
+                            '全部使用',
+                          )}
                         />
                         <SummaryItem
                           label="HappyClaw MCP"
@@ -1415,6 +1483,14 @@ export function AgentProfilesPage() {
                           请返回“基本信息”填写名称。
                         </p>
                       )}
+                      {capabilityError && (
+                        <p
+                          role="alert"
+                          className="mx-5 mb-5 rounded-lg bg-error-bg px-3 py-2 text-xs text-error"
+                        >
+                          {capabilityError}
+                        </p>
+                      )}
                     </section>
                   )}
 
@@ -1428,60 +1504,44 @@ export function AgentProfilesPage() {
                         能力配置
                       </h2>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        这里只控制 HappyClaw 额外附加给 Agent 的 Skills 与
-                        MCP。继承宿主机配置时，宿主机中的全部 Skills 和 MCP
-                        已自动生效，无需在这里重复选择。Agent
-                        始终拥有完整工具权限。
+                        按来源配置
+                        Skills。HappyClaw、宿主机与工作区能力会在运行时叠加；
+                        同名项以“最终生效能力”中的结果为准。
                       </p>
                     </div>
                     <div className="space-y-5 px-5 py-5">
-                      <div className="grid gap-4 xl:grid-cols-2">
-                        <div className="min-w-0 space-y-2">
-                          <label className="block text-xs font-medium text-muted-foreground">
-                            Skills
-                          </label>
-                          <Select
-                            value={skillsMode}
-                            onValueChange={(value) =>
-                              setSkillsMode(value as RuntimePolicyMode)
-                            }
-                          >
-                            <SelectTrigger aria-label="Agent Skills">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="inherit">
-                                使用全部已启用 Skills
-                              </SelectItem>
-                              <SelectItem value="custom">
-                                只允许所选 Skills
-                              </SelectItem>
-                              <SelectItem value="disabled">
-                                关闭 Skills
-                              </SelectItem>
-                            </SelectContent>
-                          </Select>
-                          {skillsMode === 'custom' && (
-                            <PolicyResourcePicker
-                              label="允许目录"
-                              options={skillOptions}
-                              selectedIds={skillIds}
-                              onChange={setSkillIds}
-                              loading={skillsLoading}
-                              error={skillsError}
-                              emptyText="没有已启用的用户 Skill"
-                            />
-                          )}
-                          <p className="text-[11px] leading-5 text-muted-foreground">
-                            这里只选择 HappyClaw 用户附加 Skills；系统内置
-                            Skills 始终生效。继承 ~/.claude 时，宿主机 Skills
-                            也已全部自动生效，不受这里影响。
+                      <AgentSkillsPolicyEditor
+                        managedPolicy={{ mode: skillsMode, ids: skillIds }}
+                        onManagedModeChange={setSkillsMode}
+                        onManagedIdsChange={setSkillIds}
+                        managedOptions={skillOptions}
+                        hostPolicy={{
+                          mode: hostSkillsMode,
+                          ids: hostSkillIds,
+                        }}
+                        onHostModeChange={setHostSkillsMode}
+                        onHostIdsChange={setHostSkillIds}
+                        hostOptions={hostSkillOptions}
+                        loading={skillsLoading}
+                        error={skillsError}
+                        hostAvailable={isAdmin}
+                        managedError={managedSkillsError}
+                        hostError={hostSkillsError}
+                      />
+
+                      <section className="min-w-0 space-y-2 border-t border-border pt-5">
+                        <div>
+                          <h3 className="text-sm font-semibold text-foreground">
+                            HappyClaw MCP
+                          </h3>
+                          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                            控制 HappyClaw 额外附加的 MCP；宿主机 MCP
+                            仍由上一步的宿主机配置控制。
                           </p>
                         </div>
-
-                        <div className="min-w-0 space-y-2">
+                        <div className="max-w-xl">
                           <label className="block text-xs font-medium text-muted-foreground">
-                            MCP
+                            使用方式
                           </label>
                           <Select
                             value={mcpMode}
@@ -1506,7 +1566,7 @@ export function AgentProfilesPage() {
                           </Select>
                           {mcpMode === 'custom' && (
                             <PolicyResourcePicker
-                              label="允许目录"
+                              label="选择 HappyClaw MCP"
                               options={mcpOptions}
                               selectedIds={mcpIds}
                               onChange={setMcpIds}
@@ -1515,12 +1575,8 @@ export function AgentProfilesPage() {
                               emptyText="没有已启用的 HappyClaw MCP"
                             />
                           )}
-                          <p className="text-[11px] leading-5 text-muted-foreground">
-                            只控制 HappyClaw 额外附加的 MCP；继承宿主机
-                            ~/.claude 时，宿主机全部 MCP 已自动生效。
-                          </p>
                         </div>
-                      </div>
+                      </section>
 
                       <div className="border-t border-border pt-5">
                         <div className="flex min-h-14 items-start justify-between gap-5">
@@ -1688,7 +1744,10 @@ export function AgentProfilesPage() {
                         <Button
                           onClick={handleCreate}
                           disabled={
-                            creating || !name.trim() || !!autoCompactError
+                            creating ||
+                            !name.trim() ||
+                            !!autoCompactError ||
+                            !!capabilityError
                           }
                         >
                           {creating ? (
@@ -1705,7 +1764,11 @@ export function AgentProfilesPage() {
                       <Button
                         onClick={handleSave}
                         disabled={
-                          !dirty || saving || !name.trim() || !!autoCompactError
+                          !dirty ||
+                          saving ||
+                          !name.trim() ||
+                          !!autoCompactError ||
+                          !!capabilityError
                         }
                       >
                         {saving ? (

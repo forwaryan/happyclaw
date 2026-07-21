@@ -242,6 +242,15 @@ export interface AgentProfileRuntimePolicy {
   skills: {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
+    /**
+     * Native host ~/.claude/skills selection. Missing is a legacy sentinel:
+     * follow the effective context source (host_claude => inherit, otherwise
+     * disabled). New profiles persist this field explicitly.
+     */
+    host?: {
+      mode: 'inherit' | 'custom' | 'disabled';
+      ids: string[];
+    };
   };
   mcp: {
     mode: 'inherit' | 'custom' | 'disabled';

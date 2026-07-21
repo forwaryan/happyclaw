@@ -47,10 +47,12 @@ export interface EffectiveSkillManifest {
   schemaVersion: 1;
   hash: string;
   policy: { mode: ManagedSkillPolicy['mode']; ids: string[] };
+  hostPolicy: { mode: ManagedSkillPolicy['mode']; ids: string[] };
   candidates: EffectiveSkillCandidate[];
   selected: EffectiveSkillEntry[];
   conflicts: string[];
   missingManagedSkillIds: string[];
+  missingHostSkillIds: string[];
 }
 
 export function pluginSkillLayers(
@@ -122,15 +124,22 @@ function hashSkillDirectory(skillDir: string): string {
  * Layers must be supplied from lowest to highest precedence. A disabled
  * definition is removed before precedence is evaluated, so it never acts as
  * a tombstone for an enabled definition from a lower layer. AgentProfile
- * disabled/custom policy intentionally filters managed-user Skills only.
+ * source policies independently filter managed-user and native host Skills.
  */
 export function resolveEffectiveSkills(options: {
   layers: EffectiveSkillLayer[];
   managedPolicy?: ManagedSkillPolicy;
+  hostPolicy?: ManagedSkillPolicy;
 }): EffectiveSkillManifest {
   const policy = options.managedPolicy ?? { mode: 'inherit' as const, ids: [] };
   const policyIds = [...new Set(policy.ids ?? [])].sort();
   const requestedManagedIds = new Set(policyIds);
+  const hostPolicy = options.hostPolicy ?? {
+    mode: 'inherit' as const,
+    ids: [],
+  };
+  const hostPolicyIds = [...new Set(hostPolicy.ids ?? [])].sort();
+  const requestedHostIds = new Set(hostPolicyIds);
   const candidates: EffectiveSkillCandidate[] = [];
 
   options.layers.forEach((layer, precedence) => {
@@ -140,9 +149,14 @@ export function resolveEffectiveSkills(options: {
         ? `${layer.idPrefix}:${skill.id}`
         : skill.id;
       const filteredByProfile =
-        layer.source === 'managed' &&
-        (policy.mode === 'disabled' ||
-          (policy.mode === 'custom' && !requestedManagedIds.has(candidateId)));
+        (layer.source === 'managed' &&
+          (policy.mode === 'disabled' ||
+            (policy.mode === 'custom' &&
+              !requestedManagedIds.has(candidateId)))) ||
+        (layer.source === 'host' &&
+          (hostPolicy.mode === 'disabled' ||
+            (hostPolicy.mode === 'custom' &&
+              !requestedHostIds.has(candidateId))));
       const skillPath = path.join(layer.root, skill.id);
       candidates.push({
         id: candidateId,
@@ -207,11 +221,24 @@ export function resolveEffectiveSkills(options: {
     policy.mode === 'custom'
       ? policyIds.filter((id) => !availableManagedIds.has(id))
       : [];
+  const availableHostIds = new Set(
+    candidates
+      .filter(
+        (candidate) =>
+          candidate.source === 'host' && candidate.enabled === true,
+      )
+      .map((candidate) => candidate.id),
+  );
+  const missingHostSkillIds =
+    hostPolicy.mode === 'custom'
+      ? hostPolicyIds.filter((id) => !availableHostIds.has(id))
+      : [];
   const hash = createHash('sha256')
     .update(
       JSON.stringify({
         schemaVersion: 1,
         policy: { mode: policy.mode, ids: policyIds },
+        hostPolicy: { mode: hostPolicy.mode, ids: hostPolicyIds },
         selected: selected.map(({ id, source, definitionHash, overrides }) => ({
           id,
           source,
@@ -234,10 +261,12 @@ export function resolveEffectiveSkills(options: {
     schemaVersion: 1,
     hash,
     policy: { mode: policy.mode, ids: policyIds },
+    hostPolicy: { mode: hostPolicy.mode, ids: hostPolicyIds },
     candidates,
     selected,
     conflicts,
     missingManagedSkillIds,
+    missingHostSkillIds,
   };
 }
 

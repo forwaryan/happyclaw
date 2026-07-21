@@ -12,6 +12,7 @@ import {
   normalizeMcpPolicyReferences,
 } from '../../utils/mcp-servers';
 import { PolicyResourcePicker } from '../agents/PolicyResourcePicker';
+import { AgentSkillsPolicyEditor } from '../agents/AgentSkillsPolicyEditor';
 import { EffectiveCapabilitiesPreview } from '../agents/EffectiveCapabilitiesPreview';
 import { Button } from '@/components/ui/button';
 import {
@@ -21,6 +22,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import {
+  getHostSkillPolicy,
+  skillSelectionError,
+} from '../../utils/agent-runtime-policy';
 
 type CapabilityMode = 'inherit' | 'custom' | 'disabled';
 
@@ -46,6 +51,9 @@ export function MainAgentCapabilitiesSection() {
 
   const [skillsMode, setSkillsMode] = useState<CapabilityMode>('inherit');
   const [skillIds, setSkillIds] = useState<string[]>([]);
+  const [hostSkillsMode, setHostSkillsMode] =
+    useState<CapabilityMode>('disabled');
+  const [hostSkillIds, setHostSkillIds] = useState<string[]>([]);
   const [mcpMode, setMcpMode] = useState<CapabilityMode>('inherit');
   const [mcpIds, setMcpIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -58,6 +66,9 @@ export function MainAgentCapabilitiesSection() {
     if (!profile) return;
     setSkillsMode(profile.runtime_policy.skills.mode);
     setSkillIds(profile.runtime_policy.skills.ids);
+    const hostPolicy = getHostSkillPolicy(profile.runtime_policy);
+    setHostSkillsMode(hostPolicy.mode);
+    setHostSkillIds(hostPolicy.ids);
     setMcpMode(profile.runtime_policy.mcp.mode);
     setMcpIds(normalizeMcpPolicyReferences(profile.runtime_policy.mcp.ids));
   }, [profile?.id, profile?.updated_at]);
@@ -84,6 +95,29 @@ export function MainAgentCapabilitiesSection() {
     ];
   }, [skillIds, skills]);
 
+  const hostSkillOptions = useMemo(() => {
+    const available = skills
+      .filter((skill) => skill.source === 'external' && skill.enabled)
+      .map((skill) => ({
+        id: skill.id,
+        name: skill.name || skill.id,
+        description: skill.description,
+        sourceLabel: '宿主机',
+      }));
+    const known = new Set(available.map((item) => item.id));
+    return [
+      ...available,
+      ...hostSkillIds
+        .filter((id) => !known.has(id))
+        .map((id) => ({
+          id,
+          name: id,
+          sourceLabel: '宿主机',
+          unavailable: true,
+        })),
+    ];
+  }, [hostSkillIds, skills]);
+
   const mcpOptions = useMemo(() => {
     const available = buildMcpPolicyOptions(mcpServers);
     const known = new Set(available.map((item) => item.id));
@@ -95,11 +129,27 @@ export function MainAgentCapabilitiesSection() {
     ];
   }, [mcpIds, mcpServers]);
 
+  const persistedHostPolicy = profile
+    ? getHostSkillPolicy(profile.runtime_policy)
+    : null;
+  const managedSkillsError = skillSelectionError(' HappyClaw Skill', {
+    mode: skillsMode,
+    ids: skillIds,
+  });
+  const hostSkillsError = skillSelectionError('宿主机 Skill', {
+    mode: hostSkillsMode,
+    ids: hostSkillIds,
+  });
+  const capabilityError = managedSkillsError ?? hostSkillsError;
+
   const dirty =
     !!profile &&
     (skillsMode !== profile.runtime_policy.skills.mode ||
       JSON.stringify(skillIds) !==
         JSON.stringify(profile.runtime_policy.skills.ids) ||
+      hostSkillsMode !== persistedHostPolicy?.mode ||
+      JSON.stringify(hostSkillIds) !==
+        JSON.stringify(persistedHostPolicy?.ids ?? []) ||
       mcpMode !== profile.runtime_policy.mcp.mode ||
       JSON.stringify(mcpIds) !==
         JSON.stringify(
@@ -111,20 +161,36 @@ export function MainAgentCapabilitiesSection() {
       profile
         ? {
             ...profile.runtime_policy,
-            skills: { mode: skillsMode, ids: skillIds },
+            skills: {
+              mode: skillsMode,
+              ids: skillIds,
+              host: { mode: hostSkillsMode, ids: hostSkillIds },
+            },
             mcp: { mode: mcpMode, ids: mcpIds },
           }
         : null,
-    [mcpIds, mcpMode, profile, skillIds, skillsMode],
+    [
+      hostSkillIds,
+      hostSkillsMode,
+      mcpIds,
+      mcpMode,
+      profile,
+      skillIds,
+      skillsMode,
+    ],
   );
 
   const save = async () => {
-    if (!profile || !dirty) return;
+    if (!profile || !dirty || capabilityError) return;
     setSaving(true);
     try {
       await api.patch(`/api/agent-profiles/${encodeURIComponent(profile.id)}`, {
         runtime_policy: {
-          skills: { mode: skillsMode, ids: skillIds },
+          skills: {
+            mode: skillsMode,
+            ids: skillIds,
+            host: { mode: hostSkillsMode, ids: hostSkillIds },
+          },
           mcp: { mode: mcpMode, ids: mcpIds },
         } satisfies Partial<AgentProfileRuntimePolicy>,
       });
@@ -158,34 +224,28 @@ export function MainAgentCapabilitiesSection() {
       <div>
         <h3 className="text-sm font-semibold text-foreground">系统附加能力</h3>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          控制 HappyClaw 为主 Agent 额外附加的用户 Skills 与 MCP。 系统内置
-          Skills 始终生效且不进入选择器。若主 Agent 继承宿主机
-          ~/.claude，宿主机提示词、Rules、全部 Skills 和 MCP
-          已自动生效，不受这里的选择影响。
+          按来源控制主 Agent 的 Skills，并管理 HappyClaw 附加的 MCP。 宿主机
+          Skills 可独立于宿主机 Prompt 与 Rules 启用。
         </p>
       </div>
 
-      <div className="grid gap-5 lg:grid-cols-2">
-        <CapabilityPicker
-          label="HappyClaw 用户 Skills"
-          value={skillsMode}
-          onValueChange={setSkillsMode}
-          customLabel="只允许所选 Skills"
-          disabledLabel="关闭用户附加 Skills"
-        >
-          {skillsMode === 'custom' && (
-            <PolicyResourcePicker
-              label="允许目录"
-              options={skillOptions}
-              selectedIds={skillIds}
-              onChange={setSkillIds}
-              loading={skillsLoading}
-              error={skillsError}
-              emptyText="没有已启用的用户 Skill"
-            />
-          )}
-        </CapabilityPicker>
+      <AgentSkillsPolicyEditor
+        managedPolicy={{ mode: skillsMode, ids: skillIds }}
+        onManagedModeChange={setSkillsMode}
+        onManagedIdsChange={setSkillIds}
+        managedOptions={skillOptions}
+        hostPolicy={{ mode: hostSkillsMode, ids: hostSkillIds }}
+        onHostModeChange={setHostSkillsMode}
+        onHostIdsChange={setHostSkillIds}
+        hostOptions={hostSkillOptions}
+        loading={skillsLoading}
+        error={skillsError}
+        hostAvailable
+        managedError={managedSkillsError}
+        hostError={hostSkillsError}
+      />
 
+      <div className="max-w-xl border-t border-border pt-5">
         <CapabilityPicker
           label="HappyClaw MCP"
           value={mcpMode}
@@ -210,7 +270,7 @@ export function MainAgentCapabilitiesSection() {
       <div className="flex justify-end">
         <Button
           onClick={() => void save()}
-          disabled={!dirty || saving}
+          disabled={!dirty || saving || !!capabilityError}
           className="min-h-11"
         >
           {saving && <Loader2 className="size-4 animate-spin" />}

@@ -288,6 +288,48 @@ describe('ClaudeContextResolver', () => {
     ]);
   });
 
+  test('managed context can select host Skills without linking host prompts or rules', () => {
+    const external = path.join(tmp, 'external-claude');
+    const sessionDir = path.join(tmp, 'sessions', 'selected-host', '.claude');
+    writeFile(path.join(external, 'CLAUDE.md'), '# must stay isolated');
+    writeFile(
+      path.join(external, 'rules', 'global.md'),
+      '# must stay isolated',
+    );
+    makeSkill(path.join(external, 'skills'), 'selected-host-skill');
+    makeSkill(path.join(external, 'skills'), 'unselected-host-skill');
+
+    const plan = buildClaudeContextPlan({
+      executionMode: 'host',
+      group: fakeGroup('selected-host', 'admin') as any,
+      externalClaudeDir: external,
+      projectRoot: path.join(tmp, 'project'),
+      dataDir: path.join(tmp, 'data'),
+      groupSessionsDir: sessionDir,
+      includeHostClaudeContext: false,
+      hostSkillPolicy: {
+        mode: 'custom',
+        ids: ['selected-host-skill'],
+      },
+    });
+    syncHostClaudeContext(plan, sessionDir);
+
+    expect(plan.claudeMdSource).toBeUndefined();
+    expect(plan.rulesSourceDir).toBeUndefined();
+    expect(plan.audit.claudeMd.status).toBe('unavailable');
+    expect(plan.effectiveSkills.selected.map((skill) => skill.id)).toContain(
+      'selected-host-skill',
+    );
+    expect(
+      plan.effectiveSkills.selected.map((skill) => skill.id),
+    ).not.toContain('unselected-host-skill');
+    expect(fs.existsSync(path.join(sessionDir, 'CLAUDE.md'))).toBe(false);
+    expect(fs.readdirSync(path.join(sessionDir, 'rules'))).toEqual([]);
+    expect(
+      fs.readlinkSync(path.join(sessionDir, 'skills', 'selected-host-skill')),
+    ).toBe(path.join(external, 'skills', 'selected-host-skill'));
+  });
+
   test('host context opt-in works for an admin whose home folder is not main', () => {
     const external = path.join(tmp, 'external-claude');
     writeFile(path.join(external, 'CLAUDE.md'), '# second admin');

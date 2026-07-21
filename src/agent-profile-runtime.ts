@@ -31,42 +31,50 @@ export function resolveEffectiveAgentProfile(
 ): AgentProfile | undefined {
   if (!profile) return undefined;
   const owner = getUserById(profile.owner_user_id);
-  const contextSource =
-    owner?.role !== 'admin' || owner.status !== 'active'
-      ? 'managed'
-      : profile.is_default
-        ? getSystemSettings().mainAgentContextSource
-        : profile.runtime_policy.context.source;
+  const canUseHostResources =
+    owner?.role === 'admin' && owner.status === 'active';
+  const contextSource = !canUseHostResources
+    ? 'managed'
+    : profile.is_default
+      ? getSystemSettings().mainAgentContextSource
+      : profile.runtime_policy.context.source;
   const autoCompactWindow = profile.is_default
     ? getSystemSettings().mainAgentAutoCompactWindow
     : profile.runtime_policy.context.auto_compact_window;
   const autoCompactPercentage = profile.is_default
     ? getSystemSettings().mainAgentAutoCompactPercentage
     : profile.runtime_policy.context.auto_compact_percentage;
+  const effectiveSkills =
+    !canUseHostResources &&
+    profile.runtime_policy.skills.host &&
+    profile.runtime_policy.skills.host.mode !== 'disabled'
+      ? {
+          ...profile.runtime_policy.skills,
+          host: {
+            mode: 'disabled' as const,
+            // Retain requested ids for audit/editing while failing closed.
+            ids: profile.runtime_policy.skills.host.ids,
+          },
+        }
+      : profile.runtime_policy.skills;
+  const effectiveRuntimePolicy = {
+    ...profile.runtime_policy,
+    context: {
+      ...profile.runtime_policy.context,
+      source: contextSource,
+      auto_compact_window: autoCompactWindow,
+      auto_compact_percentage: autoCompactPercentage,
+    },
+    skills: effectiveSkills,
+  };
   return {
     ...profile,
     identity_hash: computeAgentProfileIdentityHash(
       profile,
-      {
-        ...profile.runtime_policy,
-        context: {
-          ...profile.runtime_policy.context,
-          source: contextSource,
-          auto_compact_window: autoCompactWindow,
-          auto_compact_percentage: autoCompactPercentage,
-        },
-      },
+      effectiveRuntimePolicy,
       profile.name,
     ),
-    runtime_policy: {
-      ...profile.runtime_policy,
-      context: {
-        ...profile.runtime_policy.context,
-        source: contextSource,
-        auto_compact_window: autoCompactWindow,
-        auto_compact_percentage: autoCompactPercentage,
-      },
-    },
+    runtime_policy: effectiveRuntimePolicy,
   };
 }
 

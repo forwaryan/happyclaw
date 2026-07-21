@@ -6422,7 +6422,13 @@ const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
 
 type RuntimePolicyInput = Partial<{
   context: Partial<AgentProfileRuntimePolicy['context']> | null;
-  skills: Partial<AgentProfileRuntimePolicy['skills']> | null;
+  skills:
+    | (Partial<Omit<AgentProfileRuntimePolicy['skills'], 'host'>> & {
+        host?: Partial<
+          NonNullable<AgentProfileRuntimePolicy['skills']['host']>
+        > | null;
+      })
+    | null;
   mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
 }>;
 
@@ -6489,6 +6495,18 @@ export function normalizeAgentProfileRuntimePolicy(
         'inherit',
       ),
       ids: normalizeIdList(raw.skills?.ids),
+      ...(raw.skills?.host
+        ? {
+            host: {
+              mode: normalizeMode(
+                raw.skills.host.mode,
+                ['inherit', 'custom', 'disabled'] as const,
+                'disabled',
+              ),
+              ids: normalizeIdList(raw.skills.host.ids),
+            },
+          }
+        : {}),
     },
     mcp: {
       mode: normalizeMode(
@@ -6516,10 +6534,24 @@ export function mergeAgentProfileRuntimePolicy(
   const mergeCapability = <T extends 'skills' | 'mcp'>(key: T) => {
     const value = patch[key];
     if (value === null) return DEFAULT_AGENT_PROFILE_RUNTIME_POLICY[key];
-    return {
+    const merged = {
       mode: value?.mode ?? current[key].mode,
       ids: value?.ids ?? current[key].ids,
     };
+    if (key !== 'skills') return merged;
+    const skillsValue = value as RuntimePolicyInput['skills'];
+    if (skillsValue?.host === null) return merged;
+    const currentHost = current.skills.host;
+    if (skillsValue?.host !== undefined) {
+      return {
+        ...merged,
+        host: {
+          mode: skillsValue.host.mode ?? currentHost?.mode ?? 'disabled',
+          ids: skillsValue.host.ids ?? currentHost?.ids ?? [],
+        },
+      };
+    }
+    return currentHost ? { ...merged, host: currentHost } : merged;
   };
 
   return normalizeAgentProfileRuntimePolicy({

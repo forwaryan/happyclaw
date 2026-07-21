@@ -452,6 +452,42 @@ describe('AgentProfile DB model', () => {
     });
   });
 
+  test('preserves legacy missing host Skill policy and deep-merges explicit host selection', () => {
+    const legacy = normalizeAgentProfileRuntimePolicy({
+      context: { source: 'host_claude' },
+      skills: { mode: 'custom', ids: ['managed-a'] },
+    });
+    expect(legacy.skills.host).toBeUndefined();
+
+    const userId = 'agent-profile-host-skills-merge';
+    seedUser(userId, 'admin');
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Host Skill Agent',
+      runtimePolicy: {
+        skills: {
+          mode: 'custom',
+          ids: ['managed-a'],
+          host: {
+            mode: 'custom',
+            ids: ['host-a', 'host-b'],
+          },
+        },
+      },
+    });
+
+    const updated = updateAgentProfile(profile.id, userId, {
+      runtimePolicy: { skills: { host: { mode: 'disabled' } } },
+    })!;
+    expect(updated.runtime_policy.skills).toEqual({
+      mode: 'custom',
+      ids: ['managed-a'],
+      host: { mode: 'disabled', ids: ['host-a', 'host-b'] },
+    });
+    expect(updated.version).toBe(profile.version + 1);
+    expect(updated.identity_hash).not.toBe(profile.identity_hash);
+  });
+
   test('migrates the legacy system compact threshold without bumping identity metadata', () => {
     const userId = 'agent-profile-auto-compact-migration';
     seedUser(userId);
