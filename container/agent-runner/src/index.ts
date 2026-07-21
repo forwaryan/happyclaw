@@ -47,7 +47,6 @@ export type { StreamEventType, StreamEvent } from './types.js';
 import {
   sanitizeFilename,
   generateFallbackName,
-  formatLocalNow,
   isSuspectTruncatedStreamResult,
   shouldForceBackgroundTaskSummary,
   buildBackgroundTaskSummaryPrompt,
@@ -96,6 +95,12 @@ import {
   findClaudeMdExcludeLeaks,
   resolveManagedHostClaudeMdExcludes,
 } from './claude-memory-policy.js';
+import {
+  anchorAgentProfileToUserTurn,
+  resolveAgentTurnAnchor,
+  shouldAnchorInitialAgentTurn,
+} from './agent-turn-contract.js';
+import { prepareMessageStreamText } from './message-stream-text.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -648,6 +653,7 @@ class MessageStream {
   push(
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
+    decorateText?: (text: string) => string,
   ): string[] {
     // stream.done=true 后禁止写入已关闭的 SDK transport，否则触发 "ProcessTransport is not ready for writing"
     if (this.done) {
@@ -666,21 +672,17 @@ class MessageStream {
       filteredImages = valid.length > 0 ? valid : undefined;
     }
 
-    // 全部图片被过滤 + text 为空时，替换为说明文本，避免 SDK 收到空 user message
-    // 进而让主模型回复"消息是空的"。典型触发：Web 用户直接粘贴长图（height > 8000px）无文字。
-    let effectiveText = text;
-    const allImagesDropped =
-      originalImageCount > 0 &&
-      (!filteredImages || filteredImages.length === 0);
-    if (allImagesDropped && !effectiveText.trim()) {
-      effectiveText = `[用户发送了 ${originalImageCount} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
-    }
-
     // 每条 user message 前置当前本地时间，让 agent 能正确推理相对时间 / schedule_task 的
     // once/cron 取值（#563）。刻意放在 user message（缓存前缀之后的未缓存区）而非 system
     // prompt：① 不会因每 turn 时间不同而击穿整段 system+历史的 prompt cache；② 长会话里
     // 每个 turn 都拿到新鲜时间，而非会话启动那一刻的陈旧时间。
-    effectiveText = `[当前时间: ${formatLocalNow()}]\n${effectiveText}`;
+    const effectiveText = prepareMessageStreamText({
+      text,
+      originalImageCount,
+      validImageCount: filteredImages?.length ?? 0,
+      maxImageDimension: IMAGE_MAX_DIMENSION,
+      decorateText,
+    });
 
     let content:
       | string
@@ -1619,7 +1621,19 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   const assistantTextTracker = new AssistantTextTracker();
   let canonicalAssistantUuid: string | undefined;
-  const initialRejected = stream.push(prompt, images);
+  const agentTurnAnchor = resolveAgentTurnAnchor(
+    containerInput.agentProfile,
+    CLAUDE_PROVIDER_RUNTIME.endpointKind,
+  );
+  const anchorUserTurn = (message: string): string =>
+    anchorAgentProfileToUserTurn(agentTurnAnchor, message);
+  const initialRejected = stream.push(
+    prompt,
+    images,
+    shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
+      ? anchorUserTurn
+      : undefined,
+  );
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
     turnId: containerInput.turnId,
@@ -1894,7 +1908,7 @@ async function runQuery(
       // A new user turn arrived after a prior result. Cancel that result's
       // post-timeout so the stream cannot close before this turn completes.
       resultReceivedAt = null;
-      const rejected = stream.push(msg.text, msg.images);
+      const rejected = stream.push(msg.text, msg.images, anchorUserTurn);
       for (const reason of rejected) {
         emit({
           status: 'success',
@@ -1986,6 +2000,7 @@ async function runQuery(
       }
     : systemPromptAppend;
   const promptAudit = buildPromptAudit(promptPlan);
+  if (agentTurnAnchor) promptAudit.turnAnchor = agentTurnAnchor.audit;
   const contextAuditBase = runtimeContextAuditBase(containerInput);
 
   // 调试观察：HAPPYCLAW_DUMP_PROMPT=true 时把最终 system prompt 输出到 stderr

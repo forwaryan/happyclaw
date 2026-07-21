@@ -135,6 +135,14 @@ export interface ClaudeContextPromptAudit {
   totalBytes: number;
   estimatedTokens?: number;
   planHash?: string;
+  turnAnchor?: {
+    provider: 'custom';
+    maxChars: number;
+    sourceChars: number;
+    anchoredChars: number;
+    truncated: boolean;
+    estimatedTokens: number;
+  };
   files: Array<{
     name: string;
     bytes: number;
