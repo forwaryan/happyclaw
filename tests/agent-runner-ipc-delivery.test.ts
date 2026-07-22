@@ -133,7 +133,17 @@ describe('agent-runner IPC delivery turn tracker', () => {
   });
 
   test('interrupt requeue serialization preserves the exact receipt', () => {
-    const original = message('1');
+    const original: IpcInputMessage = {
+      ...message('1'),
+      sourceJid: 'feishu:oc_test#account:account-1',
+      channelContext: {
+        schemaVersion: 1,
+        provider: 'feishu',
+        sourceJid: 'feishu:oc_test#account:account-1',
+        channelAccountId: 'account-1',
+        message: { id: 'om_test' },
+      },
+    };
     const serialized = serializeIpcInputMessage(original) as {
       receipt: IpcDeliveryReceipt;
     };
@@ -141,6 +151,7 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(serialized).toMatchObject({
       type: 'message',
       text: '1',
+      channelContext: original.channelContext,
       receipt: original.receipt,
     });
   });
@@ -164,6 +175,28 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(replayed.map((item) => item.receipt)).toEqual(
       pending.map((item) => item.receipt),
     );
+  });
+
+  test('failed/interrupt requeue preserves warm-turn channel context', () => {
+    const inputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ipc-requeue-'));
+    tempDirs.push(inputDir);
+    const original: IpcInputMessage = {
+      ...message('1'),
+      sourceJid: 'feishu:oc_test#account:account-2#thread:omt_test',
+      channelContext: {
+        schemaVersion: 1,
+        provider: 'feishu',
+        sourceJid: 'feishu:oc_test#account:account-2#thread:omt_test',
+        channelAccountId: 'account-2',
+        chat: { id: 'oc_test', type: 'group', isTopicStyle: true },
+        message: { id: 'om_test', threadId: 'omt_test' },
+        sender: { openId: 'ou_sender' },
+      },
+    };
+
+    const [filepath] = requeueIpcInputMessages(inputDir, [original]);
+    const replayed = JSON.parse(fs.readFileSync(filepath, 'utf8'));
+    expect(replayed.channelContext).toEqual(original.channelContext);
   });
 
   test('intentional interrupt cancels the current warm-runner turn but preserves later turns', () => {

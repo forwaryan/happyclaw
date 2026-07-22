@@ -37,8 +37,15 @@ import {
 } from './feishu-mention-gate.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import { parseChannelAddress } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
+import {
+  executeFeishuCapability,
+  type FeishuCapabilityRequest,
+  type FeishuCapabilityResult,
+} from './feishu-capability.js';
 import type {
+  ChannelTurnContext,
   FeishuMessageMeta,
   FollowUpAction,
   FollowUpActionResult,
@@ -51,6 +58,8 @@ import type {
 export interface FeishuConnectionConfig {
   appId: string;
   appSecret: string;
+  /** Optional HappyClaw account id. The scoped source JID remains authoritative. */
+  channelAccountId?: string;
 }
 
 /** 飞书文件信息（用于下载到工作区） */
@@ -159,6 +168,10 @@ export interface FeishuConnection {
   isConnected(): boolean;
   syncGroups(): Promise<void>;
   getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
+  executeCapability(
+    context: ChannelTurnContext,
+    request: FeishuCapabilityRequest,
+  ): Promise<FeishuCapabilityResult>;
   /** Get the underlying Lark SDK client (for streaming cards) */
   getLarkClient(): lark.Client | null;
   /** Get the last received message ID for a chat (for reply threading) */
@@ -186,7 +199,7 @@ const BOT_INFO_MISSING_WARN_INTERVAL_MS = 5 * 60 * 1000;
 interface FeishuMentionLike {
   key?: string;
   name?: string;
-  id?: { open_id?: string; user_id?: string };
+  id?: { open_id?: string; user_id?: string; union_id?: string };
 }
 
 interface IncomingMessagePayload {
@@ -201,7 +214,139 @@ interface IncomingMessagePayload {
   chatType?: string;
   mentions?: FeishuMentionLike[];
   senderOpenId?: string;
+  senderUserId?: string;
+  senderUnionId?: string;
   senderName?: string;
+  senderTenantKey?: string;
+  senderType?: string;
+}
+
+interface FeishuBotPublicInfo {
+  openId?: string;
+  name?: string;
+  avatarUrl?: string;
+}
+
+interface CachedFeishuChatInfo {
+  name?: string;
+  chatType?: string;
+  chatMode?: string;
+  groupMessageType?: string;
+}
+
+export const FEISHU_CHANNEL_CAPABILITIES = [
+  'get_channel_context',
+  'send_message',
+  'send_image',
+  'send_file',
+  'feishu_get_chat',
+  'feishu_list_members',
+  'feishu_get_user',
+  'feishu_get_history',
+  'feishu_send_card',
+  'feishu_add_reaction',
+  'feishu_remove_reaction',
+  'feishu_edit_message',
+  'feishu_recall_message',
+  'feishu_api_request',
+] as const;
+
+export function buildFeishuChannelTurnContext(input: {
+  appId: string;
+  configuredChannelAccountId?: string;
+  bot?: FeishuBotPublicInfo;
+  chat: {
+    id: string;
+    type?: string;
+    name?: string;
+    mode?: string;
+    groupMessageType?: string;
+  };
+  message: {
+    id: string;
+    rootId?: string;
+    parentId?: string;
+    threadId?: string;
+    type?: string;
+  };
+  sender?: {
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+    name?: string;
+    tenantKey?: string;
+    type?: string;
+  };
+  mentions?: FeishuMentionLike[];
+  sourceJid: string;
+  targetJid?: string;
+  sessionAgentId?: string | null;
+}): ChannelTurnContext {
+  const parsedSource = parseChannelAddress(input.sourceJid);
+  const chatType =
+    input.chat.type === 'p2p' || input.chat.type === 'group'
+      ? input.chat.type
+      : undefined;
+  const isTopicStyle =
+    input.chat.mode === 'topic' || input.chat.groupMessageType === 'thread';
+  return {
+    schemaVersion: 1,
+    provider: 'feishu',
+    channelAccountId:
+      parsedSource?.channelAccountId ??
+      input.configuredChannelAccountId ??
+      null,
+    sourceJid: input.sourceJid,
+    ...(input.targetJid ? { targetJid: input.targetJid } : {}),
+    ...(input.sessionAgentId !== undefined
+      ? { sessionAgentId: input.sessionAgentId }
+      : {}),
+    bot: {
+      ...(input.appId ? { appId: input.appId } : {}),
+      ...(input.bot?.openId ? { openId: input.bot.openId } : {}),
+      ...(input.bot?.name ? { name: input.bot.name } : {}),
+      ...(input.bot?.avatarUrl ? { avatarUrl: input.bot.avatarUrl } : {}),
+    },
+    chat: {
+      id: input.chat.id,
+      ...(chatType ? { type: chatType } : {}),
+      ...(input.chat.name ? { name: input.chat.name } : {}),
+      ...(input.chat.mode ? { mode: input.chat.mode } : {}),
+      ...(input.chat.groupMessageType
+        ? { groupMessageType: input.chat.groupMessageType }
+        : {}),
+      ...(input.chat.mode || input.chat.groupMessageType
+        ? { isTopicStyle }
+        : {}),
+    },
+    message: {
+      id: input.message.id,
+      ...(input.message.rootId ? { rootId: input.message.rootId } : {}),
+      ...(input.message.parentId ? { parentId: input.message.parentId } : {}),
+      ...(input.message.threadId ? { threadId: input.message.threadId } : {}),
+      ...(input.message.type ? { type: input.message.type } : {}),
+    },
+    sender: input.sender
+      ? {
+          ...(input.sender.openId ? { openId: input.sender.openId } : {}),
+          ...(input.sender.userId ? { userId: input.sender.userId } : {}),
+          ...(input.sender.unionId ? { unionId: input.sender.unionId } : {}),
+          ...(input.sender.name ? { name: input.sender.name } : {}),
+          ...(input.sender.tenantKey
+            ? { tenantKey: input.sender.tenantKey }
+            : {}),
+          ...(input.sender.type ? { type: input.sender.type } : {}),
+        }
+      : undefined,
+    mentions: input.mentions?.map((mention) => ({
+      ...(mention.key ? { key: mention.key } : {}),
+      ...(mention.name ? { name: mention.name } : {}),
+      ...(mention.id?.open_id ? { openId: mention.id.open_id } : {}),
+      ...(mention.id?.user_id ? { userId: mention.id.user_id } : {}),
+      ...(mention.id?.union_id ? { unionId: mention.id.union_id } : {}),
+    })),
+    capabilities: [...FEISHU_CHANNEL_CAPABILITIES],
+  };
 }
 
 interface WsConnectionState {
@@ -625,6 +770,7 @@ export function createFeishuConnection(
   const typingReactionByChat = new Map<string, string>();
   const knownChatIds = new Set<string>();
   const chatTypeById = new Map<string, string>(); // chatId → 'group' | 'p2p'
+  const chatInfoById = new Map<string, CachedFeishuChatInfo>();
   const lastCreateTimeByChat = new Map<string, number>();
 
   let client: lark.Client | null = null;
@@ -632,6 +778,7 @@ export function createFeishuConnection(
   let eventDispatcher: lark.EventDispatcher | null = null;
   let connectOptions: ConnectOptions | null = null;
   let botOpenId: string = '';
+  let botPublicInfo: FeishuBotPublicInfo = {};
   let reconnecting = false;
   let backfillRunning = false;
   let reconnectRequestedAt = 0;
@@ -711,24 +858,39 @@ export function createFeishuConnection(
   }
 
   /**
-   * 拉取 bot open_id —— 启动期与自愈共用入口。
-   * 失败时返回空串，由调用方决定是否重试。
+   * 拉取可公开给 Agent 的 bot 信息（open_id、名称、头像）。
+   * 失败时返回空对象，由调用方决定是否重试。
    */
-  async function fetchBotOpenIdOnce(): Promise<string> {
-    if (!client) return '';
+  async function fetchBotOpenIdOnce(): Promise<FeishuBotPublicInfo> {
+    if (!client) return {};
     try {
       const botInfoRes = await client.request({
         method: 'GET',
         url: '/open-apis/bot/v3/info/',
       });
       const info = botInfoRes as {
-        bot?: { open_id?: string };
-        data?: { bot?: { open_id?: string } };
+        bot?: {
+          open_id?: string;
+          app_name?: string;
+          avatar_url?: string;
+        };
+        data?: {
+          bot?: {
+            open_id?: string;
+            app_name?: string;
+            avatar_url?: string;
+          };
+        };
       };
-      return info?.bot?.open_id || info?.data?.bot?.open_id || '';
+      const bot = info?.bot ?? info?.data?.bot;
+      return {
+        ...(bot?.open_id ? { openId: bot.open_id } : {}),
+        ...(bot?.app_name ? { name: bot.app_name } : {}),
+        ...(bot?.avatar_url ? { avatarUrl: bot.avatar_url } : {}),
+      };
     } catch (err) {
       logger.debug({ err }, 'fetchBotOpenIdOnce failed');
-      return '';
+      return {};
     }
   }
 
@@ -741,10 +903,11 @@ export function createFeishuConnection(
       if (attempt > 0) {
         await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
       }
-      const id = await fetchBotOpenIdOnce();
+      const info = await fetchBotOpenIdOnce();
       lastBotInfoFetchAt = Date.now();
-      if (id) {
-        botOpenId = id;
+      if (info.openId) {
+        botPublicInfo = info;
+        botOpenId = info.openId;
         logger.info(
           { botOpenId, attempt: attempt + 1 },
           'Fetched bot open_id for mention detection',
@@ -770,10 +933,11 @@ export function createFeishuConnection(
       return Promise.resolve();
     }
     botInfoRefetchInFlight = (async () => {
-      const id = await fetchBotOpenIdOnce();
+      const info = await fetchBotOpenIdOnce();
       lastBotInfoFetchAt = Date.now();
-      if (id) {
-        botOpenId = id;
+      if (info.openId) {
+        botPublicInfo = info;
+        botOpenId = info.openId;
         logger.info(
           { botOpenId, reason },
           'Recovered bot open_id (lazy refetch)',
@@ -1022,7 +1186,11 @@ export function createFeishuConnection(
       mentions,
       chatType,
       senderOpenId = '',
+      senderUserId,
+      senderUnionId,
       senderName,
+      senderTenantKey,
+      senderType,
     } = payload;
     if (!chatId || !messageId) return;
     const normalizedChatType =
@@ -1125,7 +1293,9 @@ export function createFeishuConnection(
         deliveryRootMessageId,
       );
       const resolvedSenderName = senderName || getSenderName(senderOpenId);
-      const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
+      const cachedChatInfo = chatInfoById.get(chatId);
+      const resolvedChatName =
+        cachedChatInfo?.name || (chatType === 'p2p' ? '飞书私聊' : '飞书群聊');
 
       // Audience is an identity boundary, independent from @/topic activation,
       // and therefore runs before commands and before the mention gate. This
@@ -1508,6 +1678,37 @@ export function createFeishuConnection(
       const targetJid = admittedRoute.targetJid;
 
       const targetAgentId = agentRouting?.agentId;
+      const channelContext = buildFeishuChannelTurnContext({
+        appId: config.appId,
+        configuredChannelAccountId: config.channelAccountId,
+        bot: botPublicInfo,
+        chat: {
+          id: chatId,
+          type: chatType,
+          name: cachedChatInfo?.name || resolvedChatName,
+          mode: cachedChatInfo?.chatMode,
+          groupMessageType: cachedChatInfo?.groupMessageType,
+        },
+        message: {
+          id: messageId,
+          rootId: deliveryRootMessageId,
+          parentId,
+          threadId,
+          type: messageType,
+        },
+        sender: {
+          openId: senderOpenId,
+          userId: senderUserId,
+          unionId: senderUnionId,
+          name: resolvedSenderName,
+          tenantKey: senderTenantKey,
+          type: senderType,
+        },
+        mentions,
+        sourceJid: routeSourceJid,
+        targetJid,
+        sessionAgentId: targetAgentId,
+      });
 
       storeChatMetadata(targetJid, timestamp);
       storeMessageDirect(
@@ -1518,7 +1719,11 @@ export function createFeishuConnection(
         text,
         timestamp,
         false,
-        { attachments: attachmentsJson, sourceJid: routeSourceJid },
+        {
+          attachments: attachmentsJson,
+          sourceJid: routeSourceJid,
+          channelContext,
+        },
       );
       const followUp = onFollowUpMessage?.({
         targetJid,
@@ -1558,6 +1763,7 @@ export function createFeishuConnection(
           content: text,
           timestamp,
           attachments: attachmentsJson,
+          channel_context: channelContext,
           ...deliveryFields,
         },
         targetAgentId ?? undefined,
@@ -1684,8 +1890,12 @@ export function createFeishuConnection(
             sender?: {
               id?: string;
               sender_type?: string;
+              tenant_key?: string;
+              name?: string;
               sender_id?: {
                 open_id?: string;
+                user_id?: string;
+                union_id?: string;
               };
             };
           }>;
@@ -1718,6 +1928,11 @@ export function createFeishuConnection(
             chatType: item.chat_type || chatTypeById.get(chatId) || 'group',
             mentions: item.mentions,
             senderOpenId,
+            senderUserId: item.sender?.sender_id?.user_id,
+            senderUnionId: item.sender?.sender_id?.union_id,
+            senderName: item.sender?.name,
+            senderTenantKey: item.sender?.tenant_key,
+            senderType: item.sender?.sender_type,
           };
         })
         .sort((a, b) => a.createTimeMs - b.createTimeMs);
@@ -1872,6 +2087,7 @@ export function createFeishuConnection(
       // 启动期失败后，健康检查 + 进入 mention 门控前的 lazy refetch 会兜底自愈，
       // 期间 mention 守卫维持 fail-closed（拒绝群消息），不会回退到默认放行。
       botOpenId = '';
+      botPublicInfo = {};
       lastBotInfoFetchAt = 0;
       await fetchBotOpenIdWithRetry();
 
@@ -1880,6 +2096,16 @@ export function createFeishuConnection(
         'im.message.receive_v1': async (data) => {
           try {
             const message = data.message;
+            const sender = data.sender as typeof data.sender & {
+              sender_type?: string;
+              tenant_key?: string;
+              sender_name?: string;
+              sender_id?: {
+                open_id?: string;
+                user_id?: string;
+                union_id?: string;
+              };
+            };
             await handleIncomingMessage(
               {
                 chatId: message.chat_id,
@@ -1892,7 +2118,12 @@ export function createFeishuConnection(
                 content: message.content,
                 chatType: message.chat_type,
                 mentions: message.mentions as FeishuMentionLike[] | undefined,
-                senderOpenId: data.sender.sender_id?.open_id || '',
+                senderOpenId: sender.sender_id?.open_id || '',
+                senderUserId: sender.sender_id?.user_id,
+                senderUnionId: sender.sender_id?.union_id,
+                senderName: sender.sender_name,
+                senderTenantKey: sender.tenant_key,
+                senderType: sender.sender_type,
               },
               'ws',
             );
@@ -2328,7 +2559,7 @@ export function createFeishuConnection(
           path: { chat_id: target.chatId },
         });
         if (!res.data) return null;
-        return {
+        const info = {
           avatar: res.data.avatar,
           name: res.data.name,
           user_count: res.data.user_count,
@@ -2337,10 +2568,22 @@ export function createFeishuConnection(
           group_message_type: (res.data as { group_message_type?: string })
             .group_message_type,
         };
+        chatInfoById.set(target.chatId, {
+          name: info.name,
+          chatType: info.chat_type,
+          chatMode: info.chat_mode,
+          groupMessageType: info.group_message_type,
+        });
+        return info;
       } catch (err) {
         logger.warn({ err, chatId }, 'Failed to get Feishu chat info');
         return null;
       }
+    },
+
+    async executeCapability(context, request) {
+      if (!client) throw new Error('Feishu client is not connected');
+      return executeFeishuCapability(client, context, request);
     },
 
     async syncGroups(): Promise<void> {
@@ -2368,6 +2611,17 @@ export function createFeishuConnection(
             const scopedJid =
               connectOptions?.normalizeIncomingJid?.(rawJid) ?? rawJid;
             const chatName = chat.name?.trim() || '飞书聊天';
+            const extendedChat = chat as typeof chat & {
+              chat_type?: string;
+              chat_mode?: string;
+              group_message_type?: string;
+            };
+            chatInfoById.set(chat.chat_id, {
+              name: chatName,
+              chatType: extendedChat.chat_type,
+              chatMode: extendedChat.chat_mode,
+              groupMessageType: extendedChat.group_message_type,
+            });
 
             // chat.list is the authoritative membership inventory for the bot.
             // Register every visible chat, even when the membership event was

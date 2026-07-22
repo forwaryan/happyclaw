@@ -8,6 +8,7 @@ import { killProcessTree } from './container-runner.js';
 import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
+import type { ChannelTurnContext } from './types.js';
 export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
   timestamp: string;
@@ -1271,6 +1272,7 @@ export class GroupQueue {
     sourceJid?: string,
     taskId?: string,
     deliveryTarget?: IpcDeliveryTarget,
+    channelContext?: ChannelTurnContext,
   ): SendMessageResult {
     if (this.isTerminalMutationDiscarded(groupJid)) return 'no_active';
     if (this.isMutationPaused(groupJid)) return 'no_active';
@@ -1343,6 +1345,7 @@ export class GroupQueue {
           text,
           images,
           sourceJid,
+          channelContext,
           taskId,
           receipt,
         }),

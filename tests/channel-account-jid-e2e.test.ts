@@ -21,6 +21,7 @@ const db = await import('../src/db.js');
 const { IMConnectionManager } = await import('../src/im-manager.js');
 const address = await import('../src/channel-address.js');
 import type { IMChannel, IMChannelConnectOpts } from '../src/im-channel.js';
+import type { ChannelTurnContext } from '../src/types.js';
 
 beforeAll(() => {
   fs.mkdirSync(path.join(tmp, 'db'), { recursive: true });
@@ -43,6 +44,17 @@ beforeAll(() => {
       id,
       owner_user_id: 'jid-owner',
       provider: 'telegram',
+      name: id,
+      secret_ref: `channel-account:${id}`,
+      enabled: true,
+      auth_status: 'authorized',
+    });
+  }
+  for (const id of ['feishu-bot-a', 'feishu-bot-b']) {
+    db.createChannelAccount({
+      id,
+      owner_user_id: 'jid-owner',
+      provider: 'feishu',
       name: id,
       secret_ref: `channel-account:${id}`,
       enabled: true,
@@ -154,5 +166,73 @@ describe('canonical channel-account JID end to end', () => {
     expect(address.channelConversationJid(scoped)).toBe(
       'feishu:chat-1#account:feishu-bot-a',
     );
+  });
+
+  test('Feishu capabilities execute only on the Bot account encoded by the trusted JID', async () => {
+    const manager = new IMConnectionManager();
+    const makeFeishu = () => {
+      let connected = false;
+      const executeFeishuCapability = vi.fn(async (_context, request) => ({
+        operation: request.operation,
+        data: { servedBy: request.params?.marker },
+      }));
+      const channel: IMChannel = {
+        channelType: 'feishu',
+        async connect() {
+          connected = true;
+          return true;
+        },
+        async disconnect() {
+          connected = false;
+        },
+        async sendMessage() {},
+        async setTyping() {},
+        isConnected: () => connected,
+        executeFeishuCapability,
+      };
+      return { channel, executeFeishuCapability };
+    };
+    const first = makeFeishu();
+    const second = makeFeishu();
+    await manager.connectChannel(
+      'jid-owner',
+      'feishu',
+      first.channel,
+      { onReady: vi.fn(), onNewChat: vi.fn() },
+      'feishu-bot-a',
+    );
+    await manager.connectChannel(
+      'jid-owner',
+      'feishu',
+      second.channel,
+      { onReady: vi.fn(), onNewChat: vi.fn() },
+      'feishu-bot-b',
+    );
+    const firstJid =
+      'feishu:shared-chat#account:feishu-bot-a#thread:t1#root:r1';
+    const secondJid =
+      'feishu:shared-chat#account:feishu-bot-b#thread:t1#root:r1';
+    register('feishu:shared-chat#account:feishu-bot-a', 'feishu-bot-a');
+    register('feishu:shared-chat#account:feishu-bot-b', 'feishu-bot-b');
+    const turnContext: ChannelTurnContext = {
+      schemaVersion: 1,
+      provider: 'feishu',
+      channelAccountId: 'feishu-bot-b',
+      sourceJid: secondJid,
+      chat: { id: 'shared-chat' },
+      message: { id: 'm1', threadId: 't1', rootId: 'r1' },
+    };
+
+    await manager.executeFeishuCapability(secondJid, turnContext, {
+      operation: 'get_chat',
+      params: { marker: 'bot-b' },
+    });
+
+    expect(first.executeFeishuCapability).not.toHaveBeenCalled();
+    expect(second.executeFeishuCapability).toHaveBeenCalledWith(
+      turnContext,
+      expect.objectContaining({ operation: 'get_chat' }),
+    );
+    await manager.disconnectAll();
   });
 });

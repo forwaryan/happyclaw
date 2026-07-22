@@ -72,6 +72,44 @@ afterAll(() => {
 });
 
 describe('conversational Agent Builder', () => {
+  test('requires meaningful IDENTITY and AGENTS while allowing optional sections to be empty', () => {
+    expect(() =>
+      builder.prepareAgentBuilderDraft(actor('turn-sparse-identity'), {
+        definition: {
+          ...definition('Sparse Identity'),
+          identity_prompt: '',
+        },
+      }),
+    ).toThrow('substantive identity_prompt');
+
+    expect(() =>
+      builder.prepareAgentBuilderDraft(actor('turn-sparse-agents'), {
+        definition: {
+          ...definition('Sparse Agents'),
+          agents_prompt: '   ',
+        },
+      }),
+    ).toThrow('substantive agents_prompt');
+
+    const prepared = builder.prepareAgentBuilderDraft(
+      actor('turn-optional-sections'),
+      {
+        definition: {
+          ...definition('Focused Utility'),
+          soul_prompt: '',
+          tools_prompt: '',
+        },
+      },
+    );
+    expect(prepared.draft.definition).toMatchObject({
+      identity_prompt: 'Focused Utility identity',
+      soul_prompt: '',
+      agents_prompt:
+        'Review the requested code and report findings by severity.',
+      tools_prompt: '',
+    });
+  });
+
   test('persists a preview and requires confirmation in a later user turn', async () => {
     const prepared = builder.prepareAgentBuilderDraft(actor('turn-1'), {
       definition: definition('Code Review'),

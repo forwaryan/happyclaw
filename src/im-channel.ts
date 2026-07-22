@@ -50,11 +50,16 @@ import {
 import { logger } from './logger.js';
 import type {
   ChannelMessageMeta,
+  ChannelTurnContext,
   FollowUpAction,
   FollowUpActionResult,
   FollowUpDisposition,
   FollowUpMode,
 } from './types.js';
+import type {
+  FeishuCapabilityRequest,
+  FeishuCapabilityResult,
+} from './feishu-capability.js';
 import {
   StreamingCardController,
   type StreamingCardOptions,
@@ -195,6 +200,11 @@ export interface IMChannel {
     chat_mode?: string;
     group_message_type?: string;
   } | null>;
+  /** Execute a credential-free operation through this exact Feishu Bot. */
+  executeFeishuCapability?(
+    context: ChannelTurnContext,
+    request: FeishuCapabilityRequest,
+  ): Promise<FeishuCapabilityResult>;
 }
 
 // ─── Channel Registry ───────────────────────────────────────────
@@ -338,6 +348,11 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     async getChatInfo(chatId: string) {
       if (!inner) return null;
       return inner.getChatInfo(chatId);
+    },
+
+    async executeFeishuCapability(context, request) {
+      if (!inner) throw new Error('Feishu channel is not connected');
+      return inner.executeCapability(context, request);
     },
 
     async createStreamingSession(

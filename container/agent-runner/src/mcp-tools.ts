@@ -15,10 +15,16 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 import { formatIsoLocal } from './utils.js';
+import {
+  normalizeChannelTurnContext,
+  type ChannelTurnContext,
+} from './types.js';
 
 /** Context required by MCP tools. Passed at construction time. */
 export interface McpContext {
   chatJid: string;
+  /** Mutable, credential-free context for the current input turn. */
+  channelContext?: ChannelTurnContext;
   groupFolder: string;
   isHome: boolean;
   isAdminHome: boolean;
@@ -216,6 +222,53 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   const hasCrossGroupAccess = ctx.isAdminHome;
   const toRelativePath = createToRelativePath(ctx);
 
+  const currentChannelContext = (): ChannelTurnContext | undefined =>
+    normalizeChannelTurnContext(ctx.channelContext, ctx.chatJid);
+
+  const callFeishuCapability = async (
+    operation: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const channelContext = currentChannelContext();
+    if (channelContext?.provider !== 'feishu') {
+      throw new Error(
+        `Feishu capability is unavailable for the current ${channelContext?.provider || 'unknown'} turn.`,
+      );
+    }
+    if (!ctx.currentInputTurnId) {
+      throw new Error(
+        'Feishu capability requires a current input turn correlation id.',
+      );
+    }
+    const requestId = newRequestId();
+    const result = await pollIpcResult(
+      TASKS_DIR,
+      {
+        type: 'feishu_capability',
+        operation,
+        requestId,
+        chatJid: ctx.chatJid,
+        inputTurnId: ctx.currentInputTurnId,
+        params,
+        timestamp: new Date().toISOString(),
+      },
+      'feishu_capability_result',
+      120_000,
+    );
+    if (!result.success) {
+      throw new Error(
+        typeof result.error === 'string'
+          ? result.error
+          : `Feishu ${operation} failed.`,
+      );
+    }
+    return result;
+  };
+
+  const feishuResult = (result: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+  });
+
   const callAgentBuilder = async (
     type: string,
     payload: Record<string, unknown>,
@@ -245,6 +298,173 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
   };
 
   const tools: SdkMcpToolDefinition<any>[] = [
+    // --- current channel context ---
+    tool(
+      'get_channel_context',
+      'Return the host-verified, credential-free channel context for the current input turn: provider, bound Bot/account identity, chat/thread/message IDs, sender IDs, workspace/session identity, and available capabilities. Call this before channel-specific operations instead of guessing IDs.',
+      {},
+      async () => {
+        const channelContext = currentChannelContext();
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                channelContext ?? {
+                  provider: 'unknown',
+                  sourceJid: ctx.chatJid,
+                  capabilities: [],
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      },
+    ),
+
+    // --- Feishu Bot capability broker ---
+    tool(
+      'feishu_get_chat',
+      'Get metadata for the current Feishu chat using the Bot account bound to this input turn. The host selects the account and chat; do not guess either.',
+      {},
+      async () => feishuResult(await callFeishuCapability('get_chat', {})),
+    ),
+    tool(
+      'feishu_list_members',
+      'List members of the current Feishu chat as the Bot bound to this input turn.',
+      {
+        page_size: z.number().int().min(1).max(100).optional().default(50),
+        page_token: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('list_members', {
+            pageSize: args.page_size,
+            pageToken: args.page_token,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_get_user',
+      'Get the sender of the current Feishu input turn using the current bound Bot. The host fixes the target to the verified sender; no arbitrary user ID is accepted.',
+      {},
+      async () => feishuResult(await callFeishuCapability('get_user', {})),
+    ),
+    tool(
+      'feishu_get_history',
+      'Read recent messages from the current Feishu chat/thread using the current bound Bot.',
+      {
+        page_size: z.number().int().min(1).max(50).optional().default(20),
+        page_token: z.string().optional(),
+        start_time: z.string().optional(),
+        end_time: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('get_history', {
+            pageSize: args.page_size,
+            pageToken: args.page_token,
+            startTime: args.start_time,
+            endTime: args.end_time,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_send_card',
+      'Send an interactive Feishu card to the current chat/thread as the Bot bound to this turn. The host locks the destination to the current context.',
+      {
+        card: z.record(z.string(), z.unknown()),
+        reply_to_message_id: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('send_card', {
+            card: args.card,
+            replyToMessageId: args.reply_to_message_id,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_add_reaction',
+      'Add a reaction to a Feishu message as the Bot bound to this turn. Omit message_id to target the triggering message.',
+      {
+        emoji_type: z.string().min(1),
+        message_id: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('add_reaction', {
+            emojiType: args.emoji_type,
+            messageId: args.message_id,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_remove_reaction',
+      'Remove a reaction previously created by the current Feishu Bot.',
+      {
+        reaction_id: z.string().min(1),
+        message_id: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('remove_reaction', {
+            reactionId: args.reaction_id,
+            messageId: args.message_id,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_edit_message',
+      'Edit a text message previously sent by the current Feishu Bot.',
+      {
+        message_id: z.string().min(1),
+        text: z.string(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('edit_message', {
+            messageId: args.message_id,
+            text: args.text,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_recall_message',
+      'Recall a message previously sent by the current Feishu Bot.',
+      { message_id: z.string().min(1) },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('recall_message', {
+            messageId: args.message_id,
+          }),
+        ),
+    ),
+    tool(
+      'feishu_api_request',
+      'Call a host-allowlisted Feishu OpenAPI endpoint as the Bot bound to the current input turn. Prefer typed feishu_* tools when available. Tokens and app secrets are never returned.',
+      {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+        path: z
+          .string()
+          .startsWith('/open-apis/')
+          .describe('Absolute Feishu OpenAPI path beginning with /open-apis/'),
+        query: z.record(z.string(), z.unknown()).optional(),
+        body: z.unknown().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('api_request', {
+            method: args.method,
+            path: args.path,
+            query: args.query,
+            body: args.body,
+          }),
+        ),
+    ),
+
     // --- send_message ---
     tool(
       'send_message',
@@ -1701,13 +1921,37 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
     const skillsPolicySchema = capabilityPolicySchema.extend({
       host: capabilityPolicySchema.optional(),
     });
+    const requiredPromptSection = (description: string) =>
+      z
+        .string()
+        .max(20_000)
+        .refine((value) => value.trim().length > 0, description)
+        .describe(description);
     const agentDefinitionSchema = z.object({
       name: z.string().min(1).max(80),
       prompt_schema_version: z.literal(2).optional().default(2),
-      identity_prompt: z.string().max(20_000).optional().default(''),
-      soul_prompt: z.string().max(20_000).optional().default(''),
-      agents_prompt: z.string().max(20_000).optional().default(''),
-      tools_prompt: z.string().max(20_000).optional().default(''),
+      identity_prompt: requiredPromptSection(
+        'Required IDENTITY: a concise role, core mission, and capability boundary. Do not put workflows, command examples, or tool instructions here.',
+      ),
+      soul_prompt: z
+        .string()
+        .max(20_000)
+        .optional()
+        .default('')
+        .describe(
+          'Optional SOUL: durable values, judgment principles, temperament, and communication style. May be empty for a purely mechanical Agent.',
+        ),
+      agents_prompt: requiredPromptSection(
+        'Required AGENTS: executable workflows, inputs, outputs, defaults, branches, refusal rules, and failure handling.',
+      ),
+      tools_prompt: z
+        .string()
+        .max(20_000)
+        .optional()
+        .default('')
+        .describe(
+          'Optional TOOLS: how to select and use configured Skills, MCP servers, and tools, including ordering and limits. Do not copy entire Skill documents.',
+        ),
       prompt_mode: z.enum(['append', 'replace']).optional().default('append'),
       avatar_emoji: z.string().max(8).nullable().optional().default(null),
       avatar_color: z
@@ -1791,6 +2035,8 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
       tool(
         'agent_profile_prepare',
         `Create or revise a persistent Agent draft and return a structured preview. Use natural conversation to understand the user's needs first. Pass the full desired definition on every call.
+
+Keep IDENTITY concise and place operational procedures in AGENTS. IDENTITY and AGENTS are required; SOUL and TOOLS may be empty when they would add no useful information. Never put the entire Agent specification into identity_prompt.
 
 For a new Agent, omit target_agent_profile_id. For an edit, call agent_profile_get first and pass both target_agent_profile_id and expected_agent_version. To revise an existing draft, pass draft_id and expected_draft_revision.
 

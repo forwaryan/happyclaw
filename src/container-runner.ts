@@ -76,7 +76,7 @@ import {
 } from './claude-context-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
-import type { AgentProfileRuntimePolicy } from './types.js';
+import type { AgentProfileRuntimePolicy, ChannelTurnContext } from './types.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import {
@@ -320,6 +320,8 @@ export interface ContainerInput {
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
   currentSourceJid?: string;
+  /** Sanitized provider identity for the exact input turn. */
+  channelContext?: ChannelTurnContext;
   /** @deprecated Use isHome + isAdminHome instead */
   isMain: boolean;
   turnId?: string;

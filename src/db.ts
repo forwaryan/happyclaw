@@ -26,6 +26,7 @@ import {
   BillingAuditLog,
   BillingPlan,
   ChannelMount,
+  ChannelTurnContext,
   ChannelAccount,
   ChannelProvider,
   DailyUsage,
@@ -75,7 +76,7 @@ import {
 } from './agent-profile-prompts.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 58;
+const CURRENT_SCHEMA_VERSION = 59;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -109,9 +110,9 @@ function stmts() {
       storeMessageInsert: db.prepare(
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
-          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id,
+          attachments, token_usage, channel_context, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id,
           delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, event_id, user_id, group_folder, agent_id, message_id, model,
@@ -160,7 +161,7 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id,
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, channel_context, task_id,
                 delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
@@ -180,7 +181,7 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id,
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, channel_context, task_id,
               delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
@@ -489,6 +490,7 @@ export function initDatabase(): void {
       is_from_me INTEGER,
       attachments TEXT,
       token_usage TEXT,
+      channel_context TEXT,
       turn_id TEXT,
       session_id TEXT,
       sdk_message_uuid TEXT,
@@ -1293,7 +1295,10 @@ export function initDatabase(): void {
     SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
     WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
   `);
+  // v58 -> v59: persist a sanitized, message-level channel context. Existing
+  // rows intentionally remain NULL and continue to decode as context-less.
   ensureColumn('messages', 'token_usage', 'TEXT');
+  ensureColumn('messages', 'channel_context', 'TEXT');
   ensureColumn('messages', 'turn_id', 'TEXT');
   ensureColumn('messages', 'session_id', 'TEXT');
   ensureColumn('messages', 'sdk_message_uuid', 'TEXT');
@@ -1383,6 +1388,7 @@ export function initDatabase(): void {
     'is_from_me',
     'attachments',
     'token_usage',
+    'channel_context',
   ]);
   assertSchema('scheduled_tasks', [
     'id',
@@ -2320,17 +2326,40 @@ function toUtf8StringOrNull(value: unknown): string | null {
  *  The is_from_me overload must come first — TS overload resolution stops at
  *  the first match and `NewMessage & { is_from_me: number }` is a subtype of
  *  `NewMessage`. */
+type RawMessageRow = Omit<NewMessage, 'channel_context'> & {
+  channel_context?: unknown;
+  is_from_me?: number;
+};
+
+function parseChannelTurnContext(
+  value: unknown,
+): ChannelTurnContext | undefined {
+  if (!value) return undefined;
+  if (typeof value === 'object') return value as ChannelTurnContext;
+  if (typeof value !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object'
+      ? (parsed as ChannelTurnContext)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeMessageRow(
-  row: NewMessage & { is_from_me: number },
+  row: RawMessageRow & { is_from_me: number },
 ): NewMessage & { is_from_me: boolean };
-function normalizeMessageRow(row: NewMessage): NewMessage;
+function normalizeMessageRow(row: RawMessageRow): NewMessage;
 function normalizeMessageRow(
-  row: NewMessage & { is_from_me?: number },
+  row: RawMessageRow,
 ): NewMessage & { is_from_me?: boolean } {
-  const { is_from_me, content, ...rest } = row;
+  const { is_from_me, content, channel_context, ...rest } = row;
+  const parsedChannelContext = parseChannelTurnContext(channel_context);
   const out: NewMessage & { is_from_me?: boolean } = {
     ...rest,
     content: toUtf8String(content),
+    ...(parsedChannelContext ? { channel_context: parsedChannelContext } : {}),
   };
   if (typeof is_from_me === 'number') {
     out.is_from_me = is_from_me === 1;
@@ -2363,10 +2392,12 @@ export function storeMessageDirect(
     attachments?: string;
     tokenUsage?: string;
     sourceJid?: string;
+    channelContext?: ChannelTurnContext;
     meta?: StoredMessageMeta;
   },
 ): string {
-  const { attachments, tokenUsage, sourceJid, meta } = opts ?? {};
+  const { attachments, tokenUsage, sourceJid, channelContext, meta } =
+    opts ?? {};
   // truncation_continue 与 sdk_final 同属"最终回复"：截断自动续写的后续 turn
   // 复用挂起序列的 turnId 时必须命中同一行（全渠道一条回复的 DB 合并基础）。
   const existingFinalRow =
@@ -2389,6 +2420,7 @@ export function storeMessageDirect(
     isFromMe ? 1 : 0,
     attachments ?? null,
     tokenUsage ?? null,
+    channelContext ? JSON.stringify(channelContext) : null,
     meta?.turnId ?? null,
     meta?.sessionId ?? null,
     meta?.sdkMessageUuid ?? null,
@@ -2422,6 +2454,20 @@ export function updateMessageAttachments(
   ).run(attachmentsJson, msgId, chatJid);
 }
 
+/** Return the sanitized provider context bound to one exact persisted turn. */
+export function getMessageChannelTurnContext(
+  chatJid: string,
+  messageId: string,
+): ChannelTurnContext | null {
+  const row = db
+    .prepare(
+      `SELECT channel_context FROM messages
+       WHERE id = ? AND chat_jid = ? LIMIT 1`,
+    )
+    .get(messageId, chatJid) as { channel_context?: unknown } | undefined;
+  return parseChannelTurnContext(row?.channel_context) ?? null;
+}
+
 function normalizeQueuedFollowUpRow(
   row: Record<string, unknown>,
 ): QueuedFollowUp {
@@ -2434,6 +2480,7 @@ function normalizeQueuedFollowUpRow(
     content: toUtf8String(row.content, 'messages.content'),
     timestamp: String(row.timestamp),
     attachments: row.attachments ? String(row.attachments) : undefined,
+    channel_context: parseChannelTurnContext(row.channel_context),
     delivery_mode: (row.delivery_mode === 'steer'
       ? 'steer'
       : 'queue') as FollowUpMode,
@@ -2446,7 +2493,7 @@ function normalizeQueuedFollowUpRow(
 
 const FOLLOW_UP_SELECT = `
   SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp,
-         attachments, delivery_mode, delivery_status, delivery_run_id,
+         attachments, channel_context, delivery_mode, delivery_status, delivery_run_id,
          delivery_priority
   FROM messages
 `;
@@ -9455,7 +9502,7 @@ export function getMessagesPage(
 ): Array<NewMessage & { is_from_me: boolean }> {
   const sql = before
     ? `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
       FROM messages
@@ -9464,7 +9511,7 @@ export function getMessagesPage(
       LIMIT ?
     `
     : `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
       FROM messages
@@ -9492,7 +9539,7 @@ export function getMessagesAfter(
 ): Array<NewMessage & { is_from_me: boolean }> {
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
               turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
               delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
@@ -9518,14 +9565,14 @@ export function getMessagesPageMulti(
 
   const placeholders = chatJids.map(() => '?').join(',');
   const sql = before
-    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
               turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
               delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
        WHERE chat_jid IN (${placeholders}) AND timestamp < ?
        ORDER BY timestamp DESC
        LIMIT ?`
-    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
               turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
               delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
@@ -9555,7 +9602,7 @@ export function getMessagesAfterMulti(
   const placeholders = chatJids.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
               turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
               delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
        FROM messages
@@ -9602,7 +9649,7 @@ export function getMessagesByTimeRange(
   const endIso = new Date(endTs).toISOString();
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments,
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, channel_context,
               turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
        FROM messages
        WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?

@@ -40,6 +40,11 @@ import type {
   SDKUserMessage,
   ParsedMessage,
   StreamEvent,
+  ChannelTurnContext,
+} from './types.js';
+import {
+  formatChannelTurnContextForPrompt,
+  normalizeChannelTurnContext,
 } from './types.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
@@ -57,7 +62,7 @@ import {
   parseTranscript,
 } from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
-import { createMcpTools } from './mcp-tools.js';
+import { createMcpTools, type McpContext } from './mcp-tools.js';
 import {
   parseAgentMcpPolicyMode,
   resolveAgentMcpPolicy,
@@ -1376,6 +1381,10 @@ function drainIpcInput(): IpcDrainResult {
             taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
             sourceJid:
               typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
+            channelContext: normalizeChannelTurnContext(
+              data.channelContext,
+              typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
+            ),
             receipt: parseIpcReceipt(data.receipt),
           });
         }
@@ -1520,6 +1529,11 @@ function waitForIpcMessage(): Promise<
             }
           }
         }
+        const latestMessage = latestIpcInputMessage(messages);
+        const combinedChannelContext = normalizeChannelTurnContext(
+          latestMessage?.channelContext,
+          combinedSourceJid,
+        );
         resolved = true;
         ipcWatcher?.close();
         resolve({
@@ -1527,6 +1541,7 @@ function waitForIpcMessage(): Promise<
           images: allImages.length > 0 ? allImages : undefined,
           taskId: combinedTaskId,
           sourceJid: combinedSourceJid,
+          channelContext: combinedChannelContext,
           messages,
         });
         return;
@@ -1592,6 +1607,30 @@ function pruneProcessedHistoryImagesInTranscript(
         `${result.transcriptPath ? ` from ${result.transcriptPath}` : ''}`,
     );
   }
+}
+
+function setCurrentChannelTurn(
+  containerInput: ContainerInput,
+  sourceJid: string | undefined,
+  channelContext: ChannelTurnContext | undefined,
+): void {
+  if (sourceJid) containerInput.currentSourceJid = sourceJid;
+  const normalized = normalizeChannelTurnContext(
+    channelContext,
+    sourceJid || containerInput.currentSourceJid || containerInput.chatJid,
+  );
+  containerInput.channelContext = normalized;
+  if (normalized?.sourceJid) {
+    containerInput.currentSourceJid = normalized.sourceJid;
+  }
+}
+
+function decorateChannelUserTurn(
+  message: string,
+  context: ChannelTurnContext | undefined,
+): string {
+  const channelBlock = formatChannelTurnContextForPrompt(context);
+  return channelBlock ? `${channelBlock}\n\n${message}` : message;
 }
 
 /**
@@ -1663,13 +1702,16 @@ async function runQueryAttempt(
   );
   const anchorUserTurn = (message: string): string =>
     anchorAgentProfileToUserTurn(agentTurnAnchor, message);
-  const initialRejected = stream.push(
-    prompt,
-    images,
-    shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
-      ? anchorUserTurn
-      : undefined,
-  );
+  const decorateInitialUserTurn = (message: string): string => {
+    const withChannelContext = decorateChannelUserTurn(
+      message,
+      containerInput.channelContext,
+    );
+    return shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
+      ? anchorUserTurn(withChannelContext)
+      : withChannelContext;
+  };
+  const initialRejected = stream.push(prompt, images, decorateInitialUserTurn);
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
     turnId: containerInput.turnId,
@@ -1948,7 +1990,12 @@ async function runQueryAttempt(
       // A new user turn arrived after a prior result. Cancel that result's
       // post-timeout so the stream cannot close before this turn completes.
       resultReceivedAt = null;
-      const rejected = stream.push(msg.text, msg.images, anchorUserTurn);
+      setCurrentChannelTurn(containerInput, msg.sourceJid, msg.channelContext);
+      const rejected = stream.push(msg.text, msg.images, (message) =>
+        anchorUserTurn(
+          decorateChannelUserTurn(message, containerInput.channelContext),
+        ),
+      );
       for (const reason of rejected) {
         emit({
           status: 'success',
@@ -1974,7 +2021,11 @@ async function runQueryAttempt(
     containerInput,
     isHome,
   );
-  const channel = getChannelFromJid(containerInput.chatJid);
+  const channel =
+    containerInput.channelContext?.provider ||
+    getChannelFromJid(
+      containerInput.currentSourceJid || containerInput.chatJid,
+    );
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
   const memoryPromptName = isHome
     ? 'memory-system.home'
@@ -3068,6 +3119,14 @@ async function runQuery(
   }
 
   containerInput.turnId = failed.turnId;
+  const retryInput = latestIpcInputMessage(failed.ipcMessages);
+  if (retryInput) {
+    setCurrentChannelTurn(
+      containerInput,
+      retryInput.sourceJid,
+      retryInput.channelContext,
+    );
+  }
   return runQueryAttempt(
     failed.prompt,
     failed.sessionIdBeforeTurn,
@@ -3122,6 +3181,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  setCurrentChannelTurn(
+    containerInput,
+    containerInput.currentSourceJid,
+    containerInput.channelContext,
+  );
+
   // 第三方端点没有通用的官方默认模型，缺失时必须 fail-fast；官方
   // Claude 未指定模型则交给 SDK/CLI 选择默认模型。
   if (CLAUDE_PROVIDER_RUNTIME.missingRequiredModel) {
@@ -3151,8 +3216,19 @@ async function main(): Promise<void> {
   // this run (when known) — falls back to the container's startup chatJid.
   // This lets per-channel MCP tools (discord_*, etc.) see the actual incoming
   // chat even when the home container is shared across channels.
-  const mcpToolsConfig = {
-    chatJid: containerInput.currentSourceJid || containerInput.chatJid,
+  const mcpToolsConfig: McpContext = {
+    get chatJid() {
+      return containerInput.currentSourceJid || containerInput.chatJid;
+    },
+    set chatJid(value: string) {
+      containerInput.currentSourceJid = value;
+    },
+    get channelContext() {
+      return containerInput.channelContext;
+    },
+    set channelContext(value: ChannelTurnContext | undefined) {
+      containerInput.channelContext = value;
+    },
     groupFolder: containerInput.groupFolder,
     isHome,
     isAdminHome,
@@ -3231,12 +3307,12 @@ async function main(): Promise<void> {
     }
     // The latest drained message reflects the freshest incoming chat —
     // override the startup chatJid so per-channel MCP tools see it correctly.
-    const latestPendingSource = latestIpcInputMessage(
-      pendingDrain.messages,
-    )?.sourceJid;
-    if (latestPendingSource) {
-      mcpToolsConfig.chatJid = latestPendingSource;
-    }
+    const latestPendingMessage = latestIpcInputMessage(pendingDrain.messages);
+    setCurrentChannelTurn(
+      containerInput,
+      latestPendingMessage?.sourceJid,
+      latestPendingMessage?.channelContext,
+    );
     mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
       pendingDrain.messages,
     );
@@ -3488,9 +3564,11 @@ async function main(): Promise<void> {
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
         containerInput.messageTaskId =
           mcpToolsConfig.currentTaskId ?? undefined;
-        // Update chatJid so per-channel MCP tools see the correct incoming chat.
-        if (nextMessage.sourceJid)
-          mcpToolsConfig.chatJid = nextMessage.sourceJid;
+        setCurrentChannelTurn(
+          containerInput,
+          nextMessage.sourceJid,
+          nextMessage.channelContext,
+        );
         // Rebuild MCP server to avoid "Already connected to a transport" error
         // when the previous query was aborted mid-stream (#421).
         mcpServerConfig = buildMcpServerConfig();
@@ -3815,8 +3893,11 @@ async function main(): Promise<void> {
       // to the task's notify channels, hijacking later conversation.
       mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
       containerInput.messageTaskId = mcpToolsConfig.currentTaskId ?? undefined;
-      // Update chatJid so per-channel MCP tools see the correct incoming chat.
-      if (nextMessage.sourceJid) mcpToolsConfig.chatJid = nextMessage.sourceJid;
+      setCurrentChannelTurn(
+        containerInput,
+        nextMessage.sourceJid,
+        nextMessage.channelContext,
+      );
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

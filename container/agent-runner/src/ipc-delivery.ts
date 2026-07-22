@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import type { ContainerOutput } from './types.js';
+import type { ChannelTurnContext, ContainerOutput } from './types.js';
 
 export type IpcDeliveryReceipt = NonNullable<
   ContainerOutput['ipcReceipts']
@@ -13,6 +13,7 @@ export interface IpcInputMessage {
   images?: Array<{ data: string; mimeType?: string }>;
   taskId?: string;
   sourceJid?: string;
+  channelContext?: ChannelTurnContext;
   receipt?: IpcDeliveryReceipt;
 }
 
@@ -205,6 +206,7 @@ export function serializeIpcInputMessage(message: IpcInputMessage): object {
     images: message.images,
     taskId: message.taskId,
     sourceJid: message.sourceJid,
+    channelContext: message.channelContext,
     receipt: message.receipt,
   };
 }

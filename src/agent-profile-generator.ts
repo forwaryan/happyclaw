@@ -55,7 +55,9 @@ ${description}
 生成要求：
 - 不要虚构系统当前不具备的权限、工具或外部账号能力。
 - 不要在四段之间重复同一句约束：身份放 IDENTITY，价值判断放 SOUL，工作规则放 AGENTS，工具策略放 TOOLS。
-- 用户未提供某类信息时可以返回空字符串，但 AGENTS 应尽量具体、可执行。
+- IDENTITY 和 AGENTS 必须有实质内容：IDENTITY 保持简洁，只写角色、使命和能力边界；AGENTS 具体描述工作流、输入输出、默认值、分支、拒绝规则和失败处理。
+- SOUL 和 TOOLS 可以按需返回空字符串，不要为了填满字段而制造重复内容；配置了专用工具或技能时，TOOLS 应说明选择和使用方式。
+- 不要把整份操作手册、参数表、命令示例或工具调用说明全部塞进 IDENTITY。
 - 默认用中文；如果用户明确要求英文 Agent，则用英文。
 - 只返回 JSON。`;
 }
@@ -154,7 +156,13 @@ function normalizeDraft(parsed: unknown): AgentProfileDraft | null {
     prompt_mode: source.prompt_mode === 'replace' ? 'replace' : 'append',
   });
 
-  if (!name || !hasAgentProfilePrompts(prompts)) return null;
+  if (
+    !name ||
+    !hasAgentProfilePrompts(prompts) ||
+    !prompts.identity_prompt.trim() ||
+    !prompts.agents_prompt.trim()
+  )
+    return null;
   return { name, ...prompts };
 }
 
@@ -217,7 +225,9 @@ export async function generateAgentProfileDraft(
   const parsed = parseJsonObject(result);
   const draft = normalizeDraft(parsed);
   if (!draft) {
-    throw new Error('AI 返回格式异常，请重试或手动填写');
+    throw new Error(
+      'AI 生成的 Agent 配置格式无效：IDENTITY 和 AGENTS 必须有实质内容，请重试或手动填写',
+    );
   }
   return draft;
 }

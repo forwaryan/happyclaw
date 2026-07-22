@@ -72,6 +72,7 @@ import {
   getLastGroupSync,
   getRegisteredGroup,
   getAgentBuilderInputMessage,
+  getMessageChannelTurnContext,
   getUserById,
   getMessagesSince,
   getNewMessages,
@@ -232,6 +233,14 @@ import {
   resolveTrustedDirectOwnerUpgrade,
 } from './agent-builder-turn-auth.js';
 import {
+  ActiveChannelTurnRegistry,
+  channelTurnScope,
+} from './channel-turn-registry.js';
+import type {
+  FeishuCapabilityOperation,
+  FeishuCapabilityRequest,
+} from './feishu-capability.js';
+import {
   discardPreparedAgentDraft,
   getAgentCapabilityCatalogForBuilder,
   getAgentBuilderDraftForBuilder,
@@ -317,6 +326,7 @@ import {
   AgentStatus,
   AgentProfile,
   ChannelMessageMeta,
+  ChannelTurnContext,
   MessageCursor,
   NewMessage,
   RegisteredGroup,
@@ -1072,6 +1082,11 @@ const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
 // Host-owned current-turn registry. Agent Builder authorization never trusts
 // turn/chat/task claims from the runner's writable IPC JSON.
 const activeAgentBuilderTurns = new AgentBuilderTurnRegistry();
+
+// Exact credential-free provider context for the user input currently being
+// answered. Feishu broker IPC is authorized against this host-owned registry;
+// runner-supplied chat/account claims are never trusted.
+const activeChannelTurns = new ActiveChannelTurnRegistry();
 
 // ── 卡片挂起完成机制的共享工具 ──
 // 挂起卡内各 turn 文本之间的分隔线（最终定稿卡片正文按时间序拼接各 turn）。
@@ -3928,6 +3943,52 @@ export function formatMessages(messages: NewMessage[]): string {
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
 
+function resolveBatchChannelContext(
+  messages: NewMessage[],
+  workspaceJid: string,
+  sessionAgentId?: string | null,
+): ChannelTurnContext | undefined {
+  if (messages.length === 0) return undefined;
+  const contexts = messages.map((message) => message.channel_context);
+  if (contexts.some((context) => !context)) return undefined;
+  const latest = contexts[contexts.length - 1]!;
+  const routeKey = (context: ChannelTurnContext): string =>
+    [
+      context.provider,
+      context.channelAccountId ?? '',
+      context.sourceJid,
+      context.chat.id,
+      context.message.threadId ?? '',
+      context.message.rootId ?? '',
+    ].join('\u0000');
+  if (contexts.some((context) => routeKey(context!) !== routeKey(latest))) {
+    return undefined;
+  }
+  const latestMessage = messages[messages.length - 1];
+  return {
+    ...latest,
+    targetJid: latestMessage.chat_jid,
+    workspaceJid,
+    sessionAgentId: sessionAgentId ?? null,
+  };
+}
+
+function bindActiveChannelTurn(
+  scope: string,
+  correlationId: string | undefined,
+  context: ChannelTurnContext | undefined,
+): void {
+  if (!correlationId || !context) {
+    activeChannelTurns.set(scope, null);
+    return;
+  }
+  activeChannelTurns.set(scope, {
+    correlationId,
+    sourceJid: context.sourceJid,
+    context,
+  });
+}
+
 export function collectMessageImages(
   chatJid: string,
   messages: NewMessage[],
@@ -4569,6 +4630,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // different chat (e.g. web message before the Discord one arrived).
   const currentSourceJid =
     missedMessages[missedMessages.length - 1]?.source_jid || chatJid;
+  const currentChannelContext = resolveBatchChannelContext(
+    missedMessages,
+    chatJid,
+  );
+  bindActiveChannelTurn(
+    channelTurnScope(effectiveGroup.folder),
+    lastProcessed.id,
+    currentChannelContext,
+  );
   activeIpcReplyTurnTrackers.set(effectiveGroup.folder, ipcReplyTurnTracker);
   activeAgentBuilderTurns.startBatch(
     effectiveGroup.folder,
@@ -5464,6 +5534,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       imagesForAgent,
       messageTaskId,
       currentSourceJid,
+      currentChannelContext,
       agentProfile,
     );
   } finally {
@@ -5479,6 +5550,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     activeRouteUpdaters.delete(effectiveGroup.folder);
     activeImReplyRoutes.delete(effectiveGroup.folder);
     activeAgentBuilderTurns.delete(effectiveGroup.folder);
+    activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder));
     if (
       activeIpcReplyTurnTrackers.get(effectiveGroup.folder) ===
       ipcReplyTurnTracker
@@ -6140,6 +6212,7 @@ async function runAgent(
   images?: Array<{ data: string; mimeType?: string }>,
   messageTaskId?: string,
   currentSourceJid?: string,
+  channelContext?: ChannelTurnContext,
   agentProfile?: AgentProfile,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
@@ -6266,6 +6339,7 @@ async function runAgent(
           groupFolder: group.folder,
           chatJid,
           currentSourceJid,
+          channelContext,
           isMain: isAdminHome,
           isHome,
           isAdminHome,
@@ -6289,6 +6363,7 @@ async function runAgent(
           groupFolder: group.folder,
           chatJid,
           currentSourceJid,
+          channelContext,
           isMain: isAdminHome,
           isHome,
           isAdminHome,
@@ -7763,6 +7838,10 @@ async function processTaskIpc(
     // For discord_get_history
     limit?: number;
     before?: string;
+    // Host-side Feishu capability broker
+    inputTurnId?: string;
+    operation?: string;
+    params?: Record<string, unknown>;
     // For the main HappyClaw's conversational Agent Builder
     profileId?: string;
     draftId?: string;
@@ -8803,6 +8882,80 @@ async function processTaskIpc(
       );
       break;
 
+    case 'feishu_capability': {
+      const startedAt = Date.now();
+      try {
+        if (!data.requestId || !SAFE_REQUEST_ID_RE.test(data.requestId)) {
+          throw new Error('Invalid Feishu capability requestId');
+        }
+        if (!data.inputTurnId) {
+          throw new Error('Feishu capability inputTurnId is required');
+        }
+        const allowedOperations = new Set<FeishuCapabilityOperation>([
+          'get_chat',
+          'list_members',
+          'get_user',
+          'get_history',
+          'send_card',
+          'add_reaction',
+          'remove_reaction',
+          'edit_message',
+          'recall_message',
+          'api_request',
+        ]);
+        if (
+          !data.operation ||
+          !allowedOperations.has(data.operation as FeishuCapabilityOperation)
+        ) {
+          throw new Error('Unknown Feishu capability operation');
+        }
+        const scope = channelTurnScope(sourceGroup, ipcAgentId);
+        const activeTurn = activeChannelTurns.require(scope, data.inputTurnId);
+        const request: FeishuCapabilityRequest = {
+          operation: data.operation as FeishuCapabilityOperation,
+          params: data.params,
+        };
+        const result = await imManager.executeFeishuCapability(
+          activeTurn.sourceJid,
+          activeTurn.context,
+          request,
+        );
+        writeTaskResult(tasksDir, 'feishu_capability', data.requestId, {
+          success: true,
+          ...result,
+        });
+        logger.info(
+          {
+            sourceGroup,
+            agentId: ipcAgentId,
+            operation: request.operation,
+            channelAccountId: activeTurn.context.channelAccountId,
+            chatId: activeTurn.context.chat.id,
+            inputTurnId: data.inputTurnId,
+            durationMs: Date.now() - startedAt,
+          },
+          'Feishu capability executed through bound Bot',
+        );
+      } catch (error) {
+        writeTaskResult(tasksDir, 'feishu_capability', data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        logger.warn(
+          {
+            sourceGroup,
+            agentId: ipcAgentId,
+            operation: data.operation,
+            inputTurnId: data.inputTurnId,
+            durationMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Feishu capability request rejected or failed',
+        );
+      }
+      break;
+    }
+
     case 'refresh_groups':
       // Only admin home group can request a refresh
       if (isAdminHome) {
@@ -9816,6 +9969,17 @@ async function processAgentConversation(
   let lastAgentReplyMsgId: string | undefined;
   let lastAgentReplyText: string | undefined;
   const lastProcessed = missedMessages[missedMessages.length - 1];
+  const currentAgentSourceJid = lastProcessed.source_jid || chatJid;
+  const currentAgentChannelContext = resolveBatchChannelContext(
+    missedMessages,
+    chatJid,
+    agentId,
+  );
+  bindActiveChannelTurn(
+    channelTurnScope(effectiveGroup.folder, agentId),
+    lastProcessed.id,
+    currentAgentChannelContext,
+  );
   const commitCursor = (): void => {
     if (cursorCommitted) return;
     advanceCursors(virtualChatJid, {
@@ -10546,6 +10710,8 @@ async function processAgentConversation(
       turnId: lastProcessed.id,
       groupFolder: effectiveGroup.folder,
       chatJid,
+      currentSourceJid: currentAgentSourceJid,
+      channelContext: currentAgentChannelContext,
       isMain: isAdminHome,
       isHome,
       isAdminHome,
@@ -10989,6 +11155,7 @@ async function processAgentConversation(
 
     activeImReplyRoutes.delete(virtualChatJid);
     activeAgentBuilderTurns.delete(agentBuilderScope);
+    activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder, agentId));
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
   }
 
@@ -11202,6 +11369,10 @@ async function startMessageLoop(): Promise<void> {
           // task's send_message output loses task attribution and the host skips
           // the notify_channels broadcast (riba2534/happyclaw#559).
           const injectionTaskId = extractLastTaskId(messagesToSend);
+          const warmChannelContext = resolveBatchChannelContext(
+            messagesToSend,
+            chatJid,
+          );
 
           const sendResult = queue.sendMessage(
             chatJid,
@@ -11220,6 +11391,11 @@ async function startMessageLoop(): Promise<void> {
                     }),
                   ),
                 );
+                bindActiveChannelTurn(
+                  channelTurnScope(group.folder),
+                  receipt.deliveryId,
+                  warmChannelContext,
+                );
               }
               activeRouteUpdaters.get(group.folder)?.(
                 lastSourceJidForRoute,
@@ -11230,6 +11406,7 @@ async function startMessageLoop(): Promise<void> {
             lastSourceJidForRoute,
             injectionTaskId,
             deliveryTarget,
+            warmChannelContext,
           );
           if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(
@@ -14320,6 +14497,23 @@ async function main(): Promise<void> {
             },
           ],
         );
+      }
+      if (inputTurnId) {
+        const scope = channelTurnScope(folder, runtimeAgentId);
+        const persistedContext =
+          sourceJid && inputCursor && inputChatJid
+            ? getMessageChannelTurnContext(inputChatJid, inputCursor.id)
+            : null;
+        const context =
+          persistedContext && persistedContext.sourceJid === sourceJid
+            ? {
+                ...persistedContext,
+                targetJid: inputChatJid,
+                workspaceJid: inputChatJid,
+                sessionAgentId: runtimeAgentId ?? null,
+              }
+            : undefined;
+        bindActiveChannelTurn(scope, inputTurnId, context);
       }
       if (runtimeAgentId) return;
       activeRouteUpdaters.get(folder)?.(sourceJid, inputTurnId, inputCursor);

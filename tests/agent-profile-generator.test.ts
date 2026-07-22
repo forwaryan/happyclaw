@@ -81,4 +81,22 @@ describe('AgentProfile AI generation', () => {
       '单段提示词超过 20000 字符限制',
     );
   });
+
+  test('rejects a generated all-in-one IDENTITY without an AGENTS workflow', async () => {
+    sdkQuery.mockResolvedValueOnce(
+      JSON.stringify({
+        name: 'Receipt Agent',
+        identity_prompt:
+          'Receipt assistant. Parse input, invoke scripts, retry failures, and send files.',
+        soul_prompt: '',
+        agents_prompt: '',
+        tools_prompt: '',
+        prompt_mode: 'append',
+      }),
+    );
+
+    await expect(
+      generateAgentProfileDraft('generate and send receipts'),
+    ).rejects.toThrow('AI 生成的 Agent 配置格式无效');
+  });
 });

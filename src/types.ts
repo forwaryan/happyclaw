@@ -40,6 +40,61 @@ export type ImBindingMode = 'single_context' | 'thread_map';
 export type ChannelRoutingMode = 'single_session' | 'thread_map';
 export type AudienceMode = 'everyone' | 'owner_only';
 
+/**
+ * Sanitized provider context for one inbound turn.
+ *
+ * This object is safe to persist and expose to the Agent. It intentionally
+ * contains public routing identifiers only: credentials, access tokens and
+ * application secrets must never be added here.
+ */
+export interface ChannelTurnContext {
+  schemaVersion: 1;
+  provider: string;
+  channelAccountId: string | null;
+  sourceJid: string;
+  targetJid?: string;
+  workspaceJid?: string;
+  sessionAgentId?: string | null;
+  bot?: {
+    appId?: string;
+    openId?: string;
+    name?: string;
+    avatarUrl?: string;
+  };
+  chat: {
+    id: string;
+    type?: 'p2p' | 'group';
+    name?: string;
+    mode?: string;
+    groupMessageType?: string;
+    isTopicStyle?: boolean;
+  };
+  message: {
+    id: string;
+    rootId?: string;
+    parentId?: string;
+    threadId?: string;
+    type?: string;
+  };
+  sender?: {
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+    name?: string;
+    tenantKey?: string;
+    type?: string;
+  };
+  mentions?: Array<{
+    key?: string;
+    name?: string;
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+  }>;
+  /** Capability names are populated by the host broker, never by the model. */
+  capabilities?: string[];
+}
+
 export interface ChannelMount {
   channel_jid: string;
   channel_account_id?: string | null;
@@ -73,6 +128,7 @@ export interface ChannelMessageMeta {
   messageId?: string;
   text?: string;
   title?: string;
+  channelContext?: ChannelTurnContext;
 }
 
 /** @deprecated Use ChannelMessageMeta. Kept for connector compatibility. */
@@ -300,6 +356,8 @@ export interface NewMessage {
   timestamp: string;
   attachments?: string;
   token_usage?: string;
+  /** Sanitized provider-native identifiers for this exact inbound turn. */
+  channel_context?: ChannelTurnContext;
   /** Session-derived Claude Code Workflow snapshots for historical replay. */
   workflow_runs?: WorkflowRunSnapshot[];
   turn_id?: string | null;
@@ -328,6 +386,7 @@ export interface QueuedFollowUp {
   content: string;
   timestamp: string;
   attachments?: string;
+  channel_context?: ChannelTurnContext;
   delivery_mode: FollowUpMode;
   delivery_status: 'queued' | 'promoting';
   delivery_run_id?: string | null;

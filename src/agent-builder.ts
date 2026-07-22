@@ -86,11 +86,24 @@ function normalizeDefinition(input: unknown): AgentBuilderDefinition {
   };
 }
 
+function validatePromptStructure(definition: AgentBuilderDefinition): void {
+  const missing: string[] = [];
+  if (!definition.identity_prompt.trim()) missing.push('identity_prompt');
+  if (!definition.agents_prompt.trim()) missing.push('agents_prompt');
+  if (missing.length === 0) return;
+  throw new Error(
+    `Agent definition must include substantive ${missing.join(
+      ' and ',
+    )}. Keep identity_prompt concise (role, mission, boundary) and put workflows, inputs, defaults, refusal rules, and failure handling in agents_prompt. soul_prompt and tools_prompt may be empty when not useful.`,
+  );
+}
+
 function validateDefinitionForActor(
   actor: AgentBuilderActor,
   definition: AgentBuilderDefinition,
 ): void {
   if (actor.user.status !== 'active') throw new Error('User is not active');
+  validatePromptStructure(definition);
   if (isUnauthorizedHostClaudeContext(actor.user, definition.runtime_policy)) {
     throw new Error('host_claude context requires an admin role');
   }

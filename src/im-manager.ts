@@ -55,11 +55,16 @@ import { getUserDingTalkConfig } from './runtime-config.js';
 import { logger } from './logger.js';
 import type {
   ChannelMessageMeta,
+  ChannelTurnContext,
   FollowUpAction,
   FollowUpActionResult,
   FollowUpDisposition,
   FollowUpMode,
 } from './types.js';
+import type {
+  FeishuCapabilityRequest,
+  FeishuCapabilityResult,
+} from './feishu-capability.js';
 import {
   channelConversationJid,
   extractProviderTarget,
@@ -765,6 +770,26 @@ export class IMConnectionManager {
   }
 
   /**
+   * Execute a Feishu operation through the exact account-scoped connection
+   * selected by the trusted current-turn JID. This deliberately reuses the
+   * same persisted owner/account/enabled gates as ordinary outbound sends.
+   */
+  async executeFeishuCapability(
+    jid: string,
+    context: ChannelTurnContext,
+    request: FeishuCapabilityRequest,
+  ): Promise<FeishuCapabilityResult> {
+    if (getChannelType(jid) !== 'feishu') {
+      throw new Error('Feishu capability requires a Feishu JID');
+    }
+    const channel = this.findChannelForJid(jid, 'feishu');
+    if (!channel?.executeFeishuCapability) {
+      throw new Error(`No connected Feishu Bot is available for ${jid}`);
+    }
+    return channel.executeFeishuCapability(context, request);
+  }
+
+  /**
    * Fetch recent messages from a Discord channel/DM, auto-routing via JID prefix.
    * Throws if the JID is not a Discord channel or no Discord connection is available.
    */
@@ -1039,6 +1064,7 @@ export class IMConnectionManager {
     const channel = createFeishuChannel({
       appId: config.appId,
       appSecret: config.appSecret,
+      channelAccountId: options?.accountId,
     });
 
     return this.connectChannel(
