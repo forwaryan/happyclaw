@@ -1280,21 +1280,29 @@ export function initDatabase(): void {
   );
   // v57 -> v58: split Feishu's composite owner_mentioned setting into two
   // orthogonal policies. Other providers keep their legacy mode until their
-  // connector implements the same audience gate.
-  db.exec(`
-    UPDATE registered_groups
-    SET activation_mode = 'when_mentioned', audience_mode = 'owner_only', require_mention = 1
-    WHERE jid LIKE 'feishu:%' AND activation_mode = 'owner_mentioned';
-    UPDATE registered_groups
-    SET audience_mode = 'owner_only'
-    WHERE jid LIKE 'feishu:%' AND sender_allowlist IS NOT NULL;
-    UPDATE channel_mounts
-    SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
-    WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
-    UPDATE agent_channel_mounts
-    SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
-    WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
-  `);
+  // connector implements the same audience gate. This is a one-time semantic
+  // migration: replaying it on every startup would overwrite a later explicit
+  // user choice of audience_mode='everyone' whenever the durable owner anchor
+  // (sender_allowlist) is still present.
+  const audiencePolicySchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (audiencePolicySchemaVersion < 58) {
+    db.exec(`
+      UPDATE registered_groups
+      SET activation_mode = 'when_mentioned', audience_mode = 'owner_only', require_mention = 1
+      WHERE jid LIKE 'feishu:%' AND activation_mode = 'owner_mentioned';
+      UPDATE registered_groups
+      SET audience_mode = 'owner_only'
+      WHERE jid LIKE 'feishu:%' AND sender_allowlist IS NOT NULL;
+      UPDATE channel_mounts
+      SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
+      WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
+      UPDATE agent_channel_mounts
+      SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
+      WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
+    `);
+  }
   // v58 -> v59: persist a sanitized, message-level channel context. Existing
   // rows intentionally remain NULL and continue to decode as context-less.
   ensureColumn('messages', 'token_usage', 'TEXT');

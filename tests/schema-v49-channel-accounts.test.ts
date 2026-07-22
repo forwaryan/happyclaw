@@ -95,6 +95,29 @@ describe('schema v50 channel account protocol lifecycle', () => {
     expect(
       db.getRegisteredGroup('telegram:chat#account:account-v49'),
     ).toMatchObject({ channel_account_id: 'account-v49' });
+
+    // A sender allowlist is an owner identity anchor, not a permanent audience
+    // choice. Once the user explicitly selects "everyone", later startups
+    // must not replay the v58 backfill and silently restore owner-only mode.
+    db.setRegisteredGroup('feishu:restart-audience-chat', {
+      name: 'Restart audience regression',
+      folder: 'legacy-folder',
+      added_at: '2026-07-01T00:00:00.000Z',
+      created_by: 'legacy-owner',
+      channel_account_id: 'account-v49',
+      audience_mode: 'everyone',
+      owner_im_id: 'ou_owner',
+      sender_allowlist: ['ou_owner'],
+    });
+    expect(db.getRegisteredGroup('feishu:restart-audience-chat')).toMatchObject(
+      { audience_mode: 'everyone' },
+    );
+    db.closeDatabase();
+
+    db.initDatabase();
+    expect(db.getRegisteredGroup('feishu:restart-audience-chat')).toMatchObject(
+      { audience_mode: 'everyone' },
+    );
     db.closeDatabase();
 
     const raw = new Database(path.join(store, 'messages.db'), {
