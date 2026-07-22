@@ -251,6 +251,18 @@ export interface ClaudeContextAudit {
   claudeMdExcludes?: string[];
   claudeMd: ClaudeContextFileAudit;
   rules: ClaudeContextRulesAudit;
+  nativeConfig?: {
+    enabled: boolean;
+    settingSources: Array<'user' | 'project' | 'local'>;
+    entries: Array<{
+      name: string;
+      kind: 'file' | 'directory' | 'settings';
+      sourcePath?: string;
+      runtimePath?: string;
+      status: 'linked' | 'mounted' | 'merged' | 'missing' | 'unavailable';
+      entryCount?: number;
+    }>;
+  };
   skills: ClaudeContextSkillsAudit;
   mcp?: { manifestHash: string; serverIds: string[] };
   happyclawPrompt: ClaudeContextPromptAudit;

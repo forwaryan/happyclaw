@@ -62,6 +62,8 @@ seedDb.close();
 const {
   initDatabase,
   setRegisteredGroup,
+  getRegisteredGroup,
+  updateRegisteredGroupAvatar,
   deleteRegisteredGroup,
   createAgent,
   getChannelMount,
@@ -82,6 +84,37 @@ afterAll(() => {
 });
 
 describe('channel_mounts compatibility model', () => {
+  test('provider chat avatars persist across ordinary group updates', () => {
+    const jid = 'feishu:avatar-cache';
+    const now = new Date().toISOString();
+    setRegisteredGroup(jid, {
+      name: 'Avatar group',
+      folder: 'avatar-cache',
+      added_at: now,
+      created_by: 'owner-a',
+    });
+
+    expect(
+      updateRegisteredGroupAvatar(jid, ' https://example.com/group.png '),
+    ).toBe(true);
+    expect(getRegisteredGroup(jid)?.avatar_url).toBe(
+      'https://example.com/group.png',
+    );
+
+    // Binding/name updates often omit provider presentation metadata. They
+    // must not erase the last successfully synchronized avatar.
+    setRegisteredGroup(jid, {
+      name: 'Renamed avatar group',
+      folder: 'avatar-cache',
+      added_at: now,
+      created_by: 'owner-a',
+      target_main_jid: 'web:missing-is-fine-for-legacy-compat',
+    });
+    expect(getRegisteredGroup(jid)?.avatar_url).toBe(
+      'https://example.com/group.png',
+    );
+  });
+
   test('updating a registered group preserves its SQLite row identity', () => {
     const jid = 'telegram:stable-row';
     const now = new Date().toISOString();
@@ -191,6 +224,8 @@ describe('channel_mounts compatibility model', () => {
       target_main_jid: 'web:workspace-b',
       binding_mode: 'thread_map',
       reply_policy: 'source_only',
+      audience_mode: 'owner_only',
+      owner_im_id: 'ou_owner_b',
     });
 
     expect(getChannelMount('feishu:topic-b')).toMatchObject({
@@ -198,6 +233,8 @@ describe('channel_mounts compatibility model', () => {
       workspace_jid: 'web:workspace-b',
       session_id: null,
       routing_mode: 'thread_map',
+      audience_mode: 'owner_only',
+      owner_im_id: 'ou_owner_b',
     });
 
     setRegisteredGroup('feishu:topic-b', {

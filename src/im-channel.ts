@@ -10,6 +10,7 @@ import {
   type FeishuConnection,
   type FeishuConnectionConfig,
 } from './feishu.js';
+import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
   createTelegramConnection,
   type TelegramConnection,
@@ -130,6 +131,11 @@ export interface IMChannelConnectOpts {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** Feishu-only durable activation/session plan for the current message. */
+  resolveFeishuConversationPlan?: (
+    chatJid: string,
+    messageMeta: ChannelMessageMeta,
+  ) => FeishuConversationPlan;
   /** owner_mentioned 模式下检查发送者是否为 owner */
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** 发言者白名单：返回 false 则丢弃（命令处理后、mention 门控前调用） */
@@ -246,6 +252,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
         shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+        resolveFeishuConversationPlan: opts.resolveFeishuConversationPlan,
         isGroupOwnerMessage: opts.isGroupOwnerMessage,
         isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
         onCardInterrupt: opts.onCardInterrupt,

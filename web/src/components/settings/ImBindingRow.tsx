@@ -10,7 +10,10 @@ import {
 import { Button } from '@/components/ui/button';
 import type { AvailableImGroup } from '../../types';
 import { ChannelAccountBadge, ChannelBadge } from './channel-meta';
-import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
+import {
+  ACTIVATION_MODE_OPTIONS,
+  AUDIENCE_MODE_OPTIONS,
+} from '../../constants/im';
 import { getImChannelCapabilities } from '../../constants/im-capabilities';
 
 interface ImBindingRowProps {
@@ -20,6 +23,7 @@ interface ImBindingRowProps {
   onUnbind: (group: AvailableImGroup) => void;
   onResetAllowlist: (group: AvailableImGroup) => void;
   onActivationModeChange: (jid: string, mode: string) => void;
+  onAudienceModeChange: (jid: string, mode: 'everyone' | 'owner_only') => void;
   onDelete: (group: AvailableImGroup) => void;
 }
 
@@ -30,6 +34,7 @@ export function ImBindingRow({
   onUnbind,
   onResetAllowlist,
   onActivationModeChange,
+  onAudienceModeChange,
   onDelete,
 }: ImBindingRowProps) {
   const boundSessionId = group.bound_session_id ?? group.bound_agent_id;
@@ -42,7 +47,9 @@ export function ImBindingRow({
     getImChannelCapabilities(group.channel_type)?.supports_owner_mention ===
     true;
   const activationModeOptions = ACTIVATION_MODE_OPTIONS.filter(
-    (option) => option.value !== 'owner_mentioned' || supportsOwnerMention,
+    (option) =>
+      (option.value !== 'owner_mentioned' || supportsOwnerMention) &&
+      !(group.channel_type === 'feishu' && option.value === 'owner_mentioned'),
   );
   // Empty array = "owner-locked trap": bot was added before Feishu owner DM'd it,
   // so nobody (not even the owner) can trigger the bot until allowlist is reset
@@ -149,7 +156,12 @@ export function ImBindingRow({
         {supportsActivation && (
           <div className="flex items-center gap-1.5">
             <select
-              value={group.activation_mode || 'auto'}
+              value={
+                group.channel_type === 'feishu' &&
+                group.activation_mode === 'owner_mentioned'
+                  ? 'when_mentioned'
+                  : group.activation_mode || 'auto'
+              }
               onChange={(e) =>
                 onActivationModeChange(group.jid, e.target.value)
               }
@@ -167,6 +179,32 @@ export function ImBindingRow({
               ))}
             </select>
           </div>
+        )}
+        {group.channel_type === 'feishu' && (
+          <select
+            value={
+              group.audience_mode === 'owner_only' ||
+              group.activation_mode === 'owner_mentioned'
+                ? 'owner_only'
+                : 'everyone'
+            }
+            onChange={(e) =>
+              onAudienceModeChange(
+                group.jid,
+                e.target.value as 'everyone' | 'owner_only',
+              )
+            }
+            disabled={isActioning}
+            aria-label={`${group.name} 的响应对象`}
+            title="响应对象"
+            className="text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground disabled:opacity-50"
+          >
+            {AUDIENCE_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
         )}
         {hasBound && (
           <Button

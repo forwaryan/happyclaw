@@ -1,5 +1,9 @@
 import { describe, expect, test, vi } from 'vitest';
-import { parseFeishuRouteTarget } from '../src/feishu.js';
+import {
+  buildFeishuRouteTarget,
+  parseFeishuRouteTarget,
+} from '../src/feishu.js';
+import { resolveFeishuConversationPlan } from '../src/feishu-conversation-policy.js';
 import { StreamingCardController } from '../src/feishu-streaming-card.js';
 
 describe('parseFeishuRouteTarget', () => {
@@ -22,6 +26,26 @@ describe('parseFeishuRouteTarget', () => {
       threadId: undefined,
       rootMessageId: undefined,
       replyInThread: false,
+    });
+  });
+
+  test('an ordinary-group mention becomes a reply_in_thread root target', () => {
+    const plan = resolveFeishuConversationPlan({
+      chatType: 'group',
+      chatMode: 'group',
+      activationMode: 'when_mentioned',
+      mentionedBot: true,
+      messageId: 'om_mention',
+    });
+    const target = buildFeishuRouteTarget(
+      'oc_ordinary',
+      undefined,
+      plan.rootMessageId,
+    );
+    expect(target).toMatchObject({
+      chatId: 'oc_ordinary',
+      rootMessageId: 'om_mention',
+      replyInThread: true,
     });
   });
 });

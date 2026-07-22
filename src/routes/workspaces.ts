@@ -82,6 +82,7 @@ function serializeMount(mount: AgentChannelMountRecord) {
     routing_mode: mount.routing_mode,
     reply_policy: mount.reply_policy,
     activation_mode: mount.activation_mode,
+    audience_mode: mount.audience_mode,
     owner_im_id: mount.owner_im_id ?? null,
     owner_user_id: mount.owner_user_id,
     agent_profile_id: mount.agent_profile_id,

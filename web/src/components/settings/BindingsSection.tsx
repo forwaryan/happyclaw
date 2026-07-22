@@ -208,6 +208,17 @@ export function BindingsSection() {
     [rebind],
   );
 
+  const handleAudienceModeChange = useCallback(
+    async (jid: string, mode: 'everyone' | 'owner_only') => {
+      setActioningJid(jid);
+      setLocalError(null);
+      const err = await rebind(jid, { audience_mode: mode });
+      setActioningJid(null);
+      if (err) setLocalError(err);
+    },
+    [rebind],
+  );
+
   const confirmUnbind = useCallback(async () => {
     if (!unbindGroup) return;
     const jid = unbindGroup.jid;
@@ -434,6 +445,7 @@ export function BindingsSection() {
                       onUnbind={handleUnbind}
                       onResetAllowlist={handleResetAllowlist}
                       onActivationModeChange={handleActivationModeChange}
+                      onAudienceModeChange={handleAudienceModeChange}
                       onDelete={handleDelete}
                     />
                   ))}

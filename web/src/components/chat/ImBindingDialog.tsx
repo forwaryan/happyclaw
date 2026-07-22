@@ -25,7 +25,10 @@ import { useChatStore } from '../../stores/chat';
 import { showToast } from '../../utils/toast';
 import type { AgentInfo, AvailableImGroup } from '../../types';
 import { ChannelAccountBadge, ChannelBadge } from '../settings/channel-meta';
-import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
+import {
+  ACTIVATION_MODE_OPTIONS,
+  AUDIENCE_MODE_OPTIONS,
+} from '../../constants/im';
 import {
   getImChannelCapabilities,
   IM_CHANNEL_ORDER,
@@ -48,12 +51,105 @@ interface ImBindingDialogProps {
 
 type ChannelFilter = 'all' | ImChannelType;
 
+function ImGroupAvatar({ group }: { group: AvailableImGroup }) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const avatarUrl = group.avatar?.trim() || null;
+
+  if (avatarUrl && failedUrl !== avatarUrl) {
+    return (
+      <img
+        src={avatarUrl}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        referrerPolicy="no-referrer"
+        onError={() => setFailedUrl(avatarUrl)}
+        className="size-11 shrink-0 rounded-xl bg-muted object-cover"
+      />
+    );
+  }
+
+  const initial = Array.from(group.name.trim())[0];
+  return (
+    <div
+      aria-hidden="true"
+      className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-muted text-sm font-semibold text-muted-foreground"
+    >
+      {initial || <MessageSquare className="size-5" />}
+    </div>
+  );
+}
+
 function supportsActivationModes(
   channelType: string | null | undefined,
 ): boolean {
   return (
     getImChannelCapabilities(channelType)?.supports_activation_modes === true
   );
+}
+
+function isFeishuDirectChat(group: AvailableImGroup): boolean {
+  return group.channel_type === 'feishu' && group.chat_mode === 'p2p';
+}
+
+function isNativeFeishuTopicGroup(group: AvailableImGroup): boolean {
+  return (
+    group.channel_type === 'feishu' &&
+    (group.chat_mode === 'topic' || group.group_message_type === 'thread')
+  );
+}
+
+function requiresWorkspaceBinding(group: AvailableImGroup): boolean {
+  if (group.is_thread_capable) return true;
+  if (group.channel_type !== 'feishu' || group.chat_mode === 'p2p')
+    return false;
+  return (
+    group.activation_mode === 'when_mentioned' ||
+    group.activation_mode === 'owner_mentioned' ||
+    (group.activation_mode === 'auto' && group.require_mention === true)
+  );
+}
+
+function activationOptionsFor(group: AvailableImGroup) {
+  if (group.channel_type !== 'feishu') return ACTIVATION_MODE_OPTIONS;
+  return ACTIVATION_MODE_OPTIONS.filter((option) => {
+    if (option.value === 'owner_mentioned') return false;
+    if (!isFeishuDirectChat(group)) return true;
+    return (
+      option.value === 'always' ||
+      option.value === 'auto' ||
+      option.value === 'disabled'
+    );
+  });
+}
+
+function activationDescription(
+  group: AvailableImGroup,
+  mode: string,
+): string | null {
+  const resolvedMode =
+    mode === 'auto'
+      ? group.require_mention
+        ? 'when_mentioned'
+        : 'always'
+      : mode;
+  if (isFeishuDirectChat(group)) {
+    return resolvedMode === 'disabled'
+      ? null
+      : '私聊始终响应，并共享一个上下文。';
+  }
+  if (group.channel_type !== 'feishu') return null;
+  if (resolvedMode === 'when_mentioned' || resolvedMode === 'owner_mentioned') {
+    return isNativeFeishuTopicGroup(group)
+      ? '每个新话题首次需要 @，激活后话题内无需再次 @。'
+      : '每次在群主时间线 @ 都会创建独立话题，话题内后续无需再次 @。';
+  }
+  if (resolvedMode === 'always') {
+    return isNativeFeishuTopicGroup(group)
+      ? '所有话题自动响应，每个话题使用独立上下文。'
+      : '群内消息免 @，整个普通群共享一个上下文。';
+  }
+  return null;
 }
 
 export function ImBindingDialog({
@@ -84,6 +180,9 @@ export function ImBindingDialog({
   const [activationModes, setActivationModes] = useState<
     Record<string, string>
   >({});
+  const [audienceModes, setAudienceModes] = useState<
+    Record<string, 'everyone' | 'owner_only'>
+  >({});
   const syncGeneration = useRef(0);
 
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
@@ -100,11 +199,20 @@ export function ImBindingDialog({
     () =>
       imGroups.filter((group) => {
         const capabilities = getImChannelCapabilities(group.channel_type);
-        return isWorkspaceMode
-          ? capabilities?.can_bind_workspace === true
-          : capabilities?.can_bind_session === true && !group.is_thread_capable;
+        if (isWorkspaceMode) return capabilities?.can_bind_workspace === true;
+        if (capabilities?.can_bind_session !== true) return false;
+        if (!requiresWorkspaceBinding(group)) return true;
+        // A main-conversation bind can become a workspace thread map after the
+        // user selects mention activation. Keep the now-bound row visible so
+        // it can still be inspected, changed, or restored from this dialog.
+        return (
+          (isMainMode &&
+            (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid) ||
+          (!isMainMode &&
+            (group.bound_session_id ?? group.bound_agent_id) === agentId)
+        );
       }),
-    [imGroups, isWorkspaceMode],
+    [agentId, groupJid, imGroups, isMainMode, isWorkspaceMode],
   );
 
   const loadGroupsForDialog = useCallback(
@@ -118,16 +226,29 @@ export function ImBindingDialog({
         }
         setImGroups(groups);
         const initial: Record<string, string> = {};
+        const initialAudiences: Record<string, 'everyone' | 'owner_only'> = {};
         for (const group of groups) {
           if (
             supportsActivationModes(group.channel_type) &&
             group.activation_mode &&
             group.activation_mode !== 'auto'
           ) {
-            initial[group.jid] = group.activation_mode;
+            initial[group.jid] =
+              group.channel_type === 'feishu' &&
+              group.activation_mode === 'owner_mentioned'
+                ? 'when_mentioned'
+                : group.activation_mode;
+          }
+          if (group.channel_type === 'feishu') {
+            initialAudiences[group.jid] =
+              group.audience_mode === 'owner_only' ||
+              group.activation_mode === 'owner_mentioned'
+                ? 'owner_only'
+                : 'everyone';
           }
         }
         setActivationModes(initial);
+        setAudienceModes(initialAudiences);
         return true;
       } catch (err) {
         if (generation !== undefined && generation !== syncGeneration.current) {
@@ -182,6 +303,7 @@ export function ImBindingDialog({
       setAccountFilter('all');
       setRebindTarget(null);
       setActivationModes({});
+      setAudienceModes({});
       setLoadError(null);
       setSyncError(null);
       setLastSyncedAt(null);
@@ -192,6 +314,7 @@ export function ImBindingDialog({
     setActionLoading(null);
     setRebindTarget(null);
     setActivationModes({});
+    setAudienceModes({});
     setFilter('');
     setChannelFilter('all');
     setAccountFilter('all');
@@ -320,7 +443,16 @@ export function ImBindingDialog({
         const mode = supportsActivationModes(target?.channel_type)
           ? activationModes[imJid] || 'auto'
           : undefined;
-        ok = await bindMainImGroup(groupJid, imJid, false, mode);
+        ok = await bindMainImGroup(
+          groupJid,
+          imJid,
+          false,
+          mode,
+          undefined,
+          target?.channel_type === 'feishu'
+            ? audienceModes[imJid] || 'everyone'
+            : undefined,
+        );
       } else {
         ok = await bindImGroup(groupJid, agentId, imJid);
       }
@@ -360,13 +492,44 @@ export function ImBindingDialog({
       setActivationModes((prev) => ({ ...prev, [imJid]: mode }));
       // Re-bind with force to update activation_mode on already-bound group
       try {
-        await bindMainImGroup(groupJid, imJid, true, mode);
+        const target = imGroups.find((group) => group.jid === imJid);
+        await bindMainImGroup(
+          groupJid,
+          imJid,
+          true,
+          mode,
+          undefined,
+          target?.channel_type === 'feishu'
+            ? audienceModes[imJid] || target.audience_mode || 'everyone'
+            : undefined,
+        );
         await reloadGroups();
       } catch {
         showToast('更新触发模式失败');
       }
     },
-    [groupJid, bindMainImGroup],
+    [audienceModes, groupJid, imGroups, bindMainImGroup],
+  ); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleAudienceModeChange = useCallback(
+    async (imJid: string, audienceMode: 'everyone' | 'owner_only') => {
+      setAudienceModes((prev) => ({ ...prev, [imJid]: audienceMode }));
+      const target = imGroups.find((group) => group.jid === imJid);
+      try {
+        await bindMainImGroup(
+          groupJid,
+          imJid,
+          true,
+          activationModes[imJid] || target?.activation_mode || 'auto',
+          undefined,
+          audienceMode,
+        );
+        await reloadGroups();
+      } catch {
+        showToast('更新响应对象失败');
+      }
+    },
+    [activationModes, bindMainImGroup, groupJid, imGroups],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const describeBindTarget = (group: AvailableImGroup): string => {
@@ -396,7 +559,16 @@ export function ImBindingDialog({
         const mode = supportsActivationModes(rebindGroup.channel_type)
           ? activationModes[imJid] || 'auto'
           : undefined;
-        ok = await bindMainImGroup(groupJid, imJid, true, mode);
+        ok = await bindMainImGroup(
+          groupJid,
+          imJid,
+          true,
+          mode,
+          undefined,
+          rebindGroup.channel_type === 'feishu'
+            ? audienceModes[imJid] || rebindGroup.audience_mode || 'everyone'
+            : undefined,
+        );
       } else {
         ok = await bindImGroup(groupJid, agentId!, imJid, true);
       }
@@ -417,9 +589,12 @@ export function ImBindingDialog({
 
   const renderThreadCapability = (group: AvailableImGroup) => {
     if (!group.is_thread_capable) return null;
+    const nativeTopic = isNativeFeishuTopicGroup(group);
     return (
       <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-700 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-300">
-        原生话题
+        {group.channel_type !== 'feishu' || nativeTopic
+          ? '原生话题'
+          : '按 @ 分话题'}
       </span>
     );
   };
@@ -641,6 +816,19 @@ export function ImBindingDialog({
                   const effectiveMode = (activationModes[group.jid] ||
                     group.activation_mode ||
                     'auto') as string;
+                  const activationOptions = activationOptionsFor(group);
+                  const supportsAudience =
+                    isMainMode && group.channel_type === 'feishu';
+                  const effectiveAudience =
+                    audienceModes[group.jid] ||
+                    group.audience_mode ||
+                    (group.activation_mode === 'owner_mentioned'
+                      ? 'owner_only'
+                      : 'everyone');
+                  const modeDescription = activationDescription(
+                    group,
+                    effectiveMode,
+                  );
 
                   return (
                     <article
@@ -654,17 +842,7 @@ export function ImBindingDialog({
                       }`}
                     >
                       {/* Group avatar */}
-                      {group.avatar ? (
-                        <img
-                          src={group.avatar}
-                          alt=""
-                          className="size-11 shrink-0 rounded-xl object-cover"
-                        />
-                      ) : (
-                        <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-muted">
-                          <MessageSquare className="size-5 text-muted-foreground" />
-                        </div>
-                      )}
+                      <ImGroupAvatar group={group} />
 
                       {/* Group info */}
                       <div className="flex-1 min-w-0">
@@ -709,11 +887,43 @@ export function ImBindingDialog({
                         <div className="col-span-2 min-w-0 sm:col-span-1 sm:col-start-3 sm:row-start-1 sm:min-w-64">
                           <div className="grid gap-2 min-[460px]:grid-cols-[minmax(0,1fr)_auto]">
                             <div className="min-w-0">
+                              {supportsAudience && (
+                                <>
+                                  <label
+                                    htmlFor={`audience-${group.jid}`}
+                                    className="mb-1 block text-[10px] font-medium text-muted-foreground"
+                                  >
+                                    响应对象
+                                  </label>
+                                  <select
+                                    id={`audience-${group.jid}`}
+                                    value={effectiveAudience}
+                                    onChange={(e) =>
+                                      setAudienceModes((prev) => ({
+                                        ...prev,
+                                        [group.jid]: e.target.value as
+                                          | 'everyone'
+                                          | 'owner_only',
+                                      }))
+                                    }
+                                    className="mb-2 h-9 w-full min-w-0 rounded-lg border border-border bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                                  >
+                                    {AUDIENCE_MODE_OPTIONS.map((option) => (
+                                      <option
+                                        key={option.value}
+                                        value={option.value}
+                                      >
+                                        {option.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </>
+                              )}
                               <label
                                 htmlFor={`activation-${group.jid}`}
-                                className="sr-only"
+                                className="mb-1 block text-[10px] font-medium text-muted-foreground"
                               >
-                                {group.name} 的消息触发策略
+                                触发方式
                               </label>
                               <select
                                 id={`activation-${group.jid}`}
@@ -726,16 +936,22 @@ export function ImBindingDialog({
                                 }
                                 className="h-9 w-full min-w-0 rounded-lg border border-border bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                               >
-                                {ACTIVATION_MODE_OPTIONS.map((o) => (
+                                {activationOptions.map((o) => (
                                   <option key={o.value} value={o.value}>
                                     {o.label}
                                   </option>
                                 ))}
                               </select>
-                              {effectiveMode === 'owner_mentioned' && (
-                                <span className="mt-1 flex items-start gap-1 text-[10px] leading-4 text-amber-700 dark:text-amber-300">
-                                  <Info className="mt-0.5 size-3 shrink-0" />
-                                  绑定后在群里发送 /owner_mention
+                              {effectiveAudience === 'owner_only' &&
+                                !group.owner_im_id && (
+                                  <span className="mt-1 flex items-start gap-1 text-[10px] leading-4 text-amber-700 dark:text-amber-300">
+                                    <Info className="mt-0.5 size-3 shrink-0" />
+                                    请先私聊机器人，让系统识别主人身份
+                                  </span>
+                                )}
+                              {modeDescription && (
+                                <span className="mt-1 block text-[10px] leading-4 text-muted-foreground">
+                                  {modeDescription}
                                 </span>
                               )}
                             </div>
@@ -760,11 +976,44 @@ export function ImBindingDialog({
                         <div className="col-span-2 flex w-full flex-col items-stretch gap-2 min-[460px]:flex-row min-[460px]:items-start sm:col-span-1 sm:col-start-3 sm:row-start-1 sm:w-auto sm:min-w-64">
                           {supportsActivation && (
                             <div className="min-w-0 flex-1">
+                              {supportsAudience && (
+                                <>
+                                  <label
+                                    htmlFor={`audience-${group.jid}`}
+                                    className="mb-1 block text-[10px] font-medium text-muted-foreground"
+                                  >
+                                    响应对象
+                                  </label>
+                                  <select
+                                    id={`audience-${group.jid}`}
+                                    value={effectiveAudience}
+                                    onChange={(e) =>
+                                      handleAudienceModeChange(
+                                        group.jid,
+                                        e.target.value as
+                                          | 'everyone'
+                                          | 'owner_only',
+                                      )
+                                    }
+                                    aria-label={`${group.name} 的响应对象`}
+                                    className="mb-2 h-9 w-full rounded-lg border border-border bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                                  >
+                                    {AUDIENCE_MODE_OPTIONS.map((option) => (
+                                      <option
+                                        key={option.value}
+                                        value={option.value}
+                                      >
+                                        {option.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </>
+                              )}
                               <label
                                 htmlFor={`activation-${group.jid}`}
-                                className="sr-only"
+                                className="mb-1 block text-[10px] font-medium text-muted-foreground"
                               >
-                                {group.name} 的消息触发策略
+                                触发方式
                               </label>
                               <select
                                 id={`activation-${group.jid}`}
@@ -778,19 +1027,24 @@ export function ImBindingDialog({
                                 aria-label={`${group.name} 的消息触发策略`}
                                 className="h-9 w-full rounded-lg border border-border bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                               >
-                                {ACTIVATION_MODE_OPTIONS.map((o) => (
+                                {activationOptions.map((o) => (
                                   <option key={o.value} value={o.value}>
                                     {o.label}
                                   </option>
                                 ))}
                               </select>
-                              {effectiveMode === 'owner_mentioned' &&
+                              {effectiveAudience === 'owner_only' &&
                                 !group.owner_im_id && (
                                   <span className="mt-1 flex items-start gap-1 text-[10px] leading-4 text-amber-700 dark:text-amber-300">
                                     <Info className="mt-0.5 size-3 shrink-0" />
-                                    请在群里发 /owner_mention 注册身份
+                                    请先私聊机器人，让系统识别主人身份
                                   </span>
                                 )}
+                              {modeDescription && (
+                                <span className="mt-1 block text-[10px] leading-4 text-muted-foreground">
+                                  {modeDescription}
+                                </span>
+                              )}
                             </div>
                           )}
                           <Button

@@ -125,6 +125,7 @@ import {
   cleanupOldDailyUsage,
   cleanupOldBillingAuditLog,
   getImContextBinding,
+  getImContextBindingByRootMessageId,
   upsertImContextBinding,
   touchImContextBindingActivity,
   updateAgentContextInfo,
@@ -155,6 +156,7 @@ import {
   buildNativeThreadWorkspaceUpdate,
   buildWorkspaceMountUpdate,
   hasRemainingThreadMapMount,
+  isNativeContextContainer,
   resolveChannelMountTarget,
   restoreDefaultChannelMount,
   upgradeNativeContextChannelMount,
@@ -329,6 +331,17 @@ import {
   resolveNativeThreadContext,
   type NativeThreadContext,
 } from './channel-native-context.js';
+import {
+  resolveFeishuConversationPlan,
+  requiresMention as feishuRequiresMention,
+  type ActiveFeishuContext,
+  type FeishuConversationPlan,
+} from './feishu-conversation-policy.js';
+import {
+  effectiveAudienceMode,
+  isSenderAllowedByAudience,
+  isUnknownFeishuSenderAllowed,
+} from './im-audience-policy.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { checkOwnerActive } from './owner-gate.js';
@@ -1615,6 +1628,35 @@ function markThreadMapWorkspace(targetMainJid?: string): void {
   registeredGroups[workspaceJid] = updatedWorkspace;
 }
 
+function persistActivationAwareGroupUpdate(
+  chatJid: string,
+  previous: RegisteredGroup,
+  candidate: RegisteredGroup,
+): boolean {
+  const threadMapped = isNativeContextContainer(chatJid, candidate, {
+    activation_mode: candidate.activation_mode,
+  });
+  if (threadMapped && candidate.target_agent_id) return false;
+
+  const updated = candidate.target_main_jid
+    ? buildWorkspaceMountUpdate(
+        candidate,
+        candidate.target_main_jid,
+        threadMapped ? 'thread_map' : 'single_session',
+        {
+          activationMode: candidate.activation_mode,
+          ownerImId: candidate.owner_im_id ?? null,
+        },
+      )
+    : candidate;
+  persistGroupUpdate(chatJid, updated, registeredGroups);
+  if (previous.binding_mode === 'thread_map' && !threadMapped) {
+    detachThreadMapWorkspace(previous.target_main_jid, chatJid);
+  }
+  if (threadMapped) markThreadMapWorkspace(updated.target_main_jid);
+  return true;
+}
+
 /** Restore an authorized chat to its channel account's default workspace. */
 function unbindImGroup(jid: string, reason: string): boolean {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
@@ -2817,6 +2859,9 @@ function handleRequireMentionCommand(
   }
 
   const action = rawArgs.trim().toLowerCase();
+  if (group.feishu_chat_mode === 'p2p') {
+    return '飞书私聊始终直接响应，不支持 @ 激活模式。';
+  }
   if (action === 'true') {
     // 如果当前是 owner_mentioned 模式，切换为 when_mentioned 但保留 owner
     // 注意：不清空 owner_im_id —— owner 是工作区认领标识，非 owner 通过
@@ -2827,11 +2872,15 @@ function handleRequireMentionCommand(
         require_mention: true,
         activation_mode: 'when_mentioned',
       };
-      persistGroupUpdate(chatJid, updated, registeredGroups);
+      if (!persistActivationAwareGroupUpdate(chatJid, group, updated)) {
+        return '需要 @ 模式会为每个话题创建独立会话，请先把当前聊天绑定到工作区。';
+      }
       return '已从「仅 owner 响应」切换为「需要 @机器人」模式，所有人 @机器人 均可触发';
     }
     const updated: RegisteredGroup = { ...group, require_mention: true };
-    persistGroupUpdate(chatJid, updated, registeredGroups);
+    if (!persistActivationAwareGroupUpdate(chatJid, group, updated)) {
+      return '需要 @ 模式会为每个话题创建独立会话，请先把当前聊天绑定到工作区。';
+    }
     return '已开启：群聊中需要 @机器人 才会响应';
   } else if (action === 'false') {
     // 关闭 require_mention 时退出 owner_mentioned 模式，但保留 owner_im_id：
@@ -2842,7 +2891,7 @@ function handleRequireMentionCommand(
       require_mention: false,
       activation_mode: 'always',
     };
-    persistGroupUpdate(chatJid, updated, registeredGroups);
+    persistActivationAwareGroupUpdate(chatJid, group, updated);
     return '已关闭：群聊中所有消息都会响应，无需 @机器人';
   } else if (!action) {
     const current = group.require_mention === true;
@@ -11667,6 +11716,7 @@ function buildOnNewChat(
             // the new user's Agent Builder authorization boundary.
             owner_claim_source: 'transfer_reset' as const,
             sender_allowlist: getOwnerOpenId ? [] : undefined,
+            audience_mode: getOwnerOpenId ? 'owner_only' : 'everyone',
           });
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;
@@ -11705,6 +11755,7 @@ function buildOnNewChat(
           ? [ownerOpenId]
           : []
         : undefined,
+      audience_mode: getOwnerOpenId ? 'owner_only' : 'everyone',
       require_mention: groupDefaults.requireMention,
     });
     logger.info(
@@ -12210,14 +12261,145 @@ function resolveOrCreateNativeThreadAgent(
   };
 }
 
+function isUsableFeishuContextBinding(
+  binding: ReturnType<typeof getImContextBinding>,
+  expectedWorkspaceJid: string | null,
+): binding is NonNullable<typeof binding> {
+  if (!binding || !expectedWorkspaceJid) return false;
+  const agent = getAgent(binding.agent_id);
+  return (
+    binding.workspace_jid === expectedWorkspaceJid &&
+    agent?.chat_jid === expectedWorkspaceJid
+  );
+}
+
+function findActiveFeishuContext(
+  chatJid: string,
+  group: RegisteredGroup,
+  messageMeta: ChannelMessageMeta,
+): ActiveFeishuContext | undefined {
+  const expectedWorkspaceJid = group.target_main_jid
+    ? resolveWorkspaceJid(group.target_main_jid)
+    : null;
+  if (!expectedWorkspaceJid) return undefined;
+
+  const candidateIds = Array.from(
+    new Set(
+      [messageMeta.contextId, messageMeta.threadId, messageMeta.rootId].filter(
+        (value): value is string => !!value,
+      ),
+    ),
+  );
+  for (const contextId of candidateIds) {
+    const binding = getImContextBinding(chatJid, 'thread', contextId);
+    if (isUsableFeishuContextBinding(binding, expectedWorkspaceJid)) {
+      return {
+        contextId: binding.context_id,
+        rootMessageId:
+          binding.root_message_id || messageMeta.rootId || contextId,
+      };
+    }
+  }
+
+  if (messageMeta.rootId) {
+    const binding = getImContextBindingByRootMessageId(
+      chatJid,
+      'thread',
+      messageMeta.rootId,
+    );
+    if (isUsableFeishuContextBinding(binding, expectedWorkspaceJid)) {
+      return {
+        contextId: binding.context_id,
+        rootMessageId: binding.root_message_id || messageMeta.rootId,
+      };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Context-aware Feishu activation plan used before mention gating. Reading an
+ * existing binding is side-effect free; a new conversation agent is only
+ * created later, after the gate has accepted the message.
+ */
+function resolveFeishuConversationPlanForMessage(
+  chatJid: string,
+  messageMeta: ChannelMessageMeta,
+): FeishuConversationPlan {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  const chatMode =
+    group?.feishu_chat_mode === 'topic' ||
+    group?.feishu_group_message_type === 'thread'
+      ? 'topic'
+      : (group?.feishu_chat_mode ??
+        (messageMeta.chatType === 'p2p' ? 'p2p' : 'group'));
+  const activationMode = group?.activation_mode ?? 'auto';
+  const mentionRequired = feishuRequiresMention(
+    activationMode,
+    group?.require_mention,
+  );
+  const activeContext =
+    group && (chatMode === 'topic' || mentionRequired)
+      ? findActiveFeishuContext(chatJid, group, messageMeta)
+      : undefined;
+
+  return resolveFeishuConversationPlan({
+    chatType: messageMeta.chatType,
+    chatMode,
+    activationMode,
+    requireMention: group?.require_mention,
+    mentionedBot: messageMeta.mentionedBot === true,
+    messageId: messageMeta.messageId || '',
+    threadId: messageMeta.threadId,
+    rootId: messageMeta.rootId,
+    activeContext,
+  });
+}
+
 function ensureNativeContextChannelMount(
   chatJid: string,
   group: RegisteredGroup,
 ): RegisteredGroup | null {
-  const detectedGroup: RegisteredGroup = {
-    ...group,
-    native_context_type: 'thread',
-  };
+  // A Feishu ordinary group in mention mode uses thread_map for isolated
+  // sessions, but it is not itself a native topic container. Do not persist a
+  // false capability marker merely because one message opened a topic.
+  const persistNativeCapability =
+    getChannelType(chatJid) !== 'feishu' ||
+    group.feishu_chat_mode === 'topic' ||
+    group.feishu_group_message_type === 'thread';
+  let routableGroup = group;
+  if (
+    !persistNativeCapability &&
+    group.target_agent_id &&
+    getChannelType(chatJid) === 'feishu'
+  ) {
+    // Compatibility migration for configurations created before mention mode
+    // meant "one session per activated topic". A fixed session cannot hold
+    // multiple topic sessions, so promote it to that session's workspace on
+    // the first accepted mention instead of silently dropping the message.
+    const previousSession = getAgent(group.target_agent_id);
+    const workspaceJid = previousSession?.chat_jid;
+    if (workspaceJid && getRegisteredGroup(workspaceJid)) {
+      routableGroup = buildWorkspaceMountUpdate(
+        group,
+        workspaceJid,
+        'thread_map',
+        {
+          activationMode: group.activation_mode,
+          ownerImId: group.owner_im_id ?? null,
+        },
+      );
+      setRegisteredGroup(chatJid, routableGroup);
+      registeredGroups[chatJid] = routableGroup;
+      logger.info(
+        { chatJid, previousSessionId: group.target_agent_id, workspaceJid },
+        'Promoted legacy fixed-session Feishu mention binding to workspace thread map',
+      );
+    }
+  }
+  const detectedGroup: RegisteredGroup = persistNativeCapability
+    ? { ...routableGroup, native_context_type: 'thread' }
+    : routableGroup;
   const upgrade = upgradeNativeContextChannelMount(chatJid, detectedGroup);
   if (upgrade.status === 'conflict') {
     // Persist capability detection for diagnostics/UI while retaining the
@@ -12238,9 +12420,10 @@ function ensureNativeContextChannelMount(
 
   let updated = upgrade.updated;
   if (
-    (upgrade.status === 'unchanged' &&
+    persistNativeCapability &&
+    ((upgrade.status === 'unchanged' &&
       group.native_context_type !== 'thread') ||
-    updated.native_context_type !== 'thread'
+      updated.native_context_type !== 'thread')
   ) {
     updated = { ...updated, native_context_type: 'thread' };
     setRegisteredGroup(chatJid, updated);
@@ -12283,13 +12466,15 @@ function buildResolveEffectiveChatJid(): (
       return null;
     }
 
-    const nativeThread = resolveNativeThreadContext(messageMeta);
+    const channelType = getChannelType(chatJid);
+    const nativeThread =
+      channelType === 'feishu' && messageMeta?.nativeContextType !== 'thread'
+        ? null
+        : resolveNativeThreadContext(messageMeta);
     const nativeThreadDetected =
       !!nativeThread &&
       (messageMeta?.nativeContextType === 'thread' ||
-        (getChannelType(chatJid) === 'telegram' && !!messageMeta?.threadId) ||
-        (getChannelType(chatJid) === 'feishu' &&
-          group.feishu_chat_mode === 'topic'));
+        (channelType === 'telegram' && !!messageMeta?.threadId));
     if (nativeThreadDetected) {
       const upgraded = ensureNativeContextChannelMount(chatJid, group);
       if (!upgraded) return null;
@@ -12593,8 +12778,37 @@ function isGroupOwnerMessage(chatJid: string, senderImId?: string): boolean {
  * 为字符串数组时仅列表中的 open_id 可触发。
  */
 function isSenderAllowedInGroup(chatJid: string, senderImId?: string): boolean {
-  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-  if (!group) return false;
+  const conversationJid = channelConversationJid(
+    stripVirtualJidSuffix(chatJid),
+  );
+  const group =
+    registeredGroups[conversationJid] ?? getRegisteredGroup(conversationJid);
+  // The first Feishu DM is also the trusted owner-discovery event. Let an
+  // unknown chat reach admission only if there is no known account owner yet,
+  // or this sender already matches that owner.
+  if (!group) {
+    if (getChannelType(conversationJid) !== 'feishu') return false;
+    const accountId = parseChannelAddress(conversationJid)?.channelAccountId;
+    const account = accountId ? getChannelAccount(accountId) : undefined;
+    const knownOwner = account
+      ? getUserFeishuConfig(account.owner_user_id)?.ownerOpenId
+      : undefined;
+    return isUnknownFeishuSenderAllowed(knownOwner, senderImId);
+  }
+
+  // The explicit response audience is evaluated for p2p, ordinary groups and
+  // every topic message. It is deliberately independent from mention policy.
+  if (effectiveAudienceMode(group) === 'owner_only') {
+    return isSenderAllowedByAudience(group, senderImId);
+  }
+
+  // v58 Feishu uses the explicit two-state audience policy as the source of
+  // truth. Legacy allowlists are retained only for migration/audit and for
+  // other connectors that still expose multi-member allowlists.
+  if (getChannelType(conversationJid) === 'feishu') return true;
+
+  // Keep the legacy multi-member allowlist as an additional restriction for
+  // existing installations. New UI only exposes everyone/owner-only.
   const allowlist = group.sender_allowlist;
   if (allowlist === undefined || allowlist === null) return true;
   if (!senderImId) return false;
@@ -12799,6 +13013,8 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           ...common,
           onBotAddedToGroup: onNewChat,
           shouldProcessGroupMessage,
+          resolveFeishuConversationPlan:
+            resolveFeishuConversationPlanForMessage,
           isGroupOwnerMessage,
           isSenderAllowedInGroup,
           onFollowUpMessage: handleIncomingFollowUp,
@@ -13716,6 +13932,8 @@ async function main(): Promise<void> {
             ),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
+            resolveFeishuConversationPlan:
+              resolveFeishuConversationPlanForMessage,
             isGroupOwnerMessage,
             isSenderAllowedInGroup,
             onFollowUpMessage: handleIncomingFollowUp,

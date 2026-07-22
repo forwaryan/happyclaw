@@ -75,6 +75,8 @@ export function releaseOwner(group: RegisteredGroup): RegisteredGroup {
     owner_im_id: undefined,
     owner_claim_source: undefined,
     sender_allowlist: undefined,
+    audience_mode:
+      group.audience_mode === 'owner_only' ? 'everyone' : group.audience_mode,
     activation_mode:
       group.activation_mode === 'owner_mentioned'
         ? 'when_mentioned'

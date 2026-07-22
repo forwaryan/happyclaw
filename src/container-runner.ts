@@ -71,12 +71,10 @@ import {
 } from './agent-capabilities.js';
 import {
   buildClaudeContextPlan,
+  loadHostClaudeSettings,
   syncHostClaudeContext,
 } from './claude-context-resolver.js';
-import {
-  pluginSkillLayers,
-  reconcileSessionSkills,
-} from './effective-skill-resolver.js';
+import { pluginSkillLayers } from './effective-skill-resolver.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
 import type { AgentProfileRuntimePolicy } from './types.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
@@ -185,10 +183,7 @@ function ensureSymlinkTo(localPath: string, targetPath: string): void {
   }
 }
 
-/**
- * Required env flags for settings.json — 每次容器/进程启动时强制写入，不可被用户覆盖。
- * 合并模式：仅覆盖这些 key，保留用户自定义的其他 key。
- */
+/** Required env flags for settings.json — 每次启动时强制写入，不可被宿主机配置覆盖。 */
 const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
@@ -200,20 +195,78 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_DISABLE_ATTACHMENTS: '1',
 };
 
-/** Read existing settings.json, deep-merge required env keys and mcpServers, write only if changed */
+function isSettingsRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function mergeSettingsRecord(
+  base: Record<string, unknown>,
+  overlay: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const previous = merged[key];
+    merged[key] =
+      isSettingsRecord(previous) && isSettingsRecord(value)
+        ? mergeSettingsRecord(previous, value)
+        : value;
+  }
+  return merged;
+}
+
+function removePreviousSettingsProjection(
+  current: Record<string, unknown>,
+  previousProjection: Record<string, unknown>,
+): Record<string, unknown> {
+  const cleaned = { ...current };
+  for (const [key, projectedValue] of Object.entries(previousProjection)) {
+    const currentValue = cleaned[key];
+    if (isSettingsRecord(currentValue) && isSettingsRecord(projectedValue)) {
+      const nested = removePreviousSettingsProjection(
+        currentValue,
+        projectedValue,
+      );
+      if (Object.keys(nested).length === 0) delete cleaned[key];
+      else cleaned[key] = nested;
+      continue;
+    }
+    // Preserve a value edited after projection; it is now a session-owned
+    // override rather than stale native state.
+    if (JSON.stringify(currentValue) === JSON.stringify(projectedValue)) {
+      delete cleaned[key];
+    }
+  }
+  return cleaned;
+}
+
+function readSettingsRecord(filePath: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return isSettingsRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Merge the selected native layer into the isolated session settings. */
 function ensureSettingsJson(
   settingsFile: string,
   mcpServers?: Record<string, Record<string, unknown>>,
-  options?: { replaceMcpServers?: boolean },
+  options?: {
+    replaceMcpServers?: boolean;
+    baseSettings?: Record<string, unknown>;
+  },
 ): void {
-  let existing: Record<string, unknown> = {};
-  try {
-    if (fs.existsSync(settingsFile)) {
-      existing = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
-    }
-  } catch {
-    /* ignore parse errors, overwrite */
-  }
+  const projectionFile = path.join(
+    path.dirname(settingsFile),
+    '.happyclaw-native-settings.json',
+  );
+  const current = readSettingsRecord(settingsFile);
+  const previousProjection = readSettingsRecord(projectionFile);
+  const existing = mergeSettingsRecord(
+    removePreviousSettingsProjection(current, previousProjection),
+    options?.baseSettings ?? {},
+  );
 
   const existingEnv = (existing.env as Record<string, string>) || {};
   const mergedEnv = { ...existingEnv, ...REQUIRED_SETTINGS_ENV };
@@ -231,17 +284,31 @@ function ensureSettingsJson(
 
   const newContent = JSON.stringify(merged, null, 2) + '\n';
 
-  // Only write when content actually changed
+  let settingsChanged = true;
   try {
     if (fs.existsSync(settingsFile)) {
       const current = fs.readFileSync(settingsFile, 'utf8');
-      if (current === newContent) return;
+      settingsChanged = current !== newContent;
     }
   } catch {
     /* write anyway */
   }
+  if (settingsChanged) {
+    fs.writeFileSync(settingsFile, newContent, { mode: 0o644 });
+  }
 
-  fs.writeFileSync(settingsFile, newContent, { mode: 0o644 });
+  const projectionContent = `${JSON.stringify(options?.baseSettings ?? {}, null, 2)}\n`;
+  try {
+    if (
+      fs.existsSync(projectionFile) &&
+      fs.readFileSync(projectionFile, 'utf8') === projectionContent
+    ) {
+      return;
+    }
+  } catch {
+    /* write anyway */
+  }
+  fs.writeFileSync(projectionFile, projectionContent, { mode: 0o600 });
 }
 
 export interface ContainerInput {
@@ -921,7 +988,7 @@ export function buildVolumeMounts(
     managedSkillPolicy: agentProfile?.runtimePolicy?.skills,
     pluginSkillLayers: pluginSkillLayers(pluginSkills),
   });
-  reconcileSessionSkills(groupSessionsDir, claudeContextPlan.effectiveSkills, {
+  syncHostClaudeContext(claudeContextPlan, groupSessionsDir, {
     materializeLinks: false,
   });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
@@ -933,6 +1000,7 @@ export function buildVolumeMounts(
       // with the resolved layers so removed/unselected managed MCP cannot
       // survive from a previous Agent run.
       replaceMcpServers: true,
+      baseSettings: loadHostClaudeSettings(claudeContextPlan),
     },
   );
 
@@ -1167,9 +1235,9 @@ export function buildVolumeMounts(
     readonly: true,
   });
 
-  // Admin's effective Claude config: mount CLAUDE.md and rules/ into /workspace/
-  // so the SDK's directory traversal (cwd → root) discovers them at /workspace/ level.
-  // Only for admin-created workspaces; ordinary users must not inherit host-global config.
+  // Native Claude user config overlays the isolated session config. Workspace
+  // remains the SDK cwd; these read-only mounts provide the same user-level
+  // capabilities without redirecting file and shell operations into ~/.claude.
   if (claudeContextPlan.isAdminOwned) {
     if (
       claudeContextPlan.claudeMdSource &&
@@ -1177,7 +1245,7 @@ export function buildVolumeMounts(
     ) {
       mounts.push({
         hostPath: claudeContextPlan.claudeMdSource,
-        containerPath: '/workspace/CLAUDE.md',
+        containerPath: '/home/node/.claude/CLAUDE.md',
         readonly: true,
       });
     }
@@ -1187,7 +1255,15 @@ export function buildVolumeMounts(
     ) {
       mounts.push({
         hostPath: claudeContextPlan.rulesSourceDir,
-        containerPath: '/workspace/.claude/rules',
+        containerPath: '/home/node/.claude/rules',
+        readonly: true,
+      });
+    }
+    for (const entry of claudeContextPlan.nativeConfigEntries) {
+      if (!fs.existsSync(entry.sourcePath)) continue;
+      mounts.push({
+        hostPath: entry.sourcePath,
+        containerPath: entry.runtimePath,
         readonly: true,
       });
     }
@@ -1861,16 +1937,8 @@ export async function runHostAgent(
   const localJson = path.join(groupSessionsDir, '.claude.json');
   ensureSymlinkTo(localJson, ensureHostClaudeJson());
 
-  // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
-  // Load user's global MCP servers (same logic as Docker mode).
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  ensureSettingsJson(
-    settingsFile,
-    resolveRuntimeMcpServers(group, input.agentProfile),
-    { replaceMcpServers: true },
-  );
-
-  // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
+  // 3. Resolve the selected native Claude user layer. Workspace remains cwd.
+  // 4. Skills / Rules / CLAUDE.md / native capabilities project into session.
   // 宿主 Claude 配置与 HappyClaw 记忆层始终叠加，冲突通过 audit 明示。
   const hostUserSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
     group.created_by,
@@ -1902,6 +1970,15 @@ export async function runHostAgent(
   hostClaudeContextPlan.audit.claudeMd.status =
     hostClaudeContextSync.claudeMdStatus;
   hostClaudeContextPlan.audit.warnings = hostClaudeContextSync.warnings;
+  const settingsFile = path.join(groupSessionsDir, 'settings.json');
+  ensureSettingsJson(
+    settingsFile,
+    resolveRuntimeMcpServers(group, input.agentProfile),
+    {
+      replaceMcpServers: true,
+      baseSettings: loadHostClaudeSettings(hostClaudeContextPlan),
+    },
+  );
   const hostMcpManifest = buildRuntimeMcpManifest(
     group,
     input.agentProfile,

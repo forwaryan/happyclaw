@@ -220,6 +220,22 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
     });
     fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
     fs.writeFileSync(path.join(external, 'rules', 'r.md'), '# rule');
+    fs.mkdirSync(path.join(external, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(external, 'agents', 'researcher.md'), '# agent');
+    fs.mkdirSync(path.join(external, 'commands'), { recursive: true });
+    fs.writeFileSync(path.join(external, 'commands', 'review.md'), '# command');
+    fs.writeFileSync(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        env: { FROM_HOST: 'yes' },
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'true' }] }] },
+        mcpServers: { hostMcp: { command: 'host-mcp' } },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(external, 'settings.local.json'),
+      JSON.stringify({ env: { FROM_LOCAL: 'yes' }, model: 'opus' }),
+    );
     fs.writeFileSync(
       path.join(external, 'skills', 'admin-skill', 'SKILL.md'),
       '# skill',
@@ -252,18 +268,140 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
 
     expect(mounts).toContainEqual({
       hostPath: path.join(external, 'CLAUDE.md'),
-      containerPath: '/workspace/CLAUDE.md',
+      containerPath: '/home/node/.claude/CLAUDE.md',
       readonly: true,
     });
     expect(mounts).toContainEqual({
       hostPath: path.join(external, 'rules'),
-      containerPath: '/workspace/.claude/rules',
+      containerPath: '/home/node/.claude/rules',
+      readonly: true,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(external, 'agents'),
+      containerPath: '/home/node/.claude/agents',
+      readonly: true,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(external, 'commands'),
+      containerPath: '/home/node/.claude/commands',
       readonly: true,
     });
     expect(mounts).toContainEqual({
       hostPath: path.join(external, 'skills', 'admin-skill'),
       containerPath: '/workspace/effective-skills/admin-skill',
       readonly: true,
+    });
+    const sessionSettings = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          tmpDataDir,
+          'sessions',
+          'admin-workspace',
+          '.claude',
+          'settings.json',
+        ),
+        'utf8',
+      ),
+    );
+    expect(sessionSettings).toMatchObject({
+      model: 'opus',
+      env: {
+        FROM_HOST: 'yes',
+        FROM_LOCAL: 'yes',
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
+      },
+      hooks: { Stop: expect.any(Array) },
+      mcpServers: { hostMcp: { command: 'host-mcp' } },
+    });
+  });
+
+  test('reusing a session removes native settings and capability mounts after host context is disabled', () => {
+    const external = path.join(tmpDataDir, 'switchable-external-claude');
+    fs.mkdirSync(path.join(external, 'commands'), { recursive: true });
+    fs.writeFileSync(path.join(external, 'commands', 'native.md'), '# native');
+    fs.writeFileSync(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        model: 'opus',
+        env: { NATIVE_ONLY: '1' },
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'true' }] }] },
+      }),
+    );
+    writeSystemSettings({ externalClaudeDir: external });
+    const group = fakeGroup('switch-context', 'admin') as any;
+    const profile = (source: 'host_claude' | 'managed') =>
+      ({
+        id: `profile-${source}`,
+        name: source,
+        version: 1,
+        identityHash: source,
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          context: { source },
+          skills: {
+            mode: 'disabled',
+            ids: [],
+            host: { mode: 'disabled', ids: [] },
+          },
+          mcp: { mode: 'disabled', ids: [] },
+        },
+      }) as any;
+
+    const inheritedMounts = buildVolumeMounts(
+      group,
+      false,
+      true,
+      undefined,
+      'main',
+      undefined,
+      undefined,
+      undefined,
+      profile('host_claude'),
+    );
+    expect(inheritedMounts).toContainEqual({
+      hostPath: path.join(external, 'commands'),
+      containerPath: '/home/node/.claude/commands',
+      readonly: true,
+    });
+    const settingsFile = path.join(
+      tmpDataDir,
+      'sessions',
+      group.folder,
+      '.claude',
+      'settings.json',
+    );
+    expect(JSON.parse(fs.readFileSync(settingsFile, 'utf8'))).toMatchObject({
+      model: 'opus',
+      env: { NATIVE_ONLY: '1' },
+      hooks: { Stop: expect.any(Array) },
+    });
+
+    const managedMounts = buildVolumeMounts(
+      group,
+      false,
+      true,
+      undefined,
+      'main',
+      undefined,
+      undefined,
+      undefined,
+      profile('managed'),
+    );
+    expect(
+      managedMounts.some(
+        (mount) => mount.containerPath === '/home/node/.claude/commands',
+      ),
+    ).toBe(false);
+    const managedSettings = JSON.parse(
+      fs.readFileSync(settingsFile, 'utf8'),
+    ) as Record<string, unknown>;
+    expect(managedSettings).not.toHaveProperty('model');
+    expect(managedSettings).not.toHaveProperty('hooks');
+    expect(managedSettings.env).not.toHaveProperty('NATIVE_ONLY');
+    expect(managedSettings).toMatchObject({
+      env: { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0' },
+      mcpServers: {},
     });
   });
 

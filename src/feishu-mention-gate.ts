@@ -32,6 +32,15 @@ export interface MentionGateInput {
   /** 发送者 open_id（用于 owner 判断） */
   senderOpenId?: string;
   /**
+   * Context-aware Feishu plan. When present it supersedes the legacy boolean
+   * callback and can distinguish a hard-disabled chat from an already active
+   * topic whose follow-up messages no longer need another @mention.
+   */
+  conversationPlan?: {
+    disabled: boolean;
+    allowWithoutMention: boolean;
+  };
+  /**
    * 来自 happyclaw 主进程：根据该群 activation_mode / require_mention
    * 决定"是否允许免 @"。
    *   - 返回 true → always 模式，放行；
@@ -49,6 +58,8 @@ export interface MentionGateInput {
 }
 
 export type MentionGateRejectReason =
+  /** activation_mode=disabled is a hard stop, even when the bot is mentioned */
+  | 'disabled'
   /** botOpenId 未知，fail-closed 拒绝（区别于 not_mentioned，调用方应做不同的告警 / 自愈） */
   | 'bot_open_id_missing'
   /** 该群配置要求 @bot 但本条消息没 @ */
@@ -115,14 +126,19 @@ export function stripLeadingBotMention(
 export function evaluateMentionGate(
   input: MentionGateInput,
 ): MentionGateDecision {
-  if (input.chatType !== 'group' || !input.shouldProcessGroupMessage) {
+  if (input.conversationPlan?.disabled) {
+    return { allow: false, reason: 'disabled' };
+  }
+  if (
+    input.chatType !== 'group' ||
+    (!input.conversationPlan && !input.shouldProcessGroupMessage)
+  ) {
     return ALLOW;
   }
 
-  const mentionNotRequired = input.shouldProcessGroupMessage(
-    input.chatJid,
-    input.senderOpenId,
-  );
+  const mentionNotRequired =
+    input.conversationPlan?.allowWithoutMention ??
+    input.shouldProcessGroupMessage!(input.chatJid, input.senderOpenId);
   if (mentionNotRequired) {
     return ALLOW;
   }

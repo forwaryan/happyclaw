@@ -180,6 +180,7 @@ export function useImBindings() {
           | 'owner_mentioned'
           | 'disabled';
         owner_im_id?: string;
+        audience_mode?: 'everyone' | 'owner_only';
       },
     ): Promise<string | null> => {
       setError(null);

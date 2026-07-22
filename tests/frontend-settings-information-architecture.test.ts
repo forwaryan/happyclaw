@@ -268,4 +268,18 @@ describe('settings information architecture', () => {
       "group?.conversation_source === 'native_thread'",
     );
   });
+
+  test('presents Feishu response audience independently from mention activation', () => {
+    const dialog = read('web/src/components/chat/ImBindingDialog.tsx');
+    const row = read('web/src/components/settings/ImBindingRow.tsx');
+    const constants = read('web/src/constants/im.ts');
+
+    expect(constants).toContain('AUDIENCE_MODE_OPTIONS');
+    expect(constants).toContain("value: 'everyone'");
+    expect(constants).toContain("value: 'owner_only'");
+    expect(dialog).toContain('handleAudienceModeChange');
+    expect(dialog).toContain('handleActivationModeChange');
+    expect(row).toContain('onAudienceModeChange');
+    expect(row).toContain('onActivationModeChange');
+  });
 });

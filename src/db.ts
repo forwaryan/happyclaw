@@ -67,6 +67,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 import { channelConversationJid } from './channel-address.js';
 import { getChannelFromJid } from './channel-prefixes.js';
+import { parseAudienceMode } from './im-audience-policy.js';
 import {
   includeClaudePresetForMode,
   normalizeAgentProfilePrompts,
@@ -74,7 +75,7 @@ import {
 } from './agent-profile-prompts.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 56;
+const CURRENT_SCHEMA_VERSION = 58;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -658,6 +659,7 @@ export function initDatabase(): void {
       routing_mode TEXT NOT NULL DEFAULT 'single_session',
       reply_policy TEXT NOT NULL DEFAULT 'source_only',
       activation_mode TEXT NOT NULL DEFAULT 'auto',
+      audience_mode TEXT NOT NULL DEFAULT 'everyone',
       owner_im_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -706,6 +708,7 @@ export function initDatabase(): void {
       routing_mode TEXT NOT NULL DEFAULT 'single_session',
       reply_policy TEXT NOT NULL DEFAULT 'source_only',
       activation_mode TEXT NOT NULL DEFAULT 'auto',
+      audience_mode TEXT NOT NULL DEFAULT 'everyone',
       owner_im_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -1159,6 +1162,9 @@ export function initDatabase(): void {
   ensureColumn('messages', 'source_jid', 'TEXT');
   ensureColumn('registered_groups', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'is_home', 'INTEGER DEFAULT 0');
+  // v56 -> v57: cache provider chat avatars so binding lists do not need an
+  // N+1 provider lookup on every open. Provider sync refreshes this URL.
+  ensureColumn('registered_groups', 'avatar_url', 'TEXT');
   ensureColumn('users', 'avatar_url', 'TEXT');
   ensureColumn('users', 'ai_name', 'TEXT');
   ensureColumn('users', 'ai_avatar_emoji', 'TEXT');
@@ -1220,6 +1226,11 @@ export function initDatabase(): void {
   ensureColumn('registered_groups', 'mcp_mode', "TEXT DEFAULT 'inherit'");
   ensureColumn('registered_groups', 'selected_mcps', 'TEXT');
   ensureColumn('registered_groups', 'activation_mode', "TEXT DEFAULT 'auto'");
+  ensureColumn(
+    'registered_groups',
+    'audience_mode',
+    "TEXT NOT NULL DEFAULT 'everyone'",
+  );
   ensureColumn('registered_groups', 'owner_im_id', 'TEXT');
   ensureColumn('registered_groups', 'owner_claim_source', 'TEXT');
   // Existing owner anchors predate provenance and may include credentials that
@@ -1255,6 +1266,33 @@ export function initDatabase(): void {
   ensureColumn('registered_groups', 'feishu_chat_mode', 'TEXT');
   ensureColumn('registered_groups', 'feishu_group_message_type', 'TEXT');
   ensureColumn('registered_groups', 'sender_allowlist', 'TEXT');
+  ensureColumn(
+    'channel_mounts',
+    'audience_mode',
+    "TEXT NOT NULL DEFAULT 'everyone'",
+  );
+  ensureColumn(
+    'agent_channel_mounts',
+    'audience_mode',
+    "TEXT NOT NULL DEFAULT 'everyone'",
+  );
+  // v57 -> v58: split Feishu's composite owner_mentioned setting into two
+  // orthogonal policies. Other providers keep their legacy mode until their
+  // connector implements the same audience gate.
+  db.exec(`
+    UPDATE registered_groups
+    SET activation_mode = 'when_mentioned', audience_mode = 'owner_only', require_mention = 1
+    WHERE jid LIKE 'feishu:%' AND activation_mode = 'owner_mentioned';
+    UPDATE registered_groups
+    SET audience_mode = 'owner_only'
+    WHERE jid LIKE 'feishu:%' AND sender_allowlist IS NOT NULL;
+    UPDATE channel_mounts
+    SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
+    WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
+    UPDATE agent_channel_mounts
+    SET activation_mode = 'when_mentioned', audience_mode = 'owner_only'
+    WHERE channel_type = 'feishu' AND activation_mode = 'owner_mentioned';
+  `);
   ensureColumn('messages', 'token_usage', 'TEXT');
   ensureColumn('messages', 'turn_id', 'TEXT');
   ensureColumn('messages', 'session_id', 'TEXT');
@@ -1315,6 +1353,7 @@ export function initDatabase(): void {
           name TEXT NOT NULL,
           folder TEXT NOT NULL,
           added_at TEXT NOT NULL,
+          avatar_url TEXT,
           container_config TEXT,
           execution_mode TEXT DEFAULT 'container',
           custom_cwd TEXT,
@@ -1324,7 +1363,7 @@ export function initDatabase(): void {
           owner_claim_source TEXT,
           is_home INTEGER DEFAULT 0
         );
-        INSERT INTO registered_groups_new SELECT jid, name, folder, added_at, container_config, execution_mode, custom_cwd, NULL, NULL, NULL, NULL, 0 FROM registered_groups;
+        INSERT INTO registered_groups_new SELECT jid, name, folder, added_at, avatar_url, container_config, execution_mode, custom_cwd, NULL, NULL, NULL, NULL, 0 FROM registered_groups;
         DROP TABLE registered_groups;
         ALTER TABLE registered_groups_new RENAME TO registered_groups;
       `);
@@ -1370,6 +1409,7 @@ export function initDatabase(): void {
       'name',
       'folder',
       'added_at',
+      'avatar_url',
       'container_config',
       'execution_mode',
       'custom_cwd',
@@ -7643,6 +7683,7 @@ type RegisteredGroupRow = {
   name: string;
   folder: string;
   added_at: string;
+  avatar_url: string | null;
   container_config: string | null;
   execution_mode: string | null;
   custom_cwd: string | null;
@@ -7657,6 +7698,7 @@ type RegisteredGroupRow = {
   reply_policy: string | null;
   require_mention: number;
   activation_mode: string | null;
+  audience_mode: string | null;
   owner_im_id: string | null;
   owner_claim_source: string | null;
   mcp_mode: string | null;
@@ -7718,6 +7760,7 @@ function parseGroupRow(
     name: row.name,
     folder: row.folder,
     added_at: row.added_at,
+    avatar_url: row.avatar_url ?? undefined,
     containerConfig,
     executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
     customCwd: row.custom_cwd ?? undefined,
@@ -7731,6 +7774,7 @@ function parseGroupRow(
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
     activation_mode: parseActivationMode(row.activation_mode),
+    audience_mode: parseAudienceMode(row.audience_mode),
     owner_im_id: row.owner_im_id ?? undefined,
     owner_claim_source:
       row.owner_claim_source === 'explicit' ||
@@ -8008,8 +8052,8 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
     `INSERT INTO agent_channel_mounts (
       channel_jid, channel_account_id, agent_profile_id, owner_user_id, channel_type,
       workspace_jid, workspace_folder, session_id, routing_mode, reply_policy,
-      activation_mode, owner_im_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      activation_mode, audience_mode, owner_im_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(channel_jid) DO UPDATE SET
       channel_account_id = excluded.channel_account_id,
       agent_profile_id = excluded.agent_profile_id,
@@ -8021,6 +8065,7 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
       routing_mode = excluded.routing_mode,
       reply_policy = excluded.reply_policy,
       activation_mode = excluded.activation_mode,
+      audience_mode = excluded.audience_mode,
       owner_im_id = excluded.owner_im_id,
       updated_at = excluded.updated_at`,
   ).run(
@@ -8035,6 +8080,7 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
     mount.routing_mode,
     mount.reply_policy,
     mount.activation_mode,
+    mount.audience_mode,
     mount.owner_im_id ?? null,
     mount.created_at,
     mount.updated_at,
@@ -8532,12 +8578,13 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.transaction(() => {
     const existing = getRegisteredGroup(jid);
     db.prepare(
-      `INSERT INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, owner_claim_source, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO registered_groups (jid, name, folder, added_at, avatar_url, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, audience_mode, owner_im_id, owner_claim_source, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(jid) DO UPDATE SET
          name = excluded.name,
          folder = excluded.folder,
          added_at = excluded.added_at,
+         avatar_url = COALESCE(excluded.avatar_url, registered_groups.avatar_url),
          container_config = excluded.container_config,
          execution_mode = excluded.execution_mode,
          custom_cwd = excluded.custom_cwd,
@@ -8552,6 +8599,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
          reply_policy = excluded.reply_policy,
          require_mention = excluded.require_mention,
          activation_mode = excluded.activation_mode,
+         audience_mode = excluded.audience_mode,
          owner_im_id = excluded.owner_im_id,
          owner_claim_source = excluded.owner_claim_source,
          mcp_mode = excluded.mcp_mode,
@@ -8568,6 +8616,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       group.name,
       group.folder,
       group.added_at,
+      group.avatar_url ?? null,
       group.containerConfig ? JSON.stringify(group.containerConfig) : null,
       group.executionMode ?? 'container',
       group.customCwd ?? null,
@@ -8582,6 +8631,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       group.reply_policy ?? 'source_only',
       group.require_mention === true ? 1 : 0,
       group.activation_mode ?? 'auto',
+      parseAudienceMode(group.audience_mode),
       group.owner_im_id ?? null,
       group.owner_claim_source ?? null,
       'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
@@ -8606,6 +8656,27 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       syncAgentChannelMountsForWorkspaceJid(jid);
     }
   })();
+}
+
+/**
+ * Refresh the provider-hosted avatar for an already registered external chat.
+ * Discovery invokes onNewChat first, so a missing row means the chat was not
+ * admitted and must not be created as a side effect of avatar synchronization.
+ */
+export function updateRegisteredGroupAvatar(
+  jid: string,
+  avatarUrl: string,
+): boolean {
+  const normalized = avatarUrl.trim();
+  if (!normalized) return false;
+  const result = db
+    .prepare(
+      `UPDATE registered_groups
+       SET avatar_url = ?
+       WHERE jid = ? AND COALESCE(avatar_url, '') <> ?`,
+    )
+    .run(normalized, jid, normalized);
+  return result.changes > 0;
 }
 
 export function deleteRegisteredGroup(jid: string): void {
@@ -8796,6 +8867,7 @@ type ChannelMountRow = {
   routing_mode: string | null;
   reply_policy: string | null;
   activation_mode: string | null;
+  audience_mode: string | null;
   owner_im_id: string | null;
   created_at: string;
   updated_at: string;
@@ -8812,6 +8884,7 @@ function parseChannelMountRow(row: ChannelMountRow): ChannelMount {
       row.routing_mode === 'thread_map' ? 'thread_map' : 'single_session',
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     activation_mode: parseActivationMode(row.activation_mode),
+    audience_mode: parseAudienceMode(row.audience_mode),
     owner_im_id: row.owner_im_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -8853,6 +8926,7 @@ function channelMountFromRegisteredGroup(
       routing_mode: 'single_session',
       reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
       activation_mode: group.activation_mode ?? 'auto',
+      audience_mode: parseAudienceMode(group.audience_mode),
       owner_im_id: group.owner_im_id ?? null,
     };
   }
@@ -8870,6 +8944,7 @@ function channelMountFromRegisteredGroup(
         group.binding_mode === 'thread_map' ? 'thread_map' : 'single_session',
       reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
       activation_mode: group.activation_mode ?? 'auto',
+      audience_mode: parseAudienceMode(group.audience_mode),
       owner_im_id: group.owner_im_id ?? null,
     };
   }
@@ -8889,8 +8964,8 @@ export function upsertChannelMount(
     db.prepare(
       `INSERT INTO channel_mounts (
         channel_jid, channel_account_id, channel_type, workspace_jid, session_id, routing_mode,
-        reply_policy, activation_mode, owner_im_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        reply_policy, activation_mode, audience_mode, owner_im_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(channel_jid) DO UPDATE SET
         channel_account_id = excluded.channel_account_id,
         channel_type = excluded.channel_type,
@@ -8899,6 +8974,7 @@ export function upsertChannelMount(
         routing_mode = excluded.routing_mode,
         reply_policy = excluded.reply_policy,
         activation_mode = excluded.activation_mode,
+        audience_mode = excluded.audience_mode,
         owner_im_id = excluded.owner_im_id,
         updated_at = excluded.updated_at`,
     ).run(
@@ -8910,6 +8986,7 @@ export function upsertChannelMount(
       mount.routing_mode,
       mount.reply_policy,
       mount.activation_mode,
+      mount.audience_mode ?? 'everyone',
       mount.owner_im_id ?? null,
       createdAt,
       updatedAt,
@@ -9026,6 +9103,28 @@ export function getImContextBinding(
       'SELECT * FROM im_context_bindings WHERE source_jid = ? AND context_type = ? AND context_id = ?',
     )
     .get(sourceJid, contextType, contextId) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? mapImContextBindingRow(row) : undefined;
+}
+
+/**
+ * Resolve a context whose canonical ID was created before Feishu returned a
+ * thread_id. The root message remains stable across root and follow-up events.
+ */
+export function getImContextBindingByRootMessageId(
+  sourceJid: string,
+  contextType: 'thread',
+  rootMessageId: string,
+): ImContextBinding | undefined {
+  const row = db
+    .prepare(
+      `SELECT * FROM im_context_bindings
+       WHERE source_jid = ? AND context_type = ? AND root_message_id = ?
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+    )
+    .get(sourceJid, contextType, rootMessageId) as
     | Record<string, unknown>
     | undefined;
   return row ? mapImContextBindingRow(row) : undefined;

@@ -38,6 +38,7 @@ export type ConversationSource = 'manual' | 'native_thread' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
 export type ChannelRoutingMode = 'single_session' | 'thread_map';
+export type AudienceMode = 'everyone' | 'owner_only';
 
 export interface ChannelMount {
   channel_jid: string;
@@ -53,6 +54,7 @@ export interface ChannelMount {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled';
+  audience_mode: AudienceMode;
   owner_im_id?: string | null;
   created_at: string;
   updated_at: string;
@@ -61,6 +63,8 @@ export interface ChannelMount {
 /** Provider-native topic/thread metadata used by workspace thread_map routing. */
 export interface ChannelMessageMeta {
   provider?: string;
+  chatType?: 'p2p' | 'group';
+  mentionedBot?: boolean;
   nativeContextType?: 'thread';
   contextId?: string;
   threadId?: string;
@@ -78,6 +82,8 @@ export interface RegisteredGroup {
   name: string;
   folder: string;
   added_at: string;
+  /** Provider-hosted avatar URL for an external IM chat. */
+  avatar_url?: string;
   containerConfig?: ContainerConfig;
   executionMode?: ExecutionMode; // 默认 'container'
   customCwd?: string; // 宿主机模式的自定义工作目录（绝对路径）
@@ -97,7 +103,8 @@ export interface RegisteredGroup {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
-  owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
+  audience_mode?: AudienceMode; // 响应对象，与是否需要 @ 独立（默认 everyone）
+  owner_im_id?: string; // audience_mode 为 owner_only 时，仅此 IM 标识符的发送者被响应
   /** Provenance for privileged owner workflows. Weak automatic/explicit claims
    * and credential-transfer quarantine cannot authorize Agent Builder. */
   owner_claim_source?:

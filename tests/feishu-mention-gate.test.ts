@@ -36,6 +36,35 @@ describe('evaluateMentionGate', () => {
     expect(decision).toEqual({ allow: true });
   });
 
+  test('disabled plan is a hard stop even for p2p and mentioned messages', () => {
+    expect(
+      evaluateMentionGate(
+        input({
+          chatType: 'p2p',
+          mentions: [mention(BOT_OPEN_ID)],
+          conversationPlan: {
+            disabled: true,
+            allowWithoutMention: false,
+          },
+        }),
+      ),
+    ).toEqual({ allow: false, reason: 'disabled' });
+  });
+
+  test('an active topic plan allows a follow-up without another mention', () => {
+    expect(
+      evaluateMentionGate(
+        input({
+          mentions: undefined,
+          conversationPlan: {
+            disabled: false,
+            allowWithoutMention: true,
+          },
+        }),
+      ),
+    ).toEqual({ allow: true });
+  });
+
   test('未传 shouldProcessGroupMessage 时直接放行（视作"无门控"）', () => {
     const decision = evaluateMentionGate(
       input({ shouldProcessGroupMessage: undefined, botOpenId: '' }),

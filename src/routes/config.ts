@@ -27,7 +27,6 @@ import {
   getAgentProfileForWorkspace,
   getUserById,
   logAuthEvent,
-  clearSenderAllowlist,
   deleteWorkspaceSessions,
   deleteSessionsByProviderIdAroundCommit,
   getSession,
@@ -47,6 +46,8 @@ import {
   channelConversationJid,
   parseChannelAddress,
 } from '../channel-address.js';
+import { isMentionActivationMode } from '../feishu-conversation-policy.js';
+import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
 import {
   adminRoleMiddleware,
   authMiddleware,
@@ -125,7 +126,7 @@ import type {
   OAuthUsageBucket,
 } from '../runtime-config.js';
 import { parseOAuthUsageBucket } from '../runtime-config.js';
-import type { AuthUser, RegisteredGroup } from '../types.js';
+import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
@@ -4218,7 +4219,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
 
   // Parse activation_mode for activation-only update
   const rawActivationMode = body.activation_mode;
-  const activationMode =
+  let activationMode =
     typeof rawActivationMode === 'string' &&
     VALID_ACTIVATION_MODES.has(rawActivationMode)
       ? (rawActivationMode as
@@ -4228,6 +4229,18 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
           | 'owner_mentioned'
           | 'disabled')
       : undefined;
+  let audienceMode: AudienceMode | undefined =
+    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+      ? body.audience_mode
+      : undefined;
+  if (channelType === 'feishu') {
+    const normalized = normalizeLegacyOwnerMention({
+      activationMode,
+      audienceMode,
+    });
+    activationMode = normalized.activationMode;
+    audienceMode = normalized.audienceMode;
+  }
 
   // Parse owner_im_id for owner_mentioned mode
   const ownerImId =
@@ -4271,13 +4284,22 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     if (!canModifyGroup(user, { ...freshTargetGroup, jid: targetMainJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
+      return c.json(
+        { error: 'Feishu private chats do not support mention activation' },
+        400,
+      );
+    }
     // Compute against freshImGroup, not the pre-await snapshot — see
     // fetchLiveChatInfo's doc comment.
-    const threadCapable = isNativeContextContainer(
-      imJid,
-      freshImGroup,
-      chatInfo ?? {},
-    );
+    const threadCapable = isNativeContextContainer(imJid, freshImGroup, {
+      ...(chatInfo ?? {}),
+      activation_mode: activationMode ?? freshImGroup.activation_mode,
+    });
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
@@ -4298,6 +4320,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         {
           replyPolicy,
           ...(activationMode !== undefined ? { activationMode } : {}),
+          ...(audienceMode !== undefined ? { audienceMode } : {}),
           ...(ownerImId !== undefined ? { ownerImId } : {}),
         },
       ),
@@ -4326,21 +4349,66 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   }
 
   // Activation-only update (no target, just update activation_mode and/or owner_im_id)
-  if (activationMode !== undefined || ownerImId !== undefined) {
-    const updated: RegisteredGroup = {
+  if (
+    activationMode !== undefined ||
+    audienceMode !== undefined ||
+    ownerImId !== undefined
+  ) {
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      imGroup.feishu_chat_mode === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
+      return c.json(
+        { error: 'Feishu private chats do not support mention activation' },
+        400,
+      );
+    }
+    const candidate: RegisteredGroup = {
       ...imGroup,
       ...(activationMode !== undefined
         ? { activation_mode: activationMode }
         : {}),
+      ...(audienceMode !== undefined ? { audience_mode: audienceMode } : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
       ...(ownerImId !== undefined
         ? { owner_claim_source: 'configured' as const }
         : {}),
     };
+    const threadCapable = isNativeContextContainer(imJid, candidate, {
+      activation_mode: candidate.activation_mode,
+    });
+    if (threadCapable && candidate.target_agent_id) {
+      return c.json(
+        {
+          error:
+            'Mention-activated and native-topic Feishu chats must bind to a workspace, not a fixed session',
+        },
+        400,
+      );
+    }
+    const updated = candidate.target_main_jid
+      ? buildWorkspaceMountUpdate(
+          candidate,
+          candidate.target_main_jid,
+          threadCapable ? 'thread_map' : 'single_session',
+          {
+            activationMode: candidate.activation_mode,
+            audienceMode: candidate.audience_mode,
+            ownerImId: candidate.owner_im_id ?? null,
+          },
+        )
+      : candidate;
     applyBindingUpdate(imJid, updated);
+    if (imGroup.binding_mode === 'thread_map' && !threadCapable) {
+      detachThreadMapWorkspaceIfLast(imGroup.target_main_jid, imJid);
+    }
+    if (threadCapable && updated.target_main_jid) {
+      markNativeContextWorkspace(updated.target_main_jid);
+    }
     logger.info(
-      { imJid, activationMode, ownerImId, userId: user.id },
-      'IM group activation_mode updated (bindings page)',
+      { imJid, activationMode, audienceMode, ownerImId, userId: user.id },
+      'IM group response policies updated (bindings page)',
     );
     return c.json({ success: true });
   }
@@ -4348,16 +4416,15 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   return c.json(
     {
       error:
-        'Must provide target_main_jid, target_session_id, target_agent_id, activation_mode, or unbind',
+        'Must provide target_main_jid, target_session_id, target_agent_id, activation_mode, audience_mode, or unbind',
     },
     400,
   );
 });
 
-// Reset sender_allowlist to NULL (unrestricted) — escape hatch for the
-// "owner-locked trap" where buildOnNewChat registered the group with `[]`
-// because the Feishu owner had not DM'd the bot yet. After reset, anyone
-// in the group can trigger the bot.
+// Escape hatch for the pre-owner Feishu lock. Reset both the legacy allowlist
+// and the v58 audience policy so the visible "解除限制" action truly allows
+// everyone to trigger the bot.
 configRoutes.post(
   '/user-im/bindings/:imJid/reset-allowlist',
   authMiddleware,
@@ -4390,18 +4457,16 @@ configRoutes.post(
       return c.json({ error: 'Group is not in locked allowlist state' }, 400);
     }
 
-    clearSenderAllowlist(imJid);
-
-    const updated = { ...imGroup, sender_allowlist: undefined };
-    const webDeps = getWebDeps();
-    if (webDeps) {
-      const groups = webDeps.getRegisteredGroups();
-      if (groups[imJid]) groups[imJid] = updated;
-    }
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      sender_allowlist: undefined,
+      audience_mode: 'everyone',
+    };
+    applyBindingUpdate(imJid, updated);
 
     logger.info(
       { imJid, userId: user.id },
-      'Sender allowlist cleared (manual reset from bindings page)',
+      'Feishu response audience reset to everyone (bindings page)',
     );
     return c.json({ success: true });
   },

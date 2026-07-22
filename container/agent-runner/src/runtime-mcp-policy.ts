@@ -5,7 +5,7 @@ export interface ResolvedAgentMcpPolicy {
   skipPluginMcpDiscovery: boolean;
   includeUserMcpServers: boolean;
   strictMcpConfig: boolean;
-  settingSources: Array<'project' | 'user'>;
+  settingSources: Array<'project' | 'user' | 'local'>;
 }
 
 export function parseAgentMcpPolicyMode(
@@ -29,6 +29,6 @@ export function resolveAgentMcpPolicy(
     skipPluginMcpDiscovery: exactUserMcpSet,
     includeUserMcpServers: true,
     strictMcpConfig: exactUserMcpSet,
-    settingSources: ['project', 'user'],
+    settingSources: ['project', 'user', 'local'],
   };
 }

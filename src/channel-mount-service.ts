@@ -9,6 +9,7 @@ import type {
 import { getChannelType } from './im-channel.js';
 import { parseChannelAddress } from './channel-address.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
+import { requiresMention as feishuRequiresMention } from './feishu-conversation-policy.js';
 import {
   getChannelAccount,
   getAllRegisteredGroups,
@@ -32,6 +33,7 @@ export interface ChannelMountResolutionDeps {
 export interface ChannelMountUpdateOptions {
   replyPolicy?: 'source_only' | 'mirror';
   activationMode?: ChannelMount['activation_mode'];
+  audienceMode?: ChannelMount['audience_mode'];
   ownerImId?: string | null;
 }
 
@@ -40,6 +42,7 @@ export interface NativeContextMetadata {
   group_message_type?: string | null;
   native_context_type?: string | null;
   thread_capable?: boolean | null;
+  activation_mode?: RegisteredGroup['activation_mode'] | null;
 }
 
 export interface RestoreDefaultChannelMountDeps {
@@ -123,14 +126,27 @@ export function isNativeContextContainer(
   liveInfo: NativeContextMetadata = {},
 ): boolean {
   const persisted = group as RegisteredGroup & NativeContextMetadata;
+  const channelType = getChannelType(channelJid);
+  const chatMode =
+    liveInfo.chat_mode ?? persisted.chat_mode ?? group.feishu_chat_mode;
+  const groupMessageType =
+    liveInfo.group_message_type ??
+    persisted.group_message_type ??
+    group.feishu_group_message_type;
+  if (channelType === 'feishu') {
+    if (chatMode === 'topic' || groupMessageType === 'thread') return true;
+    if (chatMode === 'p2p') return false;
+    if (chatMode === 'group') {
+      return feishuRequiresMention(
+        liveInfo.activation_mode ?? group.activation_mode,
+        group.require_mention,
+      );
+    }
+  }
   return isThreadMapCapableChat({
-    channel_type: getChannelType(channelJid),
-    chat_mode:
-      liveInfo.chat_mode ?? persisted.chat_mode ?? group.feishu_chat_mode,
-    group_message_type:
-      liveInfo.group_message_type ??
-      persisted.group_message_type ??
-      group.feishu_group_message_type,
+    channel_type: channelType,
+    chat_mode: chatMode,
+    group_message_type: groupMessageType,
     native_context_type:
       liveInfo.native_context_type ?? persisted.native_context_type,
     thread_capable: liveInfo.thread_capable ?? persisted.thread_capable,
@@ -334,6 +350,7 @@ export function normalizeChannelMountFromGroup(
       routing_mode: 'single_session',
       reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
       activation_mode: group.activation_mode ?? 'auto',
+      audience_mode: group.audience_mode ?? 'everyone',
       owner_im_id: group.owner_im_id ?? null,
     };
   }
@@ -350,6 +367,7 @@ export function normalizeChannelMountFromGroup(
       routing_mode: toRoutingMode(group),
       reply_policy: group.reply_policy === 'mirror' ? 'mirror' : 'source_only',
       activation_mode: group.activation_mode ?? 'auto',
+      audience_mode: group.audience_mode ?? 'everyone',
       owner_im_id: group.owner_im_id ?? null,
     };
   }
@@ -429,6 +447,9 @@ export function buildSessionMountUpdate(
     ...(options.activationMode !== undefined
       ? { activation_mode: options.activationMode }
       : {}),
+    ...(options.audienceMode !== undefined
+      ? { audience_mode: options.audienceMode }
+      : {}),
     ...(options.ownerImId !== undefined
       ? { owner_im_id: options.ownerImId ?? undefined }
       : {}),
@@ -450,6 +471,9 @@ export function buildWorkspaceMountUpdate(
     reply_policy: options.replyPolicy ?? group.reply_policy ?? 'source_only',
     ...(options.activationMode !== undefined
       ? { activation_mode: options.activationMode }
+      : {}),
+    ...(options.audienceMode !== undefined
+      ? { audience_mode: options.audienceMode }
       : {}),
     ...(options.ownerImId !== undefined
       ? { owner_im_id: options.ownerImId ?? undefined }

@@ -129,4 +129,38 @@ describe('native context persistence', () => {
       root_message_id: 'telegram-root',
     });
   });
+
+  test('resolves a Feishu context by its stable root after thread_id appears', () => {
+    const now = new Date().toISOString();
+    db.upsertImContextBinding({
+      source_jid: 'feishu:ordinary-group',
+      context_type: 'thread',
+      context_id: 'om_mention_root',
+      workspace_jid: 'web:workspace',
+      agent_id: 'session-from-mention',
+      root_message_id: 'om_mention_root',
+      title: 'Mention topic',
+      last_active_at: now,
+      created_at: now,
+      updated_at: now,
+    });
+
+    expect(
+      db.getImContextBindingByRootMessageId(
+        'feishu:ordinary-group',
+        'thread',
+        'om_mention_root',
+      ),
+    ).toMatchObject({
+      context_id: 'om_mention_root',
+      agent_id: 'session-from-mention',
+    });
+    expect(
+      db.getImContextBindingByRootMessageId(
+        'feishu:another-group',
+        'thread',
+        'om_mention_root',
+      ),
+    ).toBeUndefined();
+  });
 });

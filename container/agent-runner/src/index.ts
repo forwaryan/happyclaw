@@ -335,6 +335,17 @@ function runtimeContextAuditBase(
       status: 'unknown',
       fileCount: 0,
     },
+    nativeConfig: containerInput.contextAudit?.nativeConfig
+      ? {
+          ...containerInput.contextAudit.nativeConfig,
+          settingSources: [
+            ...containerInput.contextAudit.nativeConfig.settingSources,
+          ],
+          entries: containerInput.contextAudit.nativeConfig.entries.map(
+            (entry) => ({ ...entry }),
+          ),
+        }
+      : undefined,
     skills: {
       ...(containerInput.contextAudit?.skills ?? { sources: [] }),
       manifestHash:

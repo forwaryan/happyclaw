@@ -458,6 +458,7 @@ interface ChatState {
     force?: boolean,
     activationMode?: string,
     ownerImId?: string,
+    audienceMode?: 'everyone' | 'owner_only',
   ) => Promise<boolean>;
   unbindMainImGroup: (jid: string, imJid: string) => Promise<boolean>;
   // Draft persistence across route navigation
@@ -3711,7 +3712,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  bindMainImGroup: async (jid, imJid, force, activationMode, ownerImId) => {
+  bindMainImGroup: async (
+    jid,
+    imJid,
+    force,
+    activationMode,
+    ownerImId,
+    audienceMode,
+  ) => {
     try {
       await api.put(
         `/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding`,
@@ -3720,6 +3728,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...(force ? { force: true } : {}),
           ...(activationMode ? { activation_mode: activationMode } : {}),
           ...(ownerImId ? { owner_im_id: ownerImId } : {}),
+          ...(audienceMode ? { audience_mode: audienceMode } : {}),
         },
       );
       await get().loadGroups();

@@ -20,11 +20,21 @@ beforeAll(() => {
     CREATE TABLE registered_groups (
       jid TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL,
       added_at TEXT NOT NULL, container_config TEXT, created_by TEXT,
-      is_home INTEGER DEFAULT 0
+      is_home INTEGER DEFAULT 0, activation_mode TEXT, owner_im_id TEXT
     );
-    INSERT INTO registered_groups VALUES (
+    INSERT INTO registered_groups (
+      jid, name, folder, added_at, container_config, created_by, is_home
+    ) VALUES (
       'telegram:legacy-chat', 'Legacy', 'legacy-folder',
       '2026-07-01T00:00:00.000Z', NULL, 'legacy-owner', 0
+    );
+    INSERT INTO registered_groups (
+      jid, name, folder, added_at, container_config, created_by, is_home,
+      activation_mode, owner_im_id
+    ) VALUES (
+      'feishu:legacy-owner-chat', 'Legacy owner chat', 'legacy-folder',
+      '2026-07-01T00:00:00.000Z', NULL, 'legacy-owner', 0,
+      'owner_mentioned', 'ou_owner'
     );
     CREATE TABLE channel_mounts (
       channel_jid TEXT PRIMARY KEY, channel_type TEXT NOT NULL,
@@ -49,10 +59,16 @@ describe('schema v50 channel account protocol lifecycle', () => {
   test('adds account metadata and account dimensions without rewriting legacy JIDs', async () => {
     const db = await import('../src/db.js');
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('56');
+    expect(db.getRouterState('schema_version')).toBe('58');
     expect(db.getRegisteredGroup('telegram:legacy-chat')).toMatchObject({
       channel_account_id: undefined,
       created_by: 'legacy-owner',
+    });
+    expect(db.getRegisteredGroup('feishu:legacy-owner-chat')).toMatchObject({
+      activation_mode: 'when_mentioned',
+      audience_mode: 'owner_only',
+      owner_im_id: 'ou_owner',
+      require_mention: true,
     });
 
     const account = db.createChannelAccount({
@@ -97,6 +113,7 @@ describe('schema v50 channel account protocol lifecycle', () => {
       expect(columns.map((column) => column.name)).toContain(
         'channel_account_id',
       );
+      expect(columns.map((column) => column.name)).toContain('audience_mode');
     }
     const accountColumns = raw
       .prepare('PRAGMA table_info(channel_accounts)')

@@ -98,7 +98,9 @@ describe('Agent prompt and capability frontend contract', () => {
       'web/src/components/settings/SystemSettingsSection.tsx',
     );
 
-    expect(profiles).toMatch(/宿主机 Skills 在“能力配置”中单独设置/);
+    expect(profiles).toMatch(
+      /HappyClaw MCP[\s\S]*宿主机 Skills[\s\S]*“能力配置”独立控制/,
+    );
     expect(profiles).toContain("skill.source === 'external' && skill.enabled");
     expect(skillEditor).toMatch(/不使用[\s\S]*选择部分[\s\S]*全部使用/);
     expect(skillEditor).toContain('来自 ~/.claude/skills，可单独启用');

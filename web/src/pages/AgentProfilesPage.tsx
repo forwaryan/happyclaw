@@ -1301,12 +1301,14 @@ export function AgentProfilesPage() {
                         <div className="flex items-start justify-between gap-4 rounded-lg border bg-muted/20 px-3 py-3">
                           <div className="min-w-0">
                             <div className="text-sm font-medium text-foreground">
-                              加载宿主机 Prompt、Rules 与 MCP
+                              加载完整宿主机 Claude Code 配置
                             </div>
                             <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                              复用宿主机 ~/.claude 中的提示词、Rules 与 MCP。
-                              宿主机 Skills
-                              在“能力配置”中单独设置，不会被这个开关隐式启用。
+                              将 ~/.claude 作为用户配置层叠加，包含提示词、
+                              Rules、Agents、Commands、Hooks、Workflows、 Output
+                              Styles、Plugins 与设置（含宿主机 MCP）。工作区仍是
+                              运行目录；HappyClaw MCP 与宿主机 Skills
+                              继续由“能力配置”独立控制。
                             </div>
                           </div>
                           <Switch
@@ -1316,7 +1318,7 @@ export function AgentProfilesPage() {
                                 checked ? 'host_claude' : 'managed',
                               )
                             }
-                            aria-label="加载宿主机 Prompt、Rules 与 MCP"
+                            aria-label="加载完整宿主机 Claude Code 配置"
                           />
                         </div>
                       )}
@@ -1328,8 +1330,9 @@ export function AgentProfilesPage() {
                       <div className="border-b px-5 py-4">
                         <h2 className="text-sm font-semibold">宿主机配置</h2>
                         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                          决定是否加载管理员宿主机的 Prompt、Rules 与 MCP；
-                          宿主机 Skills 在“能力配置”中单独设置。
+                          决定是否将管理员的 ~/.claude 作为完整用户配置层叠加；
+                          工作区仍是运行目录。宿主机 MCP 随配置加载，HappyClaw
+                          MCP 与宿主机 Skills 在“能力配置”中独立设置。
                         </p>
                       </div>
                       <div
@@ -1348,8 +1351,8 @@ export function AgentProfilesPage() {
                             HappyClaw 托管
                           </span>
                           <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                            不加载宿主机 Prompt、Rules 与 MCP。Skills
-                            仍按下一步的来源策略加载。
+                            不加载宿主机原生配置。Skills 与 MCP
+                            仍按下一步的独立能力策略加载。
                           </span>
                         </button>
                         <button
@@ -1364,8 +1367,9 @@ export function AgentProfilesPage() {
                             加载宿主机 ~/.claude
                           </span>
                           <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                            加载提示词、Rules 与 MCP；宿主机 Skills
-                            仍由下一步单独控制。
+                            加载设置、提示词、Rules、Agents、Commands、Hooks、
+                            Workflows、Output Styles、Plugins 与宿主机 MCP；
+                            HappyClaw MCP 和宿主机 Skills 仍由下一步单独控制。
                           </span>
                         </button>
                       </div>
@@ -1443,7 +1447,7 @@ export function AgentProfilesPage() {
                           label="宿主机配置"
                           value={
                             contextSource === 'host_claude'
-                              ? '加载 Prompt、Rules 与 MCP'
+                              ? '完整加载 ~/.claude（宿主机 Skills 独立）'
                               : '不加载'
                           }
                         />

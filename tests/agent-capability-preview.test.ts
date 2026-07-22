@@ -86,6 +86,12 @@ beforeAll(() => {
   fs.mkdirSync(path.join(externalDir, 'rules'), { recursive: true });
   fs.writeFileSync(path.join(externalDir, 'CLAUDE.md'), '# host');
   fs.writeFileSync(path.join(externalDir, 'rules', 'rule.md'), '# rule');
+  fs.mkdirSync(path.join(externalDir, 'agents'), { recursive: true });
+  fs.writeFileSync(
+    path.join(externalDir, 'agents', 'researcher.md'),
+    '# agent',
+  );
+  fs.writeFileSync(path.join(externalDir, 'keybindings.json'), '{}');
   fs.writeFileSync(
     path.join(externalDir, 'settings.json'),
     JSON.stringify({ mcpServers: { shared: { command: 'host' } } }),
@@ -180,6 +186,13 @@ describe('buildAgentCapabilityPreview', () => {
       source: 'host_claude',
       claudeMd: true,
       rules: 1,
+      nativeConfig: {
+        settingsFiles: ['settings.json'],
+        entries: [
+          { name: 'agents', kind: 'directory', entryCount: 1 },
+          { name: 'keybindings.json', kind: 'file' },
+        ],
+      },
     });
     expect(preview.skills.entries).toEqual(
       expect.arrayContaining([

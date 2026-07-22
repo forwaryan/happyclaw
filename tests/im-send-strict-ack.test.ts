@@ -10,6 +10,7 @@ const controls = vi.hoisted(() => ({
   feishuFileCreate: vi.fn(),
   feishuChatList: vi.fn(),
   updateChatName: vi.fn(),
+  updateRegisteredGroupAvatar: vi.fn(),
   telegramSendMessage: vi.fn(),
   telegramSendPhoto: vi.fn(),
   telegramSendAnimation: vi.fn(),
@@ -52,6 +53,7 @@ vi.mock('../src/db.js', async (importOriginal) => {
   return {
     ...real,
     updateChatName: controls.updateChatName,
+    updateRegisteredGroupAvatar: controls.updateRegisteredGroupAvatar,
   };
 });
 
@@ -119,7 +121,11 @@ beforeEach(() => {
   controls.feishuChatList.mockResolvedValue({
     data: {
       items: [
-        { chat_id: 'oc_visible', name: '已加入的群' },
+        {
+          chat_id: 'oc_visible',
+          name: '已加入的群',
+          avatar: 'https://example.com/visible.png',
+        },
         { chat_id: 'oc_unnamed' },
       ],
       has_more: false,
@@ -183,6 +189,10 @@ describe('IM strict send acknowledgement', () => {
     expect(controls.updateChatName).toHaveBeenCalledWith(
       'feishu:oc_visible#account:secondary',
       '已加入的群',
+    );
+    expect(controls.updateRegisteredGroupAvatar).toHaveBeenCalledWith(
+      'feishu:oc_visible#account:secondary',
+      'https://example.com/visible.png',
     );
   });
 

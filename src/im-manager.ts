@@ -25,6 +25,7 @@ import type {
   DiscordGuildInfo,
 } from './discord.js';
 import { type FeishuConnectionConfig } from './feishu.js';
+import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import type { TelegramConnectionConfig } from './telegram.js';
 import type { QQConnectionConfig } from './qq.js';
 import type {
@@ -169,6 +170,10 @@ export interface ConnectFeishuOptions {
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
+  resolveFeishuConversationPlan?: (
+    chatJid: string,
+    messageMeta: ChannelMessageMeta,
+  ) => FeishuConversationPlan;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   onCardInterrupt?: (
@@ -416,6 +421,14 @@ export class IMConnectionManager {
             shouldProcessGroupMessage: (jid: string, sender?: string) =>
               inboundAllowed() &&
               opts.shouldProcessGroupMessage!(scope(jid), sender),
+          }
+        : {}),
+      ...(opts.resolveFeishuConversationPlan
+        ? {
+            resolveFeishuConversationPlan: (
+              jid: string,
+              meta: ChannelMessageMeta,
+            ) => opts.resolveFeishuConversationPlan!(scope(jid), meta),
           }
         : {}),
       ...(opts.isGroupOwnerMessage
@@ -1047,6 +1060,7 @@ export class IMConnectionManager {
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
+        resolveFeishuConversationPlan: options?.resolveFeishuConversationPlan,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
         isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
         onCardInterrupt: options?.onCardInterrupt,

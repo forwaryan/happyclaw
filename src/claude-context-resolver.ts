@@ -11,6 +11,33 @@ import {
   type ManagedSkillPolicy,
 } from './effective-skill-resolver.js';
 
+/**
+ * Native Claude Code capability directories that belong to the user config
+ * layer. Skills stay out of this list because HappyClaw governs them with an
+ * independent, per-Agent policy.
+ */
+export const HOST_CLAUDE_NATIVE_DIRECTORIES = [
+  'agents',
+  'commands',
+  'hooks',
+  'workflows',
+  'output-styles',
+  'plugins',
+] as const;
+
+export const HOST_CLAUDE_NATIVE_FILES = ['keybindings.json'] as const;
+export const HOST_CLAUDE_SETTINGS_FILES = [
+  'settings.json',
+  'settings.local.json',
+] as const;
+
+export interface ClaudeNativeConfigEntry {
+  name: string;
+  kind: 'file' | 'directory';
+  sourcePath: string;
+  runtimePath: string;
+}
+
 export interface ClaudeContextPlanArgs {
   executionMode: 'host' | 'container';
   group: RegisteredGroup;
@@ -41,6 +68,8 @@ export interface ClaudeContextPlan {
   externalClaudeDir: string;
   claudeMdSource?: string;
   rulesSourceDir?: string;
+  nativeConfigEntries: ClaudeNativeConfigEntry[];
+  settingsSourceFiles: string[];
   externalSkillsDir?: string;
   builtinSkillsDir: string;
   projectSkillsDir: string;
@@ -53,6 +82,14 @@ export interface ClaudeContextPlan {
 export interface HostClaudeContextSyncResult {
   claudeMdStatus: ClaudeContextAudit['claudeMd']['status'];
   warnings: string[];
+}
+
+export interface SyncHostClaudeContextOptions {
+  /**
+   * Host mode materializes symlinks. Container mode only clears stale session
+   * links because Docker supplies read-only nested mounts at the same paths.
+   */
+  materializeLinks?: boolean;
 }
 
 function exists(p: string | undefined): p is string {
@@ -83,6 +120,17 @@ function countRuleFiles(dir: string | undefined): number {
   }
 }
 
+function countConfigEntries(configPath: string): number | undefined {
+  if (!exists(configPath)) return undefined;
+  try {
+    return fs.statSync(configPath).isDirectory()
+      ? fs.readdirSync(configPath).length
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function fileTokenEstimate(filePath: string | undefined): number | undefined {
   if (!exists(filePath)) return undefined;
   try {
@@ -99,6 +147,48 @@ function removePath(p: string): void {
   } catch {
     /* best effort */
   }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function mergeSettings(
+  base: Record<string, unknown>,
+  overlay: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const previous = merged[key];
+    merged[key] =
+      isPlainRecord(previous) && isPlainRecord(value)
+        ? mergeSettings(previous, value)
+        : value;
+  }
+  return merged;
+}
+
+/**
+ * Load the complete native user settings layer in Claude Code precedence
+ * order. The caller applies HappyClaw's required env and effective MCP policy
+ * afterward, so enabling native context cannot bypass those explicit controls.
+ */
+export function loadHostClaudeSettings(
+  plan: ClaudeContextPlan,
+): Record<string, unknown> {
+  if (!plan.isAdminOwned) return {};
+  let merged: Record<string, unknown> = {};
+  for (const settingsFile of plan.settingsSourceFiles) {
+    if (!exists(settingsFile)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+      if (isPlainRecord(parsed)) merged = mergeSettings(merged, parsed);
+    } catch {
+      // Invalid native settings are surfaced by Claude Code when used
+      // directly. HappyClaw skips the invalid layer to keep startup usable.
+    }
+  }
+  return merged;
 }
 
 function linkEntries(
@@ -147,6 +237,34 @@ export function buildClaudeContextPlan(
   const externalSkillsDir = includeHostSkills
     ? path.join(args.externalClaudeDir, 'skills')
     : undefined;
+  const sessionConfigDir = args.groupSessionsDir;
+  const nativeConfigEntries = includeHostClaudeContext
+    ? [
+        ...HOST_CLAUDE_NATIVE_DIRECTORIES.map((name) => ({
+          name,
+          kind: 'directory' as const,
+          sourcePath: path.join(args.externalClaudeDir, name),
+          runtimePath:
+            args.executionMode === 'container'
+              ? `/home/node/.claude/${name}`
+              : path.join(sessionConfigDir ?? '', name),
+        })),
+        ...HOST_CLAUDE_NATIVE_FILES.map((name) => ({
+          name,
+          kind: 'file' as const,
+          sourcePath: path.join(args.externalClaudeDir, name),
+          runtimePath:
+            args.executionMode === 'container'
+              ? `/home/node/.claude/${name}`
+              : path.join(sessionConfigDir ?? '', name),
+        })),
+      ]
+    : [];
+  const settingsSourceFiles = includeHostClaudeContext
+    ? HOST_CLAUDE_SETTINGS_FILES.map((name) =>
+        path.join(args.externalClaudeDir, name),
+      )
+    : [];
   const builtinSkillsDir = path.join(args.dataDir, 'builtin-skills');
   const projectSkillsDir = path.join(args.projectRoot, 'container', 'skills');
   const userSkillsDir =
@@ -262,7 +380,7 @@ export function buildClaudeContextPlan(
       sourcePath: claudeMdSource,
       runtimePath:
         args.executionMode === 'container'
-          ? '/workspace/CLAUDE.md'
+          ? '/home/node/.claude/CLAUDE.md'
           : hostClaudeRuntime,
       status: exists(claudeMdSource)
         ? args.executionMode === 'container'
@@ -277,7 +395,7 @@ export function buildClaudeContextPlan(
       sourcePath: rulesSourceDir,
       runtimePath:
         args.executionMode === 'container'
-          ? '/workspace/.claude/rules'
+          ? '/home/node/.claude/rules'
           : hostRulesRuntime,
       status: exists(rulesSourceDir)
         ? args.executionMode === 'container'
@@ -287,6 +405,43 @@ export function buildClaudeContextPlan(
           ? 'missing'
           : 'unavailable',
       fileCount: countRuleFiles(rulesSourceDir),
+    },
+    nativeConfig: {
+      enabled: includeHostClaudeContext,
+      settingSources: ['user', 'project', 'local'],
+      entries: [
+        ...HOST_CLAUDE_SETTINGS_FILES.map((name) => {
+          const sourcePath = path.join(args.externalClaudeDir, name);
+          return {
+            name,
+            kind: 'settings' as const,
+            ...(includeHostClaudeContext ? { sourcePath } : {}),
+            runtimePath:
+              args.executionMode === 'container'
+                ? '/home/node/.claude/settings.json'
+                : sessionConfigDir
+                  ? path.join(sessionConfigDir, 'settings.json')
+                  : undefined,
+            status: !includeHostClaudeContext
+              ? ('unavailable' as const)
+              : exists(sourcePath)
+                ? ('merged' as const)
+                : ('missing' as const),
+          };
+        }),
+        ...nativeConfigEntries.map((entry) => ({
+          name: entry.name,
+          kind: entry.kind,
+          sourcePath: entry.sourcePath,
+          runtimePath: entry.runtimePath,
+          status: exists(entry.sourcePath)
+            ? args.executionMode === 'container'
+              ? ('mounted' as const)
+              : ('linked' as const)
+            : ('missing' as const),
+          entryCount: countConfigEntries(entry.sourcePath),
+        })),
+      ],
     },
     skills: {
       totalSkills: effectiveSkills.candidates.length,
@@ -305,6 +460,8 @@ export function buildClaudeContextPlan(
     externalClaudeDir: args.externalClaudeDir,
     claudeMdSource,
     rulesSourceDir,
+    nativeConfigEntries,
+    settingsSourceFiles,
     externalSkillsDir,
     builtinSkillsDir,
     projectSkillsDir,
@@ -318,12 +475,14 @@ export function buildClaudeContextPlan(
 export function syncHostClaudeContext(
   plan: ClaudeContextPlan,
   groupSessionsDir: string,
+  options: SyncHostClaudeContextOptions = {},
 ): HostClaudeContextSyncResult {
+  const materializeLinks = options.materializeLinks !== false;
   const warnings = [...plan.audit.warnings];
   const skillSync = reconcileSessionSkills(
     groupSessionsDir,
     plan.effectiveSkills,
-    { materializeLinks: true },
+    { materializeLinks },
   );
   for (const name of plan.effectiveSkills.conflicts) {
     warnings.push(`skill name conflict: ${name}（后序来源覆盖前序）`);
@@ -342,14 +501,41 @@ export function syncHostClaudeContext(
     }
   }
   linkEntries(
-    plan.rulesSourceDir,
+    materializeLinks ? plan.rulesSourceDir : undefined,
     rulesDir,
     (entry) => entry.isFile() || entry.isDirectory() || entry.isSymbolicLink(),
   );
 
+  // These paths are HappyClaw-owned projections of the selected native user
+  // config. Always remove a previous Agent's projection first so disabling or
+  // changing the policy cannot leak stale capabilities into the next run.
+  for (const name of [
+    ...HOST_CLAUDE_NATIVE_DIRECTORIES,
+    ...HOST_CLAUDE_NATIVE_FILES,
+  ]) {
+    removePath(path.join(groupSessionsDir, name));
+  }
+  if (materializeLinks) {
+    for (const entry of plan.nativeConfigEntries) {
+      if (!exists(entry.sourcePath)) continue;
+      try {
+        fs.symlinkSync(
+          entry.sourcePath,
+          path.join(groupSessionsDir, entry.name),
+        );
+      } catch {
+        warnings.push(`failed to link native Claude config: ${entry.name}`);
+      }
+    }
+  }
+
   let claudeMdStatus = plan.audit.claudeMd.status;
   const sessionClaudeMd = path.join(groupSessionsDir, 'CLAUDE.md');
-  if (!plan.claudeMdSource || !fs.existsSync(plan.claudeMdSource)) {
+  if (
+    !materializeLinks ||
+    !plan.claudeMdSource ||
+    !fs.existsSync(plan.claudeMdSource)
+  ) {
     // A previous host_claude Agent may have linked the native playbook into
     // this shared workspace session. Remove only resolver-owned symlinks when
     // the next Agent does not opt in; preserve real session-authored files.

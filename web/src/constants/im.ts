@@ -5,3 +5,8 @@ export const ACTIVATION_MODE_OPTIONS = [
   { value: 'auto', label: '使用会话默认策略' },
   { value: 'disabled', label: '暂停响应' },
 ] as const;
+
+export const AUDIENCE_MODE_OPTIONS = [
+  { value: 'everyone', label: '响应所有人' },
+  { value: 'owner_only', label: '仅响应主人' },
+] as const;

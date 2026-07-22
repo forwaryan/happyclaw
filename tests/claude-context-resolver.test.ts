@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
 import {
   buildClaudeContextPlan,
+  loadHostClaudeSettings,
   syncHostClaudeContext,
 } from '../src/claude-context-resolver.js';
 
@@ -47,6 +48,21 @@ describe('ClaudeContextResolver', () => {
 
     writeFile(path.join(external, 'CLAUDE.md'), '# admin playbook');
     writeFile(path.join(external, 'rules', 'browser.md'), '# browser rule');
+    writeFile(path.join(external, 'agents', 'researcher.md'), '# researcher');
+    writeFile(path.join(external, 'commands', 'review.md'), '# review');
+    writeFile(path.join(external, 'hooks', 'on-stop.sh'), '#!/bin/sh');
+    writeFile(path.join(external, 'workflows', 'research.md'), '# workflow');
+    writeFile(path.join(external, 'output-styles', 'concise.md'), '# concise');
+    writeFile(path.join(external, 'plugins', 'config.json'), '{}');
+    writeFile(path.join(external, 'keybindings.json'), '{}');
+    writeFile(
+      path.join(external, 'settings.json'),
+      JSON.stringify({ env: { HOST_BASE: '1' }, hooks: { Stop: ['base'] } }),
+    );
+    writeFile(
+      path.join(external, 'settings.local.json'),
+      JSON.stringify({ env: { HOST_LOCAL: '1' }, model: 'opus' }),
+    );
     makeSkill(path.join(external, 'skills'), 'external-skill');
     makeSkill(path.join(dataDir, 'builtin-skills'), 'builtin-skill');
     makeSkill(path.join(projectRoot, 'container', 'skills'), 'project-skill');
@@ -79,6 +95,28 @@ describe('ClaudeContextResolver', () => {
     expect(fs.readlinkSync(path.join(sessionDir, 'CLAUDE.md'))).toBe(
       path.join(external, 'CLAUDE.md'),
     );
+    for (const name of [
+      'agents',
+      'commands',
+      'hooks',
+      'workflows',
+      'output-styles',
+      'plugins',
+      'keybindings.json',
+    ]) {
+      expect(fs.readlinkSync(path.join(sessionDir, name))).toBe(
+        path.join(external, name),
+      );
+    }
+    expect(loadHostClaudeSettings(plan)).toMatchObject({
+      env: { HOST_BASE: '1', HOST_LOCAL: '1' },
+      hooks: { Stop: ['base'] },
+      model: 'opus',
+    });
+    expect(plan.audit.nativeConfig).toMatchObject({
+      enabled: true,
+      settingSources: ['user', 'project', 'local'],
+    });
     expect(fs.readlinkSync(path.join(sessionDir, 'rules', 'browser.md'))).toBe(
       path.join(external, 'rules', 'browser.md'),
     );
@@ -139,12 +177,12 @@ describe('ClaudeContextResolver', () => {
     });
     expect(adminPlan.audit.claudeMd).toMatchObject({
       sourcePath: path.join(external, 'CLAUDE.md'),
-      runtimePath: '/workspace/CLAUDE.md',
+      runtimePath: '/home/node/.claude/CLAUDE.md',
       status: 'mounted',
     });
     expect(adminPlan.audit.rules).toMatchObject({
       sourcePath: path.join(external, 'rules'),
-      runtimePath: '/workspace/.claude/rules',
+      runtimePath: '/home/node/.claude/rules',
       status: 'mounted',
       fileCount: 1,
     });
@@ -261,6 +299,7 @@ describe('ClaudeContextResolver', () => {
     const dataDir = path.join(tmp, 'data');
     const projectRoot = path.join(tmp, 'project');
     writeFile(path.join(external, 'CLAUDE.md'), '# private admin context');
+    writeFile(path.join(external, 'commands', 'private.md'), '# private');
     makeSkill(path.join(external, 'skills'), 'private-host-skill');
     makeSkill(path.join(dataDir, 'builtin-skills'), 'builtin-skill');
     makeSkill(path.join(projectRoot, 'container', 'skills'), 'project-skill');
@@ -357,6 +396,7 @@ describe('ClaudeContextResolver', () => {
     const external = path.join(tmp, 'external-claude');
     const sessionDir = path.join(tmp, 'sessions', 'main', '.claude');
     writeFile(path.join(external, 'CLAUDE.md'), '# private admin context');
+    writeFile(path.join(external, 'commands', 'private.md'), '# private');
 
     const base = {
       executionMode: 'host' as const,
@@ -374,9 +414,12 @@ describe('ClaudeContextResolver', () => {
     expect(
       fs.lstatSync(path.join(sessionDir, 'CLAUDE.md')).isSymbolicLink(),
     ).toBe(true);
+    expect(fs.existsSync(path.join(sessionDir, 'commands'))).toBe(true);
 
     syncHostClaudeContext(buildClaudeContextPlan(base), sessionDir);
     expect(fs.existsSync(path.join(sessionDir, 'CLAUDE.md'))).toBe(false);
+    expect(fs.existsSync(path.join(sessionDir, 'commands'))).toBe(false);
+    expect(loadHostClaudeSettings(buildClaudeContextPlan(base))).toEqual({});
 
     writeFile(path.join(sessionDir, 'CLAUDE.md'), '# session-authored');
     syncHostClaudeContext(buildClaudeContextPlan(base), sessionDir);

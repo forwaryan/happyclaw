@@ -30,7 +30,12 @@ import {
   getChannelAccount,
 } from '../db.js';
 import { DATA_DIR } from '../config.js';
-import type { AuthUser, RegisteredGroup, SubAgent } from '../types.js';
+import type {
+  AudienceMode,
+  AuthUser,
+  RegisteredGroup,
+  SubAgent,
+} from '../types.js';
 import { logger } from '../logger.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
 import { ensureAgentDirectories } from '../utils.js';
@@ -52,6 +57,8 @@ import {
   channelConversationJid,
   parseChannelAddress,
 } from '../channel-address.js';
+import { isMentionActivationMode } from '../feishu-conversation-policy.js';
+import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
 
 const router = new Hono<{ Variables: Variables }>();
 
@@ -1046,6 +1053,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
     group_message_type?: string;
     is_thread_capable?: boolean;
     activation_mode?: string;
+    audience_mode?: AudienceMode;
     require_mention?: boolean;
     owner_im_id?: string | null;
     sender_allowlist_locked?: boolean;
@@ -1095,6 +1103,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       reply_policy: g.reply_policy === 'mirror' ? 'mirror' : 'source_only',
       bound_target_name: boundTargetName,
       bound_workspace_name: boundWorkspaceName,
+      avatar: g.avatar_url,
       channel_type: getChannelType(j) ?? 'unknown',
       channel_account_id: g.channel_account_id ?? null,
       channel_account_name: g.channel_account_id
@@ -1104,25 +1113,30 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       group_message_type: g.feishu_group_message_type,
       is_thread_capable: isNativeContextContainer(j, g),
       activation_mode: g.activation_mode,
+      audience_mode: g.audience_mode ?? 'everyone',
       require_mention: g.require_mention === true,
       owner_im_id: g.owner_im_id ?? null,
       sender_allowlist_locked:
-        Array.isArray(g.sender_allowlist) && g.sender_allowlist.length === 0,
+        (g.audience_mode === 'owner_only' ||
+          g.activation_mode === 'owner_mentioned') &&
+        Array.isArray(g.sender_allowlist) &&
+        g.sender_allowlist.length === 0,
       added_at: g.added_at,
     });
   }
 
   // Enrich newly discovered Feishu chats so topic containers are recognized.
   // Telegram Forum capability is persisted by its connector events. Only
-  // query live Feishu metadata when the durable chat_mode field is missing:
-  // names are kept current by chat.list, while querying every chat on every
-  // dialog open is slow and amplifies provider rate limits for large bots.
+  // query live Feishu metadata when durable capability or avatar data is
+  // missing. Once persisted, subsequent reads stay cache-only; chat.list sync
+  // refreshes names and avatars without an N+1 provider lookup.
   const deps = getWebDeps();
   if (deps?.getChannelChatInfo || deps?.getFeishuChatInfo) {
     const chatInfoPromises = candidates
       .filter(
         (g) =>
-          g.channel_type === 'feishu' && !allGroups[g.jid].feishu_chat_mode,
+          g.channel_type === 'feishu' &&
+          (!allGroups[g.jid].feishu_chat_mode || !allGroups[g.jid].avatar_url),
       )
       .map(async (g) => {
         const chatId = extractChatId(g.jid);
@@ -1154,6 +1168,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
             const next: RegisteredGroup = {
               ...fresh,
               name: info.name?.trim() || fresh.name,
+              avatar_url: info.avatar?.trim() || fresh.avatar_url,
               feishu_chat_mode: info.chat_mode ?? fresh.feishu_chat_mode,
               feishu_group_message_type:
                 info.group_message_type ?? fresh.feishu_group_message_type,
@@ -1163,6 +1178,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
             };
             if (
               next.name !== fresh.name ||
+              next.avatar_url !== fresh.avatar_url ||
               next.feishu_chat_mode !== fresh.feishu_chat_mode ||
               next.feishu_group_message_type !==
                 fresh.feishu_group_message_type ||
@@ -1358,7 +1374,7 @@ router.put(
     }
     // Compute against freshImGroup, not the pre-await snapshot — see
     // fetchLiveChatInfo's doc comment.
-    const threadCapable = isNativeContextContainer(
+    let threadCapable = isNativeContextContainer(
       imJid,
       freshImGroup,
       chatInfo ?? {},
@@ -1381,13 +1397,39 @@ router.put(
       'disabled',
     ] as const;
     const rawActivationMode = body.activation_mode;
-    const activationMode =
+    let activationMode =
       typeof rawActivationMode === 'string' &&
       validActivationModes.includes(
         rawActivationMode as (typeof validActivationModes)[number],
       )
         ? (rawActivationMode as (typeof validActivationModes)[number])
         : undefined;
+    let audienceMode: AudienceMode | undefined =
+      body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+        ? body.audience_mode
+        : undefined;
+    if (getChannelType(imJid) === 'feishu') {
+      const normalized = normalizeLegacyOwnerMention({
+        activationMode,
+        audienceMode,
+      });
+      activationMode = normalized.activationMode;
+      audienceMode = normalized.audienceMode;
+    }
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
+      return c.json(
+        { error: 'Feishu private chats do not support mention activation' },
+        400,
+      );
+    }
+    threadCapable = isNativeContextContainer(imJid, freshImGroup, {
+      ...(chatInfo ?? {}),
+      activation_mode: activationMode ?? freshImGroup.activation_mode,
+    });
     const ownerImId =
       typeof body.owner_im_id === 'string' && body.owner_im_id.trim()
         ? body.owner_im_id.trim()
@@ -1401,6 +1443,7 @@ router.put(
         {
           replyPolicy,
           ...(activationMode !== undefined ? { activationMode } : {}),
+          ...(audienceMode !== undefined ? { audienceMode } : {}),
           ...(ownerImId !== undefined ? { ownerImId } : {}),
         },
       ),
@@ -1750,7 +1793,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   }
   // Compute against freshImGroup, not the pre-await snapshot — see
   // fetchLiveChatInfo's doc comment.
-  const threadCapable = isNativeContextContainer(
+  let threadCapable = isNativeContextContainer(
     imJid,
     freshImGroup,
     chatInfo ?? {},
@@ -1782,13 +1825,39 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     'disabled',
   ] as const;
   const rawActivationMode = body.activation_mode;
-  const activationMode =
+  let activationMode =
     typeof rawActivationMode === 'string' &&
     validActivationModes.includes(
       rawActivationMode as (typeof validActivationModes)[number],
     )
       ? (rawActivationMode as (typeof validActivationModes)[number])
       : undefined;
+  let audienceMode: AudienceMode | undefined =
+    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+      ? body.audience_mode
+      : undefined;
+  if (getChannelType(imJid) === 'feishu') {
+    const normalized = normalizeLegacyOwnerMention({
+      activationMode,
+      audienceMode,
+    });
+    activationMode = normalized.activationMode;
+    audienceMode = normalized.audienceMode;
+  }
+  if (
+    getChannelType(imJid) === 'feishu' &&
+    (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+    isMentionActivationMode(activationMode)
+  ) {
+    return c.json(
+      { error: 'Feishu private chats do not support mention activation' },
+      400,
+    );
+  }
+  threadCapable = isNativeContextContainer(imJid, freshImGroup, {
+    ...(chatInfo ?? {}),
+    activation_mode: activationMode ?? freshImGroup.activation_mode,
+  });
 
   // Parse owner_im_id for owner_mentioned mode
   // 如果前端传了 owner_im_id 就用，否则 owner_mentioned 模式下自动设为空（后续首条消息自动学习）
@@ -1806,6 +1875,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
       {
         ...(replyPolicy !== undefined ? { replyPolicy } : {}),
         ...(activationMode !== undefined ? { activationMode } : {}),
+        ...(audienceMode !== undefined ? { audienceMode } : {}),
         ...(ownerImId !== undefined ? { ownerImId } : {}),
       },
     ),

@@ -2,7 +2,12 @@ import fs from 'fs';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
-import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
+import {
+  storeChatMetadata,
+  storeMessageDirect,
+  updateChatName,
+  updateRegisteredGroupAvatar,
+} from './db.js';
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
@@ -32,6 +37,7 @@ import {
 } from './feishu-mention-gate.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import type {
   FeishuMessageMeta,
   FollowUpAction,
@@ -103,6 +109,11 @@ export interface ConnectOptions {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** Resolve durable Feishu topic presence and the session-routing plan. */
+  resolveFeishuConversationPlan?: (
+    chatJid: string,
+    messageMeta: FeishuMessageMeta,
+  ) => FeishuConversationPlan;
   /** owner_mentioned 模式下检查发送者是否为 owner */
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** 发言者白名单：命令处理之后、mention 门控之前调用；返回 false 则丢弃 */
@@ -270,7 +281,7 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
   }
 }
 
-function buildFeishuRouteTarget(
+export function buildFeishuRouteTarget(
   chatId: string,
   threadId?: string,
   rootMessageId?: string,
@@ -994,6 +1005,7 @@ export function createFeishuConnection(
       onAgentMessage,
       onFollowUpMessage,
       shouldProcessGroupMessage,
+      resolveFeishuConversationPlan,
       isGroupOwnerMessage,
       isSenderAllowedInGroup,
       onP2pSender,
@@ -1013,6 +1025,8 @@ export function createFeishuConnection(
       senderName,
     } = payload;
     if (!chatId || !messageId) return;
+    const normalizedChatType =
+      chatType === 'p2p' || chatType === 'group' ? chatType : undefined;
 
     if (isStale(createTimeMs)) {
       logger.debug(
@@ -1080,14 +1094,55 @@ export function createFeishuConnection(
       const rawChatJid = `feishu:${chatId}`;
       const chatJid =
         connectOptions?.normalizeIncomingJid?.(rawChatJid) ?? rawChatJid;
-      const rootMessageId = rootId || messageId;
+      const mentionedBot = isBotMentioned(
+        botOpenId,
+        mentions as MentionGateMention[] | undefined,
+      );
+      const rawMessageMeta: FeishuMessageMeta = {
+        provider: 'feishu',
+        chatType: normalizedChatType,
+        mentionedBot,
+        threadId,
+        rootId,
+        parentId,
+        messageId,
+        text,
+      };
+      const conversationPlan = resolveFeishuConversationPlan?.(
+        chatJid,
+        rawMessageMeta,
+      );
+      const rootMessageId =
+        conversationPlan?.rootMessageId || rootId || messageId;
+      const deliveryRootMessageId = conversationPlan?.independentContext
+        ? conversationPlan.rootMessageId
+        : threadId
+          ? rootMessageId
+          : rootId;
       const messageRouteTarget = buildFeishuRouteTarget(
         chatId,
         threadId,
-        threadId ? rootMessageId : rootId,
+        deliveryRootMessageId,
       );
       const resolvedSenderName = senderName || getSenderName(senderOpenId);
       const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
+
+      // Audience is an identity boundary, independent from @/topic activation,
+      // and therefore runs before commands and before the mention gate. This
+      // also applies to p2p chats and already-active topics.
+      if (
+        isSenderAllowedInGroup &&
+        !isSenderAllowedInGroup(chatJid, senderOpenId)
+      ) {
+        if (chatType === 'group' && mentionedBot) {
+          addReaction(messageId, 'SILENT').catch(() => {});
+        }
+        logger.debug(
+          { chatJid, messageId, senderOpenId, chatType },
+          'Dropped Feishu message: sender rejected by audience policy',
+        );
+        return;
+      }
 
       // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
       // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
@@ -1159,50 +1214,20 @@ export function createFeishuConnection(
         }
       }
 
-      // ── 群聊发言者白名单过滤（命令已处理后，非白名单发言者丢弃或软拒绝） ──
-      if (
-        chatType === 'group' &&
-        isSenderAllowedInGroup &&
-        !isSenderAllowedInGroup(chatJid, senderOpenId)
-      ) {
-        // 被 @bot 时回 SILENT 表情表达「看到但故意不回复」，让发言者知道 bot 并非无响应而是被白名单挡掉；
-        // 未 @bot 时静默丢弃，避免把群聊闲聊污染成一堆表情。
-        // botOpenId 缺失时 isBotMentioned() 返回 false → 不加 SILENT 反应。
-        // 反应只是 courtesy（消息已被 allowlist 决定丢弃），不能确认 @ 时宁可不加。
-        // 与下方 mention gate 的 fail-closed 方向相反：那里是业务正确性边界，必须确认。
-        if (
-          isBotMentioned(
-            botOpenId,
-            mentions as MentionGateMention[] | undefined,
-          )
-        ) {
-          addReaction(messageId, 'SILENT').catch(() => {});
-          logger.debug(
-            { chatJid, messageId, senderOpenId },
-            'Soft-rejected group message with SILENT reaction: sender not in allowlist',
-          );
-        } else {
-          logger.debug(
-            { chatJid, messageId, senderOpenId },
-            'Dropped group message: sender not in allowlist',
-          );
-        }
-        return;
-      }
-
       // ── 群聊 Mention 过滤：require_mention / owner_mentioned 模式下过滤 ──
       // 决策由 evaluateMentionGate（src/feishu-mention-gate.ts）以纯函数形式给出，
       // 历史上这里曾因 botOpenId 缺失而 fail-open 静默失效；新版 fail-closed，
       // 并通过 ensureBotOpenIdFresh() 触发后台 lazy refetch 自愈。
       {
         const decision = evaluateMentionGate({
-          chatType,
+          chatType: normalizedChatType,
           botOpenId,
           mentions: mentions as MentionGateMention[] | undefined,
           chatJid,
           senderOpenId,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
+          conversationPlan,
         });
         if (!decision.allow) {
           if (decision.reason === 'bot_open_id_missing') {
@@ -1236,10 +1261,15 @@ export function createFeishuConnection(
               { chatJid, messageId },
               'Dropped group message: mention required but bot not mentioned',
             );
-          } else {
+          } else if (decision.reason === 'not_owner') {
             logger.debug(
               { chatJid, messageId, senderOpenId },
               'Dropped group message: owner_mentioned mode, sender is not owner',
+            );
+          } else {
+            logger.debug(
+              { chatJid, messageId },
+              'Dropped Feishu message: activation mode is disabled',
             );
           }
           return;
@@ -1291,10 +1321,16 @@ export function createFeishuConnection(
         resolveEffectiveChatJid,
         {
           provider: 'feishu',
-          nativeContextType: threadId ? 'thread' : undefined,
-          contextId: threadId,
+          chatType: normalizedChatType,
+          mentionedBot,
+          nativeContextType:
+            conversationPlan?.independentContext ||
+            (!conversationPlan && !!threadId)
+              ? 'thread'
+              : undefined,
+          contextId: conversationPlan?.contextId || threadId,
           threadId,
-          rootId: rootMessageId,
+          rootId: conversationPlan?.rootMessageId || rootId,
           parentId,
           messageId,
           text,
@@ -1530,8 +1566,11 @@ export function createFeishuConnection(
         broadcastFollowUpUpdate(targetJid);
         const position = followUp.position ?? 1;
         if (followUp.runId) {
+          const queuedReplyTarget = routeSourceJid.startsWith('feishu:')
+            ? routeSourceJid.slice('feishu:'.length)
+            : messageRouteTarget.raw;
           await sendToFeishu(
-            messageRouteTarget.raw,
+            queuedReplyTarget,
             'interactive',
             JSON.stringify(
               buildQueuedFollowUpCard({
@@ -2335,6 +2374,9 @@ export function createFeishuConnection(
             // missed or the chat has never sent a message to HappyClaw. The
             // account-scoping wrapper makes the JID unique for multi-bot users.
             connectOptions?.onNewChat?.(rawJid, chatName);
+            if (chat.avatar) {
+              updateRegisteredGroupAvatar(scopedJid, chat.avatar);
+            }
             updateChatName(scopedJid, chatName);
             knownChatIds.add(chat.chat_id);
           }

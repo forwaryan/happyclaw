@@ -213,9 +213,47 @@ describe('channel binding product contract', () => {
       }),
     ).toBe(true);
     expect(
+      isNativeContextContainer('feishu:topic-group', {
+        ...makeWorkspace('Feishu topic', 'feishu-topic'),
+        feishu_chat_mode: 'group',
+        feishu_group_message_type: 'thread',
+        activation_mode: 'always',
+      }),
+    ).toBe(true);
+    expect(
       isThreadMapCapableChat({
         channel_type: 'qq',
         native_context_type: 'thread',
+      }),
+    ).toBe(false);
+  });
+
+  test('Feishu ordinary groups use thread mapping only for mention activation', () => {
+    const ordinary: RegisteredGroup = {
+      ...makeWorkspace('Ordinary group', 'ordinary'),
+      feishu_chat_mode: 'group',
+      native_context_type: 'thread',
+      activation_mode: 'always',
+    };
+    expect(isNativeContextContainer('feishu:ordinary', ordinary)).toBe(false);
+    expect(
+      isNativeContextContainer('feishu:ordinary', {
+        ...ordinary,
+        activation_mode: 'when_mentioned',
+      }),
+    ).toBe(true);
+    expect(
+      isNativeContextContainer('feishu:ordinary', {
+        ...ordinary,
+        activation_mode: 'auto',
+        require_mention: true,
+      }),
+    ).toBe(true);
+    expect(
+      isNativeContextContainer('feishu:direct', {
+        ...ordinary,
+        feishu_chat_mode: 'p2p',
+        activation_mode: 'when_mentioned',
       }),
     ).toBe(false);
   });

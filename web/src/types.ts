@@ -151,6 +151,7 @@ export interface AgentProfileChannelMount {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled';
+  audience_mode: 'everyone' | 'owner_only';
   owner_im_id: string | null;
   updated_at: string;
 }
@@ -185,6 +186,14 @@ export interface AgentCapabilityPreview {
     source: 'managed' | 'host_claude';
     claudeMd: boolean;
     rules: number;
+    nativeConfig: {
+      settingsFiles: string[];
+      entries: Array<{
+        name: string;
+        kind: 'file' | 'directory';
+        entryCount?: number;
+      }>;
+    };
   };
   skills: {
     mode: AgentProfileRuntimePolicy['skills']['mode'];
@@ -325,6 +334,7 @@ export interface AvailableImGroup {
     | 'when_mentioned'
     | 'owner_mentioned'
     | 'disabled';
+  audience_mode?: 'everyone' | 'owner_only';
   require_mention?: boolean;
   owner_im_id?: string | null;
   binding_mode?: 'single_context' | 'thread_map';

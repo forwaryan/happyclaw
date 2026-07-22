@@ -12,7 +12,7 @@ describe('AgentProfile runtime MCP selection', () => {
       skipPluginMcpDiscovery: false,
       includeUserMcpServers: true,
       strictMcpConfig: false,
-      settingSources: ['project', 'user'],
+      settingSources: ['project', 'user', 'local'],
     });
   });
 
@@ -24,7 +24,7 @@ describe('AgentProfile runtime MCP selection', () => {
         skipPluginMcpDiscovery: true,
         includeUserMcpServers: true,
         strictMcpConfig: true,
-        settingSources: ['project', 'user'],
+        settingSources: ['project', 'user', 'local'],
       });
     },
   );

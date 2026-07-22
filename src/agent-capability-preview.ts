@@ -22,6 +22,11 @@ import { resolveEffectiveSkills } from './effective-skill-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
 import { loadUserPlugins } from './plugin-utils.js';
 import { resolveHostSkillPolicy } from './agent-profile-policy.js';
+import {
+  HOST_CLAUDE_NATIVE_DIRECTORIES,
+  HOST_CLAUDE_NATIVE_FILES,
+  HOST_CLAUDE_SETTINGS_FILES,
+} from './claude-context-resolver.js';
 import type { AgentProfile, RegisteredGroup } from './types.js';
 
 export type CapabilityLayerSource =
@@ -48,6 +53,14 @@ export interface AgentCapabilityPreview {
     source: 'managed' | 'host_claude';
     claudeMd: boolean;
     rules: number;
+    nativeConfig: {
+      settingsFiles: string[];
+      entries: Array<{
+        name: string;
+        kind: 'file' | 'directory';
+        entryCount?: number;
+      }>;
+    };
   };
   skills: {
     mode: AgentProfile['runtime_policy']['skills']['mode'];
@@ -286,6 +299,11 @@ export function buildAgentCapabilityPreview(options: {
   notes.push(
     'HappyClaw 用户 Skills 与宿主机 Skills 独立筛选；内置、项目和工作区 Skills 仍按来源优先级解析。',
   );
+  if (hostContext) {
+    notes.push(
+      '运行 cwd 仍是所选工作区；宿主机 ~/.claude 作为完整用户配置层叠加，不会把文件与命令操作切换到配置目录。',
+    );
+  }
   if (mcp.conflicts.length > 0)
     notes.push(
       '同名 MCP 按宿主机 → 工作区 → 系统 MCP → 用户 MCP 的稳定顺序覆盖。',
@@ -311,6 +329,28 @@ export function buildAgentCapabilityPreview(options: {
       rules: hostContext
         ? countEntries(path.join(externalClaudeDir, 'rules'))
         : 0,
+      nativeConfig: {
+        settingsFiles: hostContext
+          ? HOST_CLAUDE_SETTINGS_FILES.filter((name) =>
+              fs.existsSync(path.join(externalClaudeDir, name)),
+            )
+          : [],
+        entries: hostContext
+          ? [
+              ...HOST_CLAUDE_NATIVE_DIRECTORIES.map((name) => ({
+                name,
+                kind: 'directory' as const,
+                entryCount: countEntries(path.join(externalClaudeDir, name)),
+              })),
+              ...HOST_CLAUDE_NATIVE_FILES.map((name) => ({
+                name,
+                kind: 'file' as const,
+              })),
+            ].filter((entry) =>
+              fs.existsSync(path.join(externalClaudeDir, entry.name)),
+            )
+          : [],
+      },
     },
     skills: {
       mode: policy.skills.mode,

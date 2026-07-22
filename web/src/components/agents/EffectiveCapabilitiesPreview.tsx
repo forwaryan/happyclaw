@@ -159,8 +159,10 @@ export function EffectiveCapabilitiesPreview({
               {preview.context.source === 'host_claude' && (
                 <span className="text-xs text-muted-foreground">
                   提示词 {preview.context.claudeMd ? '已加载' : '缺失'} ·{' '}
-                  {preview.context.rules} 项 Rules · 宿主机 Skills
-                  按独立策略加载
+                  {preview.context.rules} 项 Rules ·{' '}
+                  {preview.context.nativeConfig.settingsFiles.length} 个配置文件
+                  · {preview.context.nativeConfig.entries.length} 类原生能力 ·
+                  宿主机 Skills 按独立策略加载
                 </span>
               )}
             </PreviewRow>

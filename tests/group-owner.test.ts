@@ -88,12 +88,14 @@ describe('releaseOwner', () => {
       owner_im_id: 'u1',
       sender_allowlist: ['u1', 'u2'],
       activation_mode: 'owner_mentioned',
+      audience_mode: 'owner_only',
     });
     const r = releaseOwner(g);
     expect(r.owner_im_id).toBeUndefined();
     expect(r.owner_claim_source).toBeUndefined();
     expect(r.sender_allowlist).toBeUndefined();
     expect(r.activation_mode).toBe('when_mentioned');
+    expect(r.audience_mode).toBe('everyone');
   });
 
   test('preserves every non-owner_mentioned activation mode', () => {

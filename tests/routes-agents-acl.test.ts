@@ -456,6 +456,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     });
     const getChannelChatInfo = vi.fn().mockResolvedValue({
       name: '地址',
+      avatar: 'https://example.com/address.png',
       chat_mode: 'topic',
       group_message_type: 'chat',
       user_count: '1',
@@ -473,6 +474,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
           expect.objectContaining({
             jid: imJid,
             name: '地址',
+            avatar: 'https://example.com/address.png',
             chat_mode: 'topic',
             is_thread_capable: true,
           }),
@@ -480,6 +482,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       );
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         name: '地址',
+        avatar_url: 'https://example.com/address.png',
         feishu_chat_mode: 'topic',
         native_context_type: 'thread',
       });
@@ -492,6 +495,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         expect.arrayContaining([
           expect.objectContaining({
             jid: imJid,
+            avatar: 'https://example.com/address.png',
             chat_mode: 'topic',
             is_thread_capable: true,
           }),
@@ -534,6 +538,202 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       target_main_jid: GROUP_JID,
       binding_mode: 'single_context',
     });
+  });
+
+  test('ordinary Feishu mention mode binds as thread_map and returns to one shared context in always mode', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `feishu-mention-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'feishu',
+      name: 'Feishu bot',
+      secret_ref: `channel-account:feishu-mention-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `feishu:ordinary-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Ordinary Feishu group',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      feishu_chat_mode: 'group',
+      feishu_group_message_type: 'chat',
+    });
+    webContext.setWebDeps({
+      getChannelChatInfo: vi.fn().mockResolvedValue({
+        chat_mode: 'group',
+        group_message_type: 'chat',
+      }),
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const mentioned = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'when_mentioned',
+      });
+      expect(mentioned.status, JSON.stringify(mentioned.body)).toBe(200);
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        target_main_jid: GROUP_JID,
+        binding_mode: 'thread_map',
+        activation_mode: 'when_mentioned',
+      });
+
+      const always = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'always',
+        force: true,
+      });
+      expect(always.status, JSON.stringify(always.body)).toBe(200);
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        target_main_jid: GROUP_JID,
+        binding_mode: 'single_context',
+        activation_mode: 'always',
+      });
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
+  test('Feishu response audience changes independently from mention activation', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `feishu-audience-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'feishu',
+      name: 'Feishu audience bot',
+      secret_ref: `channel-account:feishu-audience-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `feishu:audience-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Feishu audience group',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      feishu_chat_mode: 'group',
+      feishu_group_message_type: 'chat',
+      owner_im_id: 'ou_owner',
+    });
+    webContext.setWebDeps({
+      getChannelChatInfo: vi.fn().mockResolvedValue({
+        chat_mode: 'group',
+        group_message_type: 'chat',
+      }),
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const ownerWithoutMention = await req(
+        '/sessions/main/im-binding',
+        'PUT',
+        {
+          im_jid: imJid,
+          activation_mode: 'always',
+          audience_mode: 'owner_only',
+        },
+      );
+      expect(ownerWithoutMention.status).toBe(200);
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        activation_mode: 'always',
+        audience_mode: 'owner_only',
+        binding_mode: 'single_context',
+      });
+
+      const ownerWithMention = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'when_mentioned',
+        audience_mode: 'owner_only',
+        force: true,
+      });
+      expect(ownerWithMention.status).toBe(200);
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        activation_mode: 'when_mentioned',
+        audience_mode: 'owner_only',
+        binding_mode: 'thread_map',
+      });
+
+      const everyoneWithMention = await req(
+        '/sessions/main/im-binding',
+        'PUT',
+        {
+          im_jid: imJid,
+          activation_mode: 'when_mentioned',
+          audience_mode: 'everyone',
+          force: true,
+        },
+      );
+      expect(everyoneWithMention.status).toBe(200);
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        activation_mode: 'when_mentioned',
+        audience_mode: 'everyone',
+        binding_mode: 'thread_map',
+      });
+
+      const legacyComposite = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'owner_mentioned',
+        force: true,
+      });
+      expect(legacyComposite.status).toBe(200);
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        activation_mode: 'when_mentioned',
+        audience_mode: 'owner_only',
+      });
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
+  test('Feishu private chats reject mention activation at the binding API', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `feishu-direct-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'feishu',
+      name: 'Feishu direct bot',
+      secret_ref: `channel-account:feishu-direct-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `feishu:direct-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Feishu private chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+      feishu_chat_mode: 'p2p',
+    });
+    webContext.setWebDeps({
+      getChannelChatInfo: vi.fn().mockResolvedValue({ chat_mode: 'p2p' }),
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const result = await req('/sessions/main/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'when_mentioned',
+      });
+      expect(result.status).toBe(400);
+      expect(result.body.error).toMatch(/private chats/i);
+      expect(db.getRegisteredGroup(imJid)?.target_main_jid).toBeUndefined();
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
   });
 
   test('a concurrent write during checkThreadCapableBinding is not clobbered by the pre-await snapshot', async () => {
