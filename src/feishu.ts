@@ -426,6 +426,40 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
   }
 }
 
+/**
+ * Upload endpoints in the official Lark SDK unwrap successful responses to
+ * `{ image_key }` / `{ file_key }` and therefore do not include `code: 0`.
+ * Error-shaped responses can still carry `code`/`msg` (and mocked clients do
+ * so in tests), so preserve those details while accepting the SDK's real
+ * success contract.
+ */
+function requireFeishuUploadKey(
+  operation: string,
+  response: unknown,
+  key: 'image_key' | 'file_key',
+): string {
+  if (!response || typeof response !== 'object') {
+    throw new Error(`${operation} returned no acknowledgement`);
+  }
+  const result = response as {
+    code?: number;
+    msg?: string;
+    image_key?: string;
+    file_key?: string;
+    data?: { image_key?: string; file_key?: string };
+  };
+  if (typeof result.code === 'number' && result.code !== 0) {
+    throw new Error(
+      `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
+    );
+  }
+  const uploadKey = result[key] ?? result.data?.[key];
+  if (!uploadKey) {
+    throw new Error(`${operation} returned no ${key}`);
+  }
+  return uploadKey;
+}
+
 export function buildFeishuRouteTarget(
   chatId: string,
   threadId?: string,
@@ -2360,13 +2394,11 @@ export function createFeishuConnection(
               | { image_key?: string; data?: { image_key?: string } }
               | null
               | undefined;
-            assertFeishuApiSuccess('Feishu image.create', uploadRes);
-            const imageKey = uploadRes?.image_key ?? uploadRes?.data?.image_key;
-            if (!imageKey) {
-              throw new Error(
-                `Feishu image upload returned no image_key: ${localImagePath}`,
-              );
-            }
+            const imageKey = requireFeishuUploadKey(
+              'Feishu image.create',
+              uploadRes,
+              'image_key',
+            );
             await sendToFeishu(
               chatId,
               'image',
@@ -2413,19 +2445,11 @@ export function createFeishuConnection(
           | null
           | undefined;
 
-        assertFeishuApiSuccess('Feishu image.create', uploadResult);
-
-        const imageKey =
-          uploadResult?.image_key ?? uploadResult?.data?.image_key;
-        if (!imageKey) {
-          logger.error(
-            { chatId },
-            'Feishu image upload failed: no image_key returned',
-          );
-          throw new Error(
-            'Feishu image upload failed: no image_key in response',
-          );
-        }
+        const imageKey = requireFeishuUploadKey(
+          'Feishu image.create',
+          uploadResult,
+          'image_key',
+        );
 
         // Step 2: Send image message
         await sendToFeishu(
@@ -2487,12 +2511,11 @@ export function createFeishuConnection(
           | null
           | undefined;
 
-        assertFeishuApiSuccess('Feishu file.create', uploadResult);
-
-        const fileKey = uploadResult?.file_key ?? uploadResult?.data?.file_key;
-        if (!fileKey) {
-          throw new Error('文件上传失败：未返回 file_key');
-        }
+        const fileKey = requireFeishuUploadKey(
+          'Feishu file.create',
+          uploadResult,
+          'file_key',
+        );
 
         // Determine msg_type: Feishu requires upload file_type and send msg_type to match.
         // mp4 → media (video message), opus → audio (audio message), others → file.

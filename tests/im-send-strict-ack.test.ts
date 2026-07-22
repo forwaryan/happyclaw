@@ -111,12 +111,10 @@ beforeEach(() => {
     data: { message_id: 'om_1' },
   });
   controls.feishuImageCreate.mockResolvedValue({
-    code: 0,
-    data: { image_key: 'img_1' },
+    image_key: 'img_1',
   });
   controls.feishuFileCreate.mockResolvedValue({
-    code: 0,
-    data: { file_key: 'file_1' },
+    file_key: 'file_1',
   });
   controls.feishuChatList.mockResolvedValue({
     data: {
@@ -284,6 +282,24 @@ describe('IM strict send acknowledgement', () => {
     await expect(
       telegram.sendFile('1', filePath, 'payload.txt'),
     ).rejects.toThrow('document denied');
+  });
+
+  test('accepts SDK-unwrapped upload acknowledgements without code=0', async () => {
+    const { feishu } = await connectedTransports();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'strict-im-ack-'));
+    const filePath = path.join(tempDir, 'payload.pdf');
+    await fs.writeFile(filePath, 'payload');
+    cleanup.push(() => fs.rm(tempDir, { recursive: true, force: true }));
+
+    await expect(
+      feishu.sendImage('oc_1', Buffer.from('image'), 'image/png'),
+    ).resolves.toBeUndefined();
+    await expect(
+      feishu.sendFile('oc_1', filePath, 'payload.pdf'),
+    ).resolves.toBeUndefined();
+
+    expect(controls.feishuImageCreate).toHaveBeenCalledOnce();
+    expect(controls.feishuFileCreate).toHaveBeenCalledOnce();
   });
 
   test('sendMessage rejects when a requested image attachment fails', async () => {
