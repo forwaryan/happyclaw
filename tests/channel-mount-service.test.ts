@@ -270,6 +270,7 @@ describe('channel binding product contract', () => {
       channel_account_id: account.id,
       target_agent_id: 'session-old',
       activation_mode: 'owner_mentioned',
+      audience_mode: 'owner_only',
       owner_im_id: 'owner-im',
       sender_allowlist: ['sender-a'],
       reply_policy: 'mirror',
@@ -296,6 +297,7 @@ describe('channel binding product contract', () => {
         target_agent_id: undefined,
         binding_mode: 'thread_map',
         activation_mode: 'owner_mentioned',
+        audience_mode: 'owner_only',
         owner_im_id: 'owner-im',
         sender_allowlist: ['sender-a'],
         reply_policy: 'source_only',
@@ -388,13 +390,23 @@ describe('channel binding product contract', () => {
   });
 
   test('workspace and session targets remain mutually exclusive', () => {
-    const source = makeWorkspace('Channel', 'channel-a');
+    const source: RegisteredGroup = {
+      ...makeWorkspace('Channel', 'channel-a'),
+      activation_mode: 'always',
+      audience_mode: 'owner_only',
+      owner_im_id: 'owner-im',
+    };
     const sessionBound = buildSessionMountUpdate(
       { ...source, target_main_jid: 'web:old' },
       'session-a',
     );
     expect(sessionBound.target_agent_id).toBe('session-a');
     expect(sessionBound.target_main_jid).toBeUndefined();
+    expect(sessionBound).toMatchObject({
+      activation_mode: 'always',
+      audience_mode: 'owner_only',
+      owner_im_id: 'owner-im',
+    });
 
     const workspaceBound = buildWorkspaceMountUpdate(
       { ...source, target_agent_id: 'old-session' },
@@ -403,6 +415,11 @@ describe('channel binding product contract', () => {
     );
     expect(workspaceBound.target_agent_id).toBeUndefined();
     expect(workspaceBound.target_main_jid).toBe('web:workspace-a');
+    expect(workspaceBound).toMatchObject({
+      activation_mode: 'always',
+      audience_mode: 'owner_only',
+      owner_im_id: 'owner-im',
+    });
   });
 
   test('centralizes target conflict and legacy workspace matching semantics', () => {

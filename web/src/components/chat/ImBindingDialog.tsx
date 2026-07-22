@@ -38,6 +38,10 @@ import {
   buildChannelAccountFilterOptions,
   channelAccountKey,
 } from '../../utils/channel-accounts';
+import {
+  resolveBindingActivationMode,
+  resolveBindingAudienceMode,
+} from '../../utils/im-binding-policy';
 
 interface ImBindingDialogProps {
   open: boolean;
@@ -225,30 +229,6 @@ export function ImBindingDialog({
           return false;
         }
         setImGroups(groups);
-        const initial: Record<string, string> = {};
-        const initialAudiences: Record<string, 'everyone' | 'owner_only'> = {};
-        for (const group of groups) {
-          if (
-            supportsActivationModes(group.channel_type) &&
-            group.activation_mode &&
-            group.activation_mode !== 'auto'
-          ) {
-            initial[group.jid] =
-              group.channel_type === 'feishu' &&
-              group.activation_mode === 'owner_mentioned'
-                ? 'when_mentioned'
-                : group.activation_mode;
-          }
-          if (group.channel_type === 'feishu') {
-            initialAudiences[group.jid] =
-              group.audience_mode === 'owner_only' ||
-              group.activation_mode === 'owner_mentioned'
-                ? 'owner_only'
-                : 'everyone';
-          }
-        }
-        setActivationModes(initial);
-        setAudienceModes(initialAudiences);
         return true;
       } catch (err) {
         if (generation !== undefined && generation !== syncGeneration.current) {
@@ -440,9 +420,10 @@ export function ImBindingDialog({
       let ok: boolean;
       if (isMainMode) {
         const target = imGroups.find((g) => g.jid === imJid);
-        const mode = supportsActivationModes(target?.channel_type)
-          ? activationModes[imJid] || 'auto'
-          : undefined;
+        const mode =
+          target && supportsActivationModes(target.channel_type)
+            ? resolveBindingActivationMode(target, activationModes[imJid])
+            : undefined;
         ok = await bindMainImGroup(
           groupJid,
           imJid,
@@ -450,7 +431,7 @@ export function ImBindingDialog({
           mode,
           undefined,
           target?.channel_type === 'feishu'
-            ? audienceModes[imJid] || 'everyone'
+            ? resolveBindingAudienceMode(target, audienceModes[imJid])
             : undefined,
         );
       } else {
@@ -489,47 +470,67 @@ export function ImBindingDialog({
 
   const handleActivationModeChange = useCallback(
     async (imJid: string, mode: string) => {
+      const target = imGroups.find((group) => group.jid === imJid);
+      if (!target) return;
+      const previousMode = resolveBindingActivationMode(
+        target,
+        activationModes[imJid],
+      );
       setActivationModes((prev) => ({ ...prev, [imJid]: mode }));
       // Re-bind with force to update activation_mode on already-bound group
       try {
-        const target = imGroups.find((group) => group.jid === imJid);
-        await bindMainImGroup(
+        const ok = await bindMainImGroup(
           groupJid,
           imJid,
           true,
           mode,
           undefined,
-          target?.channel_type === 'feishu'
-            ? audienceModes[imJid] || target.audience_mode || 'everyone'
+          target.channel_type === 'feishu'
+            ? resolveBindingAudienceMode(target, audienceModes[imJid])
             : undefined,
         );
+        if (!ok) throw new Error('activation update rejected');
         await reloadGroups();
       } catch {
+        setActivationModes((prev) => ({
+          ...prev,
+          [imJid]: previousMode,
+        }));
         showToast('更新触发模式失败');
       }
     },
-    [audienceModes, groupJid, imGroups, bindMainImGroup],
+    [activationModes, audienceModes, groupJid, imGroups, bindMainImGroup],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAudienceModeChange = useCallback(
     async (imJid: string, audienceMode: 'everyone' | 'owner_only') => {
-      setAudienceModes((prev) => ({ ...prev, [imJid]: audienceMode }));
       const target = imGroups.find((group) => group.jid === imJid);
+      if (!target) return;
+      const previousAudience = resolveBindingAudienceMode(
+        target,
+        audienceModes[imJid],
+      );
+      setAudienceModes((prev) => ({ ...prev, [imJid]: audienceMode }));
       try {
-        await bindMainImGroup(
+        const ok = await bindMainImGroup(
           groupJid,
           imJid,
           true,
-          activationModes[imJid] || target?.activation_mode || 'auto',
+          resolveBindingActivationMode(target, activationModes[imJid]),
           undefined,
           audienceMode,
         );
+        if (!ok) throw new Error('audience update rejected');
         await reloadGroups();
       } catch {
+        setAudienceModes((prev) => ({
+          ...prev,
+          [imJid]: previousAudience,
+        }));
         showToast('更新响应对象失败');
       }
     },
-    [activationModes, bindMainImGroup, groupJid, imGroups],
+    [activationModes, audienceModes, bindMainImGroup, groupJid, imGroups],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const describeBindTarget = (group: AvailableImGroup): string => {
@@ -557,7 +558,7 @@ export function ImBindingDialog({
       let ok: boolean;
       if (isMainMode) {
         const mode = supportsActivationModes(rebindGroup.channel_type)
-          ? activationModes[imJid] || 'auto'
+          ? resolveBindingActivationMode(rebindGroup, activationModes[imJid])
           : undefined;
         ok = await bindMainImGroup(
           groupJid,
@@ -566,7 +567,7 @@ export function ImBindingDialog({
           mode,
           undefined,
           rebindGroup.channel_type === 'feishu'
-            ? audienceModes[imJid] || rebindGroup.audience_mode || 'everyone'
+            ? resolveBindingAudienceMode(rebindGroup, audienceModes[imJid])
             : undefined,
         );
       } else {
@@ -813,18 +814,17 @@ export function ImBindingDialog({
                   const isActioning = actionLoading === group.jid;
                   const supportsActivation =
                     isMainMode && supportsActivationModes(group.channel_type);
-                  const effectiveMode = (activationModes[group.jid] ||
-                    group.activation_mode ||
-                    'auto') as string;
+                  const effectiveMode = resolveBindingActivationMode(
+                    group,
+                    activationModes[group.jid],
+                  );
                   const activationOptions = activationOptionsFor(group);
                   const supportsAudience =
                     isMainMode && group.channel_type === 'feishu';
-                  const effectiveAudience =
-                    audienceModes[group.jid] ||
-                    group.audience_mode ||
-                    (group.activation_mode === 'owner_mentioned'
-                      ? 'owner_only'
-                      : 'everyone');
+                  const effectiveAudience = resolveBindingAudienceMode(
+                    group,
+                    audienceModes[group.jid],
+                  );
                   const modeDescription = activationDescription(
                     group,
                     effectiveMode,
@@ -927,7 +927,7 @@ export function ImBindingDialog({
                               </label>
                               <select
                                 id={`activation-${group.jid}`}
-                                value={activationModes[group.jid] || 'auto'}
+                                value={effectiveMode}
                                 onChange={(e) =>
                                   setActivationModes((prev) => ({
                                     ...prev,

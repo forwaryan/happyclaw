@@ -33,6 +33,8 @@ const {
   findEmptyAllowlistFeishuGroupsForUser,
   backfillEmptyAllowlistsForUser,
   clearSenderAllowlist,
+  getChannelMount,
+  getAgentChannelMount,
 } = await import('../src/db.js');
 
 beforeAll(() => {
@@ -61,6 +63,8 @@ beforeEach(() => {
     'feishu:unrestricted',
     'feishu:transfer-reset',
     'feishu:other-user-locked',
+    'feishu:owner-projection',
+    'web:owner-projection-workspace',
     'telegram:also-locked',
     'wechat:also-locked',
   ]) {
@@ -173,6 +177,39 @@ describe('backfillEmptyAllowlistsForUser', () => {
     );
     expect(getRegisteredGroup('feishu:unrestricted')?.owner_im_id).toBe(
       'ou_new',
+    );
+  });
+
+  test('updates owner identity in every durable channel-mount projection', () => {
+    setRegisteredGroup('web:owner-projection-workspace', {
+      name: 'Owner projection workspace',
+      folder: 'owner-projection-workspace',
+      added_at: new Date().toISOString(),
+      created_by: USER_A,
+    });
+    setRegisteredGroup('feishu:owner-projection', {
+      name: 'Owner projection chat',
+      folder: 'home-user-a',
+      added_at: new Date().toISOString(),
+      created_by: USER_A,
+      target_main_jid: 'web:owner-projection-workspace',
+      audience_mode: 'owner_only',
+      sender_allowlist: [],
+    });
+
+    expect(getChannelMount('feishu:owner-projection')?.owner_im_id).toBeNull();
+    expect(
+      getAgentChannelMount('feishu:owner-projection')?.owner_im_id,
+    ).toBeNull();
+
+    expect(backfillEmptyAllowlistsForUser(USER_A, OWNER_A)).toContain(
+      'feishu:owner-projection',
+    );
+    expect(getChannelMount('feishu:owner-projection')?.owner_im_id).toBe(
+      OWNER_A,
+    );
+    expect(getAgentChannelMount('feishu:owner-projection')?.owner_im_id).toBe(
+      OWNER_A,
     );
   });
 

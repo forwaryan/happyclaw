@@ -8783,30 +8783,41 @@ export function backfillEmptyAllowlistsForUser(
   ownerOpenId: string,
 ): string[] {
   const jids = findEmptyAllowlistFeishuGroupsForUser(userId);
-  if (jids.length === 0) return [];
-  const stmt = db.prepare(
-    `UPDATE registered_groups
-     SET owner_im_id = CASE
-           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN ?
-           ELSE owner_im_id
-         END,
-         owner_claim_source = CASE
-           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN 'auto_feishu'
-           ELSE owner_claim_source
-         END,
-         sender_allowlist = CASE
-           WHEN sender_allowlist = '[]' THEN ?
-           ELSE sender_allowlist
-         END
-     WHERE jid = ?`,
-  );
-  const tx = db.transaction((targets: string[]) => {
-    for (const jid of targets) {
-      stmt.run(ownerOpenId, JSON.stringify([ownerOpenId]), jid);
-    }
-  });
-  tx(jids);
-  return jids;
+  return persistLearnedFeishuOwner(jids, ownerOpenId);
+}
+
+/**
+ * Persist owner learning through the canonical group writer so the legacy
+ * group row and both channel-mount projections change together.
+ */
+function persistLearnedFeishuOwner(
+  jids: string[],
+  ownerOpenId: string,
+): string[] {
+  const normalizedOwner = ownerOpenId.trim();
+  if (!normalizedOwner) return [];
+  const changed: string[] = [];
+  for (const jid of jids) {
+    const group = getRegisteredGroup(jid);
+    if (!group || group.owner_claim_source === 'transfer_reset') continue;
+    const ownerMissing = !group.owner_im_id?.trim();
+    const emptyAllowlist =
+      Array.isArray(group.sender_allowlist) &&
+      group.sender_allowlist.length === 0;
+    if (!ownerMissing && !emptyAllowlist) continue;
+    setRegisteredGroup(jid, {
+      ...group,
+      ...(ownerMissing
+        ? {
+            owner_im_id: normalizedOwner,
+            owner_claim_source: 'auto_feishu' as const,
+          }
+        : {}),
+      ...(emptyAllowlist ? { sender_allowlist: [normalizedOwner] } : {}),
+    });
+    changed.push(jid);
+  }
+  return changed;
 }
 
 /** Account-scoped counterpart used by first-class Feishu bots. */
@@ -8825,28 +8836,10 @@ export function backfillEmptyAllowlistsForChannelAccount(
     )
     .all(userId, channelAccountId) as Array<{ jid: string }>;
   if (!rows.length) return [];
-  const stmt = db.prepare(
-    `UPDATE registered_groups
-     SET owner_im_id = CASE
-           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN ?
-           ELSE owner_im_id
-         END,
-         owner_claim_source = CASE
-           WHEN owner_im_id IS NULL OR owner_im_id = '' THEN 'auto_feishu'
-           ELSE owner_claim_source
-         END,
-         sender_allowlist = CASE
-           WHEN sender_allowlist = '[]' THEN ?
-           ELSE sender_allowlist
-         END
-     WHERE jid = ?`,
+  return persistLearnedFeishuOwner(
+    rows.map((row) => row.jid),
+    ownerOpenId,
   );
-  db.transaction(() => {
-    for (const row of rows) {
-      stmt.run(ownerOpenId, JSON.stringify([ownerOpenId]), row.jid);
-    }
-  })();
-  return rows.map((row) => row.jid);
 }
 
 /**
