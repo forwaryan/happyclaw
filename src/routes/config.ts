@@ -133,6 +133,7 @@ import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
 import { getClientIp } from '../utils.js';
 import {
+  getWorkspaceRuntimeJids,
   quiesceWorkspaceRunnersAroundCommit,
   resolveEffectiveAgentProfile,
   withAgentProfileLocks,
@@ -210,11 +211,57 @@ interface ApplyOptions {
    * protocol-level fields (anthropicBaseUrl / anthropicModel) change.
    */
   clearSessionsForProviderId?: string;
+  sessionInvalidation?: {
+    modelChanged: boolean;
+    baseUrlChanged: boolean;
+  };
 }
 
 interface ClaudeMutationResult<T> {
   value?: T;
   applied: ClaudeApplyResultPayload;
+}
+
+class ClaudeConfigPersistedError<T> extends Error {
+  constructor(
+    public readonly persistedValue: T,
+    public readonly cause: unknown,
+  ) {
+    super(
+      cause instanceof Error
+        ? cause.message
+        : 'Provider configuration was persisted but a follow-up action failed',
+    );
+    this.name = 'ClaudeConfigPersistedError';
+  }
+}
+
+function runAfterProviderPersistence<T>(
+  persistedValue: T,
+  followUp: () => void,
+): T {
+  try {
+    followUp();
+    return persistedValue;
+  } catch (error) {
+    throw new ClaudeConfigPersistedError(persistedValue, error);
+  }
+}
+
+function appendClaudeConfigAuditBestEffort(
+  actor: string,
+  action: string,
+  changedFields: string[],
+  metadata?: Record<string, unknown>,
+): void {
+  try {
+    appendClaudeConfigAudit(actor, action, changedFields, metadata);
+  } catch (error) {
+    logger.error(
+      { error, actor, action },
+      'Provider configuration audit append failed after persistence',
+    );
+  }
 }
 
 let claudeConfigMutationTail: Promise<void> = Promise.resolve();
@@ -235,18 +282,33 @@ async function withClaudeConfigMutationLock<T>(
   }
 }
 
-function hasWorkspaceProviderOverride(folder: string): boolean {
+function hasWorkspaceProviderOverride(
+  folder: string,
+  invalidation?: ApplyOptions['sessionInvalidation'],
+): boolean {
   const override = getContainerEnvConfig(folder);
-  return !!(
+  const hasCredentialOrEndpointOverride = !!(
     override.anthropicBaseUrl ||
     override.anthropicAuthToken ||
     override.anthropicApiKey ||
     override.claudeCodeOauthToken ||
     override.claudeOAuthCredentials
   );
+  // A workspace-level model still uses the global provider endpoint. It only
+  // makes a legacy NULL session unattributable for a model-only global change;
+  // a simultaneous Base URL change still affects that workspace.
+  const hasRelevantModelOverride = !!(
+    invalidation?.modelChanged &&
+    !invalidation.baseUrlChanged &&
+    override.anthropicModel
+  );
+  return hasCredentialOrEndpointOverride || hasRelevantModelOverride;
 }
 
-function getSafeLegacyUnboundFolders(providerId: string): string[] {
+function getSafeLegacyUnboundFolders(
+  providerId: string,
+  invalidation?: ApplyOptions['sessionInvalidation'],
+): string[] {
   if (!deps) return [];
   const configuredProviders = getProviders();
   if (
@@ -261,16 +323,26 @@ function getSafeLegacyUnboundFolders(providerId: string): string[] {
         deps.getRegisteredGroups() as Record<string, RegisteredGroup>,
       )
         .map((group) => group.folder)
-        .filter((folder) => !hasWorkspaceProviderOverride(folder)),
+        .filter(
+          (folder) => !hasWorkspaceProviderOverride(folder, invalidation),
+        ),
     ),
   );
 }
 
-function clearProviderSessions(providerId: string): number {
+function clearProviderSessions(
+  providerId: string,
+  invalidation?: ApplyOptions['sessionInvalidation'],
+): number {
   if (!deps) return 0;
   const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
     providerId,
-    { includeUnboundFolders: getSafeLegacyUnboundFolders(providerId) },
+    {
+      includeUnboundFolders: getSafeLegacyUnboundFolders(
+        providerId,
+        invalidation,
+      ),
+    },
   );
   for (const folder of affectedFolders) {
     delete deps.sessions[folder];
@@ -303,19 +375,56 @@ async function mutateClaudeConfigForAllGroups<T>(
   if (!deps) throw new Error('Server not initialized');
 
   const targets = getClaudeRuntimeTargets();
+  const reason = String(metadata?.trigger ?? 'claude_config_apply');
+  const knownRuntimeJids = Array.from(
+    new Set(
+      targets.flatMap((target) =>
+        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+      ),
+    ),
+  );
   try {
     const result = await quiesceWorkspaceRunnersAroundCommit(
       deps,
       targets,
-      { reason: String(metadata?.trigger ?? 'claude_config_apply') },
+      {
+        reason,
+        onPostCommitFailure: (runtimeJids) =>
+          deps.queue.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `${reason}: post-commit provider runtime cleanup failed`,
+          ),
+      },
       async () => {
-        const value = await commit();
+        // Invalidate attributable resume state before persisting protocol
+        // changes. If cleanup fails the provider file remains unchanged, so a
+        // same-value retry cannot accidentally skip the unfinished cleanup and
+        // release a runtime-safety gate.
         const clearedSessionsCount = options?.clearSessionsForProviderId
-          ? clearProviderSessions(options.clearSessionsForProviderId)
+          ? clearProviderSessions(
+              options.clearSessionsForProviderId,
+              options.sessionInvalidation,
+            )
           : undefined;
+        let value: T;
+        try {
+          value = await commit();
+        } catch (error) {
+          if (error instanceof ClaudeConfigPersistedError) {
+            deps.queue.blockGroupsForRuntimeSafety?.(
+              knownRuntimeJids,
+              `${reason}: provider config persisted but follow-up failed`,
+            );
+          }
+          throw error;
+        }
         return { value, clearedSessionsCount };
       },
     );
+    // A successful retry proves every runtime now observes the persisted
+    // provider config, so it may repair a fail-closed gate left by an earlier
+    // post-commit teardown failure.
+    deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
     const applied: ClaudeApplyResultPayload = {
       success: true,
       stoppedCount: result.runtimeJids.length,
@@ -325,12 +434,35 @@ async function mutateClaudeConfigForAllGroups<T>(
         ? { clearedSessionsCount: result.value.clearedSessionsCount }
         : {}),
     };
-    appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
-      ...applied,
-      ...(metadata || {}),
-    });
+    appendClaudeConfigAuditBestEffort(
+      actor,
+      'apply_to_all_flows',
+      ['queue.stopGroup'],
+      {
+        ...applied,
+        ...(metadata || {}),
+      },
+    );
     return { value: result.value.value, applied };
   } catch (err) {
+    if (err instanceof ClaudeConfigPersistedError) {
+      const applied: ClaudeApplyResultPayload = {
+        success: false,
+        stoppedCount: 0,
+        failedCount: 1,
+        persisted: true,
+        phase: 'post_commit',
+        error:
+          'Configuration was saved, but provider runtime cleanup did not complete safely',
+      };
+      appendClaudeConfigAuditBestEffort(
+        actor,
+        'apply_to_all_flows',
+        ['queue.stopGroup'],
+        { ...applied, ...(metadata || {}) },
+      );
+      return { value: err.persistedValue as T, applied };
+    }
     if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
     const committed = err.committedValue as
       | { value: T; clearedSessionsCount?: number }
@@ -349,10 +481,12 @@ async function mutateClaudeConfigForAllGroups<T>(
         ? 'Configuration was saved, but one or more runtimes failed to restart safely'
         : 'Configuration was not updated because one or more runtimes failed to stop safely',
     };
-    appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
-      ...applied,
-      ...(metadata || {}),
-    });
+    appendClaudeConfigAuditBestEffort(
+      actor,
+      'apply_to_all_flows',
+      ['queue.stopGroup'],
+      { ...applied, ...(metadata || {}) },
+    );
     return { value: committed?.value, applied };
   }
 }
@@ -596,7 +730,7 @@ configRoutes.patch(
         };
         const commit = () => {
           const updated = updateProvider(id, validation.data);
-          appendClaudeConfigAudit(actor, 'update_provider', [
+          appendClaudeConfigAuditBestEffort(actor, 'update_provider', [
             `id:${id}`,
             ...changedFields,
             ...(protocolFieldChanged ? ['protocolFieldChanged'] : []),
@@ -611,14 +745,17 @@ configRoutes.patch(
             metadata,
             commit,
             shouldClearSessions
-              ? { clearSessionsForProviderId: id }
+              ? {
+                  clearSessionsForProviderId: id,
+                  sessionInvalidation: { modelChanged, baseUrlChanged },
+                }
               : undefined,
           );
         } else {
-          const updated = commit();
           const clearedSessionsCount = shouldClearSessions
-            ? clearProviderSessions(id)
+            ? clearProviderSessions(id, { modelChanged, baseUrlChanged })
             : undefined;
+          const updated = commit();
           mutation = {
             value: updated,
             applied: {
@@ -701,15 +838,16 @@ configRoutes.put(
 
         const commit = () => {
           const updated = updateProviderSecrets(id, validation.data);
-          appendClaudeConfigAudit(actor, 'update_provider_secrets', [
+          appendClaudeConfigAuditBestEffort(actor, 'update_provider_secrets', [
             `id:${id}`,
             ...changedFields,
           ]);
-          if (validation.data.claudeOAuthCredentials && updated.enabled) {
-            updateAllSessionCredentials(providerToConfig(updated));
-            deps?.queue?.closeAllActiveForCredentialRefresh();
-          }
-          return updated;
+          return runAfterProviderPersistence(updated, () => {
+            if (validation.data.claudeOAuthCredentials && updated.enabled) {
+              updateAllSessionCredentials(providerToConfig(updated));
+              deps?.queue?.closeAllActiveForCredentialRefresh();
+            }
+          });
         };
 
         const mutation = previous.enabled
@@ -795,7 +933,7 @@ configRoutes.post(
           { trigger: 'provider_toggle', providerId: id },
           () => {
             const updated = toggleProvider(id);
-            appendClaudeConfigAudit(actor, 'toggle_provider', [
+            appendClaudeConfigAuditBestEffort(actor, 'toggle_provider', [
               `id:${id}`,
               `enabled:${updated.enabled}`,
             ]);
@@ -911,11 +1049,15 @@ configRoutes.post(
   async (c) => {
     const actor = (c.get('user') as AuthUser).username;
     try {
-      const result = await applyClaudeConfigToAllGroups(actor);
-      if (!result.success) {
-        return c.json(result, 207);
-      }
-      return c.json(result);
+      return await withClaudeConfigMutationLock(async () => {
+        const result = await applyClaudeConfigToAllGroups(actor, {
+          trigger: 'manual_provider_apply',
+        });
+        if (!result.success) {
+          return c.json(result, 207);
+        }
+        return c.json(result);
+      });
     } catch (err) {
       logger.error({ err }, 'Failed to apply Claude config to all groups');
       return c.json({ error: 'Server not initialized' }, 500);

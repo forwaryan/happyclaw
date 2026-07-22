@@ -293,20 +293,22 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     const jid = `web:${folder}`;
     const group = registerWorkspace(jid, folder);
     let stopCalls = 0;
-    bindDeps(
-      { [jid]: group },
-      {
-        listDescendantJids: () => [],
-        pauseGroupsForMutation: () => ({ id: 4 }),
-        resumeGroupsAfterMutation: vi.fn(),
-        stopGroup: vi.fn(async () => {
-          stopCalls += 1;
-          if (stopCalls === 2) {
-            throw new Error('simulated post-commit stop failure');
-          }
-        }),
-      },
-    );
+    const blockGroupsForRuntimeSafety = vi.fn();
+    const unblockGroupsForRuntimeSafety = vi.fn();
+    const queue = {
+      listDescendantJids: () => [],
+      pauseGroupsForMutation: () => ({ id: 4 }),
+      resumeGroupsAfterMutation: vi.fn(),
+      blockGroupsForRuntimeSafety,
+      unblockGroupsForRuntimeSafety,
+      stopGroup: vi.fn(async () => {
+        stopCalls += 1;
+        if (stopCalls === 2) {
+          throw new Error('simulated post-commit stop failure');
+        }
+      }),
+    };
+    bindDeps({ [jid]: group }, queue);
     const provider = runtimeConfig.createProvider({
       name: unique('partially-applied-provider'),
       type: 'third_party',
@@ -331,6 +333,76 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       runtimeConfig.getProviders().find((item) => item.id === provider.id)
         ?.anthropicModel,
     ).toBe('persisted-model');
+    expect(blockGroupsForRuntimeSafety).toHaveBeenCalledWith(
+      [jid],
+      expect.stringContaining('post-commit provider runtime cleanup failed'),
+    );
+    expect(unblockGroupsForRuntimeSafety).not.toHaveBeenCalled();
+
+    const retryResponse = await patchProvider(provider.id, {
+      anthropicModel: 'retry-succeeded-model',
+    });
+    expect(retryResponse.status).toBe(200);
+    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.anthropicModel,
+    ).toBe('retry-succeeded-model');
+  });
+
+  test('serializes manual apply with a concurrent provider mutation', async () => {
+    const folder = unique('manual-apply-lock');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    let releaseFirstStop!: () => void;
+    const firstStopGate = new Promise<void>((resolve) => {
+      releaseFirstStop = resolve;
+    });
+    let stopCalls = 0;
+    bindDeps(
+      { [jid]: group },
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 5 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        blockGroupsForRuntimeSafety: vi.fn(),
+        unblockGroupsForRuntimeSafety: vi.fn(),
+        stopGroup: vi.fn(async () => {
+          stopCalls += 1;
+          if (stopCalls === 1) await firstStopGate;
+        }),
+      },
+    );
+    const provider = runtimeConfig.createProvider({
+      name: unique('locked-provider'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://same.example.test',
+      anthropicAuthToken: 'test-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const patchRequest = patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stopCalls).toBe(1);
+
+    const manualApplyRequest = app.request('/api/config/claude/apply', {
+      method: 'POST',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stopCalls).toBe(1);
+
+    releaseFirstStop();
+    const [patchResponse, applyResponse] = await Promise.all([
+      patchRequest,
+      manualApplyRequest,
+    ]);
+    expect(patchResponse.status).toBe(200);
+    expect(applyResponse.status).toBe(200);
+    expect(stopCalls).toBe(4);
   });
 });
 
@@ -372,6 +444,31 @@ describe('provider session invalidation only removes attributable sessions', () 
 
     const response = await patchProvider(provider.id, {
       anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBe(sessionId);
+  });
+
+  test('preserves an unbound session with a workspace model-only override during a global model-only update', async () => {
+    const folder = unique('model-only-override');
+    const jid = `web:${folder}`;
+    const sessionId = unique('model-override-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    runtimeConfig.saveContainerEnvConfig(folder, {
+      anthropicModel: 'workspace-model',
+    });
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'old-global-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-global-model',
     });
 
     expect(response.status).toBe(200);
