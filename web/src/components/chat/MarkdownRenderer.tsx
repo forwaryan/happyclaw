@@ -10,8 +10,7 @@ import React, { useState, useMemo, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, Check } from 'lucide-react';
 import { MermaidDiagram } from './MermaidDiagram';
-import { toBase64Url } from '../../stores/files';
-import { withBasePath } from '../../utils/url';
+import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
 import 'highlight.js/styles/github.css';
 import 'katex/dist/katex.min.css';
 
@@ -23,26 +22,6 @@ interface MarkdownRendererProps {
   streaming?: boolean;
   /** When true, force images to load eagerly. Required for offscreen render contexts (e.g. share-image export) where lazy-loaded images would otherwise never start fetching. */
   eagerImages?: boolean;
-}
-
-/** Resolve relative image paths to the file download API */
-function resolveImageSrc(src: string, groupJid?: string): string {
-  if (!groupJid || !src) return src;
-  if (/^(https?:\/\/|data:|\/\/)/.test(src) || src.startsWith('/')) return src;
-  // Strip #agent:xxx suffix — file API uses the base group JID
-  const baseJid = groupJid.replace(/#agent:.*$/, '');
-  // Markdown parser (micromark) percent-encodes non-ASCII characters in URLs;
-  // decode first so toBase64Url encodes the actual UTF-8 filename.
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(src);
-  } catch {
-    decoded = src;
-  }
-  const encoded = toBase64Url(decoded);
-  return withBasePath(
-    `/api/groups/${encodeURIComponent(baseJid)}/files/download/${encoded}`,
-  );
 }
 
 /** Image lightbox for markdown images */
@@ -309,7 +288,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
           code: (props) => <CodeBlock {...props} variant={variant} />,
           img: ({ src, alt }) => (
             <MarkdownImage
-              src={src ? resolveImageSrc(src, groupJid) : undefined}
+              src={src ? resolveMarkdownImageSrc(src, groupJid) : undefined}
               alt={alt}
               loading={eagerImages ? 'eager' : 'lazy'}
             />
