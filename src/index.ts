@@ -222,6 +222,10 @@ import {
   getUserContextIsolationConfig,
 } from './im-context-isolation.js';
 import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cross-group-acl.js';
+import {
+  resolveIpcDeliveryTargetGroup,
+  resolveIpcImRoute,
+} from './ipc-delivery-routing.js';
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
@@ -1600,13 +1604,12 @@ function resolveImRoute(opts: {
   chatJid: string;
   sourceGroup: string;
 }): string | null {
-  const { ipcAgentId, isHome, chatJid, sourceGroup } = opts;
-  if (ipcAgentId) {
-    return activeImReplyRoutes.get(`${chatJid}#agent:${ipcAgentId}`) ?? null;
-  }
-  const imFromJid = getChannelType(chatJid) !== null ? chatJid : null;
-  const imFromGroup = activeImReplyRoutes.get(sourceGroup) ?? null;
-  return isHome ? (imFromGroup ?? imFromJid) : (imFromJid ?? imFromGroup);
+  return resolveIpcImRoute({
+    ...opts,
+    getActiveRoute: (runtimeJid) => activeImReplyRoutes.get(runtimeJid) ?? null,
+    getAgentChatJid: (agentId) => getAgent(agentId)?.chat_jid ?? null,
+    isImJid: (jid) => getChannelType(jid) !== null,
+  });
 }
 
 function detachThreadMapWorkspace(
@@ -6732,6 +6735,15 @@ function canSendCrossGroupMessage(
   );
 }
 
+function getIpcDeliveryTargetGroup(
+  chatJid: string,
+): RegisteredGroup | undefined {
+  return resolveIpcDeliveryTargetGroup(
+    chatJid,
+    (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+  );
+}
+
 // Thin production wrapper around the pure helper in ./task-routing.ts so the
 // internal call sites keep their short signature (deps inferred from the
 // runtime IM manager + DB). Tests should import `broadcastToOwnerIMChannels`
@@ -6927,7 +6939,7 @@ function startIpcWatcher(): void {
               continue;
             }
             if (data.type === 'message' && data.chatJid && data.text) {
-              const targetGroup = registeredGroups[data.chatJid];
+              const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
               let messageDelivered = false;
               if (
                 isRetryDuplicateIpcSend(sourceGroup, data.chatJid, data.text)
@@ -7155,7 +7167,7 @@ function startIpcWatcher(): void {
               data.imageBase64
             ) {
               // Handle image IPC messages from send_image MCP tool
-              const targetGroup = registeredGroups[data.chatJid];
+              const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
               let taskImageTargetJids: string[] = [];
               let taskImageDeliverySettled = false;
               let isTaskIpcImage = false;
@@ -9181,7 +9193,7 @@ async function processTaskIpc(
           break;
         }
         // Cross-group authorization check (same as send_message)
-        const targetGroup = registeredGroups[data.chatJid];
+        const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
         if (
           !canSendCrossGroupMessage(
             isAdminHome,
