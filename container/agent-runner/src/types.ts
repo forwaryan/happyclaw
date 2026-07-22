@@ -65,6 +65,9 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  providerFailure?: boolean;
+  /** Internal host-control marker: this turn is being retried in-process. */
+  providerFailureRetrying?: boolean;
   streamEvent?: StreamEvent;
   turnId?: string;
   sessionId?: string;

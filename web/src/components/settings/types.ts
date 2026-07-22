@@ -98,6 +98,7 @@ export interface SystemSettings {
   maxConcurrentScripts: number;
   scriptTimeout: number;
   taskBackfillGraceMs: number;
+  fallbackModel: string;
 }
 
 export interface HostIntegrationSettings {

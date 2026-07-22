@@ -82,6 +82,7 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
   'HAPPYCLAW_CLAUDE_ENDPOINT_KIND',
+  'HAPPYCLAW_FALLBACK_MODEL',
 ]);
 
 export const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
@@ -3829,6 +3830,11 @@ export interface SystemSettings {
   mainAgentAutoCompactWindow: number;
   // 0 = 交给 SDK；50-90 = 按当前模型上下文窗口的百分比压缩。
   mainAgentAutoCompactPercentage: number;
+  // 撞额度墙自动切模型：主模型在一轮里返回账号用量上限通知（如「You've reached
+  // your Fable 5 limit」）时，用该模型（别名或完整 ID）在同一轮无缝重跑一次。
+  // 空 = 关闭（保留原行为：把上限通知直接回给用户）。同一 OAuth 账号下不同模型有
+  // 独立额度桶，因此 fable→opus 这类回退无需再配置第二个 provider。
+  fallbackModel: string;
   // Plugin catalog 自动扫描：true（默认）= 启动 5s 后扫一次 + 每小时一次；
   // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
   // 适用于不希望本机私有 plugin 自动入共享 catalog 的环境。
@@ -3867,6 +3873,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   mainAgentContextSource: 'host_claude',
   mainAgentAutoCompactWindow: 0,
   mainAgentAutoCompactPercentage: 0,
+  fallbackModel: '',
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
 };
@@ -3962,6 +3969,16 @@ function normalizeSystemSettings(
       : Math.max(50, mainAgentAutoCompactPercentageRaw);
   if (mainAgentAutoCompactPercentage !== mainAgentAutoCompactPercentageRaw) {
     invalidFields.add('mainAgentAutoCompactPercentage');
+  }
+
+  let fallbackModel = DEFAULT_SYSTEM_SETTINGS.fallbackModel;
+  if (raw.fallbackModel !== undefined) {
+    if (typeof raw.fallbackModel === 'string') {
+      // 空字符串合法（= 关闭撞墙自动切模型），仅去空白并限长。
+      fallbackModel = raw.fallbackModel.trim().slice(0, 64);
+    } else {
+      invalidFields.add('fallbackModel');
+    }
   }
 
   let billingCurrency = DEFAULT_SYSTEM_SETTINGS.billingCurrency;
@@ -4093,6 +4110,7 @@ function normalizeSystemSettings(
     mainAgentAutoCompactWindow:
       mainAgentAutoCompactPercentage > 0 ? 0 : mainAgentAutoCompactWindow,
     mainAgentAutoCompactPercentage,
+    fallbackModel,
     pluginAutoScan: booleanField(
       'pluginAutoScan',
       DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
@@ -4145,6 +4163,7 @@ function buildEnvFallbackSettings(): SystemSettings {
       mainAgentAutoCompactPercentage:
         process.env.MAIN_AGENT_AUTO_COMPACT_PERCENTAGE ??
         process.env.AUTO_COMPACT_PERCENTAGE,
+      fallbackModel: process.env.FALLBACK_MODEL,
       pluginAutoScan: process.env.PLUGIN_AUTO_SCAN,
       taskBackfillGraceMs: process.env.TASK_BACKFILL_GRACE_MS,
     },

@@ -8,6 +8,7 @@ import {
   isHealthyInputTurnCompletion,
   latestIpcDeliveryId,
   latestIpcInputMessage,
+  orderIpcInputMessages,
   parseIpcReceipt,
   requeueIpcInputMessages,
   serializeIpcInputMessage,
@@ -35,6 +36,25 @@ function message(id: string): IpcInputMessage {
 }
 
 describe('agent-runner IPC delivery turn tracker', () => {
+  test('orders requeued older messages before newly written messages by durable cursor', () => {
+    const olderRequeued = message('1');
+    const newerArrival = message('2');
+
+    expect(orderIpcInputMessages([newerArrival, olderRequeued])).toEqual([
+      olderRequeued,
+      newerArrival,
+    ]);
+  });
+
+  test('preserves filesystem order when a mixed batch has no complete durable ordering', () => {
+    const newerArrival = message('2');
+    const legacyMessage: IpcInputMessage = { text: 'legacy' };
+    const olderRequeued = message('1');
+    const drained = [newerArrival, legacyMessage, olderRequeued];
+
+    expect(orderIpcInputMessages(drained)).toEqual(drained);
+  });
+
   test('selects the greatest receipt cursor regardless of filesystem order', () => {
     const older = message('1');
     const newerSameTimestamp: IpcInputMessage = {

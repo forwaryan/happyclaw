@@ -1866,6 +1866,18 @@ export class StreamEventProcessor {
     this.fullTextAccumulator = '';
   }
 
+  /** Drop a provider/system notice that will be retried and must stay hidden. */
+  discardPendingTextOutput(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.streamBufs.clear();
+    this.fullTextAccumulator = '';
+    // Make cleanup clear rather than flush any late buffer from the spent SDK stream.
+    this.seenTextualResult = true;
+  }
+
   /**
    * Cleanup all residual state after the query loop ends.
    * Must be called after the for-await loop completes or on error.

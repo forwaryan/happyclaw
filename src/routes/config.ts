@@ -2098,6 +2098,7 @@ function toSystemSettingsResponse(
     maxConcurrentScripts: settings.maxConcurrentScripts,
     scriptTimeout: settings.scriptTimeout,
     taskBackfillGraceMs: settings.taskBackfillGraceMs,
+    fallbackModel: settings.fallbackModel,
   };
 }
 

@@ -366,6 +366,8 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
+  /** Internal agent-runner marker: the failed turn is being retried in-process. */
+  providerFailureRetrying?: boolean;
   streamEvent?: StreamEvent;
   turnId?: string;
   sessionId?: string;
@@ -883,6 +885,21 @@ export function prepareHostPlugins(
   return loadUserPlugins(ownerId, { runtime: 'host' });
 }
 
+/** Inject the globally configured same-turn fallback into the agent runner. */
+export function applyFallbackModelToEnvLines(
+  envLines: string[],
+  configuredFallbackModel = getSystemSettings().fallbackModel,
+): void {
+  for (let i = envLines.length - 1; i >= 0; i--) {
+    if (envLines[i].startsWith('HAPPYCLAW_FALLBACK_MODEL=')) {
+      envLines.splice(i, 1);
+    }
+  }
+  const fallbackModel = configuredFallbackModel?.trim();
+  if (!fallbackModel) return;
+  envLines.push(`HAPPYCLAW_FALLBACK_MODEL=${fallbackModel}`);
+}
+
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
@@ -1176,6 +1193,7 @@ export function buildVolumeMounts(
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
+  applyFallbackModelToEnvLines(envLines);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -1565,6 +1583,24 @@ export async function runContainerAgent(
       };
       const handleOutput = onOutput
         ? async (output: ContainerOutput): Promise<void> => {
+            if (output.providerFailureRetrying) {
+              if (output.providerFailure && selectedProfileId) {
+                if (!providerFailureReported) {
+                  providerFailureReported = true;
+                  providerPool.reportFailure(selectedProfileId, true);
+                  logger.warn(
+                    {
+                      group: group.name,
+                      containerName,
+                      providerId: selectedProfileId,
+                    },
+                    'Provider failure detected; agent runner is retrying the failed turn with fallback model',
+                  );
+                }
+              }
+              // This is host-control metadata, never a user-visible output.
+              return;
+            }
             await onOutput(output);
             if (output.providerFailure && selectedProfileId) {
               if (!providerFailureReported) {
@@ -1669,7 +1705,10 @@ export async function runContainerAgent(
         if (!providerFailureReported) {
           providerPool.reportFailure(selectedProfileId, true);
         }
-      } else if (result.status === 'success' || result.status === 'closed') {
+      } else if (
+        !providerFailureReported &&
+        (result.status === 'success' || result.status === 'closed')
+      ) {
         providerPool.reportSuccess(selectedProfileId);
       } else if (result.status === 'error' && isApiError(result.error || '')) {
         providerPool.reportFailure(selectedProfileId);
@@ -2057,6 +2096,12 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
+    const fallbackModel = getSystemSettings().fallbackModel?.trim();
+    if (fallbackModel) {
+      hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = fallbackModel;
+    } else {
+      delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
+    }
 
     // Third-party provider: unless this provider explicitly injects
     // ANTHROPIC_AUTH_TOKEN (Bearer proxy mode), remove any inherited host token
@@ -2373,6 +2418,24 @@ export async function runHostAgent(
       };
       const handleOutput = onOutput
         ? async (output: ContainerOutput): Promise<void> => {
+            if (output.providerFailureRetrying) {
+              if (output.providerFailure && hostSelectedProfileId) {
+                if (!hostProviderFailureReported) {
+                  hostProviderFailureReported = true;
+                  providerPool.reportFailure(hostSelectedProfileId, true);
+                  logger.warn(
+                    {
+                      group: group.name,
+                      processId,
+                      providerId: hostSelectedProfileId,
+                    },
+                    'Provider failure detected; agent runner is retrying the failed turn with fallback model',
+                  );
+                }
+              }
+              // This is host-control metadata, never a user-visible output.
+              return;
+            }
             await onOutput(output);
             if (output.providerFailure && hostSelectedProfileId) {
               if (!hostProviderFailureReported) {
@@ -2466,8 +2529,8 @@ export async function runHostAgent(
           providerPool.reportFailure(hostSelectedProfileId, true);
         }
       } else if (
-        hostResult.status === 'success' ||
-        hostResult.status === 'closed'
+        !hostProviderFailureReported &&
+        (hostResult.status === 'success' || hostResult.status === 'closed')
       ) {
         providerPool.reportSuccess(hostSelectedProfileId);
       } else if (
@@ -2485,4 +2548,23 @@ export async function runHostAgent(
       providerPool.releaseSession(hostSelectedProfileId);
     }
   }
+}
+
+/** A concrete agent runner (Docker or host) — both share this signature. */
+export type AgentRunner = typeof runContainerAgent | typeof runHostAgent;
+
+/** Compatibility entry point; same-turn fallback now lives inside agent-runner. */
+export async function runAgentWithModelFallback(
+  runFn: AgentRunner,
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (
+    proc: ChildProcess,
+    identifier: string,
+    selectedProviderId: string | null,
+  ) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+  ownerHomeFolder?: string,
+): Promise<ContainerOutput> {
+  return runFn(group, input, onProcess, onOutput, ownerHomeFolder);
 }
