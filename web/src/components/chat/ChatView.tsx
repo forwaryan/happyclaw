@@ -881,16 +881,18 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               运行中
             </span>
           )}
-          {!isHome && canModifyWorkspaceConfig && (
+          {canModifyWorkspaceConfig && (
             <button
               type="button"
-              onClick={() => setBindingAgentId(WORKSPACE_BINDING)}
+              onClick={() =>
+                setBindingAgentId(isHome ? MAIN_BINDING : WORKSPACE_BINDING)
+              }
               className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
-              title="管理工作区绑定"
-              aria-label="管理工作区绑定"
+              title={isHome ? '管理主会话渠道绑定' : '管理工作区绑定'}
+              aria-label={isHome ? '管理主会话渠道绑定' : '管理工作区绑定'}
             >
               <Link className="h-4 w-4" />
-              <span className="hidden xl:inline">渠道绑定</span>
+              <span className="hidden sm:inline">渠道绑定</span>
             </button>
           )}
           <button

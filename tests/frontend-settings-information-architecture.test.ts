@@ -235,6 +235,13 @@ describe('settings information architecture', () => {
 
     expect(sessions).toContain('? () => onBindSession(null)');
     expect(chatView).toContain('setBindingAgentId(id ?? MAIN_BINDING)');
+    expect(chatView).toContain(
+      'setBindingAgentId(isHome ? MAIN_BINDING : WORKSPACE_BINDING)',
+    );
+    expect(chatView).toContain(
+      "isHome ? '管理主会话渠道绑定' : '管理工作区绑定'",
+    );
+    expect(chatView).not.toContain('{!isHome && canModifyWorkspaceConfig && (');
     expect(chatView).toContain("? 'workspace' : 'session'");
     expect(bindingDialog).toContain(
       'capabilities?.can_bind_workspace === true',
