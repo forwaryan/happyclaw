@@ -49,6 +49,11 @@ import {
 import { isMentionActivationMode } from '../feishu-conversation-policy.js';
 import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
 import {
+  conversationBindingPolicyError,
+  resolveChannelConversationKind,
+  type ChannelConversationKind,
+} from '../channel-conversation-kind.js';
+import {
   adminRoleMiddleware,
   authMiddleware,
   systemConfigMiddleware,
@@ -1621,6 +1626,17 @@ type ChannelChatInfo = NativeContextMetadata & {
   name?: string;
   user_count?: string;
 };
+
+function getConversationKind(
+  imJid: string,
+  group: Pick<RegisteredGroup, 'feishu_chat_mode'>,
+  chatInfo?: ChannelChatInfo | null,
+): ChannelConversationKind {
+  return resolveChannelConversationKind(imJid, {
+    feishu_chat_mode: group.feishu_chat_mode,
+    chat_mode: chatInfo?.chat_mode,
+  });
+}
 
 // Only fetches live chat metadata — does NOT compute threadCapable. That
 // decision must be (re-)computed by the caller against a freshly re-read
@@ -4195,6 +4211,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         400,
       );
     }
+    const bindingPolicyError = conversationBindingPolicyError(
+      getConversationKind(imJid, freshImGroup, chatInfo),
+      'session',
+    );
+    if (bindingPolicyError) {
+      return c.json({ error: bindingPolicyError }, 400);
+    }
 
     const force = body.force === true;
     const replyPolicy =
@@ -4288,6 +4311,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     if (!canModifyGroup(user, { ...freshTargetGroup, jid: targetMainJid })) {
       return c.json({ error: 'Forbidden' }, 403);
+    }
+    const bindingPolicyError = conversationBindingPolicyError(
+      getConversationKind(imJid, freshImGroup, chatInfo),
+      'workspace',
+    );
+    if (bindingPolicyError) {
+      return c.json({ error: bindingPolicyError }, 400);
     }
     if (
       getChannelType(imJid) === 'feishu' &&

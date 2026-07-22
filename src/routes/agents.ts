@@ -60,6 +60,11 @@ import {
 } from '../channel-address.js';
 import { isMentionActivationMode } from '../feishu-conversation-policy.js';
 import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
+import {
+  conversationBindingPolicyError,
+  resolveChannelConversationKind,
+  type ChannelConversationKind,
+} from '../channel-conversation-kind.js';
 
 const router = new Hono<{ Variables: Variables }>();
 
@@ -68,6 +73,17 @@ type ChannelChatInfo = NativeContextMetadata & {
   name?: string;
   user_count?: string;
 };
+
+function getConversationKind(
+  imJid: string,
+  group: Pick<RegisteredGroup, 'feishu_chat_mode'>,
+  chatInfo?: ChannelChatInfo | null,
+): ChannelConversationKind {
+  return resolveChannelConversationKind(imJid, {
+    feishu_chat_mode: group.feishu_chat_mode,
+    chat_mode: chatInfo?.chat_mode,
+  });
+}
 
 // Only fetches live chat metadata — does NOT compute threadCapable. That
 // decision must be (re-)computed by the caller against a freshly re-read
@@ -1055,6 +1071,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
     chat_mode?: string; // 'p2p' | 'group' — from Feishu API (distinguishes P2P vs group chat)
     group_message_type?: string;
     is_thread_capable?: boolean;
+    conversation_kind: ChannelConversationKind;
     activation_mode?: string;
     audience_mode?: AudienceMode;
     require_mention?: boolean;
@@ -1115,6 +1132,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       chat_mode: g.feishu_chat_mode,
       group_message_type: g.feishu_group_message_type,
       is_thread_capable: isNativeContextContainer(j, g),
+      conversation_kind: getConversationKind(j, g),
       activation_mode: g.activation_mode,
       audience_mode: g.audience_mode ?? 'everyone',
       require_mention: g.require_mention === true,
@@ -1153,6 +1171,11 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
           g.chat_mode = info.chat_mode;
           g.group_message_type = info.group_message_type;
           g.is_thread_capable = isNativeContextContainer(
+            g.jid,
+            allGroups[g.jid],
+            info as ChannelChatInfo,
+          );
+          g.conversation_kind = getConversationKind(
             g.jid,
             allGroups[g.jid],
             info as ChannelChatInfo,
@@ -1334,6 +1357,13 @@ router.put(
           400,
         );
       }
+      const bindingPolicyError = conversationBindingPolicyError(
+        getConversationKind(imJid, freshImGroup, chatInfo),
+        'session',
+      );
+      if (bindingPolicyError) {
+        return c.json({ error: bindingPolicyError }, 400);
+      }
       const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
       if (hasConflict && !force) {
         return c.json({ error: 'IM group is already bound elsewhere' }, 409);
@@ -1374,6 +1404,13 @@ router.put(
     }
     if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
       return c.json({ error: 'Forbidden' }, 403);
+    }
+    const bindingPolicyError = conversationBindingPolicyError(
+      getConversationKind(imJid, freshImGroup, chatInfo),
+      'session',
+    );
+    if (bindingPolicyError) {
+      return c.json({ error: bindingPolicyError }, 400);
     }
     // Compute against freshImGroup, not the pre-await snapshot — see
     // fetchLiveChatInfo's doc comment.
@@ -1645,6 +1682,13 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
       400,
     );
   }
+  const bindingPolicyError = conversationBindingPolicyError(
+    getConversationKind(imJid, freshImGroup, chatInfo),
+    'session',
+  );
+  if (bindingPolicyError) {
+    return c.json({ error: bindingPolicyError }, 400);
+  }
   const force = body.force === true;
   const replyPolicy = body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
   const hasConflict = hasSessionMountConflict(freshImGroup, agentId);
@@ -1793,6 +1837,13 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   }
   if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
     return c.json({ error: 'Forbidden' }, 403);
+  }
+  const bindingPolicyError = conversationBindingPolicyError(
+    getConversationKind(imJid, freshImGroup, chatInfo),
+    'workspace',
+  );
+  if (bindingPolicyError) {
+    return c.json({ error: bindingPolicyError }, 400);
   }
   // Compute against freshImGroup, not the pre-await snapshot — see
   // fetchLiveChatInfo's doc comment.

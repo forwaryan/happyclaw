@@ -461,6 +461,15 @@ interface ChatState {
     audienceMode?: 'everyone' | 'owner_only',
   ) => Promise<boolean>;
   unbindMainImGroup: (jid: string, imJid: string) => Promise<boolean>;
+  bindWorkspaceImGroup: (
+    jid: string,
+    imJid: string,
+    force?: boolean,
+    activationMode?: string,
+    ownerImId?: string,
+    audienceMode?: 'everyone' | 'owner_only',
+  ) => Promise<boolean>;
+  unbindWorkspaceImGroup: (jid: string, imJid: string) => Promise<boolean>;
   // Draft persistence across route navigation
   drafts: Record<string, string>;
   saveDraft: (jid: string, text: string) => void;
@@ -3742,6 +3751,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       await api.delete(
         `/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding/${encodeURIComponent(imJid)}`,
+      );
+      await get().loadGroups();
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  bindWorkspaceImGroup: async (
+    jid,
+    imJid,
+    force,
+    activationMode,
+    ownerImId,
+    audienceMode,
+  ) => {
+    try {
+      await api.put(`/api/groups/${encodeURIComponent(jid)}/im-binding`, {
+        im_jid: imJid,
+        ...(force ? { force: true } : {}),
+        ...(activationMode ? { activation_mode: activationMode } : {}),
+        ...(ownerImId ? { owner_im_id: ownerImId } : {}),
+        ...(audienceMode ? { audience_mode: audienceMode } : {}),
+      });
+      await get().loadGroups();
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  unbindWorkspaceImGroup: async (jid, imJid) => {
+    try {
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/im-binding/${encodeURIComponent(imJid)}`,
       );
       await get().loadGroups();
       return true;

@@ -323,7 +323,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       secret_ref: `channel-account:account-b-${suffix}`,
     });
     for (const account of [first, second]) {
-      db.setRegisteredGroup(`telegram:shared#account:${account.id}`, {
+      db.setRegisteredGroup(`telegram:-1004242#account:${account.id}`, {
         name: 'Shared external chat',
         folder: GROUP_FOLDER,
         added_at: new Date().toISOString(),
@@ -335,17 +335,19 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     const { status, body } = await req('/im-groups', 'GET');
     expect(status).toBe(200);
     const matching = body.imGroups.filter((item: any) =>
-      item.jid.startsWith('telegram:shared#account:'),
+      item.jid.startsWith('telegram:-1004242#account:'),
     );
     expect(matching).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           channel_account_id: first.id,
           channel_account_name: 'Support bot',
+          conversation_kind: 'group',
         }),
         expect.objectContaining({
           channel_account_id: second.id,
           channel_account_name: 'Review bot',
+          conversation_kind: 'group',
         }),
       ]),
     );
@@ -508,7 +510,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     }
   });
 
-  test('ordinary chats can bind to a workspace main conversation', async () => {
+  test('a direct chat can bind to the workspace main session', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
     const suffix = Date.now().toString(36);
@@ -516,7 +518,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       id: `qq-workspace-${suffix}`,
       owner_user_id: OWNER_ID,
       provider: 'qq',
-      name: 'QQ bot',
+      name: `QQ main-session bot ${suffix}`,
       secret_ref: `channel-account:qq-workspace-${suffix}`,
       default_workspace_jid: GROUP_JID,
     });
@@ -538,6 +540,68 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       target_main_jid: GROUP_JID,
       binding_mode: 'single_context',
     });
+  });
+
+  test('workspace binding rejects a direct chat', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `qq-direct-workspace-reject-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'qq',
+      name: `QQ direct workspace reject bot ${suffix}`,
+      secret_ref: `channel-account:qq-direct-workspace-reject-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `qq:c2c:user-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'QQ direct chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+    });
+
+    const { status, body } = await req('/im-binding', 'PUT', {
+      im_jid: imJid,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/only accept group chats/i);
+    expect(db.getRegisteredGroup(imJid)?.target_main_jid).toBeUndefined();
+  });
+
+  test('session binding rejects a group chat', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Direct-only session' });
+    const sessionId = created.body.session.id as string;
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `qq-group-session-reject-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'qq',
+      name: `QQ session reject bot ${suffix}`,
+      secret_ref: `channel-account:qq-group-session-reject-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `qq:group:team-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'QQ group chat',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+    });
+
+    const { status, body } = await req(
+      `/sessions/${sessionId}/im-binding`,
+      'PUT',
+      { im_jid: imJid },
+    );
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/only accept direct chats/i);
+    expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBeUndefined();
   });
 
   test('ordinary Feishu mention mode binds as thread_map and returns to one shared context in always mode', async () => {
@@ -571,7 +635,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 
     try {
-      const mentioned = await req('/sessions/main/im-binding', 'PUT', {
+      const mentioned = await req('/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'when_mentioned',
       });
@@ -582,7 +646,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         activation_mode: 'when_mentioned',
       });
 
-      const always = await req('/sessions/main/im-binding', 'PUT', {
+      const always = await req('/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'always',
         force: true,
@@ -632,15 +696,11 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 
     try {
-      const ownerWithoutMention = await req(
-        '/sessions/main/im-binding',
-        'PUT',
-        {
-          im_jid: imJid,
-          activation_mode: 'always',
-          audience_mode: 'owner_only',
-        },
-      );
+      const ownerWithoutMention = await req('/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'always',
+        audience_mode: 'owner_only',
+      });
       expect(ownerWithoutMention.status).toBe(200);
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         activation_mode: 'always',
@@ -648,7 +708,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         binding_mode: 'single_context',
       });
 
-      const ownerWithMention = await req('/sessions/main/im-binding', 'PUT', {
+      const ownerWithMention = await req('/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'when_mentioned',
         audience_mode: 'owner_only',
@@ -661,16 +721,12 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         binding_mode: 'thread_map',
       });
 
-      const everyoneWithMention = await req(
-        '/sessions/main/im-binding',
-        'PUT',
-        {
-          im_jid: imJid,
-          activation_mode: 'when_mentioned',
-          audience_mode: 'everyone',
-          force: true,
-        },
-      );
+      const everyoneWithMention = await req('/im-binding', 'PUT', {
+        im_jid: imJid,
+        activation_mode: 'when_mentioned',
+        audience_mode: 'everyone',
+        force: true,
+      });
       expect(everyoneWithMention.status).toBe(200);
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         activation_mode: 'when_mentioned',
@@ -678,7 +734,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         binding_mode: 'thread_map',
       });
 
-      const legacyComposite = await req('/sessions/main/im-binding', 'PUT', {
+      const legacyComposite = await req('/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'owner_mentioned',
         force: true,
@@ -870,7 +926,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       secret_ref: `channel-account:telegram-forum-${suffix}`,
       default_workspace_jid: GROUP_JID,
     });
-    const imJid = `telegram:forum-${suffix}#account:${account.id}`;
+    const imJid = `telegram:-100${Date.now()}#account:${account.id}`;
     db.setRegisteredGroup(imJid, {
       name: 'Telegram Forum',
       folder: GROUP_FOLDER,
@@ -912,7 +968,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       secret_ref: `channel-account:telegram-race-${suffix}`,
       default_workspace_jid: GROUP_JID,
     });
-    const imJid = `telegram:forum-race-${suffix}#account:${account.id}`;
+    const imJid = `telegram:-101${Date.now()}#account:${account.id}`;
     db.setRegisteredGroup(imJid, {
       name: 'Telegram Forum (about to upgrade)',
       folder: GROUP_FOLDER,
@@ -1012,7 +1068,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       secret_ref: `channel-account:telegram-race-ws-${suffix}`,
       default_workspace_jid: GROUP_JID,
     });
-    const imJid = `telegram:forum-race-ws-${suffix}#account:${account.id}`;
+    const imJid = `telegram:-102${Date.now()}#account:${account.id}`;
     db.setRegisteredGroup(imJid, {
       name: 'Telegram Forum (about to upgrade, workspace bind)',
       folder: GROUP_FOLDER,
@@ -1035,7 +1091,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 
     try {
-      const { status } = await req('/sessions/main/im-binding', 'PUT', {
+      const { status } = await req('/im-binding', 'PUT', {
         im_jid: imJid,
       });
       expect(status).toBe(200);
@@ -1197,7 +1253,10 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         secret_ref: `channel-account:native-restore-${name}-${suffix}`,
         default_workspace_jid: defaultWorkspaceJid,
       });
-      const sourceJid = `${account.provider}:native-${name}-${suffix}#account:${account.id}`;
+      const sourceJid =
+        account.provider === 'feishu'
+          ? `feishu:native-${name}-${suffix}#account:${account.id}`
+          : `telegram:-103${Date.now()}#account:${account.id}`;
       sourceJids.push(sourceJid);
       db.setRegisteredGroup(sourceJid, {
         name: `${name} native container`,
@@ -1206,9 +1265,10 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         created_by: OWNER_ID,
         channel_account_id: account.id,
         native_context_type: 'thread',
+        ...(account.provider === 'feishu' ? { feishu_chat_mode: 'topic' } : {}),
       });
 
-      const bound = await req('/sessions/main/im-binding', 'PUT', {
+      const bound = await req('/im-binding', 'PUT', {
         im_jid: sourceJid,
       });
       expect(bound.status, JSON.stringify(bound.body)).toBe(200);

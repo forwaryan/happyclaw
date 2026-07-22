@@ -235,24 +235,17 @@ describe('settings information architecture', () => {
 
     expect(sessions).toContain('? () => onBindSession(null)');
     expect(chatView).toContain('setBindingAgentId(id ?? MAIN_BINDING)');
-    expect(chatView).toContain(
-      'setBindingAgentId(isHome ? MAIN_BINDING : WORKSPACE_BINDING)',
-    );
-    expect(chatView).toContain(
-      "isHome ? '管理主会话渠道绑定' : '管理工作区绑定'",
-    );
+    expect(chatView).toContain('setBindingAgentId(WORKSPACE_BINDING)');
+    expect(chatView).toContain('title="管理工作区群聊绑定"');
     expect(chatView).not.toContain('{!isHome && canModifyWorkspaceConfig && (');
     expect(chatView).toContain("? 'workspace' : 'session'");
     expect(bindingDialog).toContain(
       'capabilities?.can_bind_workspace === true',
     );
-    expect(bindingDialog).toContain('!group.is_thread_capable');
-    expect(bindings).toContain(
-      "target.type === 'session' || target.type === 'main'",
-    );
-    expect(bindings).toContain(
-      "targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'both'}",
-    );
+    expect(bindingDialog).toContain("group.conversation_kind === 'group'");
+    expect(bindingDialog).toContain("group.conversation_kind === 'direct'");
+    expect(bindings).toContain("rebindGroup.conversation_kind === 'group'");
+    expect(bindings).toContain("item.conversation_kind === 'direct'");
     expect(bindings).toContain('恢复账号默认工作区');
     expect(mobileChat).toMatch(/onRename=|onTogglePin=|onDelete=/);
     expect(createWorkspace).toContain('effective_runtime_policy');

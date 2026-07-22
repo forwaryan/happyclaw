@@ -40,9 +40,13 @@ export function ImBindingRow({
   const boundSessionId = group.bound_session_id ?? group.bound_agent_id;
   const boundWorkspaceJid = group.bound_workspace_jid ?? group.bound_main_jid;
   const hasBound = !!boundSessionId || !!boundWorkspaceJid;
+  const isLegacyGroupSessionBinding =
+    !!boundSessionId && group.conversation_kind !== 'direct';
   const supportsActivation =
+    group.conversation_kind === 'group' &&
+    !isLegacyGroupSessionBinding &&
     getImChannelCapabilities(group.channel_type)?.supports_activation_modes ===
-    true;
+      true;
   const supportsOwnerMention =
     getImChannelCapabilities(group.channel_type)?.supports_owner_mention ===
     true;
@@ -64,10 +68,14 @@ export function ImBindingRow({
         group.bound_workspace_name !== group.bound_target_name
           ? `${group.bound_workspace_name} / ${group.bound_target_name}`
           : group.bound_target_name;
-      return `会话 · ${target}`;
+      return group.conversation_kind === 'direct'
+        ? `会话 · ${target}`
+        : `异常会话绑定 · ${target}`;
     }
     if (boundWorkspaceJid && group.bound_target_name) {
-      return `工作区 · ${group.bound_target_name}`;
+      return group.conversation_kind === 'direct'
+        ? `主会话 · ${group.bound_target_name}`
+        : `工作区 · ${group.bound_target_name}`;
     }
     return '未绑定';
   };
@@ -107,6 +115,13 @@ export function ImBindingRow({
             />
           </div>
           <div className="flex items-center gap-2 mt-0.5 text-xs text-muted-foreground">
+            <span>
+              {group.conversation_kind === 'direct'
+                ? '私聊'
+                : group.conversation_kind === 'group'
+                  ? '群聊'
+                  : '类型待确认'}
+            </span>
             {group.member_count != null && (
               <span className="flex items-center gap-0.5">
                 <Users className="w-3 h-3" />
@@ -130,6 +145,12 @@ export function ImBindingRow({
                 发言者白名单为空，bot 无法响应任何人。请向 bot
                 发条私聊以认领群聊，或点击右侧「重置」清空白名单。
               </span>
+            </div>
+          )}
+          {isLegacyGroupSessionBinding && (
+            <div className="mt-1 flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              <span>历史绑定需要迁移：群聊只能绑定工作区。</span>
             </div>
           )}
         </div>
@@ -180,32 +201,34 @@ export function ImBindingRow({
             </select>
           </div>
         )}
-        {group.channel_type === 'feishu' && (
-          <select
-            value={
-              group.audience_mode === 'owner_only' ||
-              group.activation_mode === 'owner_mentioned'
-                ? 'owner_only'
-                : 'everyone'
-            }
-            onChange={(e) =>
-              onAudienceModeChange(
-                group.jid,
-                e.target.value as 'everyone' | 'owner_only',
-              )
-            }
-            disabled={isActioning}
-            aria-label={`${group.name} 的响应对象`}
-            title="响应对象"
-            className="text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground disabled:opacity-50"
-          >
-            {AUDIENCE_MODE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        )}
+        {group.channel_type === 'feishu' &&
+          group.conversation_kind === 'group' &&
+          !isLegacyGroupSessionBinding && (
+            <select
+              value={
+                group.audience_mode === 'owner_only' ||
+                group.activation_mode === 'owner_mentioned'
+                  ? 'owner_only'
+                  : 'everyone'
+              }
+              onChange={(e) =>
+                onAudienceModeChange(
+                  group.jid,
+                  e.target.value as 'everyone' | 'owner_only',
+                )
+              }
+              disabled={isActioning}
+              aria-label={`${group.name} 的响应对象`}
+              title="响应对象"
+              className="text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground disabled:opacity-50"
+            >
+              {AUDIENCE_MODE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          )}
         {hasBound && (
           <Button
             size="sm"

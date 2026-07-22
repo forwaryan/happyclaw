@@ -9,6 +9,7 @@ import {
   Info,
   RefreshCw,
   X,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   Dialog,
@@ -93,24 +94,19 @@ function supportsActivationModes(
 }
 
 function isFeishuDirectChat(group: AvailableImGroup): boolean {
-  return group.channel_type === 'feishu' && group.chat_mode === 'p2p';
+  return group.conversation_kind === 'direct';
+}
+
+function conversationKindLabel(group: AvailableImGroup): string {
+  if (group.conversation_kind === 'direct') return '私聊';
+  if (group.conversation_kind === 'group') return '群聊';
+  return '类型待确认';
 }
 
 function isNativeFeishuTopicGroup(group: AvailableImGroup): boolean {
   return (
     group.channel_type === 'feishu' &&
     (group.chat_mode === 'topic' || group.group_message_type === 'thread')
-  );
-}
-
-function requiresWorkspaceBinding(group: AvailableImGroup): boolean {
-  if (group.is_thread_capable) return true;
-  if (group.channel_type !== 'feishu' || group.chat_mode === 'p2p')
-    return false;
-  return (
-    group.activation_mode === 'when_mentioned' ||
-    group.activation_mode === 'owner_mentioned' ||
-    (group.activation_mode === 'auto' && group.require_mention === true)
   );
 }
 
@@ -195,6 +191,8 @@ export function ImBindingDialog({
   const unbindImGroup = useChatStore((s) => s.unbindImGroup);
   const bindMainImGroup = useChatStore((s) => s.bindMainImGroup);
   const unbindMainImGroup = useChatStore((s) => s.unbindMainImGroup);
+  const bindWorkspaceImGroup = useChatStore((s) => s.bindWorkspaceImGroup);
+  const unbindWorkspaceImGroup = useChatStore((s) => s.unbindWorkspaceImGroup);
 
   const isMainMode = agentId === null;
   const isWorkspaceMode = targetMode === 'workspace';
@@ -203,17 +201,24 @@ export function ImBindingDialog({
     () =>
       imGroups.filter((group) => {
         const capabilities = getImChannelCapabilities(group.channel_type);
-        if (isWorkspaceMode) return capabilities?.can_bind_workspace === true;
-        if (capabilities?.can_bind_session !== true) return false;
-        if (!requiresWorkspaceBinding(group)) return true;
-        // A main-conversation bind can become a workspace thread map after the
-        // user selects mention activation. Keep the now-bound row visible so
-        // it can still be inspected, changed, or restored from this dialog.
+        if (isWorkspaceMode) {
+          return (
+            capabilities?.can_bind_workspace === true &&
+            group.conversation_kind === 'group'
+          );
+        }
+        if (
+          capabilities?.can_bind_session === true &&
+          group.conversation_kind === 'direct'
+        ) {
+          return true;
+        }
+        // Keep a legacy group->fixed-session mismatch visible in the exact
+        // session that owns it, so the user can restore it instead of ending
+        // up with an unreachable binding after this policy became strict.
         return (
-          (isMainMode &&
-            (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid) ||
-          (!isMainMode &&
-            (group.bound_session_id ?? group.bound_agent_id) === agentId)
+          !isMainMode &&
+          (group.bound_session_id ?? group.bound_agent_id) === agentId
         );
       }),
     [agentId, groupJid, imGroups, isMainMode, isWorkspaceMode],
@@ -389,7 +394,7 @@ export function ImBindingDialog({
   ]);
 
   const isBoundToThis = (group: AvailableImGroup): boolean => {
-    if (isMainMode) {
+    if (isWorkspaceMode || isMainMode) {
       return (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid;
     }
     return (group.bound_session_id ?? group.bound_agent_id) === agentId;
@@ -418,19 +423,24 @@ export function ImBindingDialog({
     setActionLoading(imJid);
     try {
       let ok: boolean;
-      if (isMainMode) {
+      if (isWorkspaceMode || isMainMode) {
         const target = imGroups.find((g) => g.jid === imJid);
         const mode =
-          target && supportsActivationModes(target.channel_type)
+          isWorkspaceMode &&
+          target?.conversation_kind === 'group' &&
+          supportsActivationModes(target.channel_type)
             ? resolveBindingActivationMode(target, activationModes[imJid])
             : undefined;
-        ok = await bindMainImGroup(
+        const bindTarget = isWorkspaceMode
+          ? bindWorkspaceImGroup
+          : bindMainImGroup;
+        ok = await bindTarget(
           groupJid,
           imJid,
           false,
           mode,
           undefined,
-          target?.channel_type === 'feishu'
+          isWorkspaceMode && target?.channel_type === 'feishu'
             ? resolveBindingAudienceMode(target, audienceModes[imJid])
             : undefined,
         );
@@ -452,18 +462,20 @@ export function ImBindingDialog({
     setActionLoading(imJid);
     try {
       let ok: boolean;
-      if (isMainMode) {
-        ok = await unbindMainImGroup(groupJid, imJid);
+      if (isWorkspaceMode || isMainMode) {
+        ok = isWorkspaceMode
+          ? await unbindWorkspaceImGroup(groupJid, imJid)
+          : await unbindMainImGroup(groupJid, imJid);
       } else {
         ok = await unbindImGroup(groupJid, agentId!, imJid);
       }
       if (ok) {
         await reloadGroups();
       } else {
-        showToast('恢复默认工作区失败');
+        showToast('恢复账号默认路由失败');
       }
     } catch {
-      showToast('恢复默认工作区失败');
+      showToast('恢复账号默认路由失败');
     }
     setActionLoading(null);
   };
@@ -479,7 +491,7 @@ export function ImBindingDialog({
       setActivationModes((prev) => ({ ...prev, [imJid]: mode }));
       // Re-bind with force to update activation_mode on already-bound group
       try {
-        const ok = await bindMainImGroup(
+        const ok = await bindWorkspaceImGroup(
           groupJid,
           imJid,
           true,
@@ -499,7 +511,7 @@ export function ImBindingDialog({
         showToast('更新触发模式失败');
       }
     },
-    [activationModes, audienceModes, groupJid, imGroups, bindMainImGroup],
+    [activationModes, audienceModes, groupJid, imGroups, bindWorkspaceImGroup],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAudienceModeChange = useCallback(
@@ -512,7 +524,7 @@ export function ImBindingDialog({
       );
       setAudienceModes((prev) => ({ ...prev, [imJid]: audienceMode }));
       try {
-        const ok = await bindMainImGroup(
+        const ok = await bindWorkspaceImGroup(
           groupJid,
           imJid,
           true,
@@ -530,7 +542,7 @@ export function ImBindingDialog({
         showToast('更新响应对象失败');
       }
     },
-    [activationModes, audienceModes, bindMainImGroup, groupJid, imGroups],
+    [activationModes, audienceModes, bindWorkspaceImGroup, groupJid, imGroups],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const describeBindTarget = (group: AvailableImGroup): string => {
@@ -544,7 +556,9 @@ export function ImBindingDialog({
         : `会话「${group.bound_target_name}」`;
     }
     if (group.bound_main_jid && group.bound_target_name) {
-      return `工作区「${group.bound_target_name}」`;
+      return group.conversation_kind === 'direct'
+        ? `主会话「${group.bound_target_name}」`
+        : `工作区「${group.bound_target_name}」`;
     }
     return '其他对话';
   };
@@ -556,17 +570,23 @@ export function ImBindingDialog({
     setActionLoading(imJid);
     try {
       let ok: boolean;
-      if (isMainMode) {
-        const mode = supportsActivationModes(rebindGroup.channel_type)
-          ? resolveBindingActivationMode(rebindGroup, activationModes[imJid])
-          : undefined;
-        ok = await bindMainImGroup(
+      if (isWorkspaceMode || isMainMode) {
+        const mode =
+          isWorkspaceMode &&
+          rebindGroup.conversation_kind === 'group' &&
+          supportsActivationModes(rebindGroup.channel_type)
+            ? resolveBindingActivationMode(rebindGroup, activationModes[imJid])
+            : undefined;
+        const bindTarget = isWorkspaceMode
+          ? bindWorkspaceImGroup
+          : bindMainImGroup;
+        ok = await bindTarget(
           groupJid,
           imJid,
           true,
           mode,
           undefined,
-          rebindGroup.channel_type === 'feishu'
+          isWorkspaceMode && rebindGroup.channel_type === 'feishu'
             ? resolveBindingAudienceMode(rebindGroup, audienceModes[imJid])
             : undefined,
         );
@@ -616,8 +636,8 @@ export function ImBindingDialog({
               <Info className="mt-0.5 size-3.5 shrink-0" />
               <span>
                 {isWorkspaceMode
-                  ? '普通聊天进入工作区主会话；原生话题会自动创建独立会话。'
-                  : '绑定后，普通群聊或私聊会继续使用当前会话上下文。'}
+                  ? '这里只绑定群聊：普通群进入工作区主会话，话题群按话题创建独立会话。'
+                  : '这里只绑定私聊：绑定后，该私聊会继续使用当前会话上下文。'}
               </span>
             </DialogDescription>
             <DialogClose asChild>
@@ -661,7 +681,7 @@ export function ImBindingDialog({
                     )}`
                   )
                 ) : (
-                  '先显示本地记录，再同步 Bot 群聊'
+                  '先显示本地记录，再同步 Bot 聊天'
                 )}
               </div>
               <Button
@@ -738,24 +758,35 @@ export function ImBindingDialog({
                   <SearchInput
                     value={filter}
                     onChange={setFilter}
-                    placeholder="搜索名称或群组 ID"
+                    placeholder="搜索名称或聊天 ID"
                     ariaLabel="搜索渠道聊天"
                     debounce={150}
                   />
                   {accountOptions.length > 1 && (
-                    <select
-                      value={accountFilter}
-                      onChange={(event) => setAccountFilter(event.target.value)}
-                      aria-label="筛选 Bot 账号"
-                      className="h-8 rounded-lg border border-border bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-                    >
-                      <option value="all">全部 Bot 账号</option>
-                      {accountOptions.map((account) => (
-                        <option key={account.id} value={account.id}>
-                          {account.name}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="flex items-center gap-2">
+                      <label
+                        htmlFor="binding-bot-account"
+                        className="shrink-0 text-[11px] text-muted-foreground"
+                      >
+                        机器人身份
+                      </label>
+                      <select
+                        id="binding-bot-account"
+                        value={accountFilter}
+                        onChange={(event) =>
+                          setAccountFilter(event.target.value)
+                        }
+                        aria-label="筛选机器人身份"
+                        className="h-8 min-w-0 rounded-lg border border-border bg-background px-2.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                      >
+                        <option value="all">全部机器人</option>
+                        {accountOptions.map((account) => (
+                          <option key={account.id} value={account.id}>
+                            {account.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   )}
                 </div>
               </div>
@@ -790,8 +821,8 @@ export function ImBindingDialog({
               {!loading && !loadError && compatibleGroups.length === 0 && (
                 <div className="py-12 text-center text-sm text-muted-foreground">
                   {isWorkspaceMode
-                    ? '暂无可绑定的渠道聊天。请确认 Bot 已加入聊天，然后点击“同步聊天”。'
-                    : '暂无可绑定的普通群或私聊。请确认 Bot 已加入聊天，然后点击“同步聊天”。'}
+                    ? '暂无可绑定群聊。请确认 Bot 已加入群聊，然后点击“同步聊天”。'
+                    : '暂无可绑定私聊。请先向 Bot 发送一条私聊消息，然后点击“同步聊天”。'}
                 </div>
               )}
 
@@ -802,7 +833,7 @@ export function ImBindingDialog({
                   <div className="py-10 text-center text-sm text-muted-foreground">
                     {selectedChannelLabel && !filter.trim()
                       ? `暂无 ${selectedChannelLabel} 可绑定渠道。请先完成该渠道配置，并向 Bot 发送一条消息。`
-                      : '没有匹配的群组'}
+                      : '没有匹配的聊天'}
                   </div>
                 )}
 
@@ -813,14 +844,20 @@ export function ImBindingDialog({
                   const boundToOther = isBoundToOther(group);
                   const isActioning = actionLoading === group.jid;
                   const supportsActivation =
-                    isMainMode && supportsActivationModes(group.channel_type);
+                    isWorkspaceMode &&
+                    group.conversation_kind === 'group' &&
+                    supportsActivationModes(group.channel_type);
                   const effectiveMode = resolveBindingActivationMode(
                     group,
                     activationModes[group.jid],
                   );
                   const activationOptions = activationOptionsFor(group);
                   const supportsAudience =
-                    isMainMode && group.channel_type === 'feishu';
+                    isWorkspaceMode &&
+                    group.conversation_kind === 'group' &&
+                    group.channel_type === 'feishu';
+                  const policyMismatch =
+                    !isWorkspaceMode && group.conversation_kind !== 'direct';
                   const effectiveAudience = resolveBindingAudienceMode(
                     group,
                     audienceModes[group.jid],
@@ -854,6 +891,9 @@ export function ImBindingDialog({
                         </div>
                         <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
                           <ChannelBadge channelType={group.channel_type} />
+                          <span className="rounded-full border border-border/70 px-1.5 py-0.5 text-[10px]">
+                            {conversationKindLabel(group)}
+                          </span>
                           <ChannelAccountBadge
                             accountId={group.channel_account_id}
                             accountName={group.channel_account_name}
@@ -870,6 +910,14 @@ export function ImBindingDialog({
                           <div className="mt-2 inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
                             <Link2 className="size-3" />
                             已绑定当前{isWorkspaceMode ? '工作区' : '会话'}
+                          </div>
+                        )}
+                        {policyMismatch && (
+                          <div className="mt-2 flex items-start gap-1 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+                            <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+                            <span>
+                              历史绑定不符合新规则：群聊应绑定工作区。请恢复默认后到工作区绑定中重新配置。
+                            </span>
                           </div>
                         )}
                         {boundToOther && (
@@ -938,7 +986,9 @@ export function ImBindingDialog({
                               >
                                 {activationOptions.map((o) => (
                                   <option key={o.value} value={o.value}>
-                                    {o.label}
+                                    {o.value === 'auto'
+                                      ? `${o.label}（当前：${group.require_mention ? '仅 @机器人' : '所有允许成员'}）`
+                                      : o.label}
                                   </option>
                                 ))}
                               </select>
@@ -1029,7 +1079,9 @@ export function ImBindingDialog({
                               >
                                 {activationOptions.map((o) => (
                                   <option key={o.value} value={o.value}>
-                                    {o.label}
+                                    {o.value === 'auto'
+                                      ? `${o.label}（当前：${group.require_mention ? '仅 @机器人' : '所有允许成员'}）`
+                                      : o.label}
                                   </option>
                                 ))}
                               </select>

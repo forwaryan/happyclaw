@@ -149,8 +149,14 @@ export interface RegisteredGroup {
   /** Channel account that owns this external chat. Null means legacy/default. */
   channel_account_id?: string;
   is_home?: boolean; // 用户主容器标记
-  target_agent_id?: string; // 兼容旧字段：IM 消息路由到指定工作区会话（conversation session）
-  target_main_jid?: string; // IM 消息路由到指定工作区的主会话（web:{folder}）
+  /** Direct-chat binding target: a specific workspace conversation session. */
+  target_agent_id?: string;
+  /**
+   * Binding target stored as the canonical workspace JID.
+   * - group chats: the workspace itself owns the channel context;
+   * - direct chats: the workspace's main session owns the channel context.
+   */
+  target_main_jid?: string;
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
   activation_mode?:

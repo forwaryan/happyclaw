@@ -102,11 +102,38 @@ export function BindingsSection() {
   const bindingSections = useMemo(
     () => [
       {
-        key: 'workspace',
-        title: '工作区绑定',
-        description: '普通聊天进入主会话；原生话题容器按话题生成独立会话',
+        key: 'needs-migration',
+        title: '需要迁移',
+        description: '历史绑定与当前规则不一致，请换绑到正确目标',
         items: filtered.filter(
           (item) =>
+            (!!(item.bound_session_id ?? item.bound_agent_id) &&
+              item.conversation_kind !== 'direct') ||
+            (item.conversation_kind === 'unknown' &&
+              !!(
+                (item.bound_workspace_jid ?? item.bound_main_jid) ||
+                (item.bound_session_id ?? item.bound_agent_id)
+              )),
+        ),
+      },
+      {
+        key: 'workspace',
+        title: '工作区绑定',
+        description: '群聊绑定工作区；话题群中的每个话题使用独立会话',
+        items: filtered.filter(
+          (item) =>
+            item.conversation_kind === 'group' &&
+            !(item.bound_session_id ?? item.bound_agent_id) &&
+            !!(item.bound_workspace_jid ?? item.bound_main_jid),
+        ),
+      },
+      {
+        key: 'main-session',
+        title: '主会话绑定',
+        description: '私聊继续使用目标工作区的主会话上下文',
+        items: filtered.filter(
+          (item) =>
+            item.conversation_kind === 'direct' &&
             !(item.bound_session_id ?? item.bound_agent_id) &&
             !!(item.bound_workspace_jid ?? item.bound_main_jid),
         ),
@@ -114,9 +141,11 @@ export function BindingsSection() {
       {
         key: 'session',
         title: '会话绑定',
-        description: '普通群和私聊继续使用指定会话上下文',
-        items: filtered.filter((item) =>
-          Boolean(item.bound_session_id ?? item.bound_agent_id),
+        description: '私聊继续使用指定会话上下文',
+        items: filtered.filter(
+          (item) =>
+            item.conversation_kind === 'direct' &&
+            Boolean(item.bound_session_id ?? item.bound_agent_id),
         ),
       },
       {
@@ -140,12 +169,12 @@ export function BindingsSection() {
 
   const selectableTargets = useMemo(() => {
     if (!rebindGroup) return [];
-    return targets.filter((target) =>
-      rebindGroup.is_thread_capable
-        ? target.type === 'main'
-        : target.type === 'session' || target.type === 'main',
-    );
-  }, [rebindGroup?.is_thread_capable, targets]);
+    if (rebindGroup.conversation_kind === 'group') {
+      return targets.filter((target) => target.type === 'main');
+    }
+    if (rebindGroup.conversation_kind === 'direct') return targets;
+    return [];
+  }, [rebindGroup, targets]);
 
   const handleRebind = useCallback((group: AvailableImGroup) => {
     setRebindGroup(group);
@@ -293,7 +322,7 @@ export function BindingsSection() {
               渠道绑定
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              所有聊天都可绑定工作区；普通群和私聊也可绑定具体会话，原生话题容器只绑定工作区。
+              群聊绑定工作区，私聊绑定主会话或指定会话。两类绑定互不混用。
             </p>
           </div>
           <Button
@@ -366,19 +395,28 @@ export function BindingsSection() {
               />
             </div>
             {accountOptions.length > 1 && (
-              <select
-                value={accountFilter}
-                onChange={(event) => setAccountFilter(event.target.value)}
-                aria-label="筛选 Bot 账号"
-                className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground"
-              >
-                <option value="all">全部 Bot 账号</option>
-                {accountOptions.map((account) => (
-                  <option key={account.id} value={account.id}>
-                    {account.name}
-                  </option>
-                ))}
-              </select>
+              <div className="flex items-center gap-2">
+                <label
+                  htmlFor="settings-binding-bot-account"
+                  className="text-xs text-muted-foreground"
+                >
+                  机器人身份
+                </label>
+                <select
+                  id="settings-binding-bot-account"
+                  value={accountFilter}
+                  onChange={(event) => setAccountFilter(event.target.value)}
+                  aria-label="筛选机器人身份"
+                  className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                >
+                  <option value="all">全部机器人</option>
+                  {accountOptions.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
             )}
           </div>
         )}
@@ -462,7 +500,9 @@ export function BindingsSection() {
         imGroupName={rebindGroup?.name || ''}
         targets={selectableTargets}
         targetsLoading={targetsLoading}
-        targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'both'}
+        targetType={
+          rebindGroup?.conversation_kind === 'group' ? 'workspace' : 'both'
+        }
         canUnbind={
           !!(
             (rebindGroup?.bound_session_id ?? rebindGroup?.bound_agent_id) ||

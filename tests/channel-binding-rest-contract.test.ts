@@ -18,7 +18,7 @@ describe('channel binding REST contract', () => {
       expect(source).toContain(
         'Native thread containers can only bind to a workspace',
       );
-      expect(source).not.toContain('ordinary channels must bind to a session');
+      expect(source).toContain('conversationBindingPolicyError(');
     }
   });
 
@@ -41,7 +41,7 @@ describe('channel binding REST contract', () => {
     );
   });
 
-  test('settings UI classifies by actual target rather than provider capability', () => {
+  test('settings UI classifies binding targets by direct-vs-group identity', () => {
     const section = read('web/src/components/settings/BindingsSection.tsx');
     const dialog = read('web/src/components/settings/BindingTargetDialog.tsx');
 
@@ -52,8 +52,10 @@ describe('channel binding REST contract', () => {
       'Boolean(item.bound_session_id ?? item.bound_agent_id)',
     );
     expect(section).toContain(
-      "targetType={rebindGroup?.is_thread_capable ? 'workspace' : 'both'}",
+      "rebindGroup?.conversation_kind === 'group' ? 'workspace' : 'both'",
     );
+    expect(section).toContain("item.conversation_kind === 'direct'");
+    expect(section).toContain("item.conversation_kind === 'group'");
     expect(dialog).toContain('恢复账号默认工作区');
     expect(dialog).toContain("target.type === 'session'");
     expect(dialog).toContain("'绑定到此工作区'");
@@ -73,6 +75,24 @@ describe('channel binding REST contract', () => {
     expect(capabilities).toMatch(
       /wechat:[\s\S]*supports_thread_map: false[\s\S]*supports_activation_modes: false/,
     );
+  });
+
+  test('chat UI uses distinct workspace and session mutation endpoints', () => {
+    const store = read('web/src/stores/chat.ts');
+    const dialog = read('web/src/components/chat/ImBindingDialog.tsx');
+
+    expect(store).toContain('bindWorkspaceImGroup: async');
+    expect(store).toContain(
+      '`/api/groups/${encodeURIComponent(jid)}/im-binding`',
+    );
+    expect(store).toContain(
+      '`/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding`',
+    );
+    expect(dialog).toMatch(
+      /isWorkspaceMode\s*\? bindWorkspaceImGroup\s*: bindMainImGroup/,
+    );
+    expect(dialog).toContain('机器人身份');
+    expect(dialog).toContain('<ChannelAccountBadge');
   });
 
   test('a detected Telegram Forum is workspace-only before its first topic', () => {

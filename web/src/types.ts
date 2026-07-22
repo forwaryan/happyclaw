@@ -342,5 +342,6 @@ export interface AvailableImGroup {
   chat_mode?: string;
   group_message_type?: string;
   is_thread_capable?: boolean;
+  conversation_kind?: 'direct' | 'group' | 'unknown';
   sender_allowlist_locked?: boolean;
 }
