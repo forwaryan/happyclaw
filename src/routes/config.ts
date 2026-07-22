@@ -527,6 +527,17 @@ function getClaudeRuntimeTargets(): Array<{
   return [...targets.values()];
 }
 
+function getKnownClaudeRuntimeJids(): string[] {
+  if (!deps) return [];
+  return Array.from(
+    new Set(
+      getClaudeRuntimeTargets().flatMap((target) =>
+        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+      ),
+    ),
+  );
+}
+
 async function mutateClaudeConfigForAllGroups<T>(
   actor: string,
   metadata: Record<string, unknown> | undefined,
@@ -537,13 +548,7 @@ async function mutateClaudeConfigForAllGroups<T>(
 
   const targets = getClaudeRuntimeTargets();
   const reason = String(metadata?.trigger ?? 'claude_config_apply');
-  const knownRuntimeJids = Array.from(
-    new Set(
-      targets.flatMap((target) =>
-        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
-      ),
-    ),
-  );
+  const knownRuntimeJids = getKnownClaudeRuntimeJids();
   try {
     const result = await quiesceWorkspaceRunnersAroundCommit(
       deps,
@@ -963,6 +968,11 @@ configRoutes.patch(
           const clearedSessionsCount = committed.clearedSessionsCount;
           if (shouldClearSessions) {
             clearPendingProviderSessionInvalidation(id);
+            if (!hasPendingProviderSessionInvalidations()) {
+              deps?.queue?.unblockGroupsForRuntimeSafety?.(
+                getKnownClaudeRuntimeJids(),
+              );
+            }
           }
           mutation = {
             value: updated,
@@ -1108,14 +1118,49 @@ configRoutes.delete(
   '/claude/providers/:id',
   authMiddleware,
   systemConfigMiddleware,
-  (c) => {
+  async (c) => {
     const { id } = c.req.param();
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      deleteProvider(id);
-      appendClaudeConfigAudit(actor, 'delete_provider', [`id:${id}`]);
-      return c.json({ ok: true });
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((provider) => provider.id === id);
+        const pendingInvalidation = getPendingProviderSessionInvalidation(id);
+        if (!previous && !pendingInvalidation) {
+          throw new Error('未找到指定供应商');
+        }
+        const sessionInvalidation = pendingInvalidation ?? {
+          modelChanged: true,
+          baseUrlChanged: true,
+        };
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          { trigger: 'provider_delete', providerId: id },
+          () => {
+            if (previous) {
+              deleteProvider(id);
+              appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
+                `id:${id}`,
+              ]);
+            }
+            return { id };
+          },
+          {
+            clearSessionsForProviderId: id,
+            sessionInvalidation,
+          },
+        );
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+            },
+            503,
+          );
+        }
+        return c.json({ ok: true, applied: mutation.applied });
+      });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to delete provider';

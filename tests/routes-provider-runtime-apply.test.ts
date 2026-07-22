@@ -118,6 +118,12 @@ async function setProviderEnabled(
   });
 }
 
+async function deleteProvider(providerId: string): Promise<Response> {
+  return app.request(`/api/config/claude/providers/${providerId}`, {
+    method: 'DELETE',
+  });
+}
+
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
@@ -429,6 +435,136 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       runtimeConfig.getProviders().find((item) => item.id === target.id)
         ?.enabled,
     ).toBe(false);
+    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
+  });
+
+  test('unblocks a restarted workspace after a disabled provider repairs pending session cleanup', async () => {
+    const folder = unique('disabled-provider-repair');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    const staleSessionId = unique('disabled-repair-stale-session');
+    let stopCalls = 0;
+    const initialQueue = {
+      listDescendantJids: () => [],
+      pauseGroupsForMutation: () => ({ id: 8 }),
+      resumeGroupsAfterMutation: vi.fn(),
+      blockGroupsForRuntimeSafety: vi.fn(),
+      unblockGroupsForRuntimeSafety: vi.fn(),
+      stopGroup: vi.fn(async () => {
+        stopCalls += 1;
+        if (stopCalls === 2) {
+          db.setSession(folder, staleSessionId);
+          db.setSessionProviderId(folder, '', target.id);
+          throw new Error('simulated post-commit stop failure');
+        }
+      }),
+    };
+    bindDeps({ [jid]: group }, initialQueue);
+    const target = runtimeConfig.createProvider({
+      name: unique('disabled-repair-target'),
+      type: 'official',
+      anthropicApiKey: 'target-key',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+    runtimeConfig.createProvider({
+      name: unique('disabled-repair-fallback'),
+      type: 'official',
+      anthropicApiKey: 'fallback-key',
+      enabled: true,
+    });
+    db.setSession(folder, unique('disabled-repair-initial-session'));
+    db.setSessionProviderId(folder, '', target.id);
+
+    const failedPatch = await patchProvider(target.id, {
+      anthropicModel: 'persisted-model',
+    });
+    expect(failedPatch.status).toBe(503);
+    const disableResponse = await setProviderEnabled(target.id, false);
+    expect(disableResponse.status).toBe(200);
+
+    const restartedQueue = new GroupQueue();
+    liveQueue = restartedQueue;
+    bindDeps({ [jid]: group }, restartedQueue, {
+      [folder]: staleSessionId,
+    });
+    expect(restartedQueue.isGroupRuntimeSafetyBlocked(jid)).toBe(true);
+
+    const repairResponse = await patchProvider(target.id, {
+      anthropicModel: 'persisted-model',
+    });
+    expect(repairResponse.status).toBe(200);
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(restartedQueue.isGroupRuntimeSafetyBlocked(jid)).toBe(false);
+  });
+
+  test('deletes a pending provider through lossless runtime mutation and clears its gate', async () => {
+    const folder = unique('pending-provider-delete');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    const staleSessionId = unique('delete-stale-session');
+    let stopCalls = 0;
+    const stopOptions: unknown[] = [];
+    const unblockGroupsForRuntimeSafety = vi.fn();
+    const queue = {
+      listDescendantJids: () => [],
+      pauseGroupsForMutation: vi.fn(() => ({ id: 9 })),
+      resumeGroupsAfterMutation: vi.fn(),
+      blockGroupsForRuntimeSafety: vi.fn(),
+      unblockGroupsForRuntimeSafety,
+      stopGroup: vi.fn(async (_targetJid: string, options?: unknown) => {
+        stopCalls += 1;
+        stopOptions.push(options);
+        if (stopCalls === 2) {
+          db.setSession(folder, staleSessionId);
+          db.setSessionProviderId(folder, '', target.id);
+          throw new Error('simulated post-commit stop failure');
+        }
+      }),
+    };
+    bindDeps({ [jid]: group }, queue);
+    const target = runtimeConfig.createProvider({
+      name: unique('delete-target'),
+      type: 'official',
+      anthropicApiKey: 'target-key',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+    runtimeConfig.createProvider({
+      name: unique('delete-fallback'),
+      type: 'official',
+      anthropicApiKey: 'fallback-key',
+      enabled: true,
+    });
+    db.setSession(folder, unique('delete-initial-session'));
+    db.setSessionProviderId(folder, '', target.id);
+
+    const failedPatch = await patchProvider(target.id, {
+      anthropicModel: 'persisted-model',
+    });
+    expect(failedPatch.status).toBe(503);
+    expect(db.getSession(folder)).toBe(staleSessionId);
+
+    const deleteResponse = await deleteProvider(target.id);
+    expect(deleteResponse.status).toBe(200);
+    expect(
+      runtimeConfig
+        .getProviders()
+        .some((provider) => provider.id === target.id),
+    ).toBe(false);
+    expect(stopCalls).toBe(4);
+    expect(stopOptions).toSatisfy((options) =>
+      options.every(
+        (option) =>
+          (option as { force?: boolean }).force === true &&
+          (option as { preserveQueuedWork?: boolean }).preserveQueuedWork ===
+            true,
+      ),
+    );
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(
+      db.getRouterState(`provider_session_invalidation_pending:${target.id}`),
+    ).toBeUndefined();
     expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
   });
 
