@@ -352,6 +352,158 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     expect(new Set(matching.map((item: any) => item.jid)).size).toBe(2);
   });
 
+  test('manual discovery registers a bot-visible chat before it sends any message', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const discoveredJid = `feishu:discovered-${suffix}`;
+    const syncUserImGroups = vi.fn(async () => {
+      db.setRegisteredGroup(discoveredJid, {
+        name: '新加入但尚未发言的群',
+        folder: GROUP_FOLDER,
+        added_at: new Date().toISOString(),
+        created_by: OWNER_ID,
+      });
+      return { feishuAccounts: 1 };
+    });
+    webContext.setWebDeps({
+      syncUserImGroups,
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const sync = await req('/im-groups/sync', 'POST');
+      expect(sync.status).toBe(200);
+      expect(sync.body).toMatchObject({ success: true, feishuAccounts: 1 });
+      expect(syncUserImGroups).toHaveBeenCalledWith(OWNER_ID);
+
+      const listed = await req('/im-groups', 'GET');
+      expect(listed.status).toBe(200);
+      expect(listed.body.imGroups).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            jid: discoveredJid,
+            name: '新加入但尚未发言的群',
+          }),
+        ]),
+      );
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
+  test('IM candidates are ordered by current binding, recent discovery, unbound, then bound elsewhere', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const otherWorkspace = `web:other-${suffix}`;
+    db.setRegisteredGroup(otherWorkspace, {
+      name: 'Other workspace',
+      folder: `other-${suffix}`,
+      added_at: '2025-01-01T00:00:00.000Z',
+      created_by: OWNER_ID,
+    });
+    const rows = [
+      {
+        jid: `telegram:current-${suffix}`,
+        added_at: '2025-01-01T00:00:00.000Z',
+        target_main_jid: GROUP_JID,
+      },
+      {
+        jid: `telegram:recent-${suffix}`,
+        added_at: new Date().toISOString(),
+      },
+      {
+        jid: `telegram:unbound-${suffix}`,
+        added_at: '2025-02-01T00:00:00.000Z',
+      },
+      {
+        jid: `telegram:elsewhere-${suffix}`,
+        added_at: '2025-03-01T00:00:00.000Z',
+        target_main_jid: otherWorkspace,
+      },
+    ];
+    for (const row of rows) {
+      db.setRegisteredGroup(row.jid, {
+        name: row.jid,
+        folder: GROUP_FOLDER,
+        added_at: row.added_at,
+        created_by: OWNER_ID,
+        target_main_jid: row.target_main_jid,
+      });
+    }
+
+    const listed = await req('/im-groups', 'GET');
+    expect(listed.status).toBe(200);
+    const ordered = listed.body.imGroups
+      .map((item: any) => item.jid)
+      .filter((jid: string) => jid.endsWith(suffix));
+    expect(ordered).toEqual(rows.map((row) => row.jid));
+  });
+
+  test('live Feishu topic metadata is persisted and reused by cached reads', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const suffix = Date.now().toString(36);
+    const imJid = `feishu:topic-${suffix}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Old topic name',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    });
+    const getChannelChatInfo = vi.fn().mockResolvedValue({
+      name: '地址',
+      chat_mode: 'topic',
+      group_message_type: 'chat',
+      user_count: '1',
+    });
+    webContext.setWebDeps({
+      getChannelChatInfo,
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const first = await req('/im-groups', 'GET');
+      expect(first.status).toBe(200);
+      expect(first.body.imGroups).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            jid: imJid,
+            name: '地址',
+            chat_mode: 'topic',
+            is_thread_capable: true,
+          }),
+        ]),
+      );
+      expect(db.getRegisteredGroup(imJid)).toMatchObject({
+        name: '地址',
+        feishu_chat_mode: 'topic',
+        native_context_type: 'thread',
+      });
+
+      getChannelChatInfo.mockClear();
+      const second = await req('/im-groups', 'GET');
+      expect(second.status).toBe(200);
+      expect(getChannelChatInfo).not.toHaveBeenCalled();
+      expect(second.body.imGroups).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            jid: imJid,
+            chat_mode: 'topic',
+            is_thread_capable: true,
+          }),
+        ]),
+      );
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
   test('ordinary chats can bind to a workspace main conversation', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
@@ -599,6 +751,52 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     }
   });
 
+  test('a session deleted during live metadata lookup cannot receive a stale binding', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Soon deleted session' });
+    const sessionId = created.body.session.id as string;
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `deleted-target-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'qq',
+      name: 'Deleted target bot',
+      secret_ref: `channel-account:deleted-target-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const imJid = `qq:c2c:deleted-target-${suffix}#account:${account.id}`;
+    db.setRegisteredGroup(imJid, {
+      name: 'Race source',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      channel_account_id: account.id,
+    });
+    webContext.setWebDeps({
+      getChannelChatInfo: async () => {
+        db.deleteAgent(sessionId);
+        return null;
+      },
+      getRegisteredGroups: () => ({}),
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      const { status, body } = await req(
+        `/sessions/${sessionId}/im-binding`,
+        'PUT',
+        { im_jid: imJid },
+      );
+      expect(status).toBe(404);
+      expect(body.error).toMatch(/session not found/i);
+      expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBeUndefined();
+    } finally {
+      webContext.setWebDeps(
+        null as unknown as Parameters<typeof webContext.setWebDeps>[0],
+      );
+    }
+  });
+
   test('a concurrent none->thread upgrade during the live chat-info fetch routes a workspace bind as thread_map, not single_session', async () => {
     // Same race as above, but for the workspace-bind branch (sessionId
     // 'main'), where threadCapable decides thread_map vs single_session
@@ -694,6 +892,43 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       sender_allowlist: ['owner-im'],
       reply_policy: 'source_only',
     });
+  });
+
+  test('unbinding one of multiple chats keeps the agent fallback route on a remaining chat', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Multi-channel session' });
+    const sessionId = created.body.session.id as string;
+    const suffix = Date.now().toString(36);
+    const account = db.createChannelAccount({
+      id: `multi-route-${suffix}`,
+      owner_user_id: OWNER_ID,
+      provider: 'whatsapp',
+      name: 'Multi-route account',
+      secret_ref: `channel-account:multi-route-${suffix}`,
+      default_workspace_jid: GROUP_JID,
+    });
+    const firstJid = `whatsapp:first-${suffix}@s.whatsapp.net#account:${account.id}`;
+    const secondJid = `whatsapp:second-${suffix}@s.whatsapp.net#account:${account.id}`;
+    for (const [index, imJid] of [firstJid, secondJid].entries()) {
+      db.setRegisteredGroup(imJid, {
+        name: `WhatsApp chat ${index + 1}`,
+        folder: GROUP_FOLDER,
+        added_at: new Date(Date.now() + index * 1000).toISOString(),
+        created_by: OWNER_ID,
+        channel_account_id: account.id,
+        target_agent_id: sessionId,
+      });
+    }
+    db.updateAgentLastImJid(sessionId, firstJid);
+
+    const { status } = await req(
+      `/sessions/${sessionId}/im-binding/${encodeURIComponent(firstJid)}`,
+      'DELETE',
+    );
+    expect(status).toBe(200);
+    expect(db.getAgent(sessionId)?.last_im_jid).toBe(secondJid);
+    expect(db.getRegisteredGroup(secondJid)?.target_agent_id).toBe(sessionId);
   });
 
   test('multiple native-context containers can share one workspace', () => {

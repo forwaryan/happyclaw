@@ -306,6 +306,7 @@ export interface AgentInfo {
 export interface AvailableImGroup {
   jid: string;
   name: string;
+  added_at: string;
   channel_account_id?: string | null;
   channel_account_name?: string | null;
   bound_agent_id: string | null;

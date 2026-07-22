@@ -152,6 +152,8 @@ export interface WebDeps {
     | null
     | undefined
   >;
+  /** Refresh the current user's discoverable IM chats from connected bots. */
+  syncUserImGroups?: (userId: string) => Promise<{ feishuAccounts: number }>;
   clearImFailCounts?: (jid: string) => void;
   /**
    * Fully remove an IM group's registered_groups entry (plus jid-scoped data

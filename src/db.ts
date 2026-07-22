@@ -8532,8 +8532,37 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.transaction(() => {
     const existing = getRegisteredGroup(jid);
     db.prepare(
-      `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, owner_claim_source, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, owner_claim_source, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(jid) DO UPDATE SET
+         name = excluded.name,
+         folder = excluded.folder,
+         added_at = excluded.added_at,
+         container_config = excluded.container_config,
+         execution_mode = excluded.execution_mode,
+         custom_cwd = excluded.custom_cwd,
+         init_source_path = excluded.init_source_path,
+         init_git_url = excluded.init_git_url,
+         created_by = excluded.created_by,
+         channel_account_id = excluded.channel_account_id,
+         is_home = excluded.is_home,
+         selected_skills = excluded.selected_skills,
+         target_agent_id = excluded.target_agent_id,
+         target_main_jid = excluded.target_main_jid,
+         reply_policy = excluded.reply_policy,
+         require_mention = excluded.require_mention,
+         activation_mode = excluded.activation_mode,
+         owner_im_id = excluded.owner_im_id,
+         owner_claim_source = excluded.owner_claim_source,
+         mcp_mode = excluded.mcp_mode,
+         selected_mcps = excluded.selected_mcps,
+         conversation_source = excluded.conversation_source,
+         conversation_nav_mode = excluded.conversation_nav_mode,
+         binding_mode = excluded.binding_mode,
+         native_context_type = excluded.native_context_type,
+         feishu_chat_mode = excluded.feishu_chat_mode,
+         feishu_group_message_type = excluded.feishu_group_message_type,
+         sender_allowlist = excluded.sender_allowlist`,
     ).run(
       jid,
       group.name,

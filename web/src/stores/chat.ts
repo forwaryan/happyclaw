@@ -438,6 +438,9 @@ interface ChatState {
   handleActiveRunSnapshot: (runs: ActiveRunSnapshotData[]) => void;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
+  syncAvailableImGroups: (
+    jid: string,
+  ) => Promise<{ success: boolean; feishuAccounts: number }>;
   bindImGroup: (
     jid: string,
     agentId: string,
@@ -3674,6 +3677,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ error: message });
       throw err;
     }
+  },
+
+  syncAvailableImGroups: async (jid) => {
+    return api.post<{ success: boolean; feishuAccounts: number }>(
+      `/api/groups/${encodeURIComponent(jid)}/im-groups/sync`,
+    );
   },
 
   bindImGroup: async (jid, agentId, imJid, force) => {

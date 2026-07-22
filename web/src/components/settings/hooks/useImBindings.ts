@@ -22,6 +22,8 @@ type WorkspaceSessionInfo = Omit<AgentInfo, 'kind'> & {
 export function useImBindings() {
   const [bindings, setBindings] = useState<AvailableImGroup[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [targets, setTargets] = useState<BindingTarget[]>([]);
   const [targetsLoading, setTargetsLoading] = useState(true);
   const [bindingsLoadError, setBindingsLoadError] = useState<string | null>(
@@ -32,6 +34,7 @@ export function useImBindings() {
   const groups = useChatStore((s) => s.groups);
   const loadGroups = useChatStore((s) => s.loadGroups);
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
+  const syncAvailableImGroups = useChatStore((s) => s.syncAvailableImGroups);
 
   // Derive homeJid as a stable value — no callback, no dependency cycle
   const homeJid = useMemo((): string | null => {
@@ -124,6 +127,25 @@ export function useImBindings() {
     }
   }, []);
 
+  const syncBindings = useCallback(async () => {
+    const hJid = homeJidRef.current;
+    if (!hJid) return;
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      await syncAvailableImGroups(hJid);
+      const result = await loadAvailableImGroups(hJid);
+      setBindings(result);
+      setBindingsLoadError(null);
+    } catch (err) {
+      setSyncError(
+        err instanceof Error ? err.message : '渠道聊天同步失败，已保留本地列表',
+      );
+    } finally {
+      setSyncing(false);
+    }
+  }, [loadAvailableImGroups, syncAvailableImGroups]);
+
   // Initial load — run once
   useEffect(() => {
     loadGroups();
@@ -132,14 +154,14 @@ export function useImBindings() {
   // When homeJid changes (derived from groups), reload bindings and targets
   useEffect(() => {
     if (homeJid) {
-      loadBindings();
+      void loadBindings().then(() => void syncBindings());
       loadTargets();
     } else {
       // No home group — clear loading state to avoid perpetual spinner
       setLoading(false);
       setTargetsLoading(false);
     }
-  }, [homeJid, loadBindings, loadTargets]);
+  }, [homeJid, loadBindings, loadTargets, syncBindings]);
 
   const rebind = useCallback(
     async (
@@ -178,9 +200,9 @@ export function useImBindings() {
   );
 
   const reload = useCallback(() => {
-    loadBindings();
+    void syncBindings();
     loadTargets();
-  }, [loadBindings, loadTargets]);
+  }, [loadTargets, syncBindings]);
 
   const resetAllowlist = useCallback(
     async (imJid: string): Promise<string | null> => {
@@ -205,6 +227,8 @@ export function useImBindings() {
   return {
     bindings,
     loading,
+    syncing,
+    syncError,
     bindingsLoadError,
     targets,
     targetsLoading,

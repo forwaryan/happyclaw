@@ -40,12 +40,8 @@ describe('channel account startup compatibility contract', () => {
       "if (connected && account.provider === 'feishu')",
     );
     expect(indexSource).toContain('ensureFeishuSyncScheduler();');
-    expect(indexSource).toContain(
-      "getConnectedChannelAccountIds(\n      uid,\n      'feishu',",
-    );
-    expect(indexSource).toContain(
-      'Feishu account group sync failed; continuing',
-    );
+    expect(indexSource).toContain('imManager.syncAllFeishuGroups(uid)');
+    expect(indexSource).toContain('Feishu user group sync failed; continuing');
   });
 
   test('user re-enable reconnects additional first-class Bot accounts after legacy projection', () => {

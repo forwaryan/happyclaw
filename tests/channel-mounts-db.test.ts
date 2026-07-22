@@ -82,6 +82,32 @@ afterAll(() => {
 });
 
 describe('channel_mounts compatibility model', () => {
+  test('updating a registered group preserves its SQLite row identity', () => {
+    const jid = 'telegram:stable-row';
+    const now = new Date().toISOString();
+    setRegisteredGroup(jid, {
+      name: 'Before',
+      folder: 'stable-row',
+      added_at: now,
+      created_by: 'owner-a',
+    });
+    const before = probeDb
+      .prepare('SELECT rowid FROM registered_groups WHERE jid = ?')
+      .get(jid) as { rowid: number };
+
+    setRegisteredGroup(jid, {
+      name: 'After',
+      folder: 'stable-row',
+      added_at: now,
+      created_by: 'owner-a',
+    });
+    const after = probeDb
+      .prepare('SELECT rowid, name FROM registered_groups WHERE jid = ?')
+      .get(jid) as { rowid: number; name: string };
+
+    expect(after).toEqual({ rowid: before.rowid, name: 'After' });
+  });
+
   test('startup preserves orphaned user balances for operator review', () => {
     const row = probeDb
       .prepare('SELECT COUNT(*) as cnt FROM user_balances WHERE user_id = ?')

@@ -26,6 +26,8 @@ export function BindingsSection() {
   const {
     bindings,
     loading,
+    syncing,
+    syncError,
     bindingsLoadError,
     targets,
     targetsLoading,
@@ -287,14 +289,23 @@ export function BindingsSection() {
             variant="outline"
             size="sm"
             onClick={reload}
-            disabled={loading}
+            disabled={loading || syncing}
           >
             <RefreshCw
-              className={`w-3.5 h-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`}
+              className={`w-3.5 h-3.5 mr-1.5 ${loading || syncing ? 'animate-spin' : ''}`}
             />
-            刷新
+            {syncing ? '正在同步 Bot 聊天' : '同步聊天'}
           </Button>
         </div>
+
+        {syncError && bindings.length > 0 && (
+          <div
+            role="status"
+            className="rounded-lg border border-amber-300/70 bg-amber-50/60 px-4 py-2.5 text-sm text-amber-800 dark:border-amber-800/60 dark:bg-amber-950/20 dark:text-amber-200"
+          >
+            同步未完成，当前显示本地记录：{syncError}
+          </div>
+        )}
 
         {/* Error banner */}
         {errorMsg && (

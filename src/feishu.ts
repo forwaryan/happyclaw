@@ -2,12 +2,7 @@ import fs from 'fs';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
-import {
-  setLastGroupSync,
-  storeChatMetadata,
-  storeMessageDirect,
-  updateChatName,
-} from './db.js';
+import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
@@ -2328,24 +2323,30 @@ export function createFeishuConnection(
 
           const items = res.data?.items || [];
           for (const chat of items) {
-            if (chat.chat_id && chat.name) {
-              const rawJid = `feishu:${chat.chat_id}`;
-              updateChatName(
-                connectOptions?.normalizeIncomingJid?.(rawJid) ?? rawJid,
-                chat.name,
-              );
-              knownChatIds.add(chat.chat_id);
-            }
+            if (!chat.chat_id) continue;
+
+            const rawJid = `feishu:${chat.chat_id}`;
+            const scopedJid =
+              connectOptions?.normalizeIncomingJid?.(rawJid) ?? rawJid;
+            const chatName = chat.name?.trim() || '飞书聊天';
+
+            // chat.list is the authoritative membership inventory for the bot.
+            // Register every visible chat, even when the membership event was
+            // missed or the chat has never sent a message to HappyClaw. The
+            // account-scoping wrapper makes the JID unique for multi-bot users.
+            connectOptions?.onNewChat?.(rawJid, chatName);
+            updateChatName(scopedJid, chatName);
+            knownChatIds.add(chat.chat_id);
           }
 
           hasMore = res.data?.has_more || false;
           pageToken = res.data?.page_token;
         }
 
-        setLastGroupSync();
         logger.info('Feishu group sync completed');
       } catch (err) {
         logger.error({ err }, 'Failed to sync Feishu groups');
+        throw err;
       }
     },
 

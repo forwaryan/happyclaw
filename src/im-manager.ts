@@ -203,6 +203,7 @@ export class IMConnectionManager {
   // same event stream (409 polling conflicts or duplicate replies).
   private credentialClaims = new Map<string, string>();
   private connectionCredentialClaims = new Map<string, string>();
+  private feishuGroupSyncs = new Map<string, Promise<number>>();
 
   private channelKey(channelType: string, accountId?: string | null): string {
     return accountId ? `${channelType}\u0000${accountId}` : channelType;
@@ -1689,6 +1690,77 @@ export class IMConnectionManager {
         : undefined);
     if (channel?.isConnected() && channel.syncGroups) {
       await channel.syncGroups();
+    }
+  }
+
+  /**
+   * Sync every connected Feishu bot owned by one HappyClaw user.
+   *
+   * The binding UI uses this instead of guessing a default account: every bot
+   * has a different chat membership inventory, and legacy/default connectors
+   * may not have an account id encoded in their connection key.
+   */
+  async syncAllFeishuGroups(userId: string): Promise<number> {
+    const inFlight = this.feishuGroupSyncs.get(userId);
+    if (inFlight) return inFlight;
+
+    const task = (async () => {
+      const conn = this.connections.get(userId);
+      if (!conn) return 0;
+
+      const targets: Array<{
+        accountId: string | null;
+        sync: () => Promise<void>;
+      }> = [];
+      for (const [key, channel] of conn.channels.entries()) {
+        const [type, accountId] = key.split('\u0000');
+        if (
+          type !== 'feishu' ||
+          !channel.isConnected() ||
+          !channel.syncGroups ||
+          !this.isOutboundConnectionAllowed(userId, type, accountId)
+        ) {
+          continue;
+        }
+        targets.push({
+          accountId: accountId || null,
+          sync: () => channel.syncGroups!(),
+        });
+      }
+
+      const results = await Promise.allSettled(
+        targets.map((target) => target.sync()),
+      );
+      const failures: unknown[] = [];
+      let synced = 0;
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          synced += 1;
+        } else {
+          failures.push(result.reason);
+          logger.warn(
+            {
+              error: result.reason,
+              userId,
+              accountId: targets[index]?.accountId ?? null,
+            },
+            'Feishu account group sync failed',
+          );
+        }
+      });
+
+      if (failures.length > 0 && synced === 0) {
+        throw failures[0];
+      }
+      return synced;
+    })();
+    this.feishuGroupSyncs.set(userId, task);
+    try {
+      return await task;
+    } finally {
+      if (this.feishuGroupSyncs.get(userId) === task) {
+        this.feishuGroupSyncs.delete(userId);
+      }
     }
   }
 

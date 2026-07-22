@@ -39,8 +39,14 @@ import {
   VALID_ACTIVATION_MODES,
   getDefaultChannelAccount,
   getLegacyChannelAccount,
+  getChannelAccount,
+  getGroupsByTargetAgent,
+  updateAgentLastImJid,
 } from '../db.js';
-import { parseChannelAddress } from '../channel-address.js';
+import {
+  channelConversationJid,
+  parseChannelAddress,
+} from '../channel-address.js';
 import {
   adminRoleMiddleware,
   authMiddleware,
@@ -1570,6 +1576,43 @@ function applyRegisteredGroupUpdate(
     const groups = webDeps.getRegisteredGroups();
     if (groups[jid]) groups[jid] = updated;
   }
+}
+
+function hasConsistentChannelAccount(
+  userId: string,
+  imJid: string,
+  group: RegisteredGroup,
+): boolean {
+  const encodedAccountId = parseChannelAddress(imJid)?.channelAccountId ?? null;
+  const storedAccountId = group.channel_account_id ?? null;
+  if (encodedAccountId !== storedAccountId) {
+    if (!encodedAccountId && storedAccountId) {
+      const account = getChannelAccount(storedAccountId);
+      return (
+        account?.is_legacy_default === true && account.owner_user_id === userId
+      );
+    }
+    return false;
+  }
+  if (!storedAccountId) return true;
+  return getChannelAccount(storedAccountId)?.owner_user_id === userId;
+}
+
+function refreshAgentLastImJid(agentId: string): void {
+  const agent = getAgent(agentId);
+  if (!agent) return;
+  const remaining = getGroupsByTargetAgent(agentId);
+  const current = agent.last_im_jid
+    ? channelConversationJid(agent.last_im_jid)
+    : null;
+  if (current && remaining.some(({ jid }) => jid === current)) return;
+  remaining.sort((a, b) => {
+    const dateDiff =
+      Date.parse(b.group.added_at) - Date.parse(a.group.added_at);
+    if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
+    return a.jid.localeCompare(b.jid);
+  });
+  updateAgentLastImJid(agentId, remaining[0]?.jid ?? null);
 }
 
 type ChannelChatInfo = NativeContextMetadata & {
@@ -3995,6 +4038,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
+  if (!hasConsistentChannelAccount(user.id, imJid, imGroup)) {
+    return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+  }
 
   const body = await c.req.json().catch(() => ({}));
 
@@ -4017,6 +4063,10 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    const previousTargetAgentId = freshImGroup.target_agent_id;
     const previousTargetMainJid = freshImGroup.target_main_jid;
     const wasThreadMap = freshImGroup.binding_mode === 'thread_map';
     const restored = restoreDefaultChannelMount(
@@ -4038,6 +4088,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     if (restored.routingMode === 'thread_map') {
       markNativeContextWorkspace(restored.workspaceJid);
+    }
+    if (previousTargetAgentId) {
+      refreshAgentLastImJid(previousTargetAgentId);
     }
     logger.info(
       {
@@ -4102,6 +4155,27 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json({ error: 'IM group not found' }, 404);
     }
     if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    const freshAgent = getAgent(sessionId);
+    if (
+      !freshAgent ||
+      freshAgent.kind !== 'conversation' ||
+      !freshAgent.chat_jid.startsWith('web:')
+    ) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+    const freshOwnerGroup = getRegisteredGroup(freshAgent.chat_jid);
+    if (
+      !freshOwnerGroup ||
+      !canModifyGroup(user, {
+        ...freshOwnerGroup,
+        jid: freshAgent.chat_jid,
+      })
+    ) {
       return c.json({ error: 'Forbidden' }, 403);
     }
     // Compute against freshImGroup, not the pre-await snapshot — see
@@ -4187,6 +4261,16 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    const freshTargetGroup = getRegisteredGroup(targetMainJid);
+    if (!freshTargetGroup) {
+      return c.json({ error: 'Target workspace not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshTargetGroup, jid: targetMainJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
     // Compute against freshImGroup, not the pre-await snapshot — see
     // fetchLiveChatInfo's doc comment.
     const threadCapable = isNativeContextContainer(
@@ -4197,7 +4281,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-    const legacyMainJid = `web:${targetGroup.folder}`;
+    const legacyMainJid = `web:${freshTargetGroup.folder}`;
     const hasConflict = hasWorkspaceMountConflict(
       freshImGroup,
       targetMainJid,

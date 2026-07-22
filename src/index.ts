@@ -3773,21 +3773,18 @@ async function syncGroupMetadata(force = false): Promise<void> {
   // account-scoped sockets; stopping after the first/default bot leaves stale
   // metadata for every secondary account.
   const connectedUserIds = imManager.getConnectedUserIds();
+  let syncedAccounts = 0;
   for (const uid of connectedUserIds) {
-    for (const accountId of imManager.getConnectedChannelAccountIds(
-      uid,
-      'feishu',
-    )) {
-      try {
-        await imManager.syncFeishuGroups(uid, accountId);
-      } catch (error) {
-        logger.warn(
-          { error, uid, accountId },
-          'Feishu account group sync failed; continuing',
-        );
-      }
+    try {
+      syncedAccounts += await imManager.syncAllFeishuGroups(uid);
+    } catch (error) {
+      logger.warn({ error, uid }, 'Feishu user group sync failed; continuing');
     }
   }
+  // A manual per-user discovery must not postpone this shared daily repair
+  // pass for every other user. Only the all-user scheduler advances the legacy
+  // global checkpoint.
+  if (syncedAccounts > 0) setLastGroupSync();
 }
 
 let feishuSyncInterval: ReturnType<typeof setInterval> | null = null;
@@ -14073,6 +14070,9 @@ async function main(): Promise<void> {
     getFeishuChatInfo: (userId: string, chatId: string) =>
       imManager.getFeishuChatInfo(userId, chatId),
     getChannelChatInfo: (jid: string) => imManager.getChatInfo(jid),
+    syncUserImGroups: async (userId: string) => ({
+      feishuAccounts: await imManager.syncAllFeishuGroups(userId),
+    }),
     clearImFailCounts: (jid: string) => {
       imHealthCheckFailCounts.delete(jid);
     },

@@ -38,6 +38,45 @@ const callbacks = (onNewChat = vi.fn()): IMChannelConnectOpts => ({
 });
 
 describe('IM manager account lifecycle', () => {
+  test('manual Feishu discovery syncs every connected bot including a legacy connector', async () => {
+    const manager = new IMConnectionManager();
+    const legacy = fakeChannel('feishu');
+    const secondary = fakeChannel('feishu');
+    let releaseLegacy!: () => void;
+    const legacyGate = new Promise<void>((resolve) => {
+      releaseLegacy = resolve;
+    });
+    const legacySync = vi.fn(() => legacyGate);
+    const secondarySync = vi.fn().mockResolvedValue(undefined);
+    legacy.channel.syncGroups = legacySync;
+    secondary.channel.syncGroups = secondarySync;
+
+    await manager.connectChannel(
+      'sync-owner',
+      'feishu',
+      legacy.channel,
+      callbacks(),
+    );
+    await manager.connectChannel(
+      'sync-owner',
+      'feishu',
+      secondary.channel,
+      callbacks(),
+      'secondary-account',
+    );
+
+    const firstSync = manager.syncAllFeishuGroups('sync-owner');
+    const duplicateSync = manager.syncAllFeishuGroups('sync-owner');
+    await vi.waitFor(() => expect(legacySync).toHaveBeenCalledTimes(1));
+    releaseLegacy();
+    await expect(Promise.all([firstSync, duplicateSync])).resolves.toEqual([
+      2, 2,
+    ]);
+    expect(legacySync).toHaveBeenCalledTimes(1);
+    expect(secondarySync).toHaveBeenCalledTimes(1);
+    await manager.disconnectAll();
+  });
+
   test('Feishu and DingTalk wrappers forward their public credential identities', async () => {
     const manager = new IMConnectionManager();
     const connect = vi.spyOn(manager, 'connectChannel').mockResolvedValue(true);

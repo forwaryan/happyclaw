@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Loader2,
   Link2,
@@ -7,6 +7,7 @@ import {
   Users,
   ArrowRightLeft,
   Info,
+  RefreshCw,
   X,
 } from 'lucide-react';
 import {
@@ -65,6 +66,12 @@ export function ImBindingDialog({
 }: ImBindingDialogProps) {
   const [imGroups, setImGroups] = useState<AvailableImGroup[]>([]);
   const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
+  const [syncedFeishuAccounts, setSyncedFeishuAccounts] = useState<
+    number | null
+  >(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
@@ -77,8 +84,10 @@ export function ImBindingDialog({
   const [activationModes, setActivationModes] = useState<
     Record<string, string>
   >({});
+  const syncGeneration = useRef(0);
 
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
+  const syncAvailableImGroups = useChatStore((s) => s.syncAvailableImGroups);
   const bindImGroup = useChatStore((s) => s.bindImGroup);
   const unbindImGroup = useChatStore((s) => s.unbindImGroup);
   const bindMainImGroup = useChatStore((s) => s.bindMainImGroup);
@@ -98,34 +107,75 @@ export function ImBindingDialog({
     [imGroups, isWorkspaceMode],
   );
 
-  const loadGroupsForDialog = useCallback(async () => {
-    setLoading(true);
-    setLoadError(null);
-    try {
-      const groups = await loadAvailableImGroups(groupJid);
-      setImGroups(groups);
-      const initial: Record<string, string> = {};
-      for (const group of groups) {
-        if (
-          supportsActivationModes(group.channel_type) &&
-          group.activation_mode &&
-          group.activation_mode !== 'auto'
-        ) {
-          initial[group.jid] = group.activation_mode;
+  const loadGroupsForDialog = useCallback(
+    async (generation?: number) => {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const groups = await loadAvailableImGroups(groupJid);
+        if (generation !== undefined && generation !== syncGeneration.current) {
+          return false;
+        }
+        setImGroups(groups);
+        const initial: Record<string, string> = {};
+        for (const group of groups) {
+          if (
+            supportsActivationModes(group.channel_type) &&
+            group.activation_mode &&
+            group.activation_mode !== 'auto'
+          ) {
+            initial[group.jid] = group.activation_mode;
+          }
+        }
+        setActivationModes(initial);
+        return true;
+      } catch (err) {
+        if (generation !== undefined && generation !== syncGeneration.current) {
+          return false;
+        }
+        setImGroups([]);
+        setLoadError(err instanceof Error ? err.message : '消息渠道加载失败');
+        return false;
+      } finally {
+        if (generation === undefined || generation === syncGeneration.current) {
+          setLoading(false);
         }
       }
-      setActivationModes(initial);
-    } catch (err) {
-      setImGroups([]);
-      setLoadError(err instanceof Error ? err.message : '消息渠道加载失败');
-    } finally {
-      setLoading(false);
-    }
-  }, [groupJid, loadAvailableImGroups]);
+    },
+    [groupJid, loadAvailableImGroups],
+  );
+
+  const syncGroupsForDialog = useCallback(
+    async (notifyOnError = false) => {
+      const generation = ++syncGeneration.current;
+      setSyncing(true);
+      setSyncError(null);
+      try {
+        const result = await syncAvailableImGroups(groupJid);
+        const groups = await loadAvailableImGroups(groupJid);
+        if (generation !== syncGeneration.current) return;
+        setImGroups(groups);
+        setLastSyncedAt(new Date());
+        setSyncedFeishuAccounts(result.feishuAccounts);
+      } catch (err) {
+        if (generation !== syncGeneration.current) return;
+        const message = err instanceof Error ? err.message : '渠道聊天同步失败';
+        setSyncError(message);
+        if (notifyOnError) {
+          showToast('同步失败', '已保留本地聊天列表');
+        }
+      } finally {
+        if (generation === syncGeneration.current) setSyncing(false);
+      }
+    },
+    [groupJid, loadAvailableImGroups, syncAvailableImGroups],
+  );
 
   useEffect(() => {
     if (!open) {
+      syncGeneration.current += 1;
       setLoading(false);
+      setSyncing(false);
       setActionLoading(null);
       setFilter('');
       setChannelFilter('all');
@@ -133,6 +183,9 @@ export function ImBindingDialog({
       setRebindTarget(null);
       setActivationModes({});
       setLoadError(null);
+      setSyncError(null);
+      setLastSyncedAt(null);
+      setSyncedFeishuAccounts(null);
       return;
     }
 
@@ -142,8 +195,18 @@ export function ImBindingDialog({
     setFilter('');
     setChannelFilter('all');
     setAccountFilter('all');
-    void loadGroupsForDialog();
-  }, [open, groupJid, agentId, loadGroupsForDialog]);
+    const generation = ++syncGeneration.current;
+    void loadGroupsForDialog(generation).then((loaded) => {
+      if (loaded && generation === syncGeneration.current) {
+        void syncGroupsForDialog(false);
+      }
+    });
+    return () => {
+      if (generation === syncGeneration.current) {
+        syncGeneration.current += 1;
+      }
+    };
+  }, [open, groupJid, agentId, loadGroupsForDialog, syncGroupsForDialog]);
 
   const channelFilters: { key: ChannelFilter; label: string; count: number }[] =
     useMemo(() => {
@@ -183,13 +246,44 @@ export function ImBindingDialog({
     if (channelFilter !== 'all') {
       groups = groups.filter((g) => g.channel_type === channelFilter);
     }
-    if (!filter.trim()) return groups;
-    const q = filter.trim().toLowerCase();
-    return groups.filter(
-      (g) =>
-        g.name.toLowerCase().includes(q) || g.jid.toLowerCase().includes(q),
-    );
-  }, [accountFilter, compatibleGroups, channelFilter, filter]);
+    if (filter.trim()) {
+      const q = filter.trim().toLowerCase();
+      groups = groups.filter(
+        (g) =>
+          g.name.toLowerCase().includes(q) || g.jid.toLowerCase().includes(q),
+      );
+    }
+
+    const recentCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const priority = (group: AvailableImGroup): number => {
+      const boundToCurrent = isMainMode
+        ? (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid
+        : (group.bound_session_id ?? group.bound_agent_id) === agentId;
+      if (boundToCurrent) return 0;
+      const addedAt = Date.parse(group.added_at);
+      if (Number.isFinite(addedAt) && addedAt >= recentCutoff) return 1;
+      const isUnbound =
+        !(group.bound_session_id ?? group.bound_agent_id) &&
+        !(group.bound_workspace_jid ?? group.bound_main_jid);
+      return isUnbound ? 2 : 3;
+    };
+    return [...groups].sort((a, b) => {
+      const priorityDiff = priority(a) - priority(b);
+      if (priorityDiff !== 0) return priorityDiff;
+      const dateDiff = Date.parse(b.added_at) - Date.parse(a.added_at);
+      if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
+      const nameDiff = a.name.localeCompare(b.name, 'zh-CN');
+      return nameDiff !== 0 ? nameDiff : a.jid.localeCompare(b.jid);
+    });
+  }, [
+    accountFilter,
+    agentId,
+    compatibleGroups,
+    channelFilter,
+    filter,
+    groupJid,
+    isMainMode,
+  ]);
 
   const isBoundToThis = (group: AvailableImGroup): boolean => {
     if (isMainMode) {
@@ -364,6 +458,59 @@ export function ImBindingDialog({
           </DialogHeader>
 
           <div className="min-h-0 space-y-4 p-4 sm:p-5">
+            <div className="flex min-h-8 items-center justify-between gap-3">
+              <div
+                className="min-w-0 text-xs text-muted-foreground"
+                aria-live="polite"
+              >
+                {syncing ? (
+                  <span className="inline-flex items-center gap-1.5">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    正在从已连接 Bot 同步聊天…
+                  </span>
+                ) : syncError ? (
+                  <span className="text-amber-700 dark:text-amber-300">
+                    同步未完成，当前显示本地记录
+                  </span>
+                ) : lastSyncedAt ? (
+                  syncedFeishuAccounts === 0 ? (
+                    '已检查 · 当前没有已连接的飞书 Bot'
+                  ) : (
+                    `已同步 ${syncedFeishuAccounts ?? 0} 个飞书 Bot · ${lastSyncedAt.toLocaleTimeString(
+                      [],
+                      {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      },
+                    )}`
+                  )
+                ) : (
+                  '先显示本地记录，再同步 Bot 群聊'
+                )}
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={loading || syncing}
+                onClick={() => void syncGroupsForDialog(true)}
+              >
+                <RefreshCw
+                  className={`size-3.5 ${syncing ? 'animate-spin' : ''}`}
+                />
+                同步聊天
+              </Button>
+            </div>
+
+            {syncError && !loading && (
+              <div
+                role="alert"
+                className="rounded-lg border border-amber-300/70 bg-amber-50/60 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-800/60 dark:bg-amber-950/20 dark:text-amber-200"
+              >
+                {syncError}
+              </div>
+            )}
+
             {!loading && !loadError && compatibleGroups.length > 0 && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
@@ -439,7 +586,7 @@ export function ImBindingDialog({
             )}
 
             <div
-              className="max-h-[min(58dvh,32rem)] space-y-2 overflow-y-auto overscroll-contain pr-1"
+              className="max-h-[min(62dvh,38rem)] space-y-2 overflow-y-auto overscroll-contain pr-1"
               aria-live="polite"
             >
               {loading && (
@@ -467,8 +614,8 @@ export function ImBindingDialog({
               {!loading && !loadError && compatibleGroups.length === 0 && (
                 <div className="py-12 text-center text-sm text-muted-foreground">
                   {isWorkspaceMode
-                    ? '暂无可绑定的渠道聊天。请先完成渠道接入，并向 Bot 发送一条消息。'
-                    : '暂无可绑定的普通群或私聊。请先在对应渠道中向 Bot 发送一条消息。'}
+                    ? '暂无可绑定的渠道聊天。请确认 Bot 已加入聊天，然后点击“同步聊天”。'
+                    : '暂无可绑定的普通群或私聊。请确认 Bot 已加入聊天，然后点击“同步聊天”。'}
                 </div>
               )}
 
@@ -694,6 +841,12 @@ export function ImBindingDialog({
                   );
                 })}
             </div>
+
+            {!loading && !loadError && filteredGroups.length > 5 && (
+              <p className="text-center text-[11px] text-muted-foreground">
+                列表可滚动 · 已按当前绑定、最近接入和未绑定优先排序
+              </p>
+            )}
           </div>
         </DialogContent>
       </Dialog>

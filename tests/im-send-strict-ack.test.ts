@@ -8,6 +8,8 @@ const controls = vi.hoisted(() => ({
   feishuMessageReply: vi.fn(),
   feishuImageCreate: vi.fn(),
   feishuFileCreate: vi.fn(),
+  feishuChatList: vi.fn(),
+  updateChatName: vi.fn(),
   telegramSendMessage: vi.fn(),
   telegramSendPhoto: vi.fn(),
   telegramSendAnimation: vi.fn(),
@@ -25,6 +27,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
         message: { create: controls.feishuMessageCreate },
         image: { create: controls.feishuImageCreate },
         file: { create: controls.feishuFileCreate },
+        chat: { list: controls.feishuChatList },
       },
       message: { reply: controls.feishuMessageReply },
       messageReaction: {
@@ -43,6 +46,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
     async close() {}
   },
 }));
+
+vi.mock('../src/db.js', async (importOriginal) => {
+  const real = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...real,
+    updateChatName: controls.updateChatName,
+  };
+});
 
 vi.mock('grammy', () => ({
   Bot: class {
@@ -105,6 +116,15 @@ beforeEach(() => {
     code: 0,
     data: { file_key: 'file_1' },
   });
+  controls.feishuChatList.mockResolvedValue({
+    data: {
+      items: [
+        { chat_id: 'oc_visible', name: '已加入的群' },
+        { chat_id: 'oc_unnamed' },
+      ],
+      has_more: false,
+    },
+  });
   controls.telegramSendMessage.mockResolvedValue({ message_id: 1 });
   controls.telegramSendPhoto.mockResolvedValue({ message_id: 2 });
   controls.telegramSendAnimation.mockResolvedValue({ message_id: 3 });
@@ -133,6 +153,39 @@ async function connectedTransports() {
 }
 
 describe('IM strict send acknowledgement', () => {
+  test('Feishu chat inventory reports every visible chat to registration', async () => {
+    const feishu = createFeishuConnection({
+      appId: 'app',
+      appSecret: 'secret',
+    });
+    const onNewChat = vi.fn();
+    expect(
+      await feishu.connect({
+        onReady: vi.fn(),
+        onNewChat,
+        normalizeIncomingJid: (jid) => `${jid}#account:secondary`,
+      }),
+    ).toBe(true);
+    cleanup.push(() => feishu.stop());
+
+    await feishu.syncGroups();
+
+    expect(onNewChat).toHaveBeenNthCalledWith(
+      1,
+      'feishu:oc_visible',
+      '已加入的群',
+    );
+    expect(onNewChat).toHaveBeenNthCalledWith(
+      2,
+      'feishu:oc_unnamed',
+      '飞书聊天',
+    );
+    expect(controls.updateChatName).toHaveBeenCalledWith(
+      'feishu:oc_visible#account:secondary',
+      '已加入的群',
+    );
+  });
+
   test('all send methods reject while their transport is uninitialized', async () => {
     const feishu = createFeishuConnection({
       appId: 'app',

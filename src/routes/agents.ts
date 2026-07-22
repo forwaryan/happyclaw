@@ -48,7 +48,10 @@ import {
   resolveWorkspaceJid,
   type NativeContextMetadata,
 } from '../channel-mount-service.js';
-import { parseChannelAddress } from '../channel-address.js';
+import {
+  channelConversationJid,
+  parseChannelAddress,
+} from '../channel-address.js';
 
 const router = new Hono<{ Variables: Variables }>();
 
@@ -115,12 +118,33 @@ function hasConsistentChannelAccount(
   return getChannelAccount(storedAccountId)?.owner_user_id === userId;
 }
 
-function markNativeContextWorkspace(jid: string, group: RegisteredGroup): void {
+function markNativeContextWorkspace(jid: string): void {
+  const freshWorkspace = getRegisteredGroup(jid);
+  if (!freshWorkspace) return;
   updateWorkspaceGroup(jid, {
-    ...group,
+    ...freshWorkspace,
     conversation_source: 'native_thread',
     conversation_nav_mode: 'vertical_threads',
   });
+}
+
+/** Keep the agent's fallback reply route when another bound chat remains. */
+function refreshAgentLastImJid(agentId: string): void {
+  const agent = getAgent(agentId);
+  if (!agent) return;
+  const remaining = getGroupsByTargetAgent(agentId);
+  const current = agent.last_im_jid
+    ? channelConversationJid(agent.last_im_jid)
+    : null;
+  if (current && remaining.some(({ jid }) => jid === current)) return;
+
+  remaining.sort((a, b) => {
+    const dateDiff =
+      Date.parse(b.group.added_at) - Date.parse(a.group.added_at);
+    if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
+    return a.jid.localeCompare(b.jid);
+  });
+  updateAgentLastImJid(agentId, remaining[0]?.jid ?? null);
 }
 
 /**
@@ -216,8 +240,7 @@ async function restoreBindingDefault(
     restored.routingMode,
   );
   if (restored.routingMode === 'thread_map') {
-    const workspace = getRegisteredGroup(restored.workspaceJid);
-    if (workspace) markNativeContextWorkspace(restored.workspaceJid, workspace);
+    markNativeContextWorkspace(restored.workspaceJid);
   }
   return {
     status: 'resolved',
@@ -950,7 +973,38 @@ router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
-// GET /api/groups/:jid/im-groups — list available IM group chats for this folder
+// POST /api/groups/:jid/im-groups/sync — actively discover chats from every
+// connected bot owned by the current user. The GET endpoint remains a fast
+// local-cache read so opening the dialog never waits on provider APIs.
+router.post('/:jid/im-groups/sync', authMiddleware, async (c) => {
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const user = c.get('user');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  if (!canAccessGroup(user, { ...group, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const syncUserImGroups = getWebDeps()?.syncUserImGroups;
+  if (!syncUserImGroups) {
+    return c.json({ error: 'Channel discovery is unavailable' }, 503);
+  }
+
+  try {
+    const result = await syncUserImGroups(user.id);
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    logger.warn({ error, userId: user.id }, 'Manual IM group sync failed');
+    return c.json(
+      {
+        error: '同步失败，已保留本地聊天列表，请检查 Bot 连接后重试',
+      },
+      502,
+    );
+  }
+});
+
+// GET /api/groups/:jid/im-groups — list locally known IM chats for this user
 router.get('/:jid/im-groups', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const user = c.get('user');
@@ -995,6 +1049,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
     require_mention?: boolean;
     owner_im_id?: string | null;
     sender_allowlist_locked?: boolean;
+    added_at: string;
   }
 
   const candidates: ImGroupCandidate[] = [];
@@ -1053,38 +1108,98 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       owner_im_id: g.owner_im_id ?? null,
       sender_allowlist_locked:
         Array.isArray(g.sender_allowlist) && g.sender_allowlist.length === 0,
+      added_at: g.added_at,
     });
   }
 
-  // Enrich chats with provider-native metadata (Feishu topic groups and
-  // Telegram Forums both expose a native thread container).
+  // Enrich newly discovered Feishu chats so topic containers are recognized.
+  // Telegram Forum capability is persisted by its connector events. Only
+  // query live Feishu metadata when the durable chat_mode field is missing:
+  // names are kept current by chat.list, while querying every chat on every
+  // dialog open is slow and amplifies provider rate limits for large bots.
   const deps = getWebDeps();
   if (deps?.getChannelChatInfo || deps?.getFeishuChatInfo) {
-    const chatInfoPromises = candidates.map(async (g) => {
-      const chatId = extractChatId(g.jid);
-      const info = deps.getChannelChatInfo
-        ? await deps.getChannelChatInfo(g.jid)
-        : g.channel_type === 'feishu'
-          ? await deps.getFeishuChatInfo!(user.id, chatId)
-          : null;
-      if (info) {
-        g.avatar = info.avatar;
-        g.chat_mode = info.chat_mode;
-        g.group_message_type = info.group_message_type;
-        g.is_thread_capable = isNativeContextContainer(
-          g.jid,
-          allGroups[g.jid],
-          info as ChannelChatInfo,
-        );
-        if (info.user_count != null) {
-          const count = parseInt(info.user_count, 10);
-          if (!isNaN(count)) g.member_count = count;
+    const chatInfoPromises = candidates
+      .filter(
+        (g) =>
+          g.channel_type === 'feishu' && !allGroups[g.jid].feishu_chat_mode,
+      )
+      .map(async (g) => {
+        const chatId = extractChatId(g.jid);
+        const info = deps.getChannelChatInfo
+          ? await deps.getChannelChatInfo(g.jid)
+          : g.channel_type === 'feishu'
+            ? await deps.getFeishuChatInfo!(user.id, chatId)
+            : null;
+        if (info) {
+          g.avatar = info.avatar;
+          g.chat_mode = info.chat_mode;
+          g.group_message_type = info.group_message_type;
+          g.is_thread_capable = isNativeContextContainer(
+            g.jid,
+            allGroups[g.jid],
+            info as ChannelChatInfo,
+          );
+          if (info.user_count != null) {
+            const count = parseInt(info.user_count, 10);
+            if (!isNaN(count)) g.member_count = count;
+          }
+          if (info.name && info.name !== g.name) g.name = info.name;
+
+          // Persist live metadata against a fresh row so later cached reads do
+          // not forget that this is a topic container. Re-reading here also
+          // preserves any binding/owner update that landed during the await.
+          const fresh = getRegisteredGroup(g.jid);
+          if (fresh && canAccessGroup(user, { ...fresh, jid: g.jid })) {
+            const next: RegisteredGroup = {
+              ...fresh,
+              name: info.name?.trim() || fresh.name,
+              feishu_chat_mode: info.chat_mode ?? fresh.feishu_chat_mode,
+              feishu_group_message_type:
+                info.group_message_type ?? fresh.feishu_group_message_type,
+              native_context_type: g.is_thread_capable
+                ? 'thread'
+                : fresh.native_context_type,
+            };
+            if (
+              next.name !== fresh.name ||
+              next.feishu_chat_mode !== fresh.feishu_chat_mode ||
+              next.feishu_group_message_type !==
+                fresh.feishu_group_message_type ||
+              next.native_context_type !== fresh.native_context_type
+            ) {
+              setRegisteredGroup(g.jid, next);
+              const cached = deps.getRegisteredGroups();
+              if (cached[g.jid]) cached[g.jid] = next;
+            }
+          }
         }
-        if (info.name && info.name !== g.name) g.name = info.name;
-      }
-    });
+      });
     await Promise.allSettled(chatInfoPromises);
   }
+
+  const legacyMainJid = `web:${group.folder}`;
+  const recentCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const priority = (candidate: ImGroupCandidate): number => {
+    if (
+      candidate.bound_workspace_jid === jid ||
+      candidate.bound_workspace_jid === legacyMainJid
+    ) {
+      return 0;
+    }
+    const addedAt = Date.parse(candidate.added_at);
+    if (Number.isFinite(addedAt) && addedAt >= recentCutoff) return 1;
+    if (!candidate.bound_agent_id && !candidate.bound_workspace_jid) return 2;
+    return 3;
+  };
+  candidates.sort((a, b) => {
+    const priorityDiff = priority(a) - priority(b);
+    if (priorityDiff !== 0) return priorityDiff;
+    const dateDiff = Date.parse(b.added_at) - Date.parse(a.added_at);
+    if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
+    const nameDiff = a.name.localeCompare(b.name, 'zh-CN');
+    return nameDiff !== 0 ? nameDiff : a.jid.localeCompare(b.jid);
+  });
 
   // Feishu: all registered chats (group and p2p) are now returned.
   // The member_count filter was removed because p2p chats have user_count=0 or 1
@@ -1178,6 +1293,19 @@ router.put(
           400,
         );
       }
+      const freshSession = getAgent(sessionId);
+      const freshTargetGroup = getRegisteredGroup(jid);
+      if (
+        !freshSession ||
+        freshSession.chat_jid !== jid ||
+        freshSession.kind !== 'conversation' ||
+        !freshTargetGroup
+      ) {
+        return c.json({ error: 'Session not found' }, 404);
+      }
+      if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
+        return c.json({ error: 'Forbidden' }, 403);
+      }
       if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
         return c.json(
           {
@@ -1221,6 +1349,13 @@ router.put(
     if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
       return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
     }
+    const freshTargetGroup = getRegisteredGroup(jid);
+    if (!freshTargetGroup) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
     // Compute against freshImGroup, not the pre-await snapshot — see
     // fetchLiveChatInfo's doc comment.
     const threadCapable = isNativeContextContainer(
@@ -1229,7 +1364,7 @@ router.put(
       chatInfo ?? {},
     );
     const targetMainJid = jid;
-    const legacyMainJid = `web:${group.folder}`;
+    const legacyMainJid = `web:${freshTargetGroup.folder}`;
     const hasConflict = hasWorkspaceMountConflict(
       freshImGroup,
       targetMainJid,
@@ -1283,7 +1418,7 @@ router.put(
       targetMainJid,
       threadCapable ? 'thread_map' : 'single_session',
     );
-    if (threadCapable) markNativeContextWorkspace(jid, group);
+    if (threadCapable) markNativeContextWorkspace(jid);
 
     logger.info(
       { imJid, targetMainJid, threadCapable, userId: user.id },
@@ -1341,7 +1476,7 @@ router.delete(
       if (restored.status !== 'resolved') {
         return c.json({ error: restoreDefaultError(restored) }, 409);
       }
-      updateAgentLastImJid(sessionId, null);
+      refreshAgentLastImJid(sessionId);
       logger.info(
         {
           imJid,
@@ -1440,6 +1575,19 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
     return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
   }
+  const freshAgent = getAgent(agentId);
+  const freshTargetGroup = getRegisteredGroup(jid);
+  if (
+    !freshAgent ||
+    freshAgent.chat_jid !== jid ||
+    freshAgent.kind !== 'conversation' ||
+    !freshTargetGroup
+  ) {
+    return c.json({ error: 'Session not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
   // Compute against freshImGroup, not the pre-await snapshot — see
   // fetchLiveChatInfo's doc comment.
   if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
@@ -1523,7 +1671,7 @@ router.delete(
     }
 
     // Clear persisted IM routing so restart won't route to unbound channel (#225)
-    updateAgentLastImJid(agentId, null);
+    refreshAgentLastImJid(agentId);
 
     logger.info(
       {
@@ -1593,6 +1741,13 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
     return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
   }
+  const freshTargetGroup = getRegisteredGroup(jid);
+  if (!freshTargetGroup) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
   // Compute against freshImGroup, not the pre-await snapshot — see
   // fetchLiveChatInfo's doc comment.
   const threadCapable = isNativeContextContainer(
@@ -1601,7 +1756,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     chatInfo ?? {},
   );
   const targetMainJid = jid; // Use actual registered JID (not folder-based)
-  const legacyMainJid = `web:${group.folder}`;
+  const legacyMainJid = `web:${freshTargetGroup.folder}`;
   const force = body.force === true;
   // Only update reply_policy if explicitly provided; otherwise preserve existing value
   const replyPolicy =
@@ -1668,7 +1823,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     targetMainJid,
     threadCapable ? 'thread_map' : 'single_session',
   );
-  if (threadCapable) markNativeContextWorkspace(jid, group);
+  if (threadCapable) markNativeContextWorkspace(jid);
 
   logger.info(
     {
