@@ -709,11 +709,19 @@ export class GroupQueue {
   }
 
   private hasCapacityFor(groupJid: string): boolean {
-    const isHost = this.isHostMode(groupJid);
-    const systemCapacity = isHost
-      ? this.activeHostProcessCount <
-        getSystemSettings().maxConcurrentHostProcesses
-      : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
+    // Host mode mirrors the Claude Agent SDK's natural process model: the
+    // serialization key is the only admission boundary. Different sessions
+    // must be able to start immediately and run concurrently; applying a
+    // process-wide slot count here lets warm, idle sessions block unrelated
+    // Feishu topics for up to IDLE_TIMEOUT.
+    //
+    // Container mode keeps its explicit resource/billing limits because each
+    // turn consumes a managed Docker allocation. Host processes are governed
+    // by the operating system instead of an application-level capacity pool.
+    if (this.isHostMode(groupJid)) return true;
+
+    const systemCapacity =
+      this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
     if (!systemCapacity) return false;
 
     // User-level concurrent container limit (billing)

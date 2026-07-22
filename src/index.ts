@@ -2710,7 +2710,6 @@ function handleStatusCommand(chatJid: string): string {
       activeContainerCount: queueStatus.activeContainerCount,
       activeHostProcessCount: queueStatus.activeHostProcessCount,
       maxContainers: settings.maxConcurrentContainers,
-      maxHostProcesses: settings.maxConcurrentHostProcesses,
       waitingCount: queueStatus.waitingCount,
       waitingGroupJids: queueStatus.waitingGroupJids,
     },

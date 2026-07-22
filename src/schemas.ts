@@ -496,6 +496,8 @@ export const SystemSettingsSchema = z
       .max(104857600)
       .optional(),
     maxConcurrentContainers: z.number().int().min(1).max(100).optional(),
+    // Deprecated compatibility input. Host execution is serialized only by
+    // Session; the route accepts and discards this key for stale clients.
     maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
     maxLoginAttempts: z.number().int().min(1).max(100).optional(),
     loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),

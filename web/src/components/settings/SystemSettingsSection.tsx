@@ -17,7 +17,6 @@ type NumericSettingKey =
   | 'idleTimeout'
   | 'containerMaxOutputSize'
   | 'maxConcurrentContainers'
-  | 'maxConcurrentHostProcesses'
   | 'maxLoginAttempts'
   | 'loginLockoutMinutes'
   | 'maxConcurrentScripts'
@@ -48,7 +47,8 @@ const fieldGroups: FieldGroup[] = [
   {
     scope: 'runtime',
     title: '运行资源',
-    description: '限制后续启动的容器和宿主机进程。正在运行的任务不会被中断。',
+    description:
+      'Docker 容器使用显式容量上限；宿主机模式仅对同一会话串行，不限制不同会话并发。正在运行的任务不会被中断。',
     fields: [
       {
         key: 'containerTimeout',
@@ -95,17 +95,6 @@ const fieldGroups: FieldGroup[] = [
         toStored: (value) => value,
         min: 1,
         max: 100,
-        step: 1,
-      },
-      {
-        key: 'maxConcurrentHostProcesses',
-        label: '宿主机进程并发上限',
-        description: '系统同时运行的宿主机模式进程数量上限。',
-        unit: '个',
-        toDisplay: (value) => value,
-        toStored: (value) => value,
-        min: 1,
-        max: 50,
         step: 1,
       },
     ],

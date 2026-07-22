@@ -3811,7 +3811,6 @@ export interface SystemSettings {
   idleTimeout: number;
   containerMaxOutputSize: number;
   maxConcurrentContainers: number;
-  maxConcurrentHostProcesses: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
@@ -3859,7 +3858,6 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   idleTimeout: 1800000,
   containerMaxOutputSize: 10485760,
   maxConcurrentContainers: 20,
-  maxConcurrentHostProcesses: 5,
   maxLoginAttempts: 5,
   loginLockoutMinutes: 15,
   maxConcurrentScripts: 10,
@@ -4055,12 +4053,6 @@ function normalizeSystemSettings(
       1,
       100,
     ),
-    maxConcurrentHostProcesses: numberField(
-      'maxConcurrentHostProcesses',
-      DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
-      1,
-      50,
-    ),
     maxLoginAttempts: numberField(
       'maxLoginAttempts',
       DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
@@ -4146,7 +4138,6 @@ function buildEnvFallbackSettings(): SystemSettings {
       idleTimeout: process.env.IDLE_TIMEOUT,
       containerMaxOutputSize: process.env.CONTAINER_MAX_OUTPUT_SIZE,
       maxConcurrentContainers: process.env.MAX_CONCURRENT_CONTAINERS,
-      maxConcurrentHostProcesses: process.env.MAX_CONCURRENT_HOST_PROCESSES,
       maxLoginAttempts: process.env.MAX_LOGIN_ATTEMPTS,
       loginLockoutMinutes: process.env.LOGIN_LOCKOUT_MINUTES,
       maxConcurrentScripts: process.env.MAX_CONCURRENT_SCRIPTS,

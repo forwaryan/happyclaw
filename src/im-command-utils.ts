@@ -218,7 +218,6 @@ export interface QueueStatusInfo {
   activeContainerCount: number;
   activeHostProcessCount: number;
   maxContainers: number;
-  maxHostProcesses: number;
   waitingCount: number;
   waitingGroupJids: string[];
 }
@@ -243,7 +242,7 @@ export function formatSystemStatus(
     '━━━━━━━━━━',
     `📍 位置: ${location.locationLine}`,
     `⚡ 状态: ${statusText}`,
-    `📦 负载: ${queueStatus.activeContainerCount}/${queueStatus.maxContainers} 容器, ${queueStatus.activeHostProcessCount}/${queueStatus.maxHostProcesses} 进程`,
+    `📦 负载: ${queueStatus.activeContainerCount}/${queueStatus.maxContainers} 容器, ${queueStatus.activeHostProcessCount} 个宿主机进程（不同会话不设并发上限）`,
     '',
     '💡 /sw <消息> 并行任务 · /where 绑定 · /list 全部',
   ];

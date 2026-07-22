@@ -2092,7 +2092,6 @@ function toSystemSettingsResponse(
     idleTimeout: settings.idleTimeout,
     containerMaxOutputSize: settings.containerMaxOutputSize,
     maxConcurrentContainers: settings.maxConcurrentContainers,
-    maxConcurrentHostProcesses: settings.maxConcurrentHostProcesses,
     maxLoginAttempts: settings.maxLoginAttempts,
     loginLockoutMinutes: settings.loginLockoutMinutes,
     maxConcurrentScripts: settings.maxConcurrentScripts,
@@ -2137,12 +2136,17 @@ configRoutes.put(
 
     try {
       const before = toSystemSettingsResponse(getSystemSettings());
-      const saved = saveSystemSettings(validation.data);
+      // Deprecated compatibility input. Host mode no longer has an
+      // application-level concurrency pool; accept the old key so stale Web
+      // clients do not fail the whole request, but never persist/apply it.
+      const effectiveSettings = { ...validation.data };
+      delete effectiveSettings.maxConcurrentHostProcesses;
+      const saved = saveSystemSettings(effectiveSettings);
       const response = toSystemSettingsResponse(saved);
       const changedFields = changedSettingFields(
         before,
         response,
-        validation.data,
+        effectiveSettings,
       );
       if (changedFields.length > 0) {
         const actor = c.get('user') as AuthUser;

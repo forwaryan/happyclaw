@@ -92,7 +92,6 @@ export interface SystemSettings {
   idleTimeout: number;
   containerMaxOutputSize: number;
   maxConcurrentContainers: number;
-  maxConcurrentHostProcesses: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
