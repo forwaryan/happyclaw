@@ -1,0 +1,456 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
+
+const tmpDir = fs.mkdtempSync(
+  path.join(os.tmpdir(), 'happyclaw-provider-runtime-apply-'),
+);
+
+vi.mock('../src/config.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  DATA_DIR: tmpDir,
+  STORE_DIR: path.join(tmpDir, 'db'),
+  GROUPS_DIR: path.join(tmpDir, 'groups'),
+}));
+
+vi.mock('../src/logger.js', () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
+  const real =
+    await importOriginal<typeof import('../src/middleware/auth.ts')>();
+  return {
+    ...real,
+    authMiddleware: async (c: any, next: any) => {
+      c.set('user', {
+        id: 'provider-runtime-admin',
+        username: 'provider-runtime-admin',
+        display_name: 'Provider Runtime Admin',
+        role: 'admin',
+        status: 'active',
+        permissions: [],
+        must_change_password: false,
+      });
+      return next();
+    },
+  };
+});
+
+const web = await import('../src/web.js');
+const db = await import('../src/db.js');
+const runtimeConfig = await import('../src/runtime-config.js');
+const { GroupQueue } = await import('../src/group-queue.js');
+
+const app = web.createAppForTest({
+  queue: {
+    stopGroup: vi.fn(async () => {}),
+    listDescendantJids: () => [],
+    pauseGroupsForMutation: () => ({ id: 0 }),
+    resumeGroupsAfterMutation: vi.fn(),
+  },
+  getRegisteredGroups: () => ({}),
+  sessions: {},
+} as any);
+
+let sequence = 0;
+let liveQueue: InstanceType<typeof GroupQueue> | null = null;
+
+function unique(label: string): string {
+  sequence += 1;
+  return `${label}-${sequence}`;
+}
+
+function registerWorkspace(jid: string, folder: string) {
+  const group = {
+    name: folder,
+    folder,
+    added_at: new Date().toISOString(),
+    executionMode: 'container' as const,
+    created_by: 'provider-runtime-admin',
+  };
+  db.setRegisteredGroup(jid, group);
+  return group;
+}
+
+function bindDeps(
+  groups: Record<string, ReturnType<typeof registerWorkspace>>,
+  queue: unknown,
+  sessions: Record<string, string> = {},
+): void {
+  web.createAppForTest({
+    queue,
+    getRegisteredGroups: () => groups,
+    sessions,
+  } as any);
+}
+
+async function patchProvider(
+  providerId: string,
+  patch: Record<string, unknown>,
+): Promise<Response> {
+  return app.request(`/api/config/claude/providers/${providerId}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+}
+
+beforeAll(() => {
+  fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
+  fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
+  db.initDatabase();
+});
+
+beforeEach(() => {
+  fs.rmSync(path.join(tmpDir, 'config'), { recursive: true, force: true });
+  fs.rmSync(path.join(tmpDir, 'container-env'), {
+    recursive: true,
+    force: true,
+  });
+});
+
+afterEach(async () => {
+  if (liveQueue) {
+    await liveQueue.shutdown(0);
+    liveQueue = null;
+  }
+});
+
+afterAll(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe('provider runtime apply is a lossless configuration mutation', () => {
+  test('keeps a capacity-queued descendant task instead of dropping it', async () => {
+    const folder = unique('queued-work');
+    const jid = `web:${folder}`;
+    const descendantJid = `${jid}#task:scheduled`;
+    const group = registerWorkspace(jid, folder);
+    const queue = new GroupQueue();
+    liveQueue = queue;
+    queue.setSerializationKeyResolver((candidate) => {
+      const taskSeparator = candidate.indexOf('#task:');
+      if (taskSeparator >= 0) {
+        return `${folder}#task:${candidate.slice(taskSeparator + 6)}`;
+      }
+      return candidate === jid ? folder : candidate;
+    });
+    let capacityAllowed = false;
+    queue.setUserConcurrentLimitChecker(() => ({
+      allowed: capacityAllowed,
+    }));
+
+    let dropped = 0;
+    let runs = 0;
+    expect(
+      queue.enqueueTask(
+        descendantJid,
+        'scheduled',
+        async () => {
+          runs += 1;
+        },
+        {
+          onDropped: () => {
+            dropped += 1;
+          },
+        },
+      ),
+    ).toBe(true);
+    expect(queue.listDescendantJids(jid)).toEqual([descendantJid]);
+
+    bindDeps({ [jid]: group }, queue);
+    const provider = runtimeConfig.createProvider({
+      name: unique('third-party'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://old.example.test',
+      anthropicAuthToken: 'test-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(dropped).toBe(0);
+    expect(queue.listDescendantJids(jid)).toEqual([descendantJid]);
+    capacityAllowed = true;
+    (
+      queue as unknown as {
+        drainWaiting: () => void;
+      }
+    ).drainWaiting();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(runs).toBe(1);
+    expect(dropped).toBe(0);
+  });
+
+  test('never stops the same descendant concurrently when sibling JIDs share a folder', async () => {
+    const folder = unique('sibling-stop');
+    const webJid = `web:${folder}`;
+    const imJid = `feishu:${folder}`;
+    const descendantJid = `${webJid}#agent:researcher`;
+    const webGroup = registerWorkspace(webJid, folder);
+    const imGroup = registerWorkspace(imJid, folder);
+    const inFlight = new Set<string>();
+    let overlappingDuplicateStops = 0;
+    const stopOptions: unknown[] = [];
+    const queue = {
+      listDescendantJids: () => [descendantJid],
+      pauseGroupsForMutation: () => ({ id: 1 }),
+      resumeGroupsAfterMutation: vi.fn(),
+      stopGroup: vi.fn(async (target: string, options?: unknown) => {
+        stopOptions.push(options);
+        if (inFlight.has(target)) overlappingDuplicateStops += 1;
+        inFlight.add(target);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight.delete(target);
+      }),
+    };
+    bindDeps({ [webJid]: webGroup, [imJid]: imGroup }, queue);
+    const provider = runtimeConfig.createProvider({
+      name: unique('dedupe-provider'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://old.example.test',
+      anthropicAuthToken: 'test-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(overlappingDuplicateStops).toBe(0);
+    expect(stopOptions).not.toContain(undefined);
+    expect(stopOptions).toSatisfy((options) =>
+      options.every(
+        (option) =>
+          (option as { force?: boolean }).force === true &&
+          (option as { preserveQueuedWork?: boolean }).preserveQueuedWork ===
+            true,
+      ),
+    );
+  });
+
+  test('does not commit a provider update when pre-commit runtime quiesce fails', async () => {
+    const folder = unique('pre-commit-failure');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    bindDeps(
+      { [jid]: group },
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 2 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup: vi.fn(async () => {
+          throw new Error('simulated stop failure');
+        }),
+      },
+    );
+    const provider = runtimeConfig.createProvider({
+      name: unique('failed-provider'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://old.example.test',
+      anthropicAuthToken: 'test-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'must-not-commit',
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(body).toMatchObject({
+      error: expect.stringContaining('not updated'),
+      applied: { success: false, persisted: false },
+    });
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.anthropicModel,
+    ).toBe('old-model');
+  });
+
+  test('reports a persisted update when the post-commit quiesce pass fails', async () => {
+    const folder = unique('post-commit-failure');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    let stopCalls = 0;
+    bindDeps(
+      { [jid]: group },
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 4 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup: vi.fn(async () => {
+          stopCalls += 1;
+          if (stopCalls === 2) {
+            throw new Error('simulated post-commit stop failure');
+          }
+        }),
+      },
+    );
+    const provider = runtimeConfig.createProvider({
+      name: unique('partially-applied-provider'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://old.example.test',
+      anthropicAuthToken: 'test-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'persisted-model',
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(body).toMatchObject({
+      error: expect.stringContaining('saved'),
+      provider: { anthropicModel: 'persisted-model' },
+      applied: { success: false, persisted: true, phase: 'post_commit' },
+    });
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.anthropicModel,
+    ).toBe('persisted-model');
+  });
+});
+
+describe('provider session invalidation only removes attributable sessions', () => {
+  function bindIdleWorkspace(jid: string, folder: string, sessionId: string) {
+    const group = registerWorkspace(jid, folder);
+    const sessions = { [folder]: sessionId };
+    bindDeps(
+      { [jid]: group },
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 3 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup: vi.fn(async () => {}),
+      },
+      sessions,
+    );
+    return sessions;
+  }
+
+  test('preserves an unbound session owned by a workspace-level env override', async () => {
+    const folder = unique('env-override');
+    const jid = `web:${folder}`;
+    const sessionId = unique('override-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    runtimeConfig.saveContainerEnvConfig(folder, {
+      anthropicBaseUrl: 'https://workspace.example.test',
+      anthropicAuthToken: 'workspace-token',
+      anthropicModel: 'workspace-model',
+    });
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBe(sessionId);
+  });
+
+  test('preserves ambiguous unbound sessions when another provider is configured but disabled', async () => {
+    const folder = unique('ambiguous-unbound');
+    const jid = `web:${folder}`;
+    const sessionId = unique('ambiguous-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+    runtimeConfig.createProvider({
+      name: unique('disabled-third-party'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://disabled.example.test',
+      anthropicAuthToken: 'disabled-token',
+      enabled: false,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBe(sessionId);
+  });
+
+  test('still clears a legacy unbound session in a true single-provider workspace', async () => {
+    const folder = unique('single-provider');
+    const jid = `web:${folder}`;
+    const sessionId = unique('legacy-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBeUndefined();
+  });
+
+  test('keeps a bound third-party session for a model-only change', async () => {
+    const folder = unique('third-party-model');
+    const jid = `web:${folder}`;
+    const sessionId = unique('bound-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    const provider = runtimeConfig.createProvider({
+      name: unique('third-party'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://same.example.test',
+      anthropicAuthToken: 'third-party-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+    db.setSessionProviderId(folder, '', provider.id);
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBe(sessionId);
+    expect(db.getSessionProviderId(folder)).toBe(provider.id);
+  });
+});

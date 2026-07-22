@@ -6691,44 +6691,35 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
  */
 export function deleteSessionsByProviderId(
   providerId: string,
-  options?: { includeUnbound?: boolean },
+  options?: { includeUnboundFolders?: string[] },
 ): {
   deletedCount: number;
   affectedFolders: string[];
 } {
-  const includeUnbound = options?.includeUnbound ?? false;
+  const includeUnboundFolders = Array.from(
+    new Set(
+      (options?.includeUnboundFolders ?? []).filter(
+        (folder): folder is string => typeof folder === 'string' && !!folder,
+      ),
+    ),
+  );
   const tx = db.transaction((id: string) => {
-    let rows: Array<{ group_folder: string }>;
-    if (includeUnbound) {
-      rows = db
-        .prepare(
-          'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ? OR provider_id IS NULL',
-        )
-        .all(id) as Array<{ group_folder: string }>;
-      db.prepare(
-        'DELETE FROM workspace_runtime_sessions WHERE provider_id = ? OR provider_id IS NULL',
-      ).run(id);
-      const result = db
-        .prepare(
-          'DELETE FROM sessions WHERE provider_id = ? OR provider_id IS NULL',
-        )
-        .run(id);
-      return {
-        deletedCount: result.changes,
-        affectedFolders: rows.map((r) => r.group_folder),
-      };
-    }
-    rows = db
+    const placeholders = includeUnboundFolders.map(() => '?').join(', ');
+    const unboundClause = includeUnboundFolders.length
+      ? ` OR (provider_id IS NULL AND group_folder IN (${placeholders}))`
+      : '';
+    const params = [id, ...includeUnboundFolders];
+    const rows = db
       .prepare(
-        'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?',
+        `SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?${unboundClause}`,
       )
-      .all(id) as Array<{ group_folder: string }>;
+      .all(...params) as Array<{ group_folder: string }>;
     db.prepare(
-      'DELETE FROM workspace_runtime_sessions WHERE provider_id = ?',
-    ).run(id);
+      `DELETE FROM workspace_runtime_sessions WHERE provider_id = ?${unboundClause}`,
+    ).run(...params);
     const result = db
-      .prepare('DELETE FROM sessions WHERE provider_id = ?')
-      .run(id);
+      .prepare(`DELETE FROM sessions WHERE provider_id = ?${unboundClause}`)
+      .run(...params);
     return {
       deletedCount: result.changes,
       affectedFolders: rows.map((r) => r.group_folder),

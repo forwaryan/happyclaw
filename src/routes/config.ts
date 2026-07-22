@@ -87,6 +87,7 @@ import {
   saveAppearanceConfig,
   getSystemSettings,
   getEffectiveExternalDir,
+  getContainerEnvConfig,
   saveSystemSettings,
   getUserFeishuConfig,
   saveUserFeishuConfig,
@@ -196,6 +197,9 @@ interface ClaudeApplyResultPayload {
   stoppedCount: number;
   failedCount: number;
   clearedSessionsCount?: number;
+  /** Whether the config mutation itself was durably written. */
+  persisted?: boolean;
+  phase?: 'pre_commit' | 'post_commit';
   error?: string;
 }
 
@@ -208,72 +212,163 @@ interface ApplyOptions {
   clearSessionsForProviderId?: string;
 }
 
+interface ClaudeMutationResult<T> {
+  value?: T;
+  applied: ClaudeApplyResultPayload;
+}
+
+let claudeConfigMutationTail: Promise<void> = Promise.resolve();
+
+async function withClaudeConfigMutationLock<T>(
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = claudeConfigMutationTail;
+  let release!: () => void;
+  claudeConfigMutationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function hasWorkspaceProviderOverride(folder: string): boolean {
+  const override = getContainerEnvConfig(folder);
+  return !!(
+    override.anthropicBaseUrl ||
+    override.anthropicAuthToken ||
+    override.anthropicApiKey ||
+    override.claudeCodeOauthToken ||
+    override.claudeOAuthCredentials
+  );
+}
+
+function getSafeLegacyUnboundFolders(providerId: string): string[] {
+  if (!deps) return [];
+  const configuredProviders = getProviders();
+  if (
+    configuredProviders.length !== 1 ||
+    configuredProviders[0]?.id !== providerId
+  ) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      Object.values(
+        deps.getRegisteredGroups() as Record<string, RegisteredGroup>,
+      )
+        .map((group) => group.folder)
+        .filter((folder) => !hasWorkspaceProviderOverride(folder)),
+    ),
+  );
+}
+
+function clearProviderSessions(providerId: string): number {
+  if (!deps) return 0;
+  const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
+    providerId,
+    { includeUnboundFolders: getSafeLegacyUnboundFolders(providerId) },
+  );
+  for (const folder of affectedFolders) {
+    delete deps.sessions[folder];
+  }
+  return deletedCount;
+}
+
+function getClaudeRuntimeTargets(): Array<{
+  folder: string;
+  primaryJid: string;
+}> {
+  if (!deps) return [];
+  const targets = new Map<string, { folder: string; primaryJid: string }>();
+  for (const [jid, group] of Object.entries(
+    deps.getRegisteredGroups() as Record<string, RegisteredGroup>,
+  )) {
+    if (!targets.has(group.folder)) {
+      targets.set(group.folder, { folder: group.folder, primaryJid: jid });
+    }
+  }
+  return [...targets.values()];
+}
+
+async function mutateClaudeConfigForAllGroups<T>(
+  actor: string,
+  metadata: Record<string, unknown> | undefined,
+  commit: () => T | Promise<T>,
+  options?: ApplyOptions,
+): Promise<ClaudeMutationResult<T>> {
+  if (!deps) throw new Error('Server not initialized');
+
+  const targets = getClaudeRuntimeTargets();
+  try {
+    const result = await quiesceWorkspaceRunnersAroundCommit(
+      deps,
+      targets,
+      { reason: String(metadata?.trigger ?? 'claude_config_apply') },
+      async () => {
+        const value = await commit();
+        const clearedSessionsCount = options?.clearSessionsForProviderId
+          ? clearProviderSessions(options.clearSessionsForProviderId)
+          : undefined;
+        return { value, clearedSessionsCount };
+      },
+    );
+    const applied: ClaudeApplyResultPayload = {
+      success: true,
+      stoppedCount: result.runtimeJids.length,
+      failedCount: 0,
+      persisted: true,
+      ...(result.value.clearedSessionsCount !== undefined
+        ? { clearedSessionsCount: result.value.clearedSessionsCount }
+        : {}),
+    };
+    appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
+      ...applied,
+      ...(metadata || {}),
+    });
+    return { value: result.value.value, applied };
+  } catch (err) {
+    if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+    const committed = err.committedValue as
+      | { value: T; clearedSessionsCount?: number }
+      | undefined;
+    const persisted = err.persisted;
+    const applied: ClaudeApplyResultPayload = {
+      success: false,
+      stoppedCount: 0,
+      failedCount: err.failures.length,
+      persisted,
+      phase: err.phase,
+      ...(committed?.clearedSessionsCount !== undefined
+        ? { clearedSessionsCount: committed.clearedSessionsCount }
+        : {}),
+      error: persisted
+        ? 'Configuration was saved, but one or more runtimes failed to restart safely'
+        : 'Configuration was not updated because one or more runtimes failed to stop safely',
+    };
+    appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
+      ...applied,
+      ...(metadata || {}),
+    });
+    return { value: committed?.value, applied };
+  }
+}
+
 async function applyClaudeConfigToAllGroups(
   actor: string,
   metadata?: Record<string, unknown>,
   options?: ApplyOptions,
 ): Promise<ClaudeApplyResultPayload> {
-  if (!deps) {
-    throw new Error('Server not initialized');
-  }
-
-  const groupJids = Object.keys(deps.getRegisteredGroups());
-  // Also stop descendant runners (agents and scheduled tasks) — they run
-  // under {jid}#agent:{id} or {jid}#task:{id} keys which are not in
-  // registeredGroups and would otherwise keep running with stale
-  // ANTHROPIC_MODEL env vars after a provider config change.
-  const allJidsToStop = groupJids.flatMap((jid) => [
-    jid,
-    ...deps.queue.listDescendantJids(jid),
-  ]);
-  const results = await Promise.allSettled(
-    allJidsToStop.map((jid) => deps.queue.stopGroup(jid)),
+  const result = await mutateClaudeConfigForAllGroups(
+    actor,
+    metadata,
+    () => undefined,
+    options,
   );
-  const failedCount = results.filter((r) => r.status === 'rejected').length;
-  const stoppedCount = allJidsToStop.length - failedCount;
-
-  // Narrowed session cleanup: only drop sticky bindings for the provider whose
-  // protocol-level fields actually changed. Bindings to other providers stay
-  // intact so a routine update doesn't reset the entire pool. See issue #476.
-  let clearedSessionsCount: number | undefined;
-  if (options?.clearSessionsForProviderId) {
-    // In single-provider deployments, unbound (NULL) sessions certainly belong
-    // to the only provider. In multi-provider setups they could belong to any
-    // provider, so only delete exact matches to avoid collateral damage.
-    const isSingleProvider = getEnabledProviders().length <= 1;
-    const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
-      options.clearSessionsForProviderId,
-      { includeUnbound: isSingleProvider },
-    );
-    clearedSessionsCount = deletedCount;
-    for (const folder of affectedFolders) {
-      delete deps.sessions[folder];
-    }
-  }
-
-  appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
-    stoppedCount,
-    failedCount,
-    ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
-    ...(metadata || {}),
-  });
-
-  if (failedCount > 0) {
-    return {
-      success: false,
-      stoppedCount,
-      failedCount,
-      ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
-      error: `${failedCount} container(s) failed to stop`,
-    };
-  }
-
-  return {
-    success: true,
-    stoppedCount,
-    failedCount: 0,
-    ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
-  };
+  return result.applied;
 }
 
 // --- OAuth 常量 ---
@@ -472,52 +567,88 @@ configRoutes.patch(
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      const previous = getProviders().find((p) => p.id === id);
-      const updated = updateProvider(id, validation.data);
-      const changedFields = Object.keys(validation.data).map(
-        (k) => `${k}:updated`,
-      );
-      // Protocol-level fields are the ones that, if changed, can break
-      // resumption of an existing Claude session (different model framing /
-      // different signing authority for thinking blocks). Other fields
-      // (name, weight, customEnv) only affect routing or environment and are
-      // safe to apply mid-session.
-      const protocolFieldChanged = !!(
-        previous &&
-        ((validation.data.anthropicBaseUrl !== undefined &&
-          validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl) ||
-          (validation.data.anthropicModel !== undefined &&
-            validation.data.anthropicModel !== previous.anthropicModel))
-      );
-      appendClaudeConfigAudit(actor, 'update_provider', [
-        `id:${id}`,
-        ...changedFields,
-        ...(protocolFieldChanged ? ['protocolFieldChanged'] : []),
-      ]);
-
-      // If this provider is enabled, apply to running containers
-      let applied: ClaudeApplyResultPayload | null = null;
-      if (updated.enabled) {
-        // Third-party providers typically don't verify thinking block signatures,
-        // so model changes can be applied without destroying session context.
-        // Only clear sessions for official providers where signature verification
-        // would reject a cross-model resume.
-        const shouldClearSessions =
-          protocolFieldChanged && updated.type === 'official';
-        applied = await applyClaudeConfigToAllGroups(
-          actor,
-          {
-            trigger: 'provider_update',
-            providerId: id,
-            protocolFieldChanged,
-          },
-          shouldClearSessions ? { clearSessionsForProviderId: id } : undefined,
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((p) => p.id === id);
+        if (!previous) throw new Error('未找到指定供应商');
+        const changedFields = Object.keys(validation.data).map(
+          (k) => `${k}:updated`,
         );
-      }
+        const baseUrlChanged = !!(
+          validation.data.anthropicBaseUrl !== undefined &&
+          validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl
+        );
+        const modelChanged = !!(
+          validation.data.anthropicModel !== undefined &&
+          validation.data.anthropicModel !== previous.anthropicModel
+        );
+        const protocolFieldChanged = baseUrlChanged || modelChanged;
+        // Preserve this PR's model/base-URL resume behavior for third-party
+        // gateways. We do not have a reproducible third-party backend failure
+        // proving that their sessions must be invalidated.
+        const shouldClearSessions =
+          protocolFieldChanged && previous.type === 'official';
+        const metadata = {
+          trigger: 'provider_update',
+          providerId: id,
+          protocolFieldChanged,
+          baseUrlChanged,
+          modelChanged,
+        };
+        const commit = () => {
+          const updated = updateProvider(id, validation.data);
+          appendClaudeConfigAudit(actor, 'update_provider', [
+            `id:${id}`,
+            ...changedFields,
+            ...(protocolFieldChanged ? ['protocolFieldChanged'] : []),
+          ]);
+          return updated;
+        };
 
-      return c.json({
-        provider: toPublicProvider(updated),
-        ...(applied ? { applied } : {}),
+        let mutation: ClaudeMutationResult<ReturnType<typeof updateProvider>>;
+        if (previous.enabled) {
+          mutation = await mutateClaudeConfigForAllGroups(
+            actor,
+            metadata,
+            commit,
+            shouldClearSessions
+              ? { clearSessionsForProviderId: id }
+              : undefined,
+          );
+        } else {
+          const updated = commit();
+          const clearedSessionsCount = shouldClearSessions
+            ? clearProviderSessions(id)
+            : undefined;
+          mutation = {
+            value: updated,
+            applied: {
+              success: true,
+              stoppedCount: 0,
+              failedCount: 0,
+              persisted: true,
+              ...(clearedSessionsCount !== undefined
+                ? { clearedSessionsCount }
+                : {}),
+            },
+          };
+        }
+
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          applied: mutation.applied,
+        });
       });
     } catch (err) {
       const message =
@@ -547,49 +678,75 @@ configRoutes.put(
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      const updated = updateProviderSecrets(id, validation.data);
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((provider) => provider.id === id);
+        if (!previous) throw new Error('未找到指定供应商');
+        const changedFields: string[] = [];
+        if (validation.data.anthropicAuthToken !== undefined)
+          changedFields.push('anthropicAuthToken:set');
+        if (validation.data.clearAnthropicAuthToken)
+          changedFields.push('anthropicAuthToken:clear');
+        if (validation.data.anthropicApiKey !== undefined)
+          changedFields.push('anthropicApiKey:set');
+        if (validation.data.clearAnthropicApiKey)
+          changedFields.push('anthropicApiKey:clear');
+        if (validation.data.claudeCodeOauthToken !== undefined)
+          changedFields.push('claudeCodeOauthToken:set');
+        if (validation.data.clearClaudeCodeOauthToken)
+          changedFields.push('claudeCodeOauthToken:clear');
+        if (validation.data.claudeOAuthCredentials)
+          changedFields.push('claudeOAuthCredentials:set');
+        if (validation.data.clearClaudeOAuthCredentials)
+          changedFields.push('claudeOAuthCredentials:clear');
 
-      const changedFields: string[] = [];
-      if (validation.data.anthropicAuthToken !== undefined)
-        changedFields.push('anthropicAuthToken:set');
-      if (validation.data.clearAnthropicAuthToken)
-        changedFields.push('anthropicAuthToken:clear');
-      if (validation.data.anthropicApiKey !== undefined)
-        changedFields.push('anthropicApiKey:set');
-      if (validation.data.clearAnthropicApiKey)
-        changedFields.push('anthropicApiKey:clear');
-      if (validation.data.claudeCodeOauthToken !== undefined)
-        changedFields.push('claudeCodeOauthToken:set');
-      if (validation.data.clearClaudeCodeOauthToken)
-        changedFields.push('claudeCodeOauthToken:clear');
-      if (validation.data.claudeOAuthCredentials)
-        changedFields.push('claudeOAuthCredentials:set');
-      if (validation.data.clearClaudeOAuthCredentials)
-        changedFields.push('claudeOAuthCredentials:clear');
+        const commit = () => {
+          const updated = updateProviderSecrets(id, validation.data);
+          appendClaudeConfigAudit(actor, 'update_provider_secrets', [
+            `id:${id}`,
+            ...changedFields,
+          ]);
+          if (validation.data.claudeOAuthCredentials && updated.enabled) {
+            updateAllSessionCredentials(providerToConfig(updated));
+            deps?.queue?.closeAllActiveForCredentialRefresh();
+          }
+          return updated;
+        };
 
-      appendClaudeConfigAudit(actor, 'update_provider_secrets', [
-        `id:${id}`,
-        ...changedFields,
-      ]);
+        const mutation = previous.enabled
+          ? await mutateClaudeConfigForAllGroups(
+              actor,
+              {
+                trigger: 'provider_secrets_update',
+                providerId: id,
+              },
+              commit,
+            )
+          : {
+              value: commit(),
+              applied: {
+                success: true,
+                stoppedCount: 0,
+                failedCount: 0,
+                persisted: true,
+              } satisfies ClaudeApplyResultPayload,
+            };
 
-      // Update .credentials.json if OAuth credentials changed
-      if (validation.data.claudeOAuthCredentials && updated.enabled) {
-        updateAllSessionCredentials(providerToConfig(updated));
-        deps?.queue?.closeAllActiveForCredentialRefresh();
-      }
-
-      // Apply if enabled
-      let applied: ClaudeApplyResultPayload | null = null;
-      if (updated.enabled) {
-        applied = await applyClaudeConfigToAllGroups(actor, {
-          trigger: 'provider_secrets_update',
-          providerId: id,
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          applied: mutation.applied,
         });
-      }
-
-      return c.json({
-        provider: toPublicProvider(updated),
-        ...(applied ? { applied } : {}),
       });
     } catch (err) {
       const message =
@@ -632,20 +789,35 @@ configRoutes.post(
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      const updated = toggleProvider(id);
-      appendClaudeConfigAudit(actor, 'toggle_provider', [
-        `id:${id}`,
-        `enabled:${updated.enabled}`,
-      ]);
-
-      const applied = await applyClaudeConfigToAllGroups(actor, {
-        trigger: 'provider_toggle',
-        providerId: id,
-      });
-
-      return c.json({
-        provider: toPublicProvider(updated),
-        applied,
+      return await withClaudeConfigMutationLock(async () => {
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          { trigger: 'provider_toggle', providerId: id },
+          () => {
+            const updated = toggleProvider(id);
+            appendClaudeConfigAudit(actor, 'toggle_provider', [
+              `id:${id}`,
+              `enabled:${updated.enabled}`,
+            ]);
+            return updated;
+          },
+        );
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          applied: mutation.applied,
+        });
       });
     } catch (err) {
       const message =
