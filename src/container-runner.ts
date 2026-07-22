@@ -371,6 +371,8 @@ export interface ContainerOutput {
   /** Internal agent-runner marker: the failed turn is being retried in-process. */
   providerFailureRetrying?: boolean;
   streamEvent?: StreamEvent;
+  /** Durable input-turn correlation emitted by agent-runner. */
+  readonly inputTurnId?: string;
   turnId?: string;
   sessionId?: string;
   sdkMessageUuid?: string;

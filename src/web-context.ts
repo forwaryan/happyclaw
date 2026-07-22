@@ -2,7 +2,11 @@
 
 import { WebSocket } from 'ws';
 import { FollowUpActionResult, RegisteredGroup, UserRole } from './types.js';
-import { GroupQueue } from './group-queue.js';
+import {
+  GroupQueue,
+  type IpcDeliveryReceipt,
+  type IpcPrePublishAdmission,
+} from './group-queue.js';
 import type {
   AuthUser,
   NewMessage,
@@ -172,6 +176,14 @@ export interface WebDeps {
     inputTaskId?: string,
     runtimeAgentId?: string,
   ) => void;
+  /** Acquire the immutable Turn/Card/Outbox fence before an IPC file becomes
+   * visible to the SDK runner. Returning false rejects the warm injection. */
+  preAdmitReplyRoute?: (
+    folder: string,
+    sourceJid: string | null,
+    receipt: IpcDeliveryReceipt | undefined,
+    runtimeAgentId?: string,
+  ) => IpcPrePublishAdmission | false;
   /** 用户消息注入运行中 Sub-Agent 时，先把该 agent 挂起中的流式卡片定稿轮换。
    * key 为 virtualChatJid（`web:{folder}#agent:{id}`）。主会话路径无需调用
    * ——updateReplyRoute 触发的 route updater 已内置同样的收口。 */

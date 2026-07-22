@@ -165,6 +165,13 @@ export class IpcTurnDeliveryTracker {
     return [...(this.turns[0] ?? [])];
   }
 
+  /** Durable identity of the SDK input turn that owns output right now.
+   * A later accepted steer does not become current until completeNextTurn()
+   * removes the turn ahead of it. */
+  get currentTurnDeliveryId(): string | undefined {
+    return latestIpcDeliveryId(this.turns[0] ?? []);
+  }
+
   /** Accepted follow-up turns after the current one, kept in delivery order. */
   get laterTurnMessages(): IpcInputMessage[] {
     return this.turns.slice(1).flatMap((turn) => turn);
@@ -196,6 +203,39 @@ export class IpcTurnDeliveryTracker {
     return completed
       .map((message) => message.receipt)
       .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
+  }
+}
+
+/**
+ * Snapshots the durable input identity onto emitted frames.
+ *
+ * The tracker may accept future turns while the SDK is still producing output
+ * for the current one, so callers explicitly sync only when the current turn
+ * starts or after it is completed. This makes attribution independent from
+ * mutable presentation turn IDs and arrival timing.
+ */
+export class IpcTurnOutputCorrelation {
+  private inputTurnIdValue: string;
+
+  constructor(
+    private readonly tracker: IpcTurnDeliveryTracker,
+    coldHostTurnId: string,
+  ) {
+    this.inputTurnIdValue = tracker.currentTurnDeliveryId || coldHostTurnId;
+  }
+
+  get currentInputTurnId(): string {
+    return this.inputTurnIdValue;
+  }
+
+  syncCurrentTurn(fallbackInputTurnId = this.inputTurnIdValue): string {
+    this.inputTurnIdValue =
+      this.tracker.currentTurnDeliveryId || fallbackInputTurnId;
+    return this.inputTurnIdValue;
+  }
+
+  correlate(output: ContainerOutput): ContainerOutput {
+    return { ...output, inputTurnId: this.inputTurnIdValue };
   }
 }
 

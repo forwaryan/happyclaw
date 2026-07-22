@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 
 import {
   IpcTurnDeliveryTracker,
+  IpcTurnOutputCorrelation,
   isHealthyInputTurnCompletion,
   latestIpcDeliveryId,
   latestIpcInputMessage,
@@ -119,6 +120,81 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(tracker.completeNextTurn().map((r) => r.cursor.id)).toEqual(['2']);
     expect(tracker.pendingTurnCount).toBe(0);
     expect(tracker.hasPendingTurns).toBe(false);
+  });
+
+  test('keeps slow turn A as output owner until A completes, then advances to queued B', () => {
+    const turnA = message('1');
+    const turnB = message('2');
+    const tracker = new IpcTurnDeliveryTracker([turnA]);
+    const correlation = new IpcTurnOutputCorrelation(tracker, 'cold-host-turn');
+
+    // A is still running when B is accepted. A's later delta, status, usage,
+    // and result must retain A's immutable delivery identity.
+    const outputs = [
+      correlation.correlate({
+        status: 'stream',
+        result: null,
+        streamEvent: { eventType: 'text_delta', textDelta: 'A1' },
+      }),
+    ];
+    tracker.acceptTurn([turnB]);
+    outputs.push(
+      correlation.correlate({
+        status: 'stream',
+        result: null,
+        streamEvent: { eventType: 'status', statusText: 'A still running' },
+      }),
+      correlation.correlate({
+        status: 'stream',
+        result: null,
+        streamEvent: {
+          eventType: 'usage',
+          usage: {
+            eventId: 'usage-A',
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            reasoningTokens: 0,
+            costUSD: 0,
+            durationMs: 1,
+            numTurns: 1,
+          },
+        },
+      }),
+      correlation.correlate({ status: 'success', result: 'A done' }),
+      correlation.correlate({
+        status: 'error',
+        result: null,
+        error: 'A terminal diagnostic',
+      }),
+    );
+    expect(outputs.map((output) => output.inputTurnId)).toEqual([
+      'delivery-1',
+      'delivery-1',
+      'delivery-1',
+      'delivery-1',
+      'delivery-1',
+    ]);
+
+    expect(tracker.completeNextTurn()).toEqual([turnA.receipt]);
+    correlation.syncCurrentTurn();
+    const firstBEvent = correlation.correlate({
+      status: 'stream',
+      result: null,
+      streamEvent: { eventType: 'text_delta', textDelta: 'B1' },
+    });
+    expect(firstBEvent.inputTurnId).toBe('delivery-2');
+  });
+
+  test('exposes no delivery identity for a cold non-IPC turn so caller can use the original host turnId', () => {
+    const tracker = new IpcTurnDeliveryTracker([]);
+    const correlation = new IpcTurnOutputCorrelation(tracker, 'host-turn-cold');
+    expect(tracker.currentTurnDeliveryId).toBeUndefined();
+    expect(
+      correlation.correlate({ status: 'success', result: 'cold result' })
+        .inputTurnId,
+    ).toBe('host-turn-cold');
   });
 
   test('pending background, truncation, error and interrupt are not completions', () => {

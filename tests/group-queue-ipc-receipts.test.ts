@@ -193,6 +193,123 @@ describe('GroupQueue IPC delivery receipts', () => {
     expect(readPayloads()).toEqual([]);
   });
 
+  test('pre-publish admission rejection leaves no IPC file or pending receipt', async () => {
+    await startRunner();
+    const injected = vi.fn();
+    const admit = vi.fn(() => false as const);
+    const abandoned = vi.fn();
+    queue.setOnUnacknowledgedIpcDeliveries(abandoned);
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'must-not-run',
+        undefined,
+        injected,
+        JID,
+        undefined,
+        {
+          chatJid: JID,
+          coveredCursors: [cursor('m1')],
+          cursor: cursor('m1'),
+        },
+        undefined,
+        admit,
+      ),
+    ).toBe('no_active');
+
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(injected).not.toHaveBeenCalled();
+    expect(readPayloads()).toEqual([]);
+
+    releaseRun?.();
+    await tick();
+    await tick();
+    expect(abandoned).not.toHaveBeenCalled();
+  });
+
+  test('disk publish failure rolls back admission and removes the temp file', async () => {
+    await startRunner();
+    const rollback = vi.fn();
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      throw new Error('disk publish failed');
+    });
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'rollback-me',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        {
+          chatJid: JID,
+          coveredCursors: [cursor('m1')],
+          cursor: cursor('m1'),
+        },
+        undefined,
+        () => ({ rollback }),
+      ),
+    ).toBe('no_active');
+
+    rename.mockRestore();
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(fs.readdirSync(inputDir())).toEqual([]);
+  });
+
+  test('post-publish callback failure cannot misreport a visible IPC file', async () => {
+    await startRunner();
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'published',
+        undefined,
+        () => {
+          throw new Error('projection callback failed');
+        },
+        JID,
+        undefined,
+        {
+          chatJid: JID,
+          coveredCursors: [cursor('m1')],
+          cursor: cursor('m1'),
+        },
+      ),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+  });
+
+  test('post-publish eligibility failure preserves admission and reports sent', async () => {
+    await startRunner();
+    const rollback = vi.fn();
+    queue.setIpcDeliveryCommitEligibilityChecker(() => {
+      throw new Error('eligibility storage unavailable');
+    });
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'published-before-bookkeeping-error',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        {
+          chatJid: JID,
+          coveredCursors: [cursor('m1')],
+          cursor: cursor('m1'),
+        },
+        undefined,
+        () => ({ rollback }),
+      ),
+    ).toBe('sent');
+
+    expect(readPayloads()).toHaveLength(1);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
   test('an uncovered gap cannot commit and replays in DB order after runner failure', async () => {
     await startRunner();
     const orderedIds = ['m1', 'm2', 'm3'];

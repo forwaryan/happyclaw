@@ -24,6 +24,30 @@ export interface FeishuCapabilityResult {
   data: unknown;
 }
 
+const FEISHU_READ_OPERATIONS = new Set<FeishuCapabilityOperation>([
+  'get_chat',
+  'list_members',
+  'get_user',
+  'get_history',
+]);
+
+/** Classify operations before they cross the durable side-effect boundary. */
+export function isFeishuCapabilityMutation(
+  request: FeishuCapabilityRequest,
+): boolean {
+  if (FEISHU_READ_OPERATIONS.has(request.operation)) return false;
+  if (request.operation !== 'api_request') return true;
+  const params =
+    request.params &&
+    typeof request.params === 'object' &&
+    !Array.isArray(request.params)
+      ? request.params
+      : {};
+  const method =
+    typeof params.method === 'string' ? params.method.trim().toUpperCase() : '';
+  return method !== '' && method !== 'GET';
+}
+
 const GENERIC_API_PREFIXES: ReadonlyArray<{
   prefix: string;
   methods: ReadonlySet<string>;
@@ -143,11 +167,36 @@ async function assertMessageInCurrentChat(
   });
   assertApiSuccess('get_message', response);
   const items = Array.isArray(response.data?.items) ? response.data.items : [];
-  const message = items[0];
+  const message = items.find((item) => item.message_id === messageId);
   if (!message || message.chat_id !== currentChatId(context)) {
     throw new Error('Message does not belong to the current Feishu chat');
   }
   return sanitizeMessage(message);
+}
+
+async function assertMessageOwnedByCurrentBot(
+  client: lark.Client,
+  context: ChannelTurnContext,
+  messageId: string,
+): Promise<void> {
+  const message = await assertMessageInCurrentChat(client, context, messageId);
+  const sender = record(message.sender);
+  const expected = new Set(
+    [context.bot?.openId, context.bot?.appId].filter(
+      (value): value is string => typeof value === 'string' && value.length > 0,
+    ),
+  );
+  const actual = [
+    optionalString(sender.id),
+    optionalString(sender.openBotId),
+  ].filter((value): value is string => !!value);
+  if (
+    optionalString(sender.type) !== 'app' ||
+    expected.size === 0 ||
+    !actual.some((identity) => expected.has(identity))
+  ) {
+    throw new Error('Message was not sent by the current bound Feishu Bot');
+  }
 }
 
 function resolveUserTarget(context: ChannelTurnContext): {
@@ -466,7 +515,7 @@ export async function executeFeishuCapability(
       if (!messageId || text === undefined) {
         throw new Error('messageId and text are required');
       }
-      await assertMessageInCurrentChat(client, context, messageId);
+      await assertMessageOwnedByCurrentBot(client, context, messageId);
       const response = await client.im.v1.message.update({
         path: { message_id: messageId },
         data: { msg_type: 'text', content: JSON.stringify({ text }) },
@@ -481,7 +530,7 @@ export async function executeFeishuCapability(
     case 'recall_message': {
       const messageId = optionalString(params.messageId);
       if (!messageId) throw new Error('messageId is required');
-      await assertMessageInCurrentChat(client, context, messageId);
+      await assertMessageOwnedByCurrentBot(client, context, messageId);
       const response = await client.im.v1.message.delete({
         path: { message_id: messageId },
       });

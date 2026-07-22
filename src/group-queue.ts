@@ -27,6 +27,10 @@ export interface IpcDeliveryTarget {
   coveredCursors: IpcMessageCursor[];
   cursor: IpcMessageCursor;
 }
+export interface IpcPrePublishAdmission {
+  /** Undo host-side Turn/Card/Outbox reservations if disk publish fails. */
+  rollback?: () => void;
+}
 export interface MutationPauseToken {
   readonly id: number;
 }
@@ -1281,6 +1285,9 @@ export class GroupQueue {
     taskId?: string,
     deliveryTarget?: IpcDeliveryTarget,
     channelContext?: ChannelTurnContext,
+    beforePublish?: (
+      receipt?: IpcDeliveryReceipt,
+    ) => IpcPrePublishAdmission | false | void,
   ): SendMessageResult {
     if (this.isTerminalMutationDiscarded(groupJid)) return 'no_active';
     if (this.isMutationPaused(groupJid)) return 'no_active';
@@ -1313,11 +1320,14 @@ export class GroupQueue {
     // 不再写 _drain：容器无需退出重启，复用当前进程即可。
 
     const inputDir = this.resolveIpcInputDir(state);
+    let tempPath: string | undefined;
+    let admission: IpcPrePublishAdmission | undefined;
+    let published = false;
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
       const filepath = path.join(inputDir, filename);
-      const tempPath = `${filepath}.tmp`;
+      tempPath = `${filepath}.tmp`;
       if (deliveryTarget) {
         const maximum = [...deliveryTarget.coveredCursors].sort(
           compareIpcMessageCursors,
@@ -1342,6 +1352,18 @@ export class GroupQueue {
             cursor: deliveryTarget.cursor,
           }
         : undefined;
+      // Durable host admission is a strict precondition for visibility to the
+      // SDK runner. A rejected Turn fence/card reservation therefore creates
+      // neither an IPC file nor an in-memory pending receipt.
+      const admissionResult = beforePublish?.(receipt);
+      if (admissionResult === false) {
+        logger.warn(
+          { groupJid, deliveryId: receipt?.deliveryId },
+          'GroupQueue.sendMessage: pre-publish admission rejected IPC input',
+        );
+        return 'no_active';
+      }
+      admission = admissionResult || undefined;
       // Stamp taskId when this injection carries a scheduled-task prompt so the
       // agent-runner can attribute the resulting send_message output to the task
       // (drives notify_channels broadcast on the host). Omitted for regular
@@ -1359,6 +1381,8 @@ export class GroupQueue {
         }),
       );
       fs.renameSync(tempPath, filepath);
+      tempPath = undefined;
+      published = true;
       // Rename + in-memory delivery registration are one synchronous critical
       // section. Mutation pause/stop cannot observe a written file without its
       // recovery metadata (the old callback→mark race window).
@@ -1378,9 +1402,44 @@ export class GroupQueue {
         state.announcedQueryId = null;
         this.announceQueryStart(groupJid, state);
       }
-      onInjected?.(receipt);
+      try {
+        onInjected?.(receipt);
+      } catch (callbackError) {
+        // The file and receipt are already published. Callback diagnostics
+        // must never lie to the caller and trigger a duplicate cold-start.
+        logger.error(
+          { groupJid, deliveryId: receipt?.deliveryId, callbackError },
+          'GroupQueue.sendMessage: post-publish callback failed',
+        );
+      }
       return 'sent';
     } catch (err) {
+      // Once rename succeeds the runner can observe the message. From that
+      // point onward we must preserve its durable admission and report
+      // `sent`; rolling it back or returning `no_active` would let the caller
+      // cold-start a duplicate while the published IPC file is still live.
+      if (published) {
+        logger.error(
+          { groupJid, inputDir, err },
+          'GroupQueue.sendMessage: post-publish bookkeeping failed; preserving admission',
+        );
+        return 'sent';
+      }
+      if (tempPath) {
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {
+          // temp file may not have been created yet
+        }
+      }
+      try {
+        admission?.rollback?.();
+      } catch (rollbackError) {
+        logger.error(
+          { groupJid, rollbackError },
+          'GroupQueue.sendMessage: pre-publish admission rollback failed',
+        );
+      }
       // 不静默：磁盘满 / 权限错 / inode 耗尽这些根因不应该被伪装成
       // 'no_active'。下游会重新 enqueueMessageCheck 走 fallback 路径，
       // 但运维需要看到根因日志。

@@ -256,6 +256,15 @@ export interface ContainerOutput {
   /** Internal host-control marker: this turn is being retried in-process. */
   providerFailureRetrying?: boolean;
   streamEvent?: StreamEvent;
+  /**
+   * Immutable identity of the user input turn that produced this output.
+   *
+   * IPC turns use their durable deliveryId. The cold, non-IPC startup turn
+   * falls back to the host-provided ContainerInput.turnId. Unlike the legacy
+   * presentation turnId, this value must not rotate while a later steer is
+   * merely queued behind the currently executing SDK turn.
+   */
+  readonly inputTurnId?: string;
   turnId?: string;
   sessionId?: string;
   sdkMessageUuid?: string;

@@ -25,6 +25,7 @@ import {
   getWebDeps,
 } from '../web-context.js';
 import {
+  clearSessionChannelOwner,
   getRegisteredGroup,
   setRegisteredGroup,
   deleteRegisteredGroup,
@@ -1518,6 +1519,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   // 3. Delete session from DB (and in-memory cache for main session).
   try {
     deleteSession(group.folder, agentId);
+    clearSessionChannelOwner(group.folder, agentId);
     if (!agentId) {
       delete deps.getSessions()[group.folder];
     }
@@ -1653,6 +1655,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   // 3. Clear session state and message history for ALL sibling JIDs.
   try {
     deleteSession(group.folder);
+    clearSessionChannelOwner(group.folder);
     delete deps.getSessions()[group.folder];
     for (const siblingJid of siblingJids) {
       deleteChatHistory(siblingJid);

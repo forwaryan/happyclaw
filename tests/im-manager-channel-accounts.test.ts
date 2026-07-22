@@ -38,6 +38,31 @@ const callbacks = (onNewChat = vi.fn()): IMChannelConnectOpts => ({
 });
 
 describe('IM manager account lifecycle', () => {
+  test('shutdown pause and startup recovery both defer durable inbound before policy callbacks', async () => {
+    const manager = new IMConnectionManager();
+    const feishu = fakeChannel('feishu');
+    await manager.connectChannel(
+      'defer-owner',
+      'feishu',
+      feishu.channel,
+      callbacks(),
+      'defer-account',
+    );
+    const opts = feishu.getOpts()!;
+    expect(opts.shouldDeferInbound?.()).toBe(false);
+
+    manager.pauseInbound();
+    expect(opts.shouldDeferInbound?.()).toBe(true);
+    manager.resumeInbound();
+    expect(opts.shouldDeferInbound?.()).toBe(false);
+
+    manager.deferInbound();
+    expect(opts.shouldDeferInbound?.()).toBe(true);
+    manager.resumeDeferredInbound();
+    expect(opts.shouldDeferInbound?.()).toBe(false);
+    await manager.disconnectAll();
+  });
+
   test('manual Feishu discovery syncs every connected bot including a legacy connector', async () => {
     const manager = new IMConnectionManager();
     const legacy = fakeChannel('feishu');
@@ -444,6 +469,63 @@ describe('IM manager account lifecycle', () => {
     expect(
       manager.isChannelAccountConnected('user-a', 'telegram', 'bot-b'),
     ).toBe(true);
+    await manager.disconnectAll();
+  });
+
+  test('pauseInbound rejects account-scoped callbacks while keeping the transport connected', async () => {
+    const manager = new IMConnectionManager();
+    const feishu = fakeChannel('feishu');
+    const onNewChat = vi.fn();
+    const onMessage = vi.fn();
+    const onAgentMessage = vi.fn();
+    const onCommand = vi.fn().mockResolvedValue('ok');
+    const resolveEffectiveChatJid = vi.fn().mockReturnValue({
+      effectiveJid: 'web:workspace#agent:session',
+      agentId: 'session',
+    });
+
+    await manager.connectChannel(
+      'pause-owner',
+      'feishu',
+      feishu.channel,
+      {
+        onReady: vi.fn(),
+        onNewChat,
+        onMessage,
+        onAgentMessage,
+        onCommand,
+        isChatAuthorized: () => true,
+        resolveEffectiveChatJid,
+      },
+      'bot-a',
+    );
+    const wrapped = feishu.getOpts()!;
+    manager.pauseInbound();
+
+    wrapped.onNewChat('feishu:chat', 'Chat');
+    wrapped.onMessage?.('feishu:chat', 'hello', 'sender');
+    wrapped.onAgentMessage?.('feishu:chat', 'session');
+    await expect(
+      wrapped.onCommand?.('feishu:chat', '/status', 'sender'),
+    ).resolves.toBeNull();
+    expect(wrapped.isChatAuthorized?.('feishu:chat')).toBe(false);
+    expect(() => wrapped.resolveEffectiveChatJid?.('feishu:chat')).toThrow(
+      'Channel binding resolver rejected route',
+    );
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onAgentMessage).not.toHaveBeenCalled();
+    expect(onCommand).not.toHaveBeenCalled();
+    expect(resolveEffectiveChatJid).not.toHaveBeenCalled();
+    expect(feishu.channel.isConnected()).toBe(true);
+
+    manager.resumeInbound();
+    wrapped.onMessage?.('feishu:chat', 'after resume', 'sender');
+    expect(onMessage).toHaveBeenCalledWith(
+      'feishu:chat#account:bot-a',
+      'after resume',
+      'sender',
+    );
     await manager.disconnectAll();
   });
 

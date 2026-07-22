@@ -4,6 +4,7 @@
  */
 import crypto from 'crypto';
 import {
+  clearSessionChannelOwner,
   deleteSession,
   getJidsByFolder,
   storeMessageDirect,
@@ -39,9 +40,7 @@ export async function executeSessionReset(
   deps: CommandDeps,
   agentId?: string,
 ): Promise<void> {
-  const targetJid = agentId
-    ? `${baseChatJid}#agent:${agentId}`
-    : baseChatJid;
+  const targetJid = agentId ? `${baseChatJid}#agent:${agentId}` : baseChatJid;
 
   if (agentId) {
     // Agent-specific reset: only stop the agent's virtual JID process
@@ -59,6 +58,7 @@ export async function executeSessionReset(
 
   // 3. Delete session from DB (+ in-memory cache for main session)
   deleteSession(folder, agentId);
+  clearSessionChannelOwner(folder, agentId);
   if (!agentId) {
     delete deps.sessions[folder];
   }

@@ -73,6 +73,67 @@ describe('Feishu conversation policy', () => {
     });
   });
 
+  test('ordinary reply-chain mention starts a fresh context on the mentioned message', () => {
+    expect(
+      plan({
+        activationMode: 'when_mentioned',
+        mentionedBot: true,
+        rootId: 'om_old_chain_root',
+        parentId: 'om_old_chain_parent',
+        activeContext: {
+          contextId: 'om_old_chain_root',
+          rootMessageId: 'om_old_chain_root',
+        },
+      }),
+    ).toMatchObject({
+      allowWithoutMention: false,
+      independentContext: true,
+      contextId: 'om_message',
+      rootMessageId: 'om_message',
+      reason: 'new_mention_context',
+    });
+  });
+
+  test('ordinary real thread mention stays in its durable active context', () => {
+    expect(
+      plan({
+        activationMode: 'when_mentioned',
+        mentionedBot: true,
+        threadId: 'omt_active_topic',
+        rootId: 'om_active_topic_root',
+        parentId: 'om_previous_topic_message',
+        activeContext: {
+          contextId: 'om_active_topic_root',
+          rootMessageId: 'om_active_topic_root',
+        },
+      }),
+    ).toMatchObject({
+      allowWithoutMention: true,
+      independentContext: true,
+      contextId: 'om_active_topic_root',
+      rootMessageId: 'om_active_topic_root',
+      reason: 'active_context',
+    });
+  });
+
+  test('first mention inside an existing native thread adopts that thread instead of nesting', () => {
+    expect(
+      plan({
+        activationMode: 'when_mentioned',
+        mentionedBot: true,
+        threadId: 'omt_existing_topic',
+        rootId: 'om_existing_topic_root',
+        parentId: 'om_existing_topic_parent',
+      }),
+    ).toMatchObject({
+      allowWithoutMention: false,
+      independentContext: true,
+      contextId: 'omt_existing_topic',
+      rootMessageId: 'om_existing_topic_root',
+      reason: 'new_native_topic',
+    });
+  });
+
   test('ordinary active topic follows the durable binding without another mention', () => {
     expect(
       plan({

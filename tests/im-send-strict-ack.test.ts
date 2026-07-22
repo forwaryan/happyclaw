@@ -93,7 +93,11 @@ vi.mock('../src/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-const { createFeishuConnection } = await import('../src/feishu.js');
+const {
+  createFeishuConnection,
+  parseFeishuRouteTarget,
+  resolveFeishuMessageAnchor,
+} = await import('../src/feishu.js');
 const { createTelegramConnection } = await import('../src/telegram.js');
 
 let cleanup: Array<() => Promise<void>> = [];
@@ -233,6 +237,13 @@ describe('IM strict send acknowledgement', () => {
     await expect(
       feishu.sendFile('oc_1#unknown:x', '/missing', 'a.txt'),
     ).rejects.toThrow('Invalid Feishu route target');
+    await expect(
+      feishu.sendImage(
+        'oc_1#thread:omt_without_root',
+        Buffer.from('image'),
+        'image/png',
+      ),
+    ).rejects.toThrow('Invalid Feishu route target');
     await expect(telegram.sendMessage('not-a-chat', 'hello')).rejects.toThrow(
       'Invalid Telegram chat ID',
     );
@@ -246,6 +257,85 @@ describe('IM strict send acknowledgement', () => {
       telegram.sendFile('1#thread:nope', '/missing', 'a.txt'),
     ).rejects.toThrow('Invalid Telegram chat ID');
   });
+
+  test('never resolves a bare group route to the latest message from another topic', () => {
+    const bareGroup = parseFeishuRouteTarget('oc_group');
+    expect(
+      resolveFeishuMessageAnchor({
+        target: bareGroup,
+        chatType: 'group',
+        lastMessageId: 'om_latest_message_in_topic_b',
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveFeishuMessageAnchor({
+        target: bareGroup,
+        chatType: 'p2p',
+        lastMessageId: 'om_latest_private_message',
+      }),
+    ).toBe('om_latest_private_message');
+    expect(
+      resolveFeishuMessageAnchor({
+        target: parseFeishuRouteTarget('oc_group#root:om_explicit_root'),
+        chatType: 'group',
+        lastMessageId: 'om_wrong_topic',
+      }),
+    ).toBe('om_explicit_root');
+  });
+
+  test.each([230071, 230072])(
+    'falls back one threaded physical send for Feishu error %s without re-uploading',
+    async (code) => {
+      const { feishu } = await connectedTransports();
+      const tempDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), 'thread-fallback-'),
+      );
+      const filePath = path.join(tempDir, 'payload.pdf');
+      await fs.writeFile(filePath, 'payload');
+      cleanup.push(() => fs.rm(tempDir, { recursive: true, force: true }));
+
+      controls.feishuMessageReply
+        .mockRejectedValueOnce({ code, message: 'reply_in_thread unsupported' })
+        .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_image' } });
+      await expect(
+        feishu.sendImage(
+          'oc_group#thread:omt_1#root:om_root',
+          Buffer.from('image'),
+          'image/png',
+        ),
+      ).resolves.toBeUndefined();
+      expect(controls.feishuImageCreate).toHaveBeenCalledTimes(1);
+      expect(controls.feishuMessageReply).toHaveBeenCalledTimes(2);
+      expect(controls.feishuMessageReply.mock.calls[0][0].data).toMatchObject({
+        msg_type: 'image',
+        reply_in_thread: true,
+      });
+      expect(
+        controls.feishuMessageReply.mock.calls[1][0].data,
+      ).not.toHaveProperty('reply_in_thread');
+
+      controls.feishuMessageReply.mockReset();
+      controls.feishuMessageReply
+        .mockResolvedValueOnce({ code, msg: 'reply_in_thread unsupported' })
+        .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_file' } });
+      await expect(
+        feishu.sendFile(
+          'oc_group#thread:omt_1#root:om_root',
+          filePath,
+          'payload.pdf',
+        ),
+      ).resolves.toBeUndefined();
+      expect(controls.feishuFileCreate).toHaveBeenCalledTimes(1);
+      expect(controls.feishuMessageReply).toHaveBeenCalledTimes(2);
+      expect(controls.feishuMessageReply.mock.calls[0][0].data).toMatchObject({
+        msg_type: 'file',
+        reply_in_thread: true,
+      });
+      expect(
+        controls.feishuMessageReply.mock.calls[1][0].data,
+      ).not.toHaveProperty('reply_in_thread');
+    },
+  );
 
   test('final provider API failures reject text, image, and file sends', async () => {
     const { feishu, telegram } = await connectedTransports();

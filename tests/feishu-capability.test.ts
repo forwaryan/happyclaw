@@ -201,7 +201,19 @@ describe('Feishu Capability Broker executor', () => {
     const client = mockClient();
     client.im.v1.message.get.mockResolvedValue({
       code: 0,
-      data: { items: [{ message_id: 'om_bot', chat_id: 'oc_chat' }] },
+      data: {
+        items: [
+          {
+            message_id: 'om_bot',
+            chat_id: 'oc_chat',
+            sender: {
+              id: 'ou_bot',
+              id_type: 'open_id',
+              sender_type: 'app',
+            },
+          },
+        ],
+      },
     });
     client.im.v1.message.update.mockResolvedValue({
       code: 0,
@@ -241,6 +253,50 @@ describe('Feishu Capability Broker executor', () => {
         params: { messageId: 'om_other' },
       }),
     ).rejects.toThrow('does not belong');
+    expect(client.im.v1.message.delete).not.toHaveBeenCalled();
+  });
+
+  it('rejects edit or recall of a user or another Bot message in the same chat', async () => {
+    const client = mockClient();
+    client.im.v1.message.get
+      .mockResolvedValueOnce({
+        code: 0,
+        data: {
+          items: [
+            {
+              message_id: 'om_user',
+              chat_id: 'oc_chat',
+              sender: { id: 'ou_sender', sender_type: 'user' },
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        code: 0,
+        data: {
+          items: [
+            {
+              message_id: 'om_other_bot',
+              chat_id: 'oc_chat',
+              sender: { id: 'ou_other_bot', sender_type: 'app' },
+            },
+          ],
+        },
+      });
+
+    await expect(
+      executeFeishuCapability(client, context(), {
+        operation: 'edit_message',
+        params: { messageId: 'om_user', text: 'tamper' },
+      }),
+    ).rejects.toThrow('current bound Feishu Bot');
+    await expect(
+      executeFeishuCapability(client, context(), {
+        operation: 'recall_message',
+        params: { messageId: 'om_other_bot' },
+      }),
+    ).rejects.toThrow('current bound Feishu Bot');
+    expect(client.im.v1.message.update).not.toHaveBeenCalled();
     expect(client.im.v1.message.delete).not.toHaveBeenCalled();
   });
 

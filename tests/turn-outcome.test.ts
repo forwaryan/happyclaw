@@ -145,4 +145,152 @@ describe('resolveTurnOutcome', () => {
     expect(missingOutputBranch).toContain('commitCursor();');
     expect(missingOutputBranch).not.toContain('sentReply');
   });
+
+  test('does not mark or commit a final reply until the physical channel ACKs it', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const deliveryBranch = main.slice(
+      main.indexOf('const replySendOutcome = await sendMessageWithOutcome'),
+      main.indexOf('// Only reset idle timer on actual results'),
+    );
+
+    expect(deliveryBranch).toContain('let replyDeliveryAcknowledged');
+    expect(deliveryBranch).toContain(
+      'replyDeliveryAcknowledged = await sendImWithRetry',
+    );
+    expect(deliveryBranch).toContain(
+      'replyDeliveryAcknowledged &&\n                isGenuineReplyResult',
+    );
+    expect(deliveryBranch).toMatch(
+      /result\.inputTurnCompleted\s*&&\s*replyDeliveryAcknowledged/,
+    );
+    expect(deliveryBranch).not.toContain(
+      'if (result.inputTurnCompleted) commitCursor()',
+    );
+  });
+
+  test('routes streaming-card local images through the exact turn outbox and includes their ACK', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const cardAttachmentBranch = main.slice(
+      main.indexOf(
+        '// Streaming card strips local image references (only img_xxx keys',
+      ),
+      main.indexOf('// Skip IM send to the original chatJid when:'),
+    );
+    const deliveryAckBranch = main.slice(
+      main.indexOf('let replyDeliveryAcknowledged ='),
+      main.indexOf('// For routed IM (web JID with IM source)'),
+    );
+
+    expect(cardAttachmentBranch).toContain(
+      'const delivered = await sendTaskImageWithRetry',
+    );
+    expect(cardAttachmentBranch).toContain(
+      'scopeToken: outputChannelScope.scope.token',
+    );
+    expect(cardAttachmentBranch).toContain(
+      'ordinalSlot: `streaming-card-image:${imageIndex}`',
+    );
+    expect(cardAttachmentBranch).not.toContain('imManager.sendImage');
+    expect(deliveryAckBranch).toContain(
+      'streamingCardHandledIM\n                ? streamingCardAttachmentsDelivered',
+    );
+  });
+
+  test('does not emit a second channel error after an uncertain durable file send', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const fileBranch = main.slice(
+      main.indexOf('const regularFileOutboxRef'),
+      main.indexOf("'No IM route for send_file, skipped IM delivery'"),
+    );
+
+    expect(fileBranch).toContain('const durableScopedFile');
+    expect(fileBranch).toContain('投递结果待确认');
+    expect(fileBranch).toContain('if (!durableScopedFile)');
+    expect(fileBranch).toContain(
+      'await imManager.sendMessage(regularFileImRoute, failMsg)',
+    );
+  });
+
+  test('returns a negative MCP image acknowledgement when physical delivery is unconfirmed', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const imageBranch = main.slice(
+      main.indexOf('let regularImageDelivered'),
+      main.indexOf("'IPC image sent'"),
+    );
+
+    expect(imageBranch).toContain(
+      'regularImageDelivered = await sendTaskImageWithRetry',
+    );
+    expect(imageBranch).toContain('regularImageDelivered\n');
+    expect(imageBranch).toContain('success: false');
+    expect(imageBranch).toContain('do not retry automatically');
+  });
+
+  test('interrupts and commits an uncertain turn instead of scheduling another Agent loop', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const mainCleanup = main.slice(
+      main.indexOf('if (channelTurnRuntimes.size > 0)'),
+      main.indexOf('// ── 保存中断内容到数据库'),
+    );
+    expect(mainCleanup).toContain('getUncertainChannelOutboxForTurn');
+    expect(mainCleanup).toContain('runtime.interrupt');
+    expect(mainCleanup).toContain('commitCursor();');
+    expect(mainCleanup).toContain("'delivery-uncertain'");
+
+    const postCleanup = main.slice(
+      main.indexOf('// runAgent threw — output is undefined'),
+      main.indexOf('const stopDisposition ='),
+    );
+    expect(postCleanup).toContain(
+      'if (channelDeliveryNeedsManualReconciliation)',
+    );
+    expect(postCleanup).toContain(
+      'return channelManualNoticesAcknowledged && cursorCommitted;',
+    );
+
+    const agentCleanup = main.slice(
+      main.indexOf('if (agentChannelTurnRuntimes.size > 0)'),
+      main.indexOf('// ── 保存中断内容 ──'),
+    );
+    expect(agentCleanup).toContain('getUncertainChannelOutboxForTurn');
+    expect(agentCleanup).toContain('runtime.interrupt');
+    expect(agentCleanup).toContain('retryUnfinishedTurn = false');
+    expect(agentCleanup).toContain('retryUnfinishedTurn = true');
+  });
+
+  test('projects MCP send_message to Web but delivers raw native content through the exact input Outbox', () => {
+    const main = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const branch = main.slice(
+      main.indexOf('// Feishu card JSON: store extracted markdown for web'),
+      main.indexOf('// Scheduled-task output routing.'),
+    );
+
+    expect(branch).toContain('sendToIM: false');
+    expect(branch).toContain('resolveImRoute({');
+    expect(branch).toContain('ipcAgentId,');
+    expect(branch).toContain('data.inputTurnId');
+    expect(branch).toContain('channelTurnScope(sourceGroup, ipcAgentId)');
+    expect(branch).toContain(
+      'sendImWithRetry(\n                        ipcImRoute,\n                        data.text,',
+    );
+    expect(branch).not.toContain('imTextOverride: webText');
+  });
 });

@@ -7,6 +7,7 @@ import { getWebDeps } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { canAccessGroup, canModifyGroup } from '../web-context.js';
 import {
+  clearSessionChannelOwner,
   getRegisteredGroup,
   getAllRegisteredGroups,
   listAgentsByJid,
@@ -858,6 +859,7 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
 
   // Delete session records
   deleteSession(group.folder, agentId);
+  clearSessionChannelOwner(group.folder, agentId);
 
   deleteAgent(agentId);
 
@@ -971,6 +973,7 @@ router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
 
   deleteMessagesForChatJid(`${jid}#agent:${sessionId}`);
   deleteSession(group.folder, sessionId);
+  clearSessionChannelOwner(group.folder, sessionId);
   deleteAgent(sessionId);
 
   const { broadcastAgentRemoved } = await import('../web.js');

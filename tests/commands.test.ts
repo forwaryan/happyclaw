@@ -5,11 +5,13 @@ import { isClearCommand } from '../src/commands.js';
 // Hoisted so mock factories below can reference these before module evaluation.
 const {
   deleteSessionMock,
+  clearSessionChannelOwnerMock,
   getJidsByFolderMock,
   storeMessageDirectMock,
   ensureChatExistsMock,
 } = vi.hoisted(() => ({
   deleteSessionMock: vi.fn(),
+  clearSessionChannelOwnerMock: vi.fn(),
   getJidsByFolderMock: vi.fn(),
   storeMessageDirectMock: vi.fn(),
   ensureChatExistsMock: vi.fn(),
@@ -17,6 +19,7 @@ const {
 
 vi.mock('../src/db.js', () => ({
   deleteSession: deleteSessionMock,
+  clearSessionChannelOwner: clearSessionChannelOwnerMock,
   getJidsByFolder: getJidsByFolderMock,
   storeMessageDirect: storeMessageDirectMock,
   ensureChatExists: ensureChatExistsMock,
@@ -56,6 +59,7 @@ describe('isClearCommand', () => {
 describe('executeSessionReset', () => {
   beforeEach(() => {
     deleteSessionMock.mockReset();
+    clearSessionChannelOwnerMock.mockReset();
     getJidsByFolderMock.mockReset();
     storeMessageDirectMock.mockReset();
     ensureChatExistsMock.mockReset();

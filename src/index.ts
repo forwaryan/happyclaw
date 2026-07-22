@@ -34,6 +34,8 @@ import {
 } from './reply-finalization.js';
 export { buildInterruptedReply } from './reply-finalization.js';
 import { resolveTurnOutcome } from './turn-outcome.js';
+import { finalizeChannelCardAfterDelivery } from './channel-card-finalization.js';
+import { resolveContainerOutputInputTurnId } from './channel-output-correlation.js';
 import { SteeringTransitionRegistry } from './steering-transition.js';
 import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
@@ -77,6 +79,7 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getSessionChannelOwner,
   getRouterStateByPrefix,
   deleteRouterState,
   getTaskById,
@@ -94,6 +97,7 @@ import {
   setLastGroupSync,
   setRegisteredGroup,
   setRouterState,
+  setSessionChannelOwnerOnce,
   setSession,
   deleteSession,
   deleteMessagesForChatJid,
@@ -166,6 +170,27 @@ import {
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
+import {
+  reconcileChannelReliabilityOnStartup,
+  startChannelReliabilityRecoveryLoop,
+} from './channel-reliability-recovery.js';
+import {
+  deliverChannelOutboxItem,
+  reconcileChannelOutboxDeliveries,
+} from './channel-outbox-delivery.js';
+import {
+  ActiveChannelOutboxScopeRegistry,
+  semanticChannelOutboxIdentity,
+  stableChannelOutboxOrdinal,
+  syntheticChannelProviderAck,
+  type ActiveChannelOutboxScope,
+} from './channel-outbox-runtime-scope.js';
+import {
+  getChannelTurnRun,
+  getUncertainChannelOutboxForTurn,
+} from './channel-reliability-store.js';
+import { ChannelTurnRuntime } from './channel-turn-runtime.js';
+import { resolveStickyChannelOwner } from './channel-session-owner.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
 import {
   getChannelType,
@@ -244,6 +269,8 @@ import type {
   FeishuCapabilityOperation,
   FeishuCapabilityRequest,
 } from './feishu-capability.js';
+import { isFeishuCapabilityMutation } from './feishu-capability.js';
+import { deliverFeishuCapabilityMutation } from './feishu-capability-outbox.js';
 import {
   discardPreparedAgentDraft,
   getAgentCapabilityCatalogForBuilder,
@@ -300,7 +327,11 @@ import type {
   DiscordConnectConfig,
   WhatsAppConnectConfig,
 } from './im-manager.js';
-import { GroupQueue, type IpcDeliveryReceipt } from './group-queue.js';
+import {
+  GroupQueue,
+  type IpcDeliveryReceipt,
+  type IpcPrePublishAdmission,
+} from './group-queue.js';
 import {
   startSchedulerLoop,
   triggerTaskNow,
@@ -1070,8 +1101,45 @@ type ReplyRouteUpdater = (
   newSourceJid: string | null,
   inputTurnId?: string,
   inputCursor?: MessageCursor,
-) => void;
+) => Promise<void>;
 const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
+type ReplyRouteAdmission = (
+  sourceJid: string | null,
+  inputTurnId: string,
+  inputCursor?: MessageCursor,
+) => IpcPrePublishAdmission | false;
+const activeRouteAdmissions = new Map<string, ReplyRouteAdmission>();
+
+function invokeActiveRouteAdmission(
+  folder: string,
+  sourceJid: string | null,
+  receipt: IpcDeliveryReceipt | undefined,
+  runtimeAgentId?: string,
+): IpcPrePublishAdmission | false {
+  if (!receipt) return false;
+  const admission = activeRouteAdmissions.get(
+    channelTurnScope(folder, runtimeAgentId),
+  );
+  return admission
+    ? admission(sourceJid, receipt.deliveryId, receipt.cursor)
+    : false;
+}
+
+function invokeActiveRouteUpdater(
+  folder: string,
+  sourceJid: string | null,
+  inputTurnId?: string,
+  inputCursor?: MessageCursor,
+): void {
+  const updater = activeRouteUpdaters.get(folder);
+  if (!updater) return;
+  void updater(sourceJid, inputTurnId, inputCursor).catch((error) => {
+    logger.error(
+      { error, folder, sourceJid, inputTurnId },
+      'Active reply-route update failed',
+    );
+  });
+}
 
 // Per-folder IM reply route: tracks the current replySourceImJid for each
 // running processGroupMessages.  IPC watcher reads this to forward send_message
@@ -1091,6 +1159,11 @@ const activeAgentBuilderTurns = new AgentBuilderTurnRegistry();
 // answered. Feishu broker IPC is authorized against this host-owned registry;
 // runner-supplied chat/account claims are never trusted.
 const activeChannelTurns = new ActiveChannelTurnRegistry();
+
+// Durable output identity for the currently executing channel turn. Runtime
+// keys match the IPC routing keys; exact route matching inside the registry
+// prevents one thread/account from borrowing another thread's outbox.
+const activeChannelOutboxScopes = new ActiveChannelOutboxScopeRegistry();
 
 // ── 卡片挂起完成机制的共享工具 ──
 // 挂起卡内各 turn 文本之间的分隔线（最终定稿卡片正文按时间序拼接各 turn）。
@@ -1150,7 +1223,10 @@ function mergeHeldUsage(
 // Sub-Agent 路径的挂起卡 finalizer 注册表（key: virtualChatJid）。主路径复用
 // activeRouteUpdaters（用户消息注入时必经），Sub-Agent 注入点不走 route updater，
 // 由 web.ts / 消息循环在注入成功回调里显式触发。
-const activeHeldCardFinalizers = new Map<string, () => void>();
+const activeHeldCardFinalizers = new Map<
+  string,
+  (sourceJid?: string | null, inputTurnId?: string) => void
+>();
 
 interface PreparedFollowUp {
   messages: NewMessage[];
@@ -1207,12 +1283,22 @@ async function prepareFollowUp(
   };
 }
 
-function completeFollowUpReply(
+async function completeFollowUpReply(
   item: QueuedFollowUp,
   replyText: string,
-): boolean {
+): Promise<boolean> {
   const runId = item.delivery_run_id || crypto.randomUUID();
   const deliveryUpdatedAt = new Date().toISOString();
+  const sourceJid = item.source_jid || item.chat_jid;
+  const followUpRuntime = resolveFollowUpRuntime(item.chat_jid);
+  if (!followUpRuntime) return false;
+  const delivery = await sendPluginExpanderReply(item.chat_jid, replyText, {
+    originalMessageId: item.id,
+    groupFolder: followUpRuntime.effectiveGroup.folder,
+    imRouteJid: getChannelType(sourceJid) ? sourceJid : null,
+    agentId: followUpRuntime.agentId,
+  });
+  if (!delivery.acknowledged) return false;
   const released = releaseQueuedFollowUp(
     item.chat_jid,
     item.id,
@@ -1220,12 +1306,6 @@ function completeFollowUpReply(
     deliveryUpdatedAt,
   );
   if (!released) return false;
-  const sourceJid = item.source_jid || item.chat_jid;
-  sendPluginExpanderReply(
-    item.chat_jid,
-    replyText,
-    getChannelType(sourceJid) ? sourceJid : null,
-  );
   completeOutOfBandMessage(item.chat_jid, {
     timestamp: item.timestamp,
     id: item.id,
@@ -1276,9 +1356,13 @@ function injectPreparedFollowUp(
         );
       }
       if (runtime?.agentId) {
-        activeHeldCardFinalizers.get(item.chat_jid)?.();
+        activeHeldCardFinalizers.get(item.chat_jid)?.(
+          sourceJid,
+          receipt?.deliveryId,
+        );
       } else if (runtime) {
-        activeRouteUpdaters.get(runtime.effectiveGroup.folder)?.(
+        invokeActiveRouteUpdater(
+          runtime.effectiveGroup.folder,
           sourceJid,
           receipt?.deliveryId,
           receipt?.cursor,
@@ -1288,6 +1372,16 @@ function injectPreparedFollowUp(
     sourceJid,
     undefined,
     deliveryTarget,
+    undefined,
+    (receipt) =>
+      runtime
+        ? invokeActiveRouteAdmission(
+            runtime.effectiveGroup.folder,
+            sourceJid,
+            receipt,
+            runtime.agentId ?? undefined,
+          )
+        : false,
   );
 
   if (result === 'sent') {
@@ -1365,8 +1459,18 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
       return;
     }
     if (prepared.replyText && prepared.messages.length === 0) {
-      completeFollowUpReply(item, prepared.replyText);
-      queue.releaseQueryReservation(chatJid, reservedRunId, true);
+      const completed = await completeFollowUpReply(item, prepared.replyText);
+      if (!completed) {
+        restorePromotingFollowUp(chatJid, item.id);
+        broadcastFollowUpUpdate(chatJid);
+      }
+      queue.releaseQueryReservation(chatJid, reservedRunId, completed);
+      if (!completed) {
+        const retryTimer = setTimeout(() => {
+          void dispatchNextQueuedFollowUp(chatJid);
+        }, 1_000);
+        retryTimer.unref();
+      }
       return;
     }
     const result = injectPreparedFollowUp(item, prepared, reservedRunId);
@@ -2093,6 +2197,148 @@ function extractLocalImImagePaths(
 const IM_SEND_MAX_RETRIES = 3;
 const IM_SEND_RETRY_DELAY_MS = 2_000;
 
+interface ChannelOutboxDeliveryRef {
+  scopeKey: string;
+  operationKey: string;
+  scopeToken: string;
+  ordinalSlot?: string;
+}
+
+function bindChannelOutboxScope(
+  key: string,
+  runtime: ChannelTurnRuntime,
+  route: {
+    provider: string;
+    accountId: string;
+    sourceJid: string;
+    chatId: string;
+    rootId?: string | null;
+    threadId?: string | null;
+  },
+): ActiveChannelOutboxScope {
+  return activeChannelOutboxScopes.bind(key, {
+    ...route,
+    rootId: route.rootId ?? null,
+    threadId: route.threadId ?? null,
+    turnRunId: runtime.runId,
+    inputTurnId: runtime.inputTurnId,
+    owner: `happyclaw-outbox:${process.pid}:${runtime.runId}`,
+  });
+}
+
+function channelOutboxRefForInput(
+  scopeKey: string,
+  targetJid: string,
+  inputTurnId: unknown,
+  operationKey: string,
+): ChannelOutboxDeliveryRef | undefined {
+  if (typeof inputTurnId !== 'string' || !inputTurnId) return undefined;
+  const scope = activeChannelOutboxScopes.resolveInput(
+    scopeKey,
+    inputTurnId,
+    targetJid,
+  );
+  return {
+    scopeKey,
+    // A missing exact scope must fail closed in deliverScopedChannelOutput;
+    // never let an old MCP output borrow the newest warm turn's scope.
+    scopeToken: scope?.token ?? `missing:${inputTurnId}`,
+    operationKey,
+  };
+}
+
+async function deliverScopedChannelOutput(
+  targetJid: string,
+  ref: ChannelOutboxDeliveryRef | undefined,
+  input: {
+    kind: 'text' | 'card' | 'image' | 'file';
+    payload: unknown;
+    send: () => Promise<void>;
+  },
+): Promise<boolean | null> {
+  if (!ref) return null;
+  const scope = activeChannelOutboxScopes.resolveToken(
+    ref.scopeKey,
+    ref.scopeToken,
+    targetJid,
+  );
+  if (!scope) {
+    logger.error(
+      {
+        targetJid,
+        scopeKey: ref.scopeKey,
+        operationKey: ref.operationKey,
+      },
+      'Suppressed channel side effect because its exact outbox scope is unavailable',
+    );
+    return false;
+  }
+  const uncertainSibling = getUncertainChannelOutboxForTurn(scope.turnRunId);
+  if (uncertainSibling) {
+    logger.warn(
+      {
+        targetJid,
+        turnRunId: scope.turnRunId,
+        uncertainOutboxItemId: uncertainSibling.id,
+        operationKey: ref.operationKey,
+      },
+      'Blocked channel side effect until uncertain turn is manually reconciled',
+    );
+    return false;
+  }
+  const semanticIdentity = semanticChannelOutboxIdentity({
+    route: scope,
+    kind: input.kind,
+    payload: input.payload,
+    ordinalSlot: ref.ordinalSlot,
+  });
+  const ordinal = stableChannelOutboxOrdinal(semanticIdentity);
+  const result = await deliverChannelOutboxItem({
+    provider: scope.provider,
+    accountId: scope.accountId,
+    sourceJid: scope.sourceJid,
+    chatId: scope.chatId,
+    rootId: scope.rootId,
+    threadId: scope.threadId,
+    turnRunId: scope.turnRunId,
+    ordinal,
+    kind: input.kind,
+    payload: input.payload,
+    idempotencyKey: `${scope.turnRunId}:${semanticIdentity}`,
+    owner: scope.owner,
+    delivery: {
+      mode: 'single',
+      send: async ({ item }) => {
+        // deliverChannelOutboxItem persists `sending` before entering here.
+        await input.send();
+        return {
+          providerMessageId: syntheticChannelProviderAck({
+            turnRunId: scope.turnRunId,
+            ordinal,
+            payloadHash: item.payloadHash,
+          }),
+        };
+      },
+    },
+  });
+  if (result.status !== 'delivered') {
+    logger.warn(
+      {
+        targetJid,
+        turnRunId: scope.turnRunId,
+        outboxItemId: result.itemId,
+        outboxStatus: result.status,
+        operationKey: ref.operationKey,
+        error: result.error,
+      },
+      result.status === 'uncertain'
+        ? 'Channel delivery outcome is uncertain; automatic replay blocked'
+        : 'Durable channel delivery did not complete',
+    );
+  }
+  return result.status === 'delivered';
+}
+
 async function retryImOperation(
   label: string,
   imJid: string,
@@ -2126,14 +2372,75 @@ async function sendImWithRetry(
   imJid: string,
   text: string,
   localImagePaths: string[],
+  outbox?: ChannelOutboxDeliveryRef,
 ): Promise<boolean> {
-  const ok = await retryImOperation('send_message', imJid, () =>
-    imManager.sendMessage(imJid, text, localImagePaths),
-  );
+  let ok: boolean;
+  const durableScoped = outbox !== undefined;
+  if (durableScoped) {
+    ok = true;
+    if (text) {
+      const delivered = await deliverScopedChannelOutput(
+        imJid,
+        {
+          ...outbox!,
+          operationKey: `${outbox!.operationKey}:text`,
+          ordinalSlot: `${outbox!.ordinalSlot ?? 'message'}:text`,
+        },
+        {
+          kind: 'text',
+          payload: { text },
+          send: () => imManager.sendMessage(imJid, text, []),
+        },
+      );
+      ok = delivered === true;
+    }
+    for (let index = 0; index < localImagePaths.length; index++) {
+      const imagePath = localImagePaths[index];
+      const imageBuffer = fs.readFileSync(imagePath);
+      const contentHash = crypto
+        .createHash('sha256')
+        .update(imageBuffer)
+        .digest('hex');
+      const mimeType = detectImageMimeType(imageBuffer);
+      const delivered = await deliverScopedChannelOutput(
+        imJid,
+        {
+          ...outbox!,
+          operationKey: `${outbox!.operationKey}:image:${index}`,
+          ordinalSlot: `${outbox!.ordinalSlot ?? 'message'}:image:${index}`,
+        },
+        {
+          kind: 'image',
+          payload: {
+            fileName: path.basename(imagePath),
+            contentHash,
+          },
+          // One physical attachment per outbox row. A later attachment failure
+          // therefore cannot cause the already delivered body to be resent.
+          send: () =>
+            imManager.sendImage(
+              imJid,
+              imageBuffer,
+              mimeType,
+              undefined,
+              path.basename(imagePath),
+            ),
+        },
+      );
+      if (delivered !== true) ok = false;
+    }
+  } else {
+    ok = await retryImOperation('send_message', imJid, () =>
+      imManager.sendMessage(imJid, text, localImagePaths),
+    );
+  }
   if (ok) {
     imSendFailCounts.delete(imJid);
     return true;
   }
+  // `uncertain` is not evidence that the channel is unhealthy. In particular,
+  // do not auto-unbind a Bot merely because its ACK was lost after acceptance.
+  if (durableScoped) return false;
   // All retries exhausted — track cumulative failures
   const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
   imSendFailCounts.set(imJid, count);
@@ -2150,14 +2457,194 @@ async function sendImWithRetry(
   return false;
 }
 
+const CHANNEL_MANUAL_RECONCILIATION_NOTICE =
+  '⚠️ 上一次回复在部分内容已送达后异常中断。为避免重复发送，系统已停止自动重放；可能仍有附件或结论未送达，请重新发起请求或联系管理员核对。';
+
+/**
+ * Surface a crash-after-delivery fence to the exact native route. The notice
+ * itself uses an independent auxiliary Turn: an uncertain effect on the
+ * original Turn must not block the warning that tells the user why automatic
+ * replay stopped.
+ */
+async function deliverChannelManualReconciliationNotice(input: {
+  logicalChatJid: string;
+  scopeKey: string;
+  targetJid: string;
+  runtime: ChannelTurnRuntime;
+  agentId?: string | null;
+  route: {
+    provider: string;
+    accountId: string;
+    sourceJid: string;
+    chatId: string;
+    rootId?: string | null;
+    threadId?: string | null;
+  };
+}): Promise<boolean> {
+  return deliverIndependentChannelSystemNotice({
+    logicalChatJid: input.logicalChatJid,
+    scopeKey: input.scopeKey,
+    targetJid: input.targetJid,
+    route: input.route,
+    agentId: input.agentId,
+    originalInputTurnId: input.runtime.inputTurnId,
+    originalRunId: input.runtime.runId,
+    noticeKey: 'manual-reconciliation',
+    text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+  });
+}
+
+async function deliverIndependentChannelSystemNotice(input: {
+  logicalChatJid: string;
+  scopeKey: string;
+  targetJid: string;
+  originalInputTurnId: string;
+  originalRunId: string;
+  noticeKey: string;
+  text: string;
+  sender?: string;
+  agentId?: string | null;
+  route: {
+    provider: string;
+    accountId: string;
+    sourceJid: string;
+    chatId: string;
+    rootId?: string | null;
+    threadId?: string | null;
+  };
+}): Promise<boolean> {
+  const noticeRuntime = ChannelTurnRuntime.start({
+    ...input.route,
+    externalMessageId: `${input.originalInputTurnId}:system-notice:${input.noticeKey}`,
+    correlationId: input.originalInputTurnId,
+    agentId: input.agentId,
+  });
+  if (noticeRuntime.executionDisposition === 'defer') {
+    noticeRuntime.dispose();
+    return false;
+  }
+  const scope = bindChannelOutboxScope(
+    input.scopeKey,
+    noticeRuntime,
+    input.route,
+  );
+  try {
+    // An uncertain notice might already be visible. Never send a sibling;
+    // preserve the Web audit record and let an operator reconcile provider
+    // state instead of risking duplicate warnings.
+    let acknowledged = Boolean(
+      getUncertainChannelOutboxForTurn(noticeRuntime.runId),
+    );
+    if (!acknowledged) {
+      acknowledged = await sendImWithRetry(input.targetJid, input.text, [], {
+        scopeKey: input.scopeKey,
+        scopeToken: scope.token,
+        operationKey: `system-notice:${input.noticeKey}`,
+        ordinalSlot: `system-notice:${input.noticeKey}`,
+      });
+    }
+    const becameUncertain = Boolean(
+      getUncertainChannelOutboxForTurn(noticeRuntime.runId),
+    );
+    if (!acknowledged && !becameUncertain) {
+      if (noticeRuntime.executionDisposition === 'execute') {
+        noticeRuntime.retry('System notice delivery failed before ACK');
+      }
+      return false;
+    }
+
+    if (noticeRuntime.executionDisposition === 'execute') {
+      if (becameUncertain) {
+        noticeRuntime.interrupt(
+          `System notice ${input.noticeKey} delivery is uncertain; manual reconciliation required`,
+        );
+      } else {
+        noticeRuntime.markFinalizing();
+        noticeRuntime.complete({
+          originalRunId: input.originalRunId,
+          noticeKey: input.noticeKey,
+          delivered: true,
+        });
+      }
+    }
+
+    const msgId = `sys_notice_${noticeRuntime.runId}`;
+    const timestamp = new Date().toISOString();
+    ensureChatExists(input.logicalChatJid);
+    storeMessageDirect(
+      msgId,
+      input.logicalChatJid,
+      input.sender ?? '__reconciliation__',
+      ASSISTANT_NAME,
+      input.text,
+      timestamp,
+      true,
+      { sourceJid: input.targetJid },
+    );
+    broadcastNewMessage(input.logicalChatJid, {
+      id: msgId,
+      chat_jid: input.logicalChatJid,
+      sender: input.sender ?? '__reconciliation__',
+      sender_name: ASSISTANT_NAME,
+      content: input.text,
+      timestamp,
+      is_from_me: true,
+      source_jid: input.targetJid,
+    });
+    return true;
+  } finally {
+    activeChannelOutboxScopes.unbind(input.scopeKey, scope);
+    noticeRuntime.dispose();
+  }
+}
+
+function resolveDurableChannelRoute(targetJid: string): {
+  provider: string;
+  accountId: string;
+  sourceJid: string;
+  chatId: string;
+  rootId: string | null;
+  threadId: string | null;
+} | null {
+  const address = parseChannelAddress(targetJid);
+  if (!address) return null;
+  const group = getRegisteredGroup(channelConversationJid(targetJid));
+  const accountId = address.channelAccountId ?? group?.channel_account_id;
+  if (!accountId) return null;
+  return {
+    provider: address.provider,
+    accountId,
+    sourceJid: targetJid,
+    chatId: address.externalChatId,
+    rootId: address.rootMessageId ?? null,
+    threadId: address.threadId ?? null,
+  };
+}
+
 async function sendTaskImageWithRetry(
   targetJid: string,
   imageBuffer: Buffer,
   mimeType: string,
   caption?: string,
   fileName?: string,
+  outbox?: ChannelOutboxDeliveryRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
+  const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
+    kind: 'image',
+    payload: {
+      mimeType,
+      caption: caption ?? null,
+      fileName: fileName ?? null,
+      contentHash: crypto
+        .createHash('sha256')
+        .update(imageBuffer)
+        .digest('hex'),
+    },
+    send: () =>
+      imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
+  });
+  if (scoped !== null) return scoped;
   return retryImOperation('send_task_image', targetJid, () =>
     imManager.sendImage(targetJid, imageBuffer, mimeType, caption, fileName),
   );
@@ -2167,8 +2654,21 @@ async function sendTaskFileWithRetry(
   targetJid: string,
   filePath: string,
   fileName: string,
+  outbox?: ChannelOutboxDeliveryRef,
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
+  const scoped = await deliverScopedChannelOutput(targetJid, outbox, {
+    kind: 'file',
+    payload: {
+      fileName,
+      contentHash: crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(filePath))
+        .digest('hex'),
+    },
+    send: () => imManager.sendFile(targetJid, filePath, fileName),
+  });
+  if (scoped !== null) return scoped;
   return retryImOperation('send_task_file', targetJid, () =>
     imManager.sendFile(targetJid, filePath, fileName),
   );
@@ -2218,8 +2718,9 @@ function sendImWithFailTracking(
   imJid: string,
   text: string,
   localImagePaths: string[],
+  outbox?: ChannelOutboxDeliveryRef,
 ): void {
-  sendImWithRetry(imJid, text, localImagePaths).catch(() => {});
+  sendImWithRetry(imJid, text, localImagePaths, outbox).catch(() => {});
 }
 
 export function isCursorAfter(
@@ -2309,12 +2810,21 @@ function sendBillingDeniedMessage(jid: string, content: string): string {
  * etc.) would silently drop on IM and the slash command appears to no-op
  * (#20 P1-1).
  */
-function sendPluginExpanderReply(
+async function sendPluginExpanderReply(
   jid: string,
   content: string,
-  imRouteJid?: string | null,
-): string {
-  const msgId = `sys_plugin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  options: {
+    originalMessageId: string;
+    groupFolder: string;
+    imRouteJid?: string | null;
+    agentId?: string | null;
+  },
+): Promise<{ messageId: string; acknowledged: boolean }> {
+  const msgId = `sys_plugin_${crypto
+    .createHash('sha256')
+    .update(`${jid}:${options.originalMessageId}`)
+    .digest('hex')
+    .slice(0, 24)}`;
   const timestamp = new Date().toISOString();
   ensureChatExists(jid);
   storeMessageDirect(
@@ -2335,15 +2845,104 @@ function sendPluginExpanderReply(
     timestamp,
     is_from_me: true,
   });
-  if (imRouteJid && getChannelType(imRouteJid)) {
-    imManager.sendMessage(imRouteJid, content).catch((err) => {
-      logger.warn(
-        { err, jid: imRouteJid },
-        'Failed to send plugin-expander reply to IM',
-      );
-    });
+  const imRouteJid = options.imRouteJid;
+  if (!imRouteJid || !getChannelType(imRouteJid)) {
+    return { messageId: msgId, acknowledged: true };
   }
-  return msgId;
+  const address = parseChannelAddress(imRouteJid);
+  const routeGroup = address
+    ? getRegisteredGroup(channelConversationJid(imRouteJid))
+    : undefined;
+  const accountId = address?.channelAccountId ?? routeGroup?.channel_account_id;
+  if (!address || !accountId) {
+    logger.error(
+      { jid, imRouteJid, originalMessageId: options.originalMessageId },
+      'Suppressed plugin-expander IM reply without an exact channel account',
+    );
+    return { messageId: msgId, acknowledged: false };
+  }
+
+  const runtime = ChannelTurnRuntime.start({
+    provider: address.provider,
+    accountId,
+    sourceJid: imRouteJid,
+    chatId: address.externalChatId,
+    rootId: address.rootMessageId,
+    threadId: address.threadId,
+    externalMessageId: `${options.originalMessageId}:plugin-expander-reply`,
+    correlationId: options.originalMessageId,
+    agentId: options.agentId ?? null,
+    sessionId: getSession(options.groupFolder, options.agentId) ?? null,
+  });
+  if (runtime.executionDisposition !== 'execute') {
+    const disposition = runtime.executionDisposition;
+    if (disposition === 'manual_reconciliation') {
+      const notified = await deliverChannelManualReconciliationNotice({
+        logicalChatJid: jid,
+        scopeKey: channelTurnScope(options.groupFolder, options.agentId),
+        targetJid: imRouteJid,
+        runtime,
+        agentId: options.agentId,
+        route: {
+          provider: address.provider,
+          accountId,
+          sourceJid: imRouteJid,
+          chatId: address.externalChatId,
+          rootId: address.rootMessageId,
+          threadId: address.threadId,
+        },
+      });
+      runtime.dispose();
+      return { messageId: msgId, acknowledged: notified };
+    }
+    const existing = getChannelTurnRun(runtime.runId);
+    runtime.dispose();
+    return {
+      messageId: msgId,
+      acknowledged: existing?.status === 'completed',
+    };
+  }
+
+  const scopeKey = channelTurnScope(options.groupFolder, options.agentId);
+  const scope = bindChannelOutboxScope(scopeKey, runtime, {
+    provider: address.provider,
+    accountId,
+    sourceJid: imRouteJid,
+    chatId: address.externalChatId,
+    rootId: address.rootMessageId,
+    threadId: address.threadId,
+  });
+  let acknowledged = false;
+  try {
+    acknowledged = await sendImWithRetry(imRouteJid, content, [], {
+      scopeKey,
+      scopeToken: scope.token,
+      operationKey: `plugin-expander:${options.originalMessageId}:${msgId}`,
+      ordinalSlot: 'plugin-expander-reply',
+    });
+    if (acknowledged) {
+      acknowledged =
+        runtime.markFinalizing() &&
+        runtime.complete({
+          cursorCommitted: true,
+          replyDelivered: true,
+          inputTurnId: options.originalMessageId,
+        });
+    } else {
+      const uncertain = getUncertainChannelOutboxForTurn(runtime.runId);
+      if (uncertain) {
+        runtime.interrupt(
+          `Plugin-expander delivery ${uncertain.id} is uncertain; manual reconciliation required`,
+        );
+      } else {
+        runtime.retry('Plugin-expander reply was not physically acknowledged');
+      }
+    }
+  } finally {
+    activeChannelOutboxScopes.unbind(scopeKey, scope);
+    runtime.dispose();
+  }
+  return { messageId: msgId, acknowledged };
 }
 
 function getSessionClaudeDir(folder: string, agentId?: string): string {
@@ -3510,6 +4109,8 @@ interface SendMessageOptions {
   imTextOverride?: string;
   /** Pre-computed local image paths to attach to IM messages. Avoids redundant filesystem scans. */
   localImagePaths?: string[];
+  /** Stable durable-output identity for a reply produced inside an active turn. */
+  channelOutbox?: ChannelOutboxDeliveryRef;
   /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
   source?: string;
   /** Completed Claude Code Workflow snapshots associated with this reply. */
@@ -4102,7 +4703,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // message originated from web, the web user expects replies on web only — do
   // not broadcast to IM (#99).
   const directImReply = getChannelType(chatJid) !== null;
-  let replySourceImJid: string | null = null;
+  let incomingImOwner: string | null = null;
   if (!directImReply) {
     // chatJid is a web channel — check if ALL messages share the same IM source
     const firstSourceJid = missedMessages[0]?.source_jid || chatJid;
@@ -4110,11 +4711,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       getChannelType(firstSourceJid) !== null &&
       missedMessages.every((m) => (m.source_jid || chatJid) === firstSourceJid);
     if (allSameImSource) {
-      replySourceImJid = firstSourceJid;
+      incomingImOwner = firstSourceJid;
     }
   } else {
     // chatJid is an IM channel — reply directly
-    replySourceImJid = chatJid;
+    incomingImOwner = chatJid;
+  }
+  const persistedMainOwner = getSessionChannelOwner(effectiveGroup.folder);
+  let replySourceImJid = resolveStickyChannelOwner(
+    persistedMainOwner ?? null,
+    incomingImOwner,
+  );
+  if (!persistedMainOwner && replySourceImJid) {
+    replySourceImJid = setSessionChannelOwnerOnce(
+      effectiveGroup.folder,
+      null,
+      replySourceImJid,
+    );
   }
   // Publish the current IM reply route so the IPC watcher can forward
   // send_message outputs to the correct IM channel.
@@ -4146,6 +4759,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         toSend.length === 0
           ? completeOutOfBandMessage
           : advanceNextPullCursorOnly;
+      let pluginRepliesAcknowledged = true;
       for (const r of replies) {
         // Per-reply IM target: prefer the originating message's source_jid
         // (so individual replies route back to whoever sent the slash command,
@@ -4155,7 +4769,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           r.originalMsg.source_jid && getChannelType(r.originalMsg.source_jid)
             ? r.originalMsg.source_jid
             : replySourceImJid;
-        sendPluginExpanderReply(chatJid, r.text, perMsgImJid);
+        const delivery = await sendPluginExpanderReply(chatJid, r.text, {
+          originalMessageId: r.originalMsg.id,
+          groupFolder: effectiveGroup.folder,
+          imRouteJid: perMsgImJid,
+        });
+        if (!delivery.acknowledged) {
+          pluginRepliesAcknowledged = false;
+          break;
+        }
         // Advance cursor to the original user message timestamp so the next
         // poll skips it. setCursors (not advance) bypasses any stale future
         // cursor when the reply is the only output of this batch.
@@ -4164,6 +4786,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           id: r.originalMsg.id,
         });
       }
+      if (!pluginRepliesAcknowledged) return false;
       if (toSend.length === 0) {
         // Reply-only batch never spawns a runner — the normal completion
         // path's finally block (line ~3532) is skipped, so clear the IM
@@ -4312,10 +4935,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let lastError = '';
   let cursorCommitted = false;
   let healthyInputTurnCompleted = false;
+  let channelDeliveryNeedsManualReconciliation = false;
+  let channelManualNoticesAcknowledged = true;
   let lastReplyMsgId: string | undefined;
   let lastSavedTurnId: string | undefined; // tracks last turnId saved to DB, prevents UPSERT overwrite
   const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
+  const sentReplyByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
+  const channelPhysicalDeliveryAckByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
   // Cold-start MCP output uses the triggering DB message id. Warm IPC turns
   // replace this with the receipt delivery id through activeRouteUpdaters.
   const ipcReplyTurnTracker: IpcReplyTurnTracker = {
@@ -4331,19 +4962,190 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Create a streaming session for Feishu channels (typing-machine effect).
   // Non-Feishu channels get undefined → all streaming logic is no-op.
   let streamingSessionJid = replySourceImJid ?? chatJid;
+  const streamingAddress = parseChannelAddress(streamingSessionJid);
+  const streamingGroup = streamingAddress
+    ? getRegisteredGroup(channelConversationJid(streamingSessionJid))
+    : undefined;
+  const streamingAccountId =
+    streamingAddress?.channelAccountId ?? streamingGroup?.channel_account_id;
+  let channelTurnRuntime =
+    streamingAddress && streamingAccountId
+      ? ChannelTurnRuntime.start({
+          provider: streamingAddress.provider,
+          accountId: streamingAccountId,
+          sourceJid: streamingSessionJid,
+          chatId: streamingAddress.externalChatId,
+          rootId: streamingAddress.rootMessageId,
+          threadId: streamingAddress.threadId,
+          externalMessageId: lastProcessed.id,
+          sessionId: sessions[effectiveGroup.folder] ?? null,
+        })
+      : undefined;
+  const channelTurnRuntimes = new Map<string, ChannelTurnRuntime>();
+  if (channelTurnRuntime) {
+    channelTurnRuntimes.set(lastProcessed.id, channelTurnRuntime);
+  }
+  const completeChannelRuntimesForOutput = (
+    result: ContainerOutput,
+  ): boolean => {
+    if (!result.inputTurnCompleted) return false;
+    let allCompleted = true;
+    const inputIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [result.inputTurnId ?? lastProcessed.id];
+    for (const inputId of inputIds) {
+      const runtime = channelTurnRuntimes.get(inputId);
+      if (!runtime) continue;
+      if (channelPhysicalDeliveryAckByInput.get(inputId) !== true) {
+        allCompleted = false;
+        logger.error(
+          { chatJid, inputTurnId: inputId, runId: runtime.runId },
+          'Refusing to complete channel input without exact physical delivery ACK',
+        );
+        continue;
+      }
+      const completed =
+        runtime.markFinalizing() &&
+        runtime.complete({
+          cursorCommitted: true,
+          sentReply: true,
+          inputTurnId: inputId,
+        });
+      if (completed) {
+        // Keep the immutable scope projection until the whole warm runner
+        // exits. A late duplicate SDK callback for this already-completed
+        // input must still resolve the same delivered Outbox item instead of
+        // falling back to an ungoverned legacy send.
+        runtime.dispose();
+        channelTurnRuntimes.delete(inputId);
+      } else {
+        allCompleted = false;
+        logger.error(
+          {
+            chatJid,
+            inputTurnId: inputId,
+            runId: runtime.runId,
+            durabilityFailure: runtime.hasDurabilityFailure,
+            lostFence: runtime.hasLostFence,
+          },
+          'Completed input could not terminalize its channel turn ledger',
+        );
+      }
+    }
+    return allCompleted;
+  };
+  const channelScopeForOutput = (
+    result: ContainerOutput,
+  ): {
+    inputId: string;
+    scope?: ActiveChannelOutboxScope;
+    rejected: boolean;
+  } => {
+    const inputIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [];
+    const inputId = resolveContainerOutputInputTurnId(result, lastProcessed.id);
+    return {
+      inputId,
+      scope: channelOutboxScopesByInput.get(inputId),
+      rejected: inputIds.some((id) => rejectedChannelInputTurns.has(id)),
+    };
+  };
+  if (
+    channelTurnRuntime &&
+    channelTurnRuntime.executionDisposition !== 'execute'
+  ) {
+    const disposition = channelTurnRuntime.executionDisposition;
+    if (
+      disposition === 'manual_reconciliation' &&
+      streamingAddress &&
+      streamingAccountId
+    ) {
+      const notified = await deliverChannelManualReconciliationNotice({
+        logicalChatJid: chatJid,
+        scopeKey: channelTurnScope(effectiveGroup.folder),
+        targetJid: streamingSessionJid,
+        runtime: channelTurnRuntime,
+        route: {
+          provider: streamingAddress.provider,
+          accountId: streamingAccountId,
+          sourceJid: streamingSessionJid,
+          chatId: streamingAddress.externalChatId,
+          rootId: streamingAddress.rootMessageId,
+          threadId: streamingAddress.threadId,
+        },
+      });
+      channelTurnRuntime.dispose();
+      if (idleTimer) clearTimeout(idleTimer);
+      await setTyping(chatJid, false);
+      activeImReplyRoutes.delete(effectiveGroup.folder);
+      if (!notified) return false;
+      advanceCursors(chatJid, {
+        timestamp: lastProcessed.timestamp,
+        id: lastProcessed.id,
+      });
+      return true;
+    }
+    channelTurnRuntime.dispose();
+    if (idleTimer) clearTimeout(idleTimer);
+    await setTyping(chatJid, false);
+    activeImReplyRoutes.delete(effectiveGroup.folder);
+    if (disposition === 'skip_terminal') {
+      advanceCursors(chatJid, {
+        timestamp: lastProcessed.timestamp,
+        id: lastProcessed.id,
+      });
+      return true;
+    }
+    logger.info(
+      { chatJid, turnRunId: channelTurnRuntime.runId },
+      'Channel turn is already leased; deferring duplicate execution',
+    );
+    return false;
+  }
+  // Retried executions reuse the same logical run but deliberately avoid a
+  // second provider card. The final static fallback remains outbox-governed.
+  const retryAttempt = queue.getRetryCount(chatJid);
+  let activeDurableCardLifecycle =
+    retryAttempt === 0 && streamingAddress?.provider === 'feishu'
+      ? channelTurnRuntime?.reserveStreamingCard()
+      : undefined;
+  if (
+    channelTurnRuntime &&
+    streamingAddress?.provider === 'feishu' &&
+    retryAttempt === 0 &&
+    !activeDurableCardLifecycle
+  ) {
+    channelTurnRuntime.retry('Duplicate streaming card reservation');
+    channelTurnRuntime.dispose();
+    if (idleTimer) clearTimeout(idleTimer);
+    await setTyping(chatJid, false);
+    activeImReplyRoutes.delete(effectiveGroup.folder);
+    return false;
+  }
+  let channelOutboxScope: ActiveChannelOutboxScope | undefined;
+  const channelOutboxScopesByInput = new Map<
+    string,
+    ActiveChannelOutboxScope
+  >();
+  const rejectedChannelInputTurns = new Set<string>();
   const makeOnCardCreated = (jid: string) => (messageId: string) =>
     registerMessageIdMapping(messageId, jid);
   // 重试轮（指数退避后的重跑）静默执行，不新建流式卡片：否则一条持续失败的
   // 消息每轮都会在飞书发一张「生成中→处理出错」卡，最多刷 6 张（消息洪流）。
   // 重试成功时最终回复仍经静态 sendMessage 送达。
-  const retryAttempt = queue.getRetryCount(chatJid);
   let streamingSession =
     retryAttempt > 0
       ? undefined
       : await imManager.createStreamingSession(
           streamingSessionJid,
           makeOnCardCreated(streamingSessionJid),
+          activeDurableCardLifecycle,
         );
+  const channelStreamingSessionsByInput = new Map<
+    string,
+    { session: NonNullable<typeof streamingSession>; jid: string }
+  >();
   let streamingAccumulatedText = '';
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
@@ -4423,15 +5225,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     unregisterStreamingSession(streamingSessionJid);
     streamingAccumulatedText = '';
     streamingAccumulatedThinking = '';
-    streamingSession = await imManager
-      .createStreamingSession(
-        streamingSessionJid,
-        makeOnCardCreated(streamingSessionJid),
-      )
-      .catch(() => undefined);
-    if (streamingSession) {
-      registerStreamingSession(streamingSessionJid, streamingSession);
-    }
+    streamingSession = undefined;
   };
   logger.info(
     { chatJid, streamingSessionJid, hasSession: !!streamingSession },
@@ -4439,8 +5233,115 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
+    channelStreamingSessionsByInput.set(lastProcessed.id, {
+      session: streamingSession,
+      jid: streamingSessionJid,
+    });
     logger.debug({ chatJid }, 'Streaming card session created for Feishu');
   }
+
+  interface AdmittedWarmMainInput {
+    sourceJid: string | null;
+    imJid: string | null;
+    runtime?: ChannelTurnRuntime;
+    scope?: ActiveChannelOutboxScope;
+    lifecycle?: typeof activeDurableCardLifecycle;
+  }
+  const admittedWarmMainInputs = new Map<string, AdmittedWarmMainInput>();
+  const mainAdmissionKey = channelTurnScope(effectiveGroup.folder);
+  activeRouteAdmissions.set(
+    mainAdmissionKey,
+    (newSourceJid, inputTurnId, inputCursor) => {
+      const isCurrentOrNewer =
+        !inputCursor ||
+        isCursorAfter(inputCursor, currentInputCursor) ||
+        (inputCursor.timestamp === currentInputCursor.timestamp &&
+          inputCursor.id === currentInputCursor.id);
+      if (!isCurrentOrNewer || admittedWarmMainInputs.has(inputTurnId)) {
+        return false;
+      }
+
+      const newImJid = resolveStickyChannelOwner(
+        replySourceImJid,
+        newSourceJid,
+      );
+      let nextRuntime: ChannelTurnRuntime | undefined;
+      let nextScope: ActiveChannelOutboxScope | undefined;
+      let nextLifecycle: typeof activeDurableCardLifecycle;
+      if (newImJid) {
+        const nextAddress = parseChannelAddress(newImJid);
+        const nextGroup = nextAddress
+          ? getRegisteredGroup(channelConversationJid(newImJid))
+          : undefined;
+        const nextAccountId =
+          nextAddress?.channelAccountId ?? nextGroup?.channel_account_id;
+        if (!nextAddress || !nextAccountId) return false;
+        nextRuntime = ChannelTurnRuntime.start({
+          provider: nextAddress.provider,
+          accountId: nextAccountId,
+          sourceJid: newImJid,
+          chatId: nextAddress.externalChatId,
+          rootId: nextAddress.rootMessageId,
+          threadId: nextAddress.threadId,
+          externalMessageId: inputTurnId,
+          sessionId: activeSessionId,
+        });
+        if (nextRuntime.executionDisposition !== 'execute') {
+          nextRuntime.dispose();
+          return false;
+        }
+        nextLifecycle =
+          nextAddress.provider === 'feishu'
+            ? nextRuntime.reserveStreamingCard()
+            : undefined;
+        if (nextAddress.provider === 'feishu' && !nextLifecycle) {
+          nextRuntime.retry('Unable to reserve warm streaming card');
+          nextRuntime.dispose();
+          return false;
+        }
+        nextScope = bindChannelOutboxScope(mainAdmissionKey, nextRuntime, {
+          provider: nextAddress.provider,
+          accountId: nextAccountId,
+          sourceJid: newImJid,
+          chatId: nextAddress.externalChatId,
+          rootId: nextAddress.rootMessageId,
+          threadId: nextAddress.threadId,
+        });
+        channelTurnRuntimes.set(inputTurnId, nextRuntime);
+        channelOutboxScopesByInput.set(inputTurnId, nextScope);
+      }
+      admittedWarmMainInputs.set(inputTurnId, {
+        sourceJid: newSourceJid,
+        imJid: newImJid,
+        runtime: nextRuntime,
+        scope: nextScope,
+        lifecycle: nextLifecycle,
+      });
+      return {
+        rollback: () => {
+          const admitted = admittedWarmMainInputs.get(inputTurnId);
+          if (!admitted) return;
+          admittedWarmMainInputs.delete(inputTurnId);
+          channelTurnRuntimes.delete(inputTurnId);
+          channelOutboxScopesByInput.delete(inputTurnId);
+          activeChannelOutboxScopes.unbind(mainAdmissionKey, admitted.scope);
+          if (admitted.runtime) {
+            const cardRolledBack = admitted.lifecycle
+              ? admitted.runtime.rollbackUnpublishedStreamingCardReservation()
+              : true;
+            if (cardRolledBack) {
+              admitted.runtime.retry('IPC publish failed after warm admission');
+            } else {
+              admitted.runtime.interrupt(
+                'Warm admission could not safely roll back its unpublished card',
+              );
+            }
+            admitted.runtime.dispose();
+          }
+        },
+      };
+    },
+  );
 
   // ── Dynamic reply route updater ──
   // Allows IPC-injected messages (from web.ts / IM polling) to update the
@@ -4449,7 +5350,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   activeRouteUpdaters.set(
     effectiveGroup.folder,
     async (newSourceJid, inputTurnId, inputCursor) => {
+      let acceptedNewInput = false;
+      let previousSessionForRotation: typeof streamingSession;
+      let durableLifecycleForInput: typeof activeDurableCardLifecycle;
+      const admittedInput = inputTurnId
+        ? admittedWarmMainInputs.get(inputTurnId)
+        : undefined;
       if (inputTurnId) {
+        // A warm input must have acquired its Turn/Card/Outbox fence before
+        // GroupQueue published the IPC file. The post-publish updater only
+        // activates that immutable reservation; it may never create one late.
+        if (!admittedInput) return;
         const isCurrentOrNewer =
           !inputCursor ||
           isCursorAfter(inputCursor, currentInputCursor) ||
@@ -4458,25 +5369,75 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (!isCurrentOrNewer) return;
         if (inputCursor) currentInputCursor = inputCursor;
         setIpcReplyInputTurn(ipcReplyTurnTracker, inputTurnId);
+        acceptedNewInput = true;
       }
-      const newImJid =
-        newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
+      // Web is a public control surface, not a transport ownership change. A
+      // session first opened from Feishu/QQ/etc. keeps that exact account and
+      // thread route when its next input is submitted from Web.
+      let newImJid =
+        admittedInput?.imJid ??
+        resolveStickyChannelOwner(replySourceImJid, newSourceJid);
+      if (!replySourceImJid && newImJid) {
+        newImJid = setSessionChannelOwnerOnce(
+          effectiveGroup.folder,
+          null,
+          newImJid,
+        );
+      }
+      if (acceptedNewInput && inputTurnId && admittedInput) {
+        channelTurnRuntime = admittedInput.runtime;
+        channelOutboxScope = admittedInput.scope;
+        activeDurableCardLifecycle = admittedInput.lifecycle;
+        durableLifecycleForInput = admittedInput.lifecycle;
+      }
       // 用户新消息注入：挂起中的卡片先定稿轮换——IM 时间线上旧卡在用户消息
       // 之前，新 turn 的回复不能长在旧卡里。route updater 在所有用户消息
       // 注入点（index.ts 消息循环 / web.ts）都会被调用，是天然的挂钩位置。
-      await finalizeHeldCardForNewMessage().catch((err) => {
-        logger.warn(
-          { err, chatJid },
-          'Failed to finalize held streaming card on new message',
-        );
-      });
+      if (previousSessionForRotation) {
+        const previousText = heldCardParts.join(HELD_TURN_DIVIDER);
+        heldCardParts = [];
+        heldCardUsage = null;
+        heldDbTurnId = null;
+        try {
+          if (previousSessionForRotation.isActive()) {
+            if (previousText) {
+              await previousSessionForRotation.complete(previousText);
+            } else {
+              await previousSessionForRotation.abort('新消息已开始');
+            }
+          }
+        } finally {
+          previousSessionForRotation.dispose();
+        }
+      } else if (!acceptedNewInput)
+        await finalizeHeldCardForNewMessage().catch((err) => {
+          logger.warn(
+            { err, chatJid },
+            'Failed to finalize held streaming card on new message',
+          );
+        });
       // New IPC user message arrived — reset sentReply so the next result
       // can be delivered to IM. This is the correct place to reset, NOT
       // in the streaming session rebuild (which also fires on SDK Task
       // completion and would cause multi-result IM spam).
       sentReply = false;
+      if (inputTurnId) sentReplyByInput.set(inputTurnId, false);
+      if (inputTurnId) {
+        channelPhysicalDeliveryAckByInput.set(inputTurnId, false);
+      }
       genuineReplyDelivered = false;
+      healthyInputTurnCompleted = false;
+      cursorCommitted = false;
+      // Do not rotate the visible provider projection merely because B was
+      // published while A is still emitting. The first B-correlated runner
+      // event activates B after A has reached its own terminal output.
+      if (acceptedNewInput) return;
       if (newImJid === replySourceImJid) {
+        if (streamingSession && !streamingSession.isActive()) {
+          streamingSession.dispose();
+          unregisterStreamingSession(streamingSessionJid);
+          streamingSession = undefined;
+        }
         // 同一路由下，若上一轮卡片因连续更新失败进入 error 态被冻结（防同轮刷屏，
         // 见下方 stream 事件处理的 sessionErrored 分支），在新用户消息开启新一轮时
         // 重建一张干净卡片，恢复流式展示能力。
@@ -4493,6 +5454,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             streamingSession = await imManager.createStreamingSession(
               streamingSessionJid,
               makeOnCardCreated(streamingSessionJid),
+              durableLifecycleForInput,
             );
           } catch (err: any) {
             logger.warn(
@@ -4503,6 +5465,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           if (streamingSession) {
             registerStreamingSession(streamingSessionJid, streamingSession);
+            if (inputTurnId) {
+              channelStreamingSessionsByInput.set(inputTurnId, {
+                session: streamingSession,
+                jid: streamingSessionJid,
+              });
+            }
+          }
+        }
+        if (!streamingSession && newImJid) {
+          streamingSession = await imManager
+            .createStreamingSession(
+              streamingSessionJid,
+              makeOnCardCreated(streamingSessionJid),
+              durableLifecycleForInput,
+            )
+            .catch((err) => {
+              logger.error(
+                { err, streamingSessionJid, inputTurnId },
+                'Failed to create warm streaming session',
+              );
+              return undefined;
+            });
+          if (streamingSession) {
+            registerStreamingSession(streamingSessionJid, streamingSession);
+            if (inputTurnId) {
+              channelStreamingSessionsByInput.set(inputTurnId, {
+                session: streamingSession,
+                jid: streamingSessionJid,
+              });
+            }
           }
         }
         return; // no route change
@@ -4515,9 +5507,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
       // Rebuild streaming session if the target channel changed.
-      // When the route is cleared to null (web message injected into IM-originated
-      // session), fall back to the web JID — NOT the original IM chatJid — so the
-      // Feishu streaming card is properly disposed.
+      // A route changes only when another concrete IM route takes ownership.
+      // Web follow-ups keep the existing transport/account/thread identity.
       const newStreamingJid =
         replySourceImJid ??
         (directImReply ? `web:${effectiveGroup.folder}` : chatJid);
@@ -4531,6 +5522,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           streamingSession = await imManager.createStreamingSession(
             streamingSessionJid,
             makeOnCardCreated(streamingSessionJid),
+            durableLifecycleForInput,
           );
         } catch (err: any) {
           logger.error(
@@ -4543,10 +5535,54 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         streamingAccumulatedThinking = '';
         if (streamingSession) {
           registerStreamingSession(streamingSessionJid, streamingSession);
+          if (inputTurnId) {
+            channelStreamingSessionsByInput.set(inputTurnId, {
+              session: streamingSession,
+              jid: streamingSessionJid,
+            });
+          }
         }
       }
     },
   );
+
+  const activateMainProjectionForInput = async (
+    inputTurnId: string | undefined,
+  ): Promise<void> => {
+    if (!inputTurnId) return;
+    const existing = channelStreamingSessionsByInput.get(inputTurnId);
+    if (existing) {
+      streamingSession = existing.session;
+      streamingSessionJid = existing.jid;
+      return;
+    }
+    const admitted = admittedWarmMainInputs.get(inputTurnId);
+    if (!admitted?.imJid || !admitted.lifecycle) return;
+    const projectionJid = admitted.imJid;
+    const session = await imManager
+      .createStreamingSession(
+        projectionJid,
+        makeOnCardCreated(projectionJid),
+        admitted.lifecycle,
+      )
+      .catch((error) => {
+        logger.error(
+          { error, chatJid, inputTurnId, projectionJid },
+          'Failed to activate pre-admitted streaming projection',
+        );
+        return undefined;
+      });
+    if (!session) return;
+    channelStreamingSessionsByInput.set(inputTurnId, {
+      session,
+      jid: projectionJid,
+    });
+    registerStreamingSession(projectionJid, session);
+    streamingSession = session;
+    streamingSessionJid = projectionJid;
+    streamingAccumulatedText = '';
+    streamingAccumulatedThinking = '';
+  };
 
   const pickRunningTaskForNotification = (): string | null => {
     const runningInQuery = Array.from(queryTaskIds)
@@ -4604,7 +5640,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       if (!accessResult.allowed) {
         const sysMsg = formatBillingAccessDeniedMessage(accessResult);
-        sendBillingDeniedMessage(chatJid, sysMsg);
+        if (replySourceImJid) {
+          const route = resolveDurableChannelRoute(replySourceImJid);
+          const acknowledged = route
+            ? await deliverIndependentChannelSystemNotice({
+                logicalChatJid: chatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder),
+                targetJid: replySourceImJid,
+                originalInputTurnId: lastProcessed.id,
+                originalRunId: `billing:${lastProcessed.id}`,
+                noticeKey: 'billing-denied',
+                text: sysMsg,
+                sender: '__billing__',
+                route,
+              })
+            : false;
+          if (!acknowledged) {
+            await setTyping(chatJid, false);
+            logger.warn(
+              { chatJid, replySourceImJid, messageId: lastProcessed.id },
+              'Billing notice not acknowledged; preserving cursor for retry',
+            );
+            return false;
+          }
+        } else {
+          sendBillingDeniedMessage(chatJid, sysMsg);
+        }
         completeOutOfBandMessages(chatJid, missedMessages);
         cursorCommitted = true;
         await setTyping(chatJid, false);
@@ -4651,6 +5712,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     })),
   );
   try {
+    channelOutboxScope =
+      channelTurnRuntime && streamingAddress && streamingAccountId
+        ? bindChannelOutboxScope(
+            channelTurnScope(effectiveGroup.folder),
+            channelTurnRuntime,
+            {
+              provider: streamingAddress.provider,
+              accountId: streamingAccountId,
+              sourceJid: streamingSessionJid,
+              chatId: streamingAddress.externalChatId,
+              rootId: streamingAddress.rootMessageId,
+              threadId: streamingAddress.threadId,
+            },
+          )
+        : undefined;
+    if (channelOutboxScope) {
+      channelOutboxScopesByInput.set(lastProcessed.id, channelOutboxScope);
+    }
     output = await runAgent(
       effectiveGroup,
       prompt,
@@ -4684,6 +5763,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             );
             return;
           }
+          await activateMainProjectionForInput(result.inputTurnId);
           if (result.inputTurnCompleted) {
             healthyInputTurnCompleted = true;
             const completedInputs = result.ipcReceipts?.length
@@ -4809,8 +5889,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
 
             // ── Feed stream events into Feishu streaming card ──
-            // IPC 注入的新 query 开始时，旧卡片已 complete()/abort()，
-            // 需要为新 query 重建流式卡片并重置会话级状态。
             // 例外：卡片因连续更新失败进入 error 态时绝不在本轮重建——每次重建
             // 都会向群里再发一张新卡片（失败持续时演变成每隔几秒一条的刷屏），
             // 且清空 streamingAccumulatedText 会丢失已生成的内容。error 态保持
@@ -4834,17 +5912,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // spamming the IM channel. The first substantive reply already
               // delivered the main content; follow-up results are DB-only.
               streamInterrupted = false;
-              streamingSession = await imManager.createStreamingSession(
-                streamingSessionJid,
-                makeOnCardCreated(streamingSessionJid),
-              );
-              if (streamingSession) {
-                registerStreamingSession(streamingSessionJid, streamingSession);
-                logger.debug(
-                  { chatJid },
-                  'Rebuilt streaming card for IPC-injected query',
-                );
-              }
+              // Never rebuild here without a fresh input receipt and durable
+              // lifecycle reservation. A second result belonging to the same
+              // logical input falls back to that input's exact Outbox instead
+              // of creating an ungoverned provider card.
+              streamingSession = undefined;
+              activeDurableCardLifecycle = undefined;
             }
             if (streamingSession) {
               const se = result.streamEvent;
@@ -5209,6 +6282,31 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
           // Streaming output callback — called for each agent result
           if (result.result) {
+            const outputChannelScope = channelScopeForOutput(result);
+            if (outputChannelScope.rejected) {
+              hadError = true;
+              logger.error(
+                { chatJid, inputTurnId: outputChannelScope.inputId },
+                'Suppressing output for a warm input that failed durable admission',
+              );
+              return;
+            }
+            const outputCardProjection = channelStreamingSessionsByInput.get(
+              outputChannelScope.inputId,
+            );
+            const outputStreamingSession = outputCardProjection?.session;
+            const outputReplySourceJid =
+              outputChannelScope.scope?.sourceJid ?? replySourceImJid;
+            if (outputReplySourceJid && !outputChannelScope.scope) {
+              hadError = true;
+              logger.error(
+                { chatJid, inputTurnId: outputChannelScope.inputId },
+                'Suppressing IM output without an exact durable turn scope',
+              );
+              return;
+            }
+            const outputAlreadySent =
+              sentReplyByInput.get(outputChannelScope.inputId) ?? false;
             const raw =
               typeof result.result === 'string'
                 ? result.result
@@ -5250,9 +6348,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // 后台任务未 settle / 截断待续写的 result 进入挂起序列：内容进
               // heldCardParts，DB 合并到同一条消息（全渠道一条回复），有卡片
               // 则卡片同步保持活跃，全部结束后的 healthy result 才收尾。
+              const isPartialOutput =
+                result.sourceKind === 'compact_partial' ||
+                result.sourceKind === 'overflow_partial';
               const holdReason: 'bg_tasks' | 'truncated' | null = runEnded
                 ? null
-                : result.finalizationReason === 'truncated'
+                : result.finalizationReason === 'truncated' || isPartialOutput
                   ? 'truncated'
                   : (result.pendingBgTasks ?? 0) > 0
                     ? 'bg_tasks'
@@ -5279,20 +6380,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // If a streaming card is active, finalize it with the complete text.
               // The card replaces the normal IM sendMessage for the Feishu channel.
               let streamingCardHandledIM = false;
+              let streamingCardAttachmentsDelivered = true;
               let cardHeldThisResult = false;
+              let pendingStreamingCardCompletion:
+                | NonNullable<typeof outputStreamingSession>
+                | undefined;
               if (holdReason) {
                 heldCardParts.push(text);
                 cardHeldThisResult = true;
-                if (streamingSession?.isActive()) {
+                if (outputStreamingSession?.isActive()) {
                   streamingCardHandledIM = true;
-                  imManager.clearAckReaction(replySourceImJid || chatJid);
+                  imManager.clearAckReaction(outputReplySourceJid || chatJid);
                   const holdNote =
                     holdReason === 'truncated'
                       ? '检测到上游断流，自动续写中…'
                       : `${result.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
-                  streamingSession.setSystemStatus(holdNote);
-                  if (streamingSession instanceof StreamingCardController) {
-                    streamingSession.setHeldOpen(
+                  outputStreamingSession.setSystemStatus(holdNote);
+                  if (
+                    outputStreamingSession instanceof StreamingCardController
+                  ) {
+                    outputStreamingSession.setHeldOpen(
                       holdReason === 'bg_tasks'
                         ? (result.pendingBgTasks ?? 0)
                         : null,
@@ -5309,35 +6416,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   },
                   'Reply held open (background tasks / truncation continue)',
                 );
-              } else if (streamingSession?.isActive()) {
-                try {
-                  await streamingSession.complete(text);
-                  streamingCardHandledIM = true;
-                  // 定稿后 session 即将轮换；留住引用供随后到达的 usage 事件
-                  // 打合并 usage note（挂起期累计 + 最终 turn）。
-                  heldUsagePatchTarget = streamingSession;
-                  heldCardParts = [];
-                  // Streaming card replaced the normal sendMessage path,
-                  // so clear the ack reaction that would normally be cleared in sendMessage.
-                  imManager.clearAckReaction(replySourceImJid || chatJid);
-                  logger.debug(
-                    { chatJid },
-                    'Streaming card completed with final text',
-                  );
-                } catch (err) {
-                  logger.warn(
-                    { err, chatJid },
-                    'Streaming card complete failed, falling back to static message',
-                  );
-                  // Abort the card so it doesn't stay stuck in "streaming" state
-                  await streamingSession
-                    .abort('回复已通过消息发送')
-                    .catch(() => {});
-                  // 卡片已死，挂起累积随之作废（内容早已逐 turn 入库）
-                  heldCardParts = [];
-                  heldCardUsage = null;
-                  // Fall through to normal sendMessage
-                }
+              } else if (outputStreamingSession?.isActive()) {
+                pendingStreamingCardCompletion = outputStreamingSession;
+                streamingCardHandledIM = true;
               }
 
               // ── Rebuild streaming card after completion ──
@@ -5346,25 +6427,51 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Previously only rebuilt for partial outputs (#223); now rebuild for
               // all completions to fix DingTalk "second message gets no reply" bug.
               // 挂起中的卡片不轮换：session 保持原状，后续 turn 继续追加。
-              if (streamingCardHandledIM) {
+              if (streamingCardHandledIM && !pendingStreamingCardCompletion) {
                 // Streaming card strips local image references (only img_xxx keys
                 // are valid in Feishu cards).  Send any local images as separate
                 // messages so they are not silently lost.
-                if (localImagePaths.length > 0 && replySourceImJid) {
-                  for (const imgPath of localImagePaths) {
+                if (localImagePaths.length > 0 && outputReplySourceJid) {
+                  for (
+                    let imageIndex = 0;
+                    imageIndex < localImagePaths.length;
+                    imageIndex++
+                  ) {
+                    const imgPath = localImagePaths[imageIndex];
                     try {
                       const imgBuf = await fs.promises.readFile(imgPath);
                       const mimeType = detectImageMimeType(imgBuf);
-                      await imManager.sendImage(
-                        replySourceImJid,
+                      if (!outputChannelScope.scope) {
+                        streamingCardAttachmentsDelivered = false;
+                        logger.error(
+                          { chatJid, imgPath },
+                          'Suppressed streaming-card image without an exact durable turn scope',
+                        );
+                        continue;
+                      }
+                      const delivered = await sendTaskImageWithRetry(
+                        outputReplySourceJid,
                         imgBuf,
                         mimeType,
+                        undefined,
+                        path.basename(imgPath),
+                        {
+                          scopeKey: channelTurnScope(effectiveGroup.folder),
+                          scopeToken: outputChannelScope.scope.token,
+                          operationKey: `streaming-card-image:${outputChannelScope.inputId}:${imageIndex}`,
+                          ordinalSlot: `streaming-card-image:${imageIndex}`,
+                        },
                       );
+                      if (!delivered) {
+                        streamingCardAttachmentsDelivered = false;
+                        continue;
+                      }
                       logger.info(
                         { chatJid, imgPath },
                         'Sent local image after streaming card completion',
                       );
                     } catch (imgErr) {
+                      streamingCardAttachmentsDelivered = false;
                       logger.warn(
                         { chatJid, imgPath, err: imgErr },
                         'Failed to send local image after streaming card',
@@ -5374,22 +6481,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 }
 
                 if (!cardHeldThisResult) {
-                  unregisterStreamingSession(streamingSessionJid);
+                  channelStreamingSessionsByInput.delete(
+                    outputChannelScope.inputId,
+                  );
                   streamingAccumulatedText = '';
                   streamingAccumulatedThinking = '';
-                  streamingSession = await imManager.createStreamingSession(
-                    streamingSessionJid,
-                    makeOnCardCreated(streamingSessionJid),
-                  );
-                  if (streamingSession) {
-                    registerStreamingSession(
-                      streamingSessionJid,
-                      streamingSession,
-                    );
-                    logger.debug(
-                      { chatJid, sourceKind: result.sourceKind },
-                      'Rebuilt streaming card after partial output',
-                    );
+                  // Do not pre-create the next provider card. Its deterministic
+                  // run id and lifecycle only exist after the next input receipt;
+                  // the route updater creates both together.
+                  if (outputStreamingSession === streamingSession) {
+                    if (outputCardProjection) {
+                      unregisterStreamingSession(outputCardProjection.jid);
+                    }
+                    streamingSession = undefined;
+                    activeDurableCardLifecycle = undefined;
                   }
                 }
               }
@@ -5401,11 +6506,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // 3. Reply route was cleared to null (web message injected into an
               //    IM-originated session — replies should go to web only).
               // Any send_message content is delivered independently via IPC watcher.
-              const routeCleared = directImReply && replySourceImJid === null;
+              const routeCleared =
+                directImReply && outputReplySourceJid === null;
               const routeSwitchedAway =
                 directImReply &&
-                replySourceImJid !== null &&
-                replySourceImJid !== chatJid;
+                outputReplySourceJid !== null &&
+                outputReplySourceJid !== chatJid;
               const skipImSend =
                 (streamingCardHandledIM && directImReply) ||
                 routeSwitchedAway ||
@@ -5432,26 +6538,148 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 if (!holdReason) heldDbTurnId = null; // healthy 收尾，序列结束
               } else {
                 turnIdForDb =
-                  sentReply && effectiveTurnId === lastSavedTurnId
+                  outputAlreadySent && effectiveTurnId === lastSavedTurnId
                     ? undefined // no turnId → fresh INSERT, no UPSERT dedup
                     : effectiveTurnId;
               }
+              const durableOutputIdentity =
+                result.sdkMessageUuid ||
+                crypto
+                  .createHash('sha256')
+                  .update(text)
+                  .digest('hex')
+                  .slice(0, 24);
 
-              lastReplyMsgId = await sendMessage(chatJid, dbText, {
-                sendToIM: directImReply && !skipImSend,
-                imTextOverride: dbText !== text ? text : undefined,
-                localImagePaths,
-                workflowRuns: holdReason
-                  ? activeWorkflowRuns
-                  : completedWorkflowRuns,
-                messageMeta: {
-                  turnId: turnIdForDb,
-                  sessionId: result.sessionId || activeSessionId,
-                  sdkMessageUuid: result.sdkMessageUuid,
-                  sourceKind: result.sourceKind || 'sdk_final',
-                  finalizationReason: result.finalizationReason || 'completed',
+              const replySendOutcome = await sendMessageWithOutcome(
+                chatJid,
+                dbText,
+                {
+                  sendToIM: directImReply && !skipImSend,
+                  imTextOverride: dbText !== text ? text : undefined,
+                  localImagePaths,
+                  channelOutbox: outputChannelScope.scope
+                    ? {
+                        scopeKey: channelTurnScope(effectiveGroup.folder),
+                        scopeToken: outputChannelScope.scope.token,
+                        operationKey: `main:${lastProcessed.id}:${effectiveTurnId}:${durableOutputIdentity}`,
+                      }
+                    : undefined,
+                  workflowRuns: holdReason
+                    ? activeWorkflowRuns
+                    : completedWorkflowRuns,
+                  messageMeta: {
+                    turnId: turnIdForDb,
+                    sessionId: result.sessionId || activeSessionId,
+                    sdkMessageUuid: result.sdkMessageUuid,
+                    sourceKind: result.sourceKind || 'sdk_final',
+                    finalizationReason:
+                      result.finalizationReason || 'completed',
+                  },
                 },
-              });
+              );
+              lastReplyMsgId = replySendOutcome.messageId;
+              // A final provider-card ACK is the irreversible user-visible
+              // side effect for this turn.  Do it only after the Web/DB row is
+              // durable, and only after every local attachment has reached
+              // its exact turn-scoped Outbox destination.  This ordering
+              // makes a crash before DB persistence safely retryable and
+              // prevents a completed card from claiming success while one of
+              // its files is still missing.
+              let pendingStreamingCardCompleted = false;
+              if (pendingStreamingCardCompletion) {
+                if (localImagePaths.length > 0 && outputReplySourceJid) {
+                  for (
+                    let imageIndex = 0;
+                    imageIndex < localImagePaths.length;
+                    imageIndex++
+                  ) {
+                    const imgPath = localImagePaths[imageIndex];
+                    try {
+                      if (!outputChannelScope.scope) {
+                        streamingCardAttachmentsDelivered = false;
+                        logger.error(
+                          { chatJid, imgPath },
+                          'Suppressed final streaming-card image without an exact durable turn scope',
+                        );
+                        continue;
+                      }
+                      const imgBuf = await fs.promises.readFile(imgPath);
+                      const delivered = await sendTaskImageWithRetry(
+                        outputReplySourceJid,
+                        imgBuf,
+                        detectImageMimeType(imgBuf),
+                        undefined,
+                        path.basename(imgPath),
+                        {
+                          scopeKey: channelTurnScope(effectiveGroup.folder),
+                          scopeToken: outputChannelScope.scope.token,
+                          operationKey: `streaming-card-image:${outputChannelScope.inputId}:${imageIndex}`,
+                          ordinalSlot: `streaming-card-image:${imageIndex}`,
+                        },
+                      );
+                      if (!delivered) {
+                        streamingCardAttachmentsDelivered = false;
+                      }
+                    } catch (imgErr) {
+                      streamingCardAttachmentsDelivered = false;
+                      logger.warn(
+                        { chatJid, imgPath, err: imgErr },
+                        'Failed to deliver final streaming-card image',
+                      );
+                    }
+                  }
+                }
+
+                const cardFinalization = await finalizeChannelCardAfterDelivery(
+                  pendingStreamingCardCompletion,
+                  text,
+                  streamingCardAttachmentsDelivered,
+                  streamingCardAttachmentsDelivered
+                    ? '回复投递未确认，系统将重试'
+                    : '附件投递未确认，系统将重试',
+                );
+                pendingStreamingCardCompleted = cardFinalization.acknowledged;
+                if (pendingStreamingCardCompleted) {
+                  heldUsagePatchTarget = pendingStreamingCardCompletion;
+                  heldCardParts = [];
+                  imManager.clearAckReaction(outputReplySourceJid || chatJid);
+                } else if (cardFinalization.error) {
+                  logger.warn(
+                    { cardError: cardFinalization.error, chatJid },
+                    'Streaming card final ACK failed; keeping the channel turn retryable',
+                  );
+                } else {
+                  logger.error(
+                    { chatJid, inputTurnId: outputChannelScope.inputId },
+                    'Streaming card remains unfinished because an attachment was not physically ACKed',
+                  );
+                }
+
+                // A provisional active card is not a delivery ACK.  Failed
+                // attachment/card completion must flow into the retry path.
+                streamingCardHandledIM = pendingStreamingCardCompleted;
+                if (pendingStreamingCardCompleted) {
+                  channelStreamingSessionsByInput.delete(
+                    outputChannelScope.inputId,
+                  );
+                  if (outputStreamingSession === streamingSession) {
+                    if (outputCardProjection) {
+                      unregisterStreamingSession(outputCardProjection.jid);
+                    }
+                    streamingSession = undefined;
+                    activeDurableCardLifecycle = undefined;
+                  }
+                }
+              }
+              // A completed streaming card is the physical IM delivery. The
+              // static send path is intentionally skipped in that case, so its
+              // targetDelivered flag remains false even though Feishu ACKed the
+              // card. Any separately emitted local image is part of the same
+              // logical reply and must also be durably ACKed before the turn can
+              // advance its cursor.
+              let replyDeliveryAcknowledged = streamingCardHandledIM
+                ? streamingCardAttachmentsDelivered
+                : replySendOutcome.targetDelivered;
               if (!holdReason) {
                 activeWorkflowRuns = [];
                 completedWorkflowRuns = [];
@@ -5462,12 +6690,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // substantive reply to IM. Subsequent results (e.g., SDK Task
               // completions) are stored in DB but not spammed to IM.
               // Streaming card already handles IM delivery for the first reply.
-              if (replySourceImJid && replySourceImJid !== chatJid) {
-                if (!streamingCardHandledIM && !sentReply) {
-                  sendImWithFailTracking(
-                    replySourceImJid,
+              if (outputReplySourceJid && outputReplySourceJid !== chatJid) {
+                if (!streamingCardHandledIM && !outputAlreadySent) {
+                  replyDeliveryAcknowledged = await sendImWithRetry(
+                    outputReplySourceJid,
                     text,
                     localImagePaths,
+                    outputChannelScope.scope
+                      ? {
+                          scopeKey: channelTurnScope(effectiveGroup.folder),
+                          scopeToken: outputChannelScope.scope.token,
+                          operationKey: `main-routed:${lastProcessed.id}:${effectiveTurnId}:${durableOutputIdentity}`,
+                        }
+                      : undefined,
                   );
                 }
               }
@@ -5476,6 +6711,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               const webJid = chatJid.startsWith('web:')
                 ? chatJid
                 : `web:${effectiveGroup.folder}`;
+              let mirrorDeliveryAcknowledged = true;
               for (const [imJid, g] of Object.entries(registeredGroups)) {
                 if (
                   g.target_main_jid !== webJid ||
@@ -5484,11 +6720,54 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 )
                   continue;
                 if (g.reply_policy !== 'mirror') continue;
-                if (getChannelType(imJid))
-                  sendImWithFailTracking(imJid, text, localImagePaths);
+                if (!getChannelType(imJid)) continue;
+                const mirrorRuntime = channelTurnRuntimes.get(
+                  outputChannelScope.inputId,
+                );
+                const mirrorAddress = parseChannelAddress(imJid);
+                const mirrorAccountId =
+                  mirrorAddress?.channelAccountId ?? g.channel_account_id;
+                if (!mirrorRuntime || !mirrorAddress || !mirrorAccountId) {
+                  mirrorDeliveryAcknowledged = false;
+                  logger.error(
+                    { chatJid, imJid, inputTurnId: outputChannelScope.inputId },
+                    'Suppressed mirror delivery without an exact durable source turn',
+                  );
+                  continue;
+                }
+                const mirrorScope = bindChannelOutboxScope(
+                  mainAdmissionKey,
+                  mirrorRuntime,
+                  {
+                    provider: mirrorAddress.provider,
+                    accountId: mirrorAccountId,
+                    sourceJid: imJid,
+                    chatId: mirrorAddress.externalChatId,
+                    rootId: mirrorAddress.rootMessageId,
+                    threadId: mirrorAddress.threadId,
+                  },
+                );
+                channelOutboxScopesByInput.set(
+                  `${outputChannelScope.inputId}:mirror:${imJid}`,
+                  mirrorScope,
+                );
+                const delivered = await sendImWithRetry(
+                  imJid,
+                  text,
+                  localImagePaths,
+                  {
+                    scopeKey: mainAdmissionKey,
+                    scopeToken: mirrorScope.token,
+                    operationKey: `main-mirror:${outputChannelScope.inputId}:${imJid}:${durableOutputIdentity}`,
+                    ordinalSlot: `mirror:${imJid}`,
+                  },
+                );
+                mirrorDeliveryAcknowledged &&= delivered;
               }
+              replyDeliveryAcknowledged &&= mirrorDeliveryAcknowledged;
 
               sentReply = true;
+              sentReplyByInput.set(outputChannelScope.inputId, true);
               // See isGenuineReplyResult's doc comment (src/reply-delivery.ts)
               // for why a held/partial result must not count. Only ever SET
               // to true, never overwrite back to false: a later held/partial
@@ -5496,6 +6775,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // SDK task result after the main reply already completed)
               // must not erase an earlier genuine delivery in this same run.
               if (
+                replyDeliveryAcknowledged &&
                 isGenuineReplyResult({
                   holdReason,
                   sourceKind: result.sourceKind,
@@ -5518,7 +6798,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // Persist cursor as soon as a visible reply is emitted.
               // Long-lived runners may stay alive for idleTimeout, and waiting
               // until process exit would cause duplicate replay after restart.
-              if (result.inputTurnCompleted) commitCursor();
+              if (replyDeliveryAcknowledged) {
+                const acknowledgedInputIds = result.ipcReceipts?.length
+                  ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+                  : [result.inputTurnId ?? lastProcessed.id];
+                for (const inputId of acknowledgedInputIds) {
+                  channelPhysicalDeliveryAckByInput.set(inputId, true);
+                }
+              }
+              if (
+                result.inputTurnCompleted &&
+                replyDeliveryAcknowledged &&
+                completeChannelRuntimesForOutput(result)
+              ) {
+                commitCursor();
+              }
             }
             // Only reset idle timer on actual results, not session-update markers (result: null)
             resetIdleTimer();
@@ -5550,9 +6844,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     imManager.clearAckReaction(ackJid);
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
+    activeRouteAdmissions.delete(mainAdmissionKey);
     activeImReplyRoutes.delete(effectiveGroup.folder);
     activeAgentBuilderTurns.delete(effectiveGroup.folder);
     activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder));
+    for (const scope of new Set(channelOutboxScopesByInput.values())) {
+      activeChannelOutboxScopes.unbind(
+        channelTurnScope(effectiveGroup.folder),
+        scope,
+      );
+    }
     if (
       activeIpcReplyTurnTrackers.get(effectiveGroup.folder) ===
       ipcReplyTurnTracker
@@ -5637,6 +6938,75 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       heldCardUsage = null;
     }
 
+    if (channelTurnRuntimes.size > 0) {
+      const explicitDiscard =
+        queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard';
+      for (const [inputTurnId, runtime] of channelTurnRuntimes) {
+        const inputSettled =
+          healthyInputTurnCompleted &&
+          channelPhysicalDeliveryAckByInput.get(inputTurnId) === true;
+        let settled = false;
+        const uncertainDelivery = getUncertainChannelOutboxForTurn(
+          runtime.runId,
+        );
+        if (uncertainDelivery) {
+          channelDeliveryNeedsManualReconciliation = true;
+          settled = runtime.interrupt(
+            `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
+          );
+          const exactScope = channelOutboxScopesByInput.get(inputTurnId);
+          const notified = exactScope?.chatId
+            ? await deliverIndependentChannelSystemNotice({
+                logicalChatJid: chatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder),
+                targetJid: exactScope.sourceJid,
+                originalInputTurnId: inputTurnId,
+                originalRunId: runtime.runId,
+                noticeKey: 'delivery-uncertain',
+                text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+                route: { ...exactScope, chatId: exactScope.chatId },
+              })
+            : false;
+          if (!notified) channelManualNoticesAcknowledged = false;
+        } else if (explicitDiscard) {
+          settled = runtime.cancel('Input discarded by explicit stop');
+        } else if (
+          inputTurnId === ipcReplyTurnTracker.inputTurnId &&
+          inputSettled
+        ) {
+          settled =
+            runtime.markFinalizing() &&
+            runtime.complete({ cursorCommitted, sentReply });
+        } else {
+          settled = runtime.retry(
+            lastError ||
+              (output?.status === 'closed'
+                ? 'Agent connection closed before completing input turn'
+                : wasInterrupted
+                  ? 'Agent interrupted before completing input turn'
+                  : 'Agent execution ended before completing input turn'),
+          );
+        }
+        if (!settled) {
+          logger.error(
+            {
+              chatJid,
+              inputTurnId,
+              runId: runtime.runId,
+              durabilityFailure: runtime.hasDurabilityFailure,
+              lostFence: runtime.hasLostFence,
+            },
+            'Channel turn cleanup did not reach a durable state',
+          );
+        }
+        runtime.dispose();
+      }
+      channelTurnRuntimes.clear();
+      if (channelDeliveryNeedsManualReconciliation) {
+        if (channelManualNoticesAcknowledged) commitCursor();
+      }
+    }
+
     // ── 保存中断内容到数据库 + 广播到 Web ──
     // Skip if the shutdown handler already saved this streaming text (prevents duplicates).
     const webJidForShutdownCheck = chatJid.startsWith('web:')
@@ -5704,6 +7074,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // runAgent threw — output is undefined, cannot proceed with post-processing.
   // If a reply was already sent, commit the cursor so we don't re-process.
   // Otherwise return false to allow retry (H-1 audit fix).
+  if (channelDeliveryNeedsManualReconciliation) {
+    return channelManualNoticesAcknowledged && cursorCommitted;
+  }
   if (!output) {
     if (queue.getRecentStopDisposition(effectiveGroup.folder) === 'discard') {
       commitCursor();
@@ -6449,8 +7822,12 @@ async function sendMessageWithOutcome(
         const localImagePaths =
           options.localImagePaths ??
           extractLocalImImagePaths(imText, resolveEffectiveFolder(jid));
-        await imManager.sendMessage(jid, imText, localImagePaths);
-        targetDelivered = true;
+        targetDelivered = await sendImWithRetry(
+          jid,
+          imText,
+          localImagePaths,
+          options.channelOutbox,
+        );
       } catch (err) {
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
@@ -6470,7 +7847,7 @@ async function sendMessageWithOutcome(
       true,
       { meta: options.messageMeta },
     );
-    if (!isIMChannel) targetDelivered = true;
+    if (!sendToIM || !isIMChannel) targetDelivered = true;
 
     broadcastNewMessage(
       jid,
@@ -6996,6 +8373,10 @@ function startIpcWatcher(): void {
                   effectiveChatJid,
                   webText,
                   {
+                    // Persist/project only. Native delivery below must use
+                    // the exact inputTurnId-bound Outbox even when this JID
+                    // itself is a Feishu/IM address.
+                    sendToIM: false,
                     messageMeta: {
                       sourceKind: 'sdk_send_message',
                     },
@@ -7003,31 +8384,50 @@ function startIpcWatcher(): void {
                 );
                 messageDelivered = sendOutcome.targetDelivered;
 
-                // Forward to IM channel — but NOT for conversation agent messages.
-                // Conversation agents handle their own IM routing in
-                // processAgentConversation's wrappedOnOutput callback.
-                if (!ipcAgentId) {
-                  const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
-                  if (
-                    !isTaskIpcMessage &&
-                    ipcImRoute &&
-                    getChannelType(data.chatJid) === null &&
-                    ipcImRoute !== data.chatJid
-                  ) {
-                    const localImages = extractLocalImImagePaths(
-                      data.text,
-                      sourceGroup,
-                    );
-                    // A Web persistence success is not enough when this turn
-                    // originated from IM. Wait for the connector result so the
-                    // MCP tool and retry logic never acknowledge a failed send.
-                    messageDelivered = await sendImWithRetry(
-                      ipcImRoute,
-                      data.text,
-                      localImages,
-                    );
+                // Every non-task native send, including conversation agents,
+                // resolves the sticky exact route and uses the Turn Outbox.
+                // DB/Web stores markdown extracted from a Feishu card; the
+                // connector receives the original JSON/text payload.
+                if (!isTaskIpcMessage) {
+                  const ipcImRoute = resolveImRoute({
+                    ipcAgentId,
+                    isHome,
+                    chatJid: data.chatJid,
+                    sourceGroup,
+                  });
+                  if (ipcImRoute) {
+                    if (
+                      typeof data.inputTurnId !== 'string' ||
+                      !data.inputTurnId
+                    ) {
+                      messageDelivered = false;
+                      logger.error(
+                        {
+                          sourceGroup,
+                          agentId: ipcAgentId,
+                          chatJid: data.chatJid,
+                        },
+                        'Suppressed IPC send_message without an immutable inputTurnId',
+                      );
+                    } else {
+                      messageDelivered = await sendImWithRetry(
+                        ipcImRoute,
+                        data.text,
+                        extractLocalImImagePaths(data.text, sourceGroup),
+                        channelOutboxRefForInput(
+                          channelTurnScope(sourceGroup, ipcAgentId),
+                          ipcImRoute,
+                          data.inputTurnId,
+                          `ipc-message:${messageRequestId ?? file}`,
+                        ),
+                      );
+                    }
                   }
+                }
 
+                // Scheduled-task delivery uses its independent durable task
+                // receipt ledger.
+                if (!ipcAgentId) {
                   // Scheduled-task output routing. Decision logic is in
                   // resolveTaskRoutingDecision() (src/task-routing.ts) so it
                   // can be unit-tested without booting this module.
@@ -7093,7 +8493,10 @@ function startIpcWatcher(): void {
                     ) {
                       // Fallback: broadcast to all connected IM channels
                       const alreadySent = new Set<string>(
-                        [data.chatJid, ipcImRoute].filter(Boolean) as string[],
+                        [
+                          data.chatJid,
+                          activeImReplyRoutes.get(sourceGroup),
+                        ].filter(Boolean) as string[],
                       );
                       broadcastToOwnerIMChannels(
                         sourceGroupEntry.created_by,
@@ -7224,6 +8627,8 @@ function startIpcWatcher(): void {
                         chatJid: data.chatJid,
                         sourceGroup,
                       });
+                  let regularImageDelivered: boolean | null = null;
+                  let durableScopedImage = false;
                   if (isTaskIpcImage) {
                     const imgRoutingDecision = resolveTaskRoutingDecision(
                       data,
@@ -7250,20 +8655,25 @@ function startIpcWatcher(): void {
                     }
                   }
                   if (imgImRoute) {
-                    const sent = await retryImOperation(
-                      'send_image',
+                    const imageOutboxRef = channelOutboxRefForInput(
+                      channelTurnScope(sourceGroup, ipcAgentId),
                       imgImRoute,
-                      () =>
-                        imManager.sendImage(
-                          imgImRoute,
-                          imageBuffer,
-                          mimeType,
-                          caption,
-                          fileName,
-                        ),
+                      data.inputTurnId,
+                      `ipc-image:${messageRequestId ?? file}`,
                     );
-                    if (!sent) {
-                      const failMsg = `⚠️ 图片 "${fileName || caption || 'image'}" 发送失败（IM 通道发送失败），请稍后重试。`;
+                    durableScopedImage = Boolean(imageOutboxRef);
+                    regularImageDelivered = await sendTaskImageWithRetry(
+                      imgImRoute,
+                      imageBuffer,
+                      mimeType,
+                      caption,
+                      fileName,
+                      imageOutboxRef,
+                    );
+                    if (!regularImageDelivered) {
+                      const failMsg = durableScopedImage
+                        ? `⚠️ 图片 "${fileName || caption || 'image'}" 的投递结果待确认，系统不会自动重发，以免产生重复图片。`
+                        : `⚠️ 图片 "${fileName || caption || 'image'}" 发送失败（IM 通道发送失败），请稍后重试。`;
                       broadcastToWebClients(sourceGroup, failMsg);
                     }
                   } else if (!isTaskIpcImage) {
@@ -7375,7 +8785,14 @@ function startIpcWatcher(): void {
                     messageResultWritten = writeIpcMessageResult(
                       messageResultsDir,
                       messageRequestId,
-                      { success: true },
+                      regularImageDelivered
+                        ? { success: true }
+                        : {
+                            success: false,
+                            error: durableScopedImage
+                              ? 'Image delivery outcome is uncertain; do not retry automatically.'
+                              : 'Image could not be delivered to its IM target.',
+                          },
                     );
                   }
 
@@ -8926,11 +10343,57 @@ async function processTaskIpc(
           operation: data.operation as FeishuCapabilityOperation,
           params: data.params,
         };
-        const result = await imManager.executeFeishuCapability(
-          activeTurn.sourceJid,
-          activeTurn.context,
-          request,
-        );
+        let result;
+        if (isFeishuCapabilityMutation(request)) {
+          const outboxScope = activeChannelOutboxScopes.resolveInput(
+            scope,
+            data.inputTurnId,
+            activeTurn.sourceJid,
+          );
+          if (!outboxScope) {
+            throw new Error(
+              'Exact durable scope for this Feishu mutation is unavailable; operation suppressed.',
+            );
+          }
+          const mutation = await deliverFeishuCapabilityMutation({
+            ...outboxScope,
+            requestId: data.requestId,
+            request,
+            owner: `happyclaw-feishu-capability:${process.pid}:${outboxScope.turnRunId}`,
+            execute: () =>
+              imManager.executeFeishuCapability(
+                activeTurn.sourceJid,
+                activeTurn.context,
+                request,
+              ),
+          });
+          if (mutation.delivery.status !== 'delivered') {
+            throw new Error(
+              mutation.delivery.status === 'uncertain'
+                ? 'Feishu mutation delivery is uncertain; do not retry automatically. An operator must confirm the provider result.'
+                : mutation.delivery.error ||
+                    `Feishu mutation did not complete (${mutation.delivery.status}).`,
+            );
+          }
+          result =
+            mutation.result ??
+            ({
+              operation: request.operation,
+              data: {
+                deliveryStatus: 'already_delivered',
+                providerReceipt:
+                  mutation.delivery.receipt?.providerMessageId ?? null,
+              },
+            } satisfies Awaited<
+              ReturnType<typeof imManager.executeFeishuCapability>
+            >);
+        } else {
+          result = await imManager.executeFeishuCapability(
+            activeTurn.sourceJid,
+            activeTurn.context,
+            request,
+          );
+        }
         writeTaskResult(tasksDir, 'feishu_capability', data.requestId, {
           success: true,
           ...result,
@@ -9255,7 +10718,25 @@ async function processTaskIpc(
               });
               if (imRoute) {
                 try {
-                  await imManager.sendMessage(imRoute, warnMsg);
+                  const ref = channelOutboxRefForInput(
+                    channelTurnScope(sourceGroup, ipcAgentId),
+                    imRoute,
+                    data.inputTurnId,
+                    `ipc-file-not-found:${data.requestId ?? data.filePath}`,
+                  );
+                  if (ref) {
+                    await sendImWithRetry(imRoute, warnMsg, [], ref);
+                  } else if (ipcTaskId || data.isScheduledTask) {
+                    // Scheduled tasks use a separate durable receipt ledger;
+                    // retain the legacy notification until that branch records
+                    // its task-scoped failure below.
+                    await imManager.sendMessage(imRoute, warnMsg);
+                  } else {
+                    logger.error(
+                      { sourceGroup, agentId: ipcAgentId, imRoute },
+                      'Suppressed file-not-found warning without exact channel Turn scope',
+                    );
+                  }
                 } catch {
                   // ignore
                 }
@@ -9375,26 +10856,40 @@ async function processTaskIpc(
                   : delivery.receipt.error || 'File delivery failed.',
               );
             } else if (regularFileImRoute) {
-              const sent = await retryImOperation(
-                'send_file',
+              const regularFileOutboxRef = channelOutboxRefForInput(
+                channelTurnScope(sourceGroup, ipcAgentId),
                 regularFileImRoute,
-                () =>
-                  imManager.sendFile(
-                    regularFileImRoute,
-                    resolvedPath,
-                    imFileName,
-                  ),
+                data.inputTurnId,
+                `ipc-file:${data.requestId ?? ipcTaskId ?? data.filePath}`,
+              );
+              const durableScopedFile = Boolean(regularFileOutboxRef);
+              const sent = await sendTaskFileWithRetry(
+                regularFileImRoute,
+                resolvedPath,
+                imFileName,
+                regularFileOutboxRef,
               );
               if (!sent) {
-                const failMsg = `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`;
+                const failMsg = durableScopedFile
+                  ? `⚠️ 文件 "${data.fileName}" 的投递结果待确认，系统不会自动重发，以免产生重复文件。`
+                  : `⚠️ 文件 "${data.fileName}" 发送失败，请稍后重试。`;
                 broadcastToWebClients(sourceGroup, failMsg);
-                try {
-                  await imManager.sendMessage(regularFileImRoute, failMsg);
-                } catch {
-                  // ignore — failure notification itself failing should not crash
+                if (!durableScopedFile) {
+                  try {
+                    await imManager.sendMessage(regularFileImRoute, failMsg);
+                  } catch {
+                    // ignore — failure notification itself failing should not crash
+                  }
                 }
               }
-              finishSendFile(sent, sent ? undefined : 'File delivery failed.');
+              finishSendFile(
+                sent,
+                sent
+                  ? undefined
+                  : durableScopedFile
+                    ? 'File delivery outcome is uncertain; do not retry automatically.'
+                    : 'File delivery failed.',
+              );
             }
           } else {
             logger.debug(
@@ -9674,17 +11169,28 @@ async function processAgentConversation(
         }
         return null;
       })();
+      let agentPluginRepliesAcknowledged = true;
       for (const r of replies) {
         const perMsgImJid =
           r.originalMsg.source_jid && getChannelType(r.originalMsg.source_jid)
             ? r.originalMsg.source_jid
             : persistedAgentImJid;
-        sendPluginExpanderReply(virtualChatJid, r.text, perMsgImJid);
+        const delivery = await sendPluginExpanderReply(virtualChatJid, r.text, {
+          originalMessageId: r.originalMsg.id,
+          groupFolder: effectiveGroup.folder,
+          imRouteJid: perMsgImJid,
+          agentId,
+        });
+        if (!delivery.acknowledged) {
+          agentPluginRepliesAcknowledged = false;
+          break;
+        }
         advanceReplyCursor(virtualChatJid, {
           timestamp: r.originalMsg.timestamp,
           id: r.originalMsg.id,
         });
       }
+      if (!agentPluginRepliesAcknowledged) return false;
       if (toSend.length === 0) {
         // Spawn agents are fire-and-forget: if expansion consumed all
         // messages with replies, mark as completed so the agent slot is freed.
@@ -9770,39 +11276,34 @@ async function processAgentConversation(
   // are explicitly bound to IM groups, so the user expects replies to go back
   // to the IM channel they last messaged from — even if older messages in
   // the batch originated from the web (e.g. after a /clear).
-  let replySourceImJid: string | null = null;
-  {
-    const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
-    if (lastSourceJid && getChannelType(lastSourceJid) !== null) {
-      replySourceImJid = lastSourceJid;
+  const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
+  const incomingAgentOwner =
+    lastSourceJid && getChannelType(lastSourceJid) !== null
+      ? lastSourceJid
+      : null;
+  const agentRow = getAgent(agentId);
+  const persistedAgentOwner =
+    getSessionChannelOwner(effectiveGroup.folder, agentId) ??
+    agentRow?.last_im_jid ??
+    null;
+  let replySourceImJid = resolveStickyChannelOwner(
+    persistedAgentOwner,
+    incomingAgentOwner,
+  );
+
+  // Persist once so restarts and later Web/other-IM input keep the first
+  // concrete channel/account/thread identity for this logical Session.
+  if (!persistedAgentOwner && replySourceImJid) {
+    replySourceImJid = setSessionChannelOwnerOnce(
+      effectiveGroup.folder,
+      agentId,
+      replySourceImJid,
+    );
+    if (!agentRow?.last_im_jid) {
+      updateAgentLastImJid(agentId, replySourceImJid);
     }
   }
-
-  // Fallback: if no IM source in current messages (e.g. web "继续" after
-  // restart), recover from the persisted last_im_jid in the DB (#225).
-  // Verify the channel is actually connected — stale JIDs from disabled
-  // channels would cause unnecessary retries and eventual auto-unbind.
-  if (!replySourceImJid) {
-    const agentRow = getAgent(agentId);
-    if (agentRow?.last_im_jid) {
-      if (imManager.isChannelAvailableForJid(agentRow.last_im_jid)) {
-        replySourceImJid = agentRow.last_im_jid;
-        logger.info(
-          { chatJid, agentId, recoveredImJid: replySourceImJid },
-          'Recovered IM routing from persisted last_im_jid',
-        );
-      } else {
-        logger.info(
-          { chatJid, agentId, staleImJid: agentRow.last_im_jid },
-          'Skipped last_im_jid recovery: channel disconnected',
-        );
-      }
-    }
-  }
-
-  // Persist the IM routing target so it survives service restarts.
   if (replySourceImJid) {
-    updateAgentLastImJid(agentId, replySourceImJid);
     // Publish to activeImReplyRoutes so send_file/send_image IPC can route to IM.
     // Only use virtualChatJid key (per-agent) — folder-level key would collide
     // when multiple auto_im agents share the same workspace folder.
@@ -9823,11 +11324,191 @@ async function processAgentConversation(
   const streamingSessionJid = replySourceImJid
     ? `${replySourceImJid}#agent:${agentId}`
     : undefined;
+  const lastProcessed = missedMessages[missedMessages.length - 1];
+  let activeAgentInputTurnId = lastProcessed.id;
+  const agentStreamingAddress = replySourceImJid
+    ? parseChannelAddress(replySourceImJid)
+    : null;
+  const agentStreamingGroup = replySourceImJid
+    ? getRegisteredGroup(channelConversationJid(replySourceImJid))
+    : undefined;
+  const agentStreamingAccountId =
+    agentStreamingAddress?.channelAccountId ??
+    agentStreamingGroup?.channel_account_id;
+  let agentChannelTurnRuntime =
+    replySourceImJid && agentStreamingAddress && agentStreamingAccountId
+      ? ChannelTurnRuntime.start({
+          provider: agentStreamingAddress.provider,
+          accountId: agentStreamingAccountId,
+          sourceJid: replySourceImJid,
+          chatId: agentStreamingAddress.externalChatId,
+          rootId: agentStreamingAddress.rootMessageId,
+          threadId: agentStreamingAddress.threadId,
+          externalMessageId: lastProcessed.id,
+          agentId,
+          sessionId,
+        })
+      : undefined;
+  const agentChannelTurnRuntimes = new Map<string, ChannelTurnRuntime>();
+  if (agentChannelTurnRuntime) {
+    agentChannelTurnRuntimes.set(lastProcessed.id, agentChannelTurnRuntime);
+  }
+  const completeAgentChannelRuntimesForOutput = (
+    result: ContainerOutput,
+  ): boolean => {
+    if (!result.inputTurnCompleted) return false;
+    let allCompleted = true;
+    const inputIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [result.inputTurnId ?? lastProcessed.id];
+    for (const inputId of inputIds) {
+      const runtime = agentChannelTurnRuntimes.get(inputId);
+      if (!runtime) continue;
+      if (agentPhysicalDeliveryAckByInput.get(inputId) !== true) {
+        allCompleted = false;
+        logger.error(
+          { chatJid, agentId, inputTurnId: inputId, runId: runtime.runId },
+          'Refusing to complete agent input without exact physical delivery ACK',
+        );
+        continue;
+      }
+      const completed =
+        runtime.markFinalizing() &&
+        runtime.complete({
+          cursorCommitted: true,
+          replyDelivered: true,
+          inputTurnId: inputId,
+        });
+      if (completed) {
+        // Retain exact scope until runner finally; see main-path comment.
+        runtime.dispose();
+        agentChannelTurnRuntimes.delete(inputId);
+      } else {
+        allCompleted = false;
+        logger.error(
+          {
+            chatJid,
+            agentId,
+            inputTurnId: inputId,
+            runId: runtime.runId,
+            durabilityFailure: runtime.hasDurabilityFailure,
+            lostFence: runtime.hasLostFence,
+          },
+          'Completed agent input could not terminalize its channel turn ledger',
+        );
+      }
+    }
+    return allCompleted;
+  };
+  const agentScopeForOutput = (
+    result: ContainerOutput,
+  ): {
+    inputId: string;
+    scope?: ActiveChannelOutboxScope;
+    rejected: boolean;
+  } => {
+    const inputIds = result.ipcReceipts?.length
+      ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
+      : [];
+    const inputId = resolveContainerOutputInputTurnId(result, lastProcessed.id);
+    return {
+      inputId,
+      scope: agentChannelOutboxScopesByInput.get(inputId),
+      rejected: inputIds.some((id) => rejectedAgentInputTurns.has(id)),
+    };
+  };
+  if (
+    agentChannelTurnRuntime &&
+    agentChannelTurnRuntime.executionDisposition !== 'execute'
+  ) {
+    const disposition = agentChannelTurnRuntime.executionDisposition;
+    if (
+      disposition === 'manual_reconciliation' &&
+      agentStreamingAddress &&
+      agentStreamingAccountId &&
+      replySourceImJid
+    ) {
+      const notified = await deliverChannelManualReconciliationNotice({
+        logicalChatJid: virtualChatJid,
+        scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+        targetJid: replySourceImJid,
+        runtime: agentChannelTurnRuntime,
+        agentId,
+        route: {
+          provider: agentStreamingAddress.provider,
+          accountId: agentStreamingAccountId,
+          sourceJid: replySourceImJid,
+          chatId: agentStreamingAddress.externalChatId,
+          rootId: agentStreamingAddress.rootMessageId,
+          threadId: agentStreamingAddress.threadId,
+        },
+      });
+      agentChannelTurnRuntime.dispose();
+      activeImReplyRoutes.delete(virtualChatJid);
+      updateAgentStatus(agentId, 'idle');
+      if (!notified) return false;
+      advanceCursors(virtualChatJid, {
+        timestamp: lastProcessed.timestamp,
+        id: lastProcessed.id,
+      });
+      return true;
+    }
+    agentChannelTurnRuntime.dispose();
+    activeImReplyRoutes.delete(virtualChatJid);
+    updateAgentStatus(
+      agentId,
+      agent.kind === 'spawn' && disposition === 'skip_terminal'
+        ? 'completed'
+        : 'idle',
+    );
+    if (disposition === 'skip_terminal') {
+      advanceCursors(virtualChatJid, {
+        timestamp: lastProcessed.timestamp,
+        id: lastProcessed.id,
+      });
+      return true;
+    }
+    logger.info(
+      { chatJid, agentId, turnRunId: agentChannelTurnRuntime.runId },
+      'Agent channel turn is already leased; deferring duplicate execution',
+    );
+    return false;
+  }
+  const agentRetryAttempt = queue.getRetryCount(virtualChatJid);
+  let activeAgentDurableCardLifecycle =
+    agentRetryAttempt === 0 && agentStreamingAddress?.provider === 'feishu'
+      ? agentChannelTurnRuntime?.reserveStreamingCard()
+      : undefined;
+  if (
+    agentChannelTurnRuntime &&
+    agentStreamingAddress?.provider === 'feishu' &&
+    agentRetryAttempt === 0 &&
+    !activeAgentDurableCardLifecycle
+  ) {
+    agentChannelTurnRuntime.retry('Duplicate streaming card reservation');
+    agentChannelTurnRuntime.dispose();
+    activeImReplyRoutes.delete(virtualChatJid);
+    updateAgentStatus(agentId, 'idle');
+    return false;
+  }
+  let agentChannelOutboxScope: ActiveChannelOutboxScope | undefined;
+  const agentChannelOutboxScopesByInput = new Map<
+    string,
+    ActiveChannelOutboxScope
+  >();
+  const rejectedAgentInputTurns = new Set<string>();
   let agentStreamingSession = replySourceImJid
-    ? await imManager.createStreamingSession(replySourceImJid, (messageId) =>
-        registerMessageIdMapping(messageId, streamingSessionJid!),
+    ? await imManager.createStreamingSession(
+        replySourceImJid,
+        (messageId) =>
+          registerMessageIdMapping(messageId, streamingSessionJid!),
+        activeAgentDurableCardLifecycle,
       )
     : undefined;
+  const agentStreamingSessionsByInput = new Map<
+    string,
+    { session: NonNullable<typeof agentStreamingSession>; jid: string }
+  >();
   let agentStreamingAccText = '';
   let agentStreamInterrupted = false;
   let agentStreamSteered = false;
@@ -9917,47 +11598,236 @@ async function processAgentConversation(
   };
   if (agentStreamingSession && streamingSessionJid) {
     registerStreamingSession(streamingSessionJid, agentStreamingSession);
+    agentStreamingSessionsByInput.set(lastProcessed.id, {
+      session: agentStreamingSession,
+      jid: streamingSessionJid,
+    });
     logger.debug(
       { chatJid, agentId },
       'Streaming card session created for conversation agent',
     );
   }
+  interface AdmittedWarmAgentInput {
+    sourceJid: string | null;
+    imJid: string | null;
+    runtime?: ChannelTurnRuntime;
+    scope?: ActiveChannelOutboxScope;
+    lifecycle?: typeof activeAgentDurableCardLifecycle;
+  }
+  const admittedWarmAgentInputs = new Map<string, AdmittedWarmAgentInput>();
+  const agentAdmissionKey = channelTurnScope(effectiveGroup.folder, agentId);
+  activeRouteAdmissions.set(agentAdmissionKey, (newSourceJid, inputTurnId) => {
+    if (admittedWarmAgentInputs.has(inputTurnId)) return false;
+    const targetSourceJid = resolveStickyChannelOwner(
+      replySourceImJid,
+      newSourceJid,
+    );
+    let nextRuntime: ChannelTurnRuntime | undefined;
+    let nextScope: ActiveChannelOutboxScope | undefined;
+    let nextLifecycle: typeof activeAgentDurableCardLifecycle;
+    if (targetSourceJid) {
+      const nextAddress = parseChannelAddress(targetSourceJid);
+      const nextGroup = nextAddress
+        ? getRegisteredGroup(channelConversationJid(targetSourceJid))
+        : undefined;
+      const nextAccountId =
+        nextAddress?.channelAccountId ?? nextGroup?.channel_account_id;
+      if (!nextAddress || !nextAccountId) return false;
+      nextRuntime = ChannelTurnRuntime.start({
+        provider: nextAddress.provider,
+        accountId: nextAccountId,
+        sourceJid: targetSourceJid,
+        chatId: nextAddress.externalChatId,
+        rootId: nextAddress.rootMessageId,
+        threadId: nextAddress.threadId,
+        externalMessageId: inputTurnId,
+        agentId,
+        sessionId: currentAgentSessionId,
+      });
+      if (nextRuntime.executionDisposition !== 'execute') {
+        nextRuntime.dispose();
+        return false;
+      }
+      nextLifecycle =
+        nextAddress.provider === 'feishu'
+          ? nextRuntime.reserveStreamingCard()
+          : undefined;
+      if (nextAddress.provider === 'feishu' && !nextLifecycle) {
+        nextRuntime.retry('Unable to reserve warm agent card');
+        nextRuntime.dispose();
+        return false;
+      }
+      nextScope = bindChannelOutboxScope(agentAdmissionKey, nextRuntime, {
+        provider: nextAddress.provider,
+        accountId: nextAccountId,
+        sourceJid: targetSourceJid,
+        chatId: nextAddress.externalChatId,
+        rootId: nextAddress.rootMessageId,
+        threadId: nextAddress.threadId,
+      });
+      agentChannelTurnRuntimes.set(inputTurnId, nextRuntime);
+      agentChannelOutboxScopesByInput.set(inputTurnId, nextScope);
+    }
+    admittedWarmAgentInputs.set(inputTurnId, {
+      sourceJid: newSourceJid,
+      imJid: targetSourceJid,
+      runtime: nextRuntime,
+      scope: nextScope,
+      lifecycle: nextLifecycle,
+    });
+    return {
+      rollback: () => {
+        const admitted = admittedWarmAgentInputs.get(inputTurnId);
+        if (!admitted) return;
+        admittedWarmAgentInputs.delete(inputTurnId);
+        agentChannelTurnRuntimes.delete(inputTurnId);
+        agentChannelOutboxScopesByInput.delete(inputTurnId);
+        activeChannelOutboxScopes.unbind(agentAdmissionKey, admitted.scope);
+        if (admitted.runtime) {
+          const cardRolledBack = admitted.lifecycle
+            ? admitted.runtime.rollbackUnpublishedStreamingCardReservation()
+            : true;
+          if (cardRolledBack) {
+            admitted.runtime.retry(
+              'IPC publish failed after warm agent admission',
+            );
+          } else {
+            admitted.runtime.interrupt(
+              'Warm agent admission could not safely roll back its unpublished card',
+            );
+          }
+          admitted.runtime.dispose();
+        }
+      },
+    };
+  });
   // 用户在挂起期间发来新消息 → 先定稿旧卡、开新卡（注入点在 web.ts /
   // 消息循环，经 activeHeldCardFinalizers 以 virtualChatJid 为键触达）。
-  activeHeldCardFinalizers.set(virtualChatJid, () => {
-    void (async () => {
-      if (heldAgentParts.length === 0) return;
-      const txt = heldAgentParts.join(HELD_TURN_DIVIDER);
-      heldAgentParts = [];
-      heldAgentUsage = null;
-      // DB 合并行内容已随每个 held turn 更新到位，仅需结束序列锚点
-      heldAgentDbMsgId = null;
-      heldAgentDbTurnId = null;
-      if (!agentStreamingSession?.isActive()) return;
-      try {
-        await agentStreamingSession.complete(txt);
-      } catch {
-        await agentStreamingSession.abort('').catch(() => {});
+  activeHeldCardFinalizers.set(virtualChatJid, (newSourceJid, inputTurnId) => {
+    const admittedInput = inputTurnId
+      ? admittedWarmAgentInputs.get(inputTurnId)
+      : undefined;
+    if (inputTurnId && !admittedInput) return;
+    const admittedAgentLifecycle = admittedInput?.lifecycle;
+    const agentInputAdmitted = !!admittedInput;
+    let targetSourceJid =
+      admittedInput?.imJid ??
+      resolveStickyChannelOwner(replySourceImJid, newSourceJid ?? null);
+    if (!replySourceImJid && targetSourceJid) {
+      targetSourceJid = setSessionChannelOwnerOnce(
+        effectiveGroup.folder,
+        agentId,
+        targetSourceJid,
+      );
+      if (!getAgent(agentId)?.last_im_jid) {
+        updateAgentLastImJid(agentId, targetSourceJid);
       }
-      if (streamingSessionJid) unregisterStreamingSession(streamingSessionJid);
+    }
+    if (inputTurnId) {
+      activeAgentInputTurnId = inputTurnId;
+      healthyAgentInputTurnCompleted = false;
+      cursorCommitted = false;
+      lastAgentReplyMsgId = undefined;
+      lastAgentReplyText = undefined;
+      agentReplySentByInput.set(inputTurnId, false);
+      agentPhysicalDeliveryAckByInput.set(inputTurnId, false);
+    }
+    if (inputTurnId && targetSourceJid) {
+      agentChannelTurnRuntime = admittedInput?.runtime;
+      agentChannelOutboxScope = admittedInput?.scope;
+      activeAgentDurableCardLifecycle = admittedInput?.lifecycle;
+      replySourceImJid = targetSourceJid;
+      activeImReplyRoutes.set(virtualChatJid, targetSourceJid);
+    }
+    // Reservation is durable, but projection activation belongs to the first
+    // runner output carrying this inputTurnId. Keep A's card untouched while
+    // B is merely queued/published.
+    if (agentInputAdmitted) return;
+    const previousAgentSession = agentStreamingSession;
+    agentStreamingSession = undefined;
+    if (streamingSessionJid) {
+      unregisterStreamingSession(streamingSessionJid);
+    }
+    void (async () => {
+      if (heldAgentParts.length > 0) {
+        const txt = heldAgentParts.join(HELD_TURN_DIVIDER);
+        heldAgentParts = [];
+        heldAgentUsage = null;
+        heldAgentDbMsgId = null;
+        heldAgentDbTurnId = null;
+        if (previousAgentSession?.isActive()) {
+          try {
+            await previousAgentSession.complete(txt);
+          } catch {
+            await previousAgentSession.abort('').catch(() => {});
+          }
+        }
+      } else if (previousAgentSession?.isActive()) {
+        await previousAgentSession.abort('新消息已开始').catch(() => {});
+      }
+      previousAgentSession?.dispose();
       agentStreamingAccText = '';
-      agentStreamingSession = replySourceImJid
-        ? await imManager
-            .createStreamingSession(replySourceImJid, (messageId) =>
-              registerMessageIdMapping(messageId, streamingSessionJid!),
-            )
-            .catch(() => undefined)
-        : undefined;
+      agentStreamingSession =
+        targetSourceJid && inputTurnId && agentInputAdmitted
+          ? await imManager
+              .createStreamingSession(
+                targetSourceJid,
+                (messageId) =>
+                  registerMessageIdMapping(messageId, streamingSessionJid!),
+                admittedAgentLifecycle,
+              )
+              .catch(() => undefined)
+          : undefined;
       if (agentStreamingSession && streamingSessionJid) {
         registerStreamingSession(streamingSessionJid, agentStreamingSession);
+        if (inputTurnId) {
+          agentStreamingSessionsByInput.set(inputTurnId, {
+            session: agentStreamingSession,
+            jid: streamingSessionJid,
+          });
+        }
       }
     })().catch((err) => {
       logger.warn(
-        { err, chatJid, agentId },
-        'Failed to finalize held agent streaming card on new message',
+        { err, chatJid, agentId, inputTurnId },
+        'Failed to rotate agent streaming card on new message',
       );
     });
   });
+
+  const activateAgentProjectionForInput = async (
+    inputTurnId: string | undefined,
+  ): Promise<void> => {
+    if (!inputTurnId) return;
+    const existing = agentStreamingSessionsByInput.get(inputTurnId);
+    if (existing) {
+      agentStreamingSession = existing.session;
+      return;
+    }
+    const admitted = admittedWarmAgentInputs.get(inputTurnId);
+    if (!admitted?.imJid || !admitted.lifecycle || !streamingSessionJid) return;
+    const session = await imManager
+      .createStreamingSession(
+        admitted.imJid,
+        (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
+        admitted.lifecycle,
+      )
+      .catch((error) => {
+        logger.error(
+          { error, chatJid, agentId, inputTurnId },
+          'Failed to activate pre-admitted agent streaming projection',
+        );
+        return undefined;
+      });
+    if (!session) return;
+    agentStreamingSessionsByInput.set(inputTurnId, {
+      session,
+      jid: streamingSessionJid,
+    });
+    registerStreamingSession(streamingSessionJid, session);
+    agentStreamingSession = session;
+    agentStreamingAccText = '';
+  };
 
   // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -9975,11 +11845,17 @@ async function processAgentConversation(
   let cursorCommitted = false;
   let healthyAgentInputTurnCompleted = false;
   let retryUnfinishedTurn = false;
+  let agentDeliveryNeedsManualReconciliation = false;
   let hadError = false;
   let lastError = '';
   let lastAgentReplyMsgId: string | undefined;
   let lastAgentReplyText: string | undefined;
-  const lastProcessed = missedMessages[missedMessages.length - 1];
+  const agentReplySentByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
+  const agentPhysicalDeliveryAckByInput = new Map<string, boolean>([
+    [lastProcessed.id, false],
+  ]);
   const currentAgentSourceJid = lastProcessed.source_jid || chatJid;
   const currentAgentChannelContext = resolveBatchChannelContext(
     missedMessages,
@@ -10032,6 +11908,7 @@ async function processAgentConversation(
       );
       return;
     }
+    await activateAgentProjectionForInput(output.inputTurnId);
     if (output.ipcReceipts?.length) {
       queue.acknowledgeIpcDeliveries(
         virtualJid,
@@ -10389,6 +12266,29 @@ async function processAgentConversation(
 
     // Agent reply
     if (output.result) {
+      const outputAgentScope = agentScopeForOutput(output);
+      if (outputAgentScope.rejected) {
+        hadError = true;
+        logger.error(
+          { chatJid, agentId, inputTurnId: outputAgentScope.inputId },
+          'Suppressing agent output for a warm input that failed durable admission',
+        );
+        return;
+      }
+      const outputAgentCardProjection = agentStreamingSessionsByInput.get(
+        outputAgentScope.inputId,
+      );
+      const outputAgentStreamingSession = outputAgentCardProjection?.session;
+      const outputAgentReplySourceJid =
+        outputAgentScope.scope?.sourceJid ?? replySourceImJid;
+      if (outputAgentReplySourceJid && !outputAgentScope.scope) {
+        hadError = true;
+        logger.error(
+          { chatJid, agentId, inputTurnId: outputAgentScope.inputId },
+          'Suppressing agent IM output without an exact durable turn scope',
+        );
+        return;
+      }
       const raw =
         typeof output.result === 'string'
           ? output.result
@@ -10420,8 +12320,11 @@ async function processAgentConversation(
       }
       if (text) {
         // ── 挂起判定（消息级，与卡片存在性解耦，对齐主路径）──
+        const isPartialOutput =
+          output.sourceKind === 'compact_partial' ||
+          output.sourceKind === 'overflow_partial';
         const holdReason: 'bg_tasks' | 'truncated' | null =
-          output.finalizationReason === 'truncated'
+          output.finalizationReason === 'truncated' || isPartialOutput
             ? 'truncated'
             : (output.pendingBgTasks ?? 0) > 0
               ? 'bg_tasks'
@@ -10434,7 +12337,9 @@ async function processAgentConversation(
         }
         if (!holdReason) text = stripRedundantCompletionPreamble(text);
         heldAgentUsagePatchPending = false;
-        const isFirstReply = !lastAgentReplyMsgId;
+        const isFirstReply = !(
+          agentReplySentByInput.get(outputAgentScope.inputId) ?? false
+        );
         // ── 挂起序列 DB 合并：全渠道一条回复 ──
         // 序列内所有 turn 复用第一个 held turn 的消息 id 与 turnId，
         // INSERT OR REPLACE 覆盖同一行，正文为按时间序拼接的全量内容；
@@ -10518,23 +12423,30 @@ async function processAgentConversation(
 
         // ── Complete or hold Feishu streaming card, or fall back to static ──
         let streamingCardHandledIM = false;
+        let agentCardAttachmentsDelivered = true;
+        let agentStaticImDelivered = false;
+        let pendingAgentCardCompletion:
+          | NonNullable<typeof outputAgentStreamingSession>
+          | undefined;
         if (holdReason) {
           // 挂起：不定稿，正文进 heldAgentParts，有卡片则状态行提示，后续
           // turn 的流式增量继续追加到同一张卡（Sub 路径 session 本就不轮换）。
           heldAgentParts.push(text);
           agentStreamingAccText = '';
-          if (agentStreamingSession?.isActive()) {
+          if (outputAgentStreamingSession?.isActive()) {
             streamingCardHandledIM = true;
-            if (replySourceImJid) {
-              imManager.clearAckReaction(replySourceImJid);
+            if (outputAgentReplySourceJid) {
+              imManager.clearAckReaction(outputAgentReplySourceJid);
             }
             const holdNote =
               holdReason === 'truncated'
                 ? '检测到上游断流，自动续写中…'
                 : `${output.pendingBgTasks} 个后台任务运行中，完成后将继续汇总`;
-            agentStreamingSession.setSystemStatus(holdNote);
-            if (agentStreamingSession instanceof StreamingCardController) {
-              agentStreamingSession.setHeldOpen(
+            outputAgentStreamingSession.setSystemStatus(holdNote);
+            if (
+              outputAgentStreamingSession instanceof StreamingCardController
+            ) {
+              outputAgentStreamingSession.setHeldOpen(
                 holdReason === 'bg_tasks' ? (output.pendingBgTasks ?? 0) : null,
               );
             }
@@ -10550,72 +12462,131 @@ async function processAgentConversation(
             },
             'Agent reply held open (background tasks / truncation continue)',
           );
-        } else if (agentStreamingSession?.isActive()) {
-          try {
-            await agentStreamingSession.complete(text);
-            streamingCardHandledIM = true;
+        } else if (outputAgentStreamingSession?.isActive()) {
+          // Provisional only: DB/Web persistence above is durable, but the
+          // provider card must remain active until every local attachment has
+          // a physical, exact-turn Outbox ACK.
+          pendingAgentCardCompletion = outputAgentStreamingSession;
+          streamingCardHandledIM = true;
+        }
+
+        // Provider cards cannot embed local filesystem images. Deliver each
+        // attachment through the same exact input Turn Outbox and require all
+        // physical ACKs before the Turn/cursor may complete.
+        if (
+          streamingCardHandledIM &&
+          localImagePaths.length > 0 &&
+          outputAgentReplySourceJid
+        ) {
+          for (
+            let imageIndex = 0;
+            imageIndex < localImagePaths.length;
+            imageIndex++
+          ) {
+            const imagePath = localImagePaths[imageIndex];
+            try {
+              if (!outputAgentScope.scope) {
+                agentCardAttachmentsDelivered = false;
+                logger.error(
+                  { chatJid, agentId, imagePath },
+                  'Suppressed agent card image without an exact durable turn scope',
+                );
+                continue;
+              }
+              const imageBuffer = await fs.promises.readFile(imagePath);
+              const delivered = await sendTaskImageWithRetry(
+                outputAgentReplySourceJid,
+                imageBuffer,
+                detectImageMimeType(imageBuffer),
+                undefined,
+                path.basename(imagePath),
+                {
+                  scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+                  scopeToken: outputAgentScope.scope.token,
+                  operationKey: `agent-streaming-card-image:${outputAgentScope.inputId}:${imageIndex}`,
+                  ordinalSlot: `agent-streaming-card-image:${imageIndex}`,
+                },
+              );
+              if (!delivered) agentCardAttachmentsDelivered = false;
+            } catch (error) {
+              agentCardAttachmentsDelivered = false;
+              logger.warn(
+                { error, chatJid, agentId, imagePath },
+                'Agent streaming-card image delivery failed',
+              );
+            }
+          }
+        }
+
+        if (pendingAgentCardCompletion) {
+          const cardFinalization = await finalizeChannelCardAfterDelivery(
+            pendingAgentCardCompletion,
+            text,
+            agentCardAttachmentsDelivered,
+            agentCardAttachmentsDelivered
+              ? '回复投递未确认，已切换为消息发送'
+              : '附件投递未确认，已切换为消息发送',
+          );
+          const cardCompleted = cardFinalization.acknowledged;
+          if (cardCompleted) {
             // 定稿后等最终 usage 事件做合并补丁（挂起期累计 + 最终 turn）
             heldAgentUsagePatchPending = true;
             heldAgentParts = [];
-            if (replySourceImJid) {
-              imManager.clearAckReaction(replySourceImJid);
+            if (outputAgentReplySourceJid) {
+              imManager.clearAckReaction(outputAgentReplySourceJid);
             }
-          } catch (err) {
+          } else if (cardFinalization.error) {
             logger.warn(
-              { err, chatJid, agentId },
-              'Agent streaming card complete failed, falling back to static message',
+              { err: cardFinalization.error, chatJid, agentId },
+              'Agent streaming card final ACK failed, falling back to exact static delivery',
             );
-            await agentStreamingSession
-              .abort('回复已通过消息发送')
-              .catch(() => {});
             heldAgentParts = [];
             heldAgentUsage = null;
+          } else {
+            logger.error(
+              { chatJid, agentId, inputTurnId: outputAgentScope.inputId },
+              'Agent streaming card remains unfinished because an attachment was not physically ACKed',
+            );
+          }
+          streamingCardHandledIM = cardCompleted;
+          if (cardCompleted) {
+            agentStreamingSessionsByInput.delete(outputAgentScope.inputId);
+            if (outputAgentStreamingSession === agentStreamingSession) {
+              if (outputAgentCardProjection) {
+                unregisterStreamingSession(outputAgentCardProjection.jid);
+              }
+              agentStreamingSession = undefined;
+              activeAgentDurableCardLifecycle = undefined;
+            }
           }
         }
 
-        // ── Rebuild streaming card after compact_partial / overflow_partial ──
-        // The completed card was consumed; create a new one so post-compaction
-        // tool-call progress remains visible on Feishu (#223).
         if (
-          streamingCardHandledIM &&
-          (output.sourceKind === 'compact_partial' ||
-            output.sourceKind === 'overflow_partial') &&
-          streamingSessionJid
+          outputAgentReplySourceJid &&
+          !streamingCardHandledIM &&
+          isFirstReply
         ) {
-          agentStreamingAccText = '';
-          unregisterStreamingSession(streamingSessionJid);
-          agentStreamingSession = await imManager.createStreamingSession(
-            replySourceImJid!,
-            (messageId) =>
-              registerMessageIdMapping(messageId, streamingSessionJid!),
-          );
-          if (agentStreamingSession) {
-            registerStreamingSession(
-              streamingSessionJid,
-              agentStreamingSession,
-            );
-            logger.debug(
-              { chatJid, agentId, sourceKind: output.sourceKind },
-              'Rebuilt streaming card after partial output',
-            );
-          }
-        }
-
-        if (replySourceImJid && !streamingCardHandledIM && isFirstReply) {
           // Only send the FIRST substantive reply to IM. Subsequent results
           // (SDK Task completions) are stored in DB but not spammed to IM.
-          const imSent = await sendImWithRetry(
-            replySourceImJid,
+          agentStaticImDelivered = await sendImWithRetry(
+            outputAgentReplySourceJid,
             text,
             localImagePaths,
+            outputAgentScope.scope
+              ? {
+                  scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+                  scopeToken: outputAgentScope.scope.token,
+                  operationKey: `agent:${agentId}:${lastProcessed.id}:${output.sdkMessageUuid || crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)}`,
+                }
+              : undefined,
           );
-          if (imSent) {
-            imManager.clearAckReaction(replySourceImJid);
+          if (agentStaticImDelivered) {
+            imManager.clearAckReaction(outputAgentReplySourceJid);
             logger.info(
               {
                 chatJid,
                 agentId,
-                replySourceImJid,
+                replySourceImJid: outputAgentReplySourceJid,
                 sourceKind: output.sourceKind,
                 textLen: text.length,
               },
@@ -10640,15 +12611,86 @@ async function processAgentConversation(
         }
 
         // Optional mirror mode for linked IM channels
+        let agentMirrorDeliveryAcknowledged = true;
         for (const [imJid, g] of Object.entries(registeredGroups)) {
           if (g.target_agent_id !== agentId || imJid === replySourceImJid)
             continue;
           if (g.reply_policy !== 'mirror') continue;
-          if (getChannelType(imJid))
-            sendImWithFailTracking(imJid, text, localImagePaths);
+          if (!getChannelType(imJid)) continue;
+          const mirrorRuntime = agentChannelTurnRuntimes.get(
+            outputAgentScope.inputId,
+          );
+          const mirrorAddress = parseChannelAddress(imJid);
+          const mirrorAccountId =
+            mirrorAddress?.channelAccountId ?? g.channel_account_id;
+          if (!mirrorRuntime || !mirrorAddress || !mirrorAccountId) {
+            agentMirrorDeliveryAcknowledged = false;
+            logger.error(
+              {
+                chatJid,
+                agentId,
+                imJid,
+                inputTurnId: outputAgentScope.inputId,
+              },
+              'Suppressed agent mirror delivery without an exact durable source turn',
+            );
+            continue;
+          }
+          const mirrorScope = bindChannelOutboxScope(
+            agentAdmissionKey,
+            mirrorRuntime,
+            {
+              provider: mirrorAddress.provider,
+              accountId: mirrorAccountId,
+              sourceJid: imJid,
+              chatId: mirrorAddress.externalChatId,
+              rootId: mirrorAddress.rootMessageId,
+              threadId: mirrorAddress.threadId,
+            },
+          );
+          agentChannelOutboxScopesByInput.set(
+            `${outputAgentScope.inputId}:mirror:${imJid}`,
+            mirrorScope,
+          );
+          const delivered = await sendImWithRetry(
+            imJid,
+            text,
+            localImagePaths,
+            {
+              scopeKey: agentAdmissionKey,
+              scopeToken: mirrorScope.token,
+              operationKey: `agent-mirror:${agentId}:${outputAgentScope.inputId}:${imJid}:${output.sdkMessageUuid || crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)}`,
+              ordinalSlot: `mirror:${imJid}`,
+            },
+          );
+          agentMirrorDeliveryAcknowledged &&= delivered;
         }
 
-        if (output.inputTurnCompleted) commitCursor();
+        const agentReplyDeliveryAcknowledged =
+          (!outputAgentReplySourceJid ||
+            agentPhysicalDeliveryAckByInput.get(outputAgentScope.inputId) ===
+              true ||
+            (streamingCardHandledIM &&
+              !holdReason &&
+              agentCardAttachmentsDelivered) ||
+            agentStaticImDelivered) &&
+          agentMirrorDeliveryAcknowledged;
+        if (agentReplyDeliveryAcknowledged) {
+          const acknowledgedInputIds = output.ipcReceipts?.length
+            ? output.ipcReceipts.map((receipt) => receipt.deliveryId)
+            : [output.inputTurnId ?? lastProcessed.id];
+          for (const inputId of acknowledgedInputIds) {
+            agentPhysicalDeliveryAckByInput.set(inputId, true);
+            agentReplySentByInput.set(inputId, true);
+          }
+        }
+
+        if (
+          output.inputTurnCompleted &&
+          completeAgentChannelRuntimesForOutput(output)
+        ) {
+          commitCursor();
+        }
         resetIdleTimer();
 
         // Per-turn snapshot cleanup — mirror of the main path (clearStreamingSnapshot
@@ -10699,6 +12741,30 @@ async function processAgentConversation(
 
   ipcWatcherManager?.watchGroup(effectiveGroup.folder);
   try {
+    agentChannelOutboxScope =
+      agentChannelTurnRuntime &&
+      replySourceImJid &&
+      agentStreamingAddress &&
+      agentStreamingAccountId
+        ? bindChannelOutboxScope(
+            channelTurnScope(effectiveGroup.folder, agentId),
+            agentChannelTurnRuntime,
+            {
+              provider: agentStreamingAddress.provider,
+              accountId: agentStreamingAccountId,
+              sourceJid: replySourceImJid,
+              chatId: agentStreamingAddress.externalChatId,
+              rootId: agentStreamingAddress.rootMessageId,
+              threadId: agentStreamingAddress.threadId,
+            },
+          )
+        : undefined;
+    if (agentChannelOutboxScope) {
+      agentChannelOutboxScopesByInput.set(
+        lastProcessed.id,
+        agentChannelOutboxScope,
+      );
+    }
     const executionMode = effectiveGroup.executionMode || 'container';
     const onProcessCb = (
       proc: ChildProcess,
@@ -10844,7 +12910,12 @@ async function processAgentConversation(
     // Only commit cursor if a reply was actually sent.  Without a reply the
     // messages haven't been "processed" — leaving the cursor behind lets the
     // recovery logic pick them up after a restart.
-    if (lastAgentReplyMsgId && healthyAgentInputTurnCompleted) {
+    const activeAgentInputPhysicallyAcknowledged =
+      agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true;
+    if (
+      activeAgentInputPhysicallyAcknowledged &&
+      healthyAgentInputTurnCompleted
+    ) {
       commitCursor();
     }
 
@@ -10856,7 +12927,7 @@ async function processAgentConversation(
         status: output.status,
         healthyInputTurnCompleted: healthyAgentInputTurnCompleted,
         cursorCommitted,
-        replyDelivered: !!lastAgentReplyMsgId,
+        replyDelivered: activeAgentInputPhysicallyAcknowledged,
         stopRequested: true,
       });
       if (turnOutcome.cursor === 'commit') commitCursor();
@@ -10869,7 +12940,7 @@ async function processAgentConversation(
         status: output.status,
         healthyInputTurnCompleted: healthyAgentInputTurnCompleted,
         cursorCommitted,
-        replyDelivered: !!lastAgentReplyMsgId,
+        replyDelivered: activeAgentInputPhysicallyAcknowledged,
       });
       if (turnOutcome.cursor === 'commit') commitCursor();
       retryUnfinishedTurn = turnOutcome.kind === 'retryable';
@@ -10898,6 +12969,7 @@ async function processAgentConversation(
 
     // ── Streaming card cleanup ──
     activeHeldCardFinalizers.delete(virtualChatJid);
+    activeRouteAdmissions.delete(agentAdmissionKey);
     if (agentStreamingSession) {
       if (agentStreamingSession.isActive()) {
         // Symmetric with the main session's five-way finalize (index.ts ~3804):
@@ -10963,6 +13035,80 @@ async function processAgentConversation(
       );
       heldAgentParts = [];
       heldAgentUsage = null;
+    }
+
+    if (agentChannelTurnRuntimes.size > 0) {
+      let allAgentManualNoticesAcknowledged = true;
+      for (const [inputTurnId, runtime] of agentChannelTurnRuntimes) {
+        const inputSettled =
+          healthyAgentInputTurnCompleted &&
+          agentPhysicalDeliveryAckByInput.get(inputTurnId) === true;
+        const uncertainDelivery = getUncertainChannelOutboxForTurn(
+          runtime.runId,
+        );
+        let settled: boolean;
+        if (uncertainDelivery) {
+          agentDeliveryNeedsManualReconciliation = true;
+          settled = runtime.interrupt(
+            `Channel delivery ${uncertainDelivery.id} is uncertain; manual reconciliation required`,
+          );
+          const exactScope = agentChannelOutboxScopesByInput.get(inputTurnId);
+          const notified = exactScope?.chatId
+            ? await deliverIndependentChannelSystemNotice({
+                logicalChatJid: virtualChatJid,
+                scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+                targetJid: exactScope.sourceJid,
+                originalInputTurnId: inputTurnId,
+                originalRunId: runtime.runId,
+                noticeKey: 'delivery-uncertain',
+                text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+                agentId,
+                route: { ...exactScope, chatId: exactScope.chatId },
+              })
+            : false;
+          if (!notified) allAgentManualNoticesAcknowledged = false;
+        } else if (runtime === agentChannelTurnRuntime && inputSettled) {
+          settled =
+            runtime.markFinalizing() &&
+            runtime.complete({
+              cursorCommitted,
+              replyDelivered: true,
+              inputTurnId,
+            });
+        } else {
+          settled = runtime.retry(
+            lastError ||
+              (agentClosed
+                ? 'Agent connection closed before completing input turn'
+                : wasInterrupted
+                  ? 'Agent interrupted before completing input turn'
+                  : 'Agent execution ended before completing input turn'),
+          );
+        }
+        if (!settled) {
+          logger.error(
+            {
+              chatJid,
+              agentId,
+              inputTurnId,
+              runId: runtime.runId,
+              durabilityFailure: runtime.hasDurabilityFailure,
+              lostFence: runtime.hasLostFence,
+            },
+            'Agent channel turn cleanup did not reach a durable state',
+          );
+        }
+        runtime.dispose();
+      }
+      agentChannelTurnRuntimes.clear();
+      if (agentDeliveryNeedsManualReconciliation) {
+        if (allAgentManualNoticesAcknowledged) {
+          commitCursor();
+          retryUnfinishedTurn = false;
+        } else {
+          retryUnfinishedTurn = true;
+        }
+      }
     }
 
     // ── 保存中断内容 ──
@@ -11084,6 +13230,13 @@ async function processAgentConversation(
             replySourceImJid,
             partialReply,
             localImagePaths,
+            {
+              scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
+              scopeToken:
+                agentChannelOutboxScopesByInput.get(lastProcessed.id)?.token ??
+                `missing:${lastProcessed.id}`,
+              operationKey: `agent:${agentId}:${lastProcessed.id}:partial-fallback`,
+            },
           );
           if (imSent) {
             imManager.clearAckReaction(replySourceImJid);
@@ -11165,6 +13318,12 @@ async function processAgentConversation(
     );
 
     activeImReplyRoutes.delete(virtualChatJid);
+    for (const scope of new Set(agentChannelOutboxScopesByInput.values())) {
+      activeChannelOutboxScopes.unbind(
+        channelTurnScope(effectiveGroup.folder, agentId),
+        scope,
+      );
+    }
     activeAgentBuilderTurns.delete(agentBuilderScope);
     activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder, agentId));
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
@@ -11258,24 +13417,39 @@ async function startMessageLoop(): Promise<void> {
                   'Billing access denied, blocking message processing',
                 );
                 const sysMsg = formatBillingAccessDeniedMessage(accessResult);
-                sendBillingDeniedMessage(chatJid, sysMsg);
 
                 // Notify IM channel if the message came from an IM source
-                const lastSourceJid =
-                  groupMessages[groupMessages.length - 1]?.source_jid;
+                const lastInput = groupMessages[groupMessages.length - 1];
+                const lastSourceJid = lastInput?.source_jid;
                 const imSourceJid = lastSourceJid || chatJid;
                 if (getChannelType(imSourceJid)) {
-                  imManager
-                    .sendMessage(imSourceJid, sysMsg)
-                    .catch((err) =>
-                      logger.warn(
-                        { err, jid: imSourceJid },
-                        'Failed to send quota exceeded notice to IM',
-                      ),
+                  const route = resolveDurableChannelRoute(imSourceJid);
+                  const acknowledged =
+                    route && lastInput
+                      ? await deliverIndependentChannelSystemNotice({
+                          logicalChatJid: chatJid,
+                          scopeKey: channelTurnScope(group.folder),
+                          targetJid: imSourceJid,
+                          originalInputTurnId: lastInput.id,
+                          originalRunId: `billing:${lastInput.id}`,
+                          noticeKey: 'billing-denied',
+                          text: sysMsg,
+                          sender: '__billing__',
+                          route,
+                        })
+                      : false;
+                  if (!acknowledged) {
+                    logger.warn(
+                      { jid: imSourceJid, messageId: lastInput?.id },
+                      'Quota notice not acknowledged; preserving input cursor for retry',
                     );
+                    continue;
+                  }
+                } else {
+                  sendBillingDeniedMessage(chatJid, sysMsg);
                 }
 
-                // Advance cursor past these messages so they aren't re-processed
+                // Advance only after Web persistence or strict native ACK.
                 completeOutOfBandMessages(chatJid, groupMessages);
                 continue;
               }
@@ -11332,6 +13506,7 @@ async function startMessageLoop(): Promise<void> {
               // we route to itself; otherwise prefer the originating message's
               // source_jid (mixed batches retain individual user routing).
               const directImReply = getChannelType(chatJid) !== null;
+              let warmPluginRepliesAcknowledged = true;
               for (const r of replies) {
                 let imRouteJid: string | null = null;
                 if (directImReply) {
@@ -11342,11 +13517,27 @@ async function startMessageLoop(): Promise<void> {
                 ) {
                   imRouteJid = r.originalMsg.source_jid;
                 }
-                sendPluginExpanderReply(chatJid, r.text, imRouteJid);
+                const delivery = await sendPluginExpanderReply(
+                  chatJid,
+                  r.text,
+                  {
+                    originalMessageId: r.originalMsg.id,
+                    groupFolder: activeEffectiveGroup.folder,
+                    imRouteJid,
+                  },
+                );
+                if (!delivery.acknowledged) {
+                  warmPluginRepliesAcknowledged = false;
+                  break;
+                }
                 advanceReplyCursor(chatJid, {
                   timestamp: r.originalMsg.timestamp,
                   id: r.originalMsg.id,
                 });
+              }
+              if (!warmPluginRepliesAcknowledged) {
+                queue.enqueueMessageCheck(chatJid);
+                continue;
               }
               if (toSend.length === 0) {
                 continue;
@@ -11408,7 +13599,8 @@ async function startMessageLoop(): Promise<void> {
                   warmChannelContext,
                 );
               }
-              activeRouteUpdaters.get(group.folder)?.(
+              invokeActiveRouteUpdater(
+                group.folder,
                 lastSourceJidForRoute,
                 receipt?.deliveryId,
                 receipt?.cursor,
@@ -11418,6 +13610,12 @@ async function startMessageLoop(): Promise<void> {
             injectionTaskId,
             deliveryTarget,
             warmChannelContext,
+            (receipt) =>
+              invokeActiveRouteAdmission(
+                group.folder,
+                lastSourceJidForRoute,
+                receipt,
+              ),
           );
           if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(
@@ -12792,6 +14990,11 @@ function buildResolveEffectiveChatJid(): (
  */
 function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
   return (baseChatJid: string, agentId: string) => {
+    // The IM sockets deliberately remain connected while graceful shutdown
+    // drains/stops Agent loops and finalizes their cards. Reject new intake at
+    // this boundary so the live connection cannot enqueue a fresh run during
+    // that drain window.
+    if (shuttingDown) return;
     const group =
       registeredGroups[baseChatJid] ?? getRegisteredGroup(baseChatJid);
     if (!group) {
@@ -12874,7 +15077,10 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             imagesForAgent,
             (receipt) => {
               // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
-              activeHeldCardFinalizers.get(virtualChatJid)?.();
+              activeHeldCardFinalizers.get(virtualChatJid)?.(
+                lastAgentSourceJid,
+                receipt?.deliveryId,
+              );
               if (receipt) {
                 activeAgentBuilderTurns.enqueueBatch(
                   agentBuilderTurnScope(
@@ -12894,6 +15100,14 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             lastAgentSourceJid,
             undefined,
             deliveryTarget,
+            undefined,
+            (receipt) =>
+              invokeActiveRouteAdmission(
+                agent?.group_folder ?? group.folder,
+                lastAgentSourceJid,
+                receipt,
+                agentId,
+              ),
           )
         : 'no_active';
       if (sendResult === 'sent' && deliveryTarget) {
@@ -13869,6 +16083,10 @@ async function main(): Promise<void> {
   // NOTE: this runs once at startup; runtime toggle requires restart.
   let startupPluginScanTimer: ReturnType<typeof setTimeout> | null = null;
   let periodicPluginScanInterval: ReturnType<typeof setInterval> | null = null;
+  let channelReliabilityRecoveryLoop: ReturnType<
+    typeof startChannelReliabilityRecoveryLoop
+  > | null = null;
+  let unsubscribeChannelReadyRecovery: (() => void) | null = null;
   if (getSystemSettings().pluginAutoScan) {
     startupPluginScanTimer = setTimeout(() => {
       scanHostMarketplaces().catch((err) =>
@@ -13901,6 +16119,10 @@ async function main(): Promise<void> {
     }
     shutdownInProgress = true;
     shuttingDown = true;
+    // Stop every account-scoped inbound callback immediately while retaining
+    // the live clients for card finalization and other shutdown-time outbound
+    // acknowledgements. disconnectAll runs only after those are settled.
+    imManager.pauseInbound();
     logger.info({ signal }, 'Shutdown signal received, cleaning up...');
 
     // Force exit after 30s if graceful shutdown hangs.
@@ -13920,6 +16142,10 @@ async function main(): Promise<void> {
 
     if (startupPluginScanTimer) clearTimeout(startupPluginScanTimer);
     if (periodicPluginScanInterval) clearInterval(periodicPluginScanInterval);
+    channelReliabilityRecoveryLoop?.stop();
+    channelReliabilityRecoveryLoop = null;
+    unsubscribeChannelReadyRecovery?.();
+    unsubscribeChannelReadyRecovery = null;
 
     try {
       ipcWatcherManager?.closeAll();
@@ -13933,26 +16159,10 @@ async function main(): Promise<void> {
       logger.warn({ err }, 'Error shutting down terminals');
     }
 
-    // Stop periodic buffer, then persist streaming text to DB + clean buffer files.
-    stopStreamingBuffer();
-    saveInterruptedStreamingMessages();
-
-    // Run cleanup tasks concurrently with a tight timeout
+    // Phase 1: stop external/web intake and drain or stop every Agent loop.
+    // Keep IM transports connected through this phase: active runs may still
+    // need the authenticated Feishu client to finalize their current card.
     await Promise.allSettled([
-      // Abort all active streaming cards before disconnecting IM,
-      // so users see "服务维护中" instead of a stuck "生成中..." card.
-      // Race with a 5s timeout to avoid a hung Feishu API blocking shutdown.
-      Promise.race([
-        abortAllStreamingSessions('服务维护中'),
-        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
-      ]).catch((err) =>
-        logger.warn({ err }, 'Error aborting streaming sessions'),
-      ),
-      imManager
-        .disconnectAll()
-        .catch((err) =>
-          logger.warn({ err }, 'Error disconnecting IM connections'),
-        ),
       shutdownWebServer().catch((err) =>
         logger.warn({ err }, 'Error shutting down web server'),
       ),
@@ -13960,6 +16170,26 @@ async function main(): Promise<void> {
         .shutdown(15_000)
         .catch((err) => logger.warn({ err }, 'Error shutting down queue')),
     ]);
+
+    // Agent output is now quiescent. Persist any partial text that did not
+    // reach a normal result before touching the external card lifecycle.
+    stopStreamingBuffer();
+    saveInterruptedStreamingMessages();
+
+    // Phase 2: terminalize every remaining card while the Feishu clients are
+    // still connected. Do not race this with disconnectAll: that race was the
+    // source of orphan 「生成中」cards after otherwise graceful restarts.
+    await abortAllStreamingSessions('服务维护中').catch((err) =>
+      logger.warn({ err }, 'Error aborting streaming sessions'),
+    );
+
+    // Phase 3: only after card finalization has settled may transports release
+    // their clients/tokens.
+    await imManager
+      .disconnectAll()
+      .catch((err) =>
+        logger.warn({ err }, 'Error disconnecting IM connections'),
+      );
 
     clearTimeout(forceExitTimer);
 
@@ -14488,6 +16718,12 @@ async function main(): Promise<void> {
       imHealthCheckFailCounts.delete(jid);
     },
     removeImGroupRecord,
+    preAdmitReplyRoute: (
+      folder: string,
+      sourceJid: string | null,
+      receipt: IpcDeliveryReceipt | undefined,
+      runtimeAgentId?: string,
+    ) => invokeActiveRouteAdmission(folder, sourceJid, receipt, runtimeAgentId),
     updateReplyRoute: (
       folder: string,
       sourceJid: string | null,
@@ -14526,8 +16762,14 @@ async function main(): Promise<void> {
             : undefined;
         bindActiveChannelTurn(scope, inputTurnId, context);
       }
-      if (runtimeAgentId) return;
-      activeRouteUpdaters.get(folder)?.(sourceJid, inputTurnId, inputCursor);
+      if (runtimeAgentId) {
+        const agentRuntimeKey = inputChatJid?.includes('#agent:')
+          ? inputChatJid
+          : `web:${folder}#agent:${runtimeAgentId}`;
+        activeHeldCardFinalizers.get(agentRuntimeKey)?.(sourceJid, inputTurnId);
+        return;
+      }
+      invokeActiveRouteUpdater(folder, sourceJid, inputTurnId, inputCursor);
     },
     finalizeHeldCard: (key: string) => {
       activeHeldCardFinalizers.get(key)?.();
@@ -14993,14 +17235,6 @@ async function main(): Promise<void> {
     webDeps.cancelTaskRun = (runId: string) => cancelTaskRunNow(runId);
   }
 
-  startIpcWatcher();
-  recoverStreamingBuffer();
-  recoverStartupTypedIpcDeliveries();
-  recoverPendingMessages();
-  recoverConversationAgents();
-  startStreamingBuffer();
-  startMessageLoop();
-
   // --- IM Connection Pool: connect per-user IM channels ---
   // Load global IM config (backward compat: used for admin if no per-user config exists)
   const globalFeishuConfig = getFeishuProviderConfigWithSource();
@@ -15242,12 +17476,48 @@ async function main(): Promise<void> {
   // Single startup path: after legacy singleton configs are projected, only
   // first-class accounts connect. This prevents the same credentials from
   // running once as `provider` and again as `provider\0accountId`.
+  // Feishu records its durable Inbox before invoking these callbacks. Keep
+  // execution paused while transports connect and old provider cards are
+  // reconciled; messages arriving in this window remain queued for retry.
+  imManager.deferInbound();
   await Promise.allSettled(
     listEnabledChannelAccounts().map((account) =>
       reloadChannelAccountById(account.id),
     ),
   );
   anyFeishuConnected = imManager.isAnyFeishuConnected();
+
+  // Recovery order is intentional and forms a correctness boundary:
+  // exact Bot account ready -> close cards left live by the old process ->
+  // invalidate expired execution fences -> only then resume Agent work.
+  // Starting the message loop earlier can create a second active card for the
+  // same logical turn while the provider still shows the old one as running.
+  await reconcileChannelReliabilityOnStartup(imManager);
+  const outboxRecovery = reconcileChannelOutboxDeliveries();
+  if (outboxRecovery.uncertain > 0) {
+    logger.warn(
+      outboxRecovery,
+      'Channel outbox contains uncertain sends; automatic replay is blocked',
+    );
+  } else if (outboxRecovery.retryable > 0) {
+    logger.info(
+      outboxRecovery,
+      'Channel outbox recovered retryable pre-send work',
+    );
+  }
+  channelReliabilityRecoveryLoop =
+    startChannelReliabilityRecoveryLoop(imManager);
+  unsubscribeChannelReadyRecovery = imManager.onChannelReady(() => {
+    void channelReliabilityRecoveryLoop?.trigger();
+  });
+  imManager.resumeDeferredInbound();
+  recoverStreamingBuffer();
+  recoverStartupTypedIpcDeliveries();
+  recoverPendingMessages();
+  recoverConversationAgents();
+  startIpcWatcher();
+  startStreamingBuffer();
+  startMessageLoop();
 
   // Start Feishu group sync if any connection is active
   if (anyFeishuConnected) {

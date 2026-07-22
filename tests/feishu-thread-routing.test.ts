@@ -51,6 +51,66 @@ describe('parseFeishuRouteTarget', () => {
 });
 
 describe('StreamingCardController Feishu thread reply', () => {
+  test('emits durable lifecycle identities through waiting and terminal states', async () => {
+    const events: Array<{
+      status: string;
+      messageId: string | null;
+      cardId: string | null;
+      version: number;
+    }> = [];
+    const client = {
+      cardkit: {
+        v1: {
+          card: {
+            create: vi
+              .fn()
+              .mockResolvedValue({ data: { card_id: 'card_life' } }),
+            settings: vi.fn().mockResolvedValue({}),
+            update: vi.fn().mockResolvedValue({}),
+          },
+          cardElement: { content: vi.fn().mockResolvedValue({}) },
+        },
+      },
+      im: {
+        message: {
+          reply: vi.fn().mockResolvedValue({ data: { message_id: 'om_life' } }),
+        },
+        v1: { message: { create: vi.fn(), patch: vi.fn() } },
+      },
+    };
+    const controller = new StreamingCardController({
+      client: client as any,
+      chatId: 'oc_life',
+      replyToMsgId: 'om_root',
+      lifecycle: { onEvent: (event) => events.push(event) },
+    });
+
+    controller.append('开始');
+    await vi.waitFor(() =>
+      expect(events.some((event) => event.status === 'streaming')).toBe(true),
+    );
+    controller.startTool('ask-life', 'AskUserQuestion');
+    controller.endTool('ask-life', false);
+    await controller.complete('完成');
+
+    expect(events.map((event) => event.status)).toEqual(
+      expect.arrayContaining([
+        'creating',
+        'streaming',
+        'waiting_user',
+        'running',
+        'finalizing',
+        'completed',
+      ]),
+    );
+    expect(events.at(-1)).toMatchObject({
+      status: 'completed',
+      messageId: 'om_life',
+      cardId: 'card_life',
+    });
+    expect(events.at(-1)!.version).toBeGreaterThan(1);
+  });
+
   test('passes reply_in_thread when creating the initial streaming card', async () => {
     const reply = vi
       .fn()
@@ -83,6 +143,90 @@ describe('StreamingCardController Feishu thread reply', () => {
       msg_type: 'interactive',
       reply_in_thread: true,
     });
+  });
+
+  test('retries a card reply without reply_in_thread only for unsupported thread errors', async () => {
+    const reply = vi
+      .fn()
+      .mockRejectedValueOnce({ code: 230071, message: 'thread unsupported' })
+      .mockResolvedValueOnce({ data: { message_id: 'om_plain_reply' } });
+    const client = {
+      cardkit: {
+        v1: {
+          card: {
+            create: vi.fn().mockResolvedValue({ data: { card_id: 'card_1' } }),
+          },
+          cardElement: {},
+        },
+      },
+      im: {
+        message: { reply },
+        v1: { message: { create: vi.fn() } },
+      },
+    };
+
+    const controller = new StreamingCardController({
+      client: client as any,
+      chatId: 'oc_123',
+      replyToMsgId: 'om_root',
+      replyInThread: true,
+    });
+
+    controller.setThinking();
+    await vi.waitFor(() => expect(reply).toHaveBeenCalledTimes(2));
+    expect(reply.mock.calls[0][0].data.reply_in_thread).toBe(true);
+    expect(reply.mock.calls[1][0].data.reply_in_thread).toBeUndefined();
+  });
+
+  test('AskUserQuestion is a real waiting phase and wins over thinking', async () => {
+    const reply = vi
+      .fn()
+      .mockResolvedValue({ data: { message_id: 'om_card' } });
+    const client = {
+      cardkit: {
+        v1: {
+          card: {
+            create: vi.fn().mockResolvedValue({ data: { card_id: 'card_1' } }),
+          },
+          cardElement: {},
+        },
+      },
+      im: {
+        message: { reply },
+        v1: { message: { create: vi.fn() } },
+      },
+    };
+    const controller = new StreamingCardController({
+      client: client as any,
+      chatId: 'oc_123',
+      replyToMsgId: 'om_root',
+    });
+
+    controller.setThinking();
+    await vi.waitFor(() => expect(reply).toHaveBeenCalledTimes(1));
+    controller.startTool('ask-1', 'AskUserQuestion');
+    controller.setToolMeta('ask-1', {
+      toolInput: { question: '请选择投递方式？' },
+    });
+
+    const internals = controller as unknown as {
+      derivePhase(): string;
+      buildRichPanelPatches(): { askContent?: string; statusBanner: string };
+    };
+    expect(internals.derivePhase()).toBe('waiting');
+    expect(internals.buildRichPanelPatches().statusBanner).toContain(
+      '等待输入',
+    );
+    expect(internals.buildRichPanelPatches().askContent).toContain(
+      '等待你的回复',
+    );
+    expect(internals.buildRichPanelPatches().askContent).toContain(
+      '请选择投递方式',
+    );
+
+    controller.endTool('ask-1', false);
+    expect(internals.derivePhase()).toBe('idle');
+    expect(internals.buildRichPanelPatches().askContent).toBeUndefined();
   });
 
   test('preserves trace link when usage patch updates a legacy completed card', async () => {

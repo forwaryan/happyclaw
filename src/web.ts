@@ -785,6 +785,7 @@ async function handleWebUserMessage(
   let pipedToActive = false;
   const images = toAgentImages(normalizedAttachments);
   const updateRoute = deps.updateReplyRoute;
+  const preAdmitRoute = deps.preAdmitReplyRoute;
   const sendResult = deps.queue.sendMessage(
     chatJid,
     formatted,
@@ -807,6 +808,8 @@ async function handleWebUserMessage(
       coveredCursors: [{ timestamp, id: messageId }],
       cursor: { timestamp, id: messageId },
     },
+    undefined,
+    (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
@@ -1128,22 +1131,27 @@ async function handleAgentConversationMessage(
   const agentImages = toAgentImages(normalizedAttachments);
   const finalizeHeld = deps.finalizeHeldCard;
   const updateRoute = deps.updateReplyRoute;
+  const preAdmitRoute = deps.preAdmitReplyRoute;
   const agentSendResult = deps.queue.sendMessage(
     virtualChatJid,
     formatted,
     agentImages,
     (receipt) => {
-      // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
-      finalizeHeld?.(virtualChatJid);
-      updateRoute?.(
-        agent.group_folder,
-        null,
-        receipt?.deliveryId,
-        receipt?.cursor,
-        receipt?.chatJid,
-        undefined,
-        agentId,
-      );
+      // Route update owns both the durable warm turn and card rotation. Older
+      // embedders without updateReplyRoute retain the legacy finalizer hook.
+      if (updateRoute) {
+        updateRoute(
+          agent.group_folder,
+          null,
+          receipt?.deliveryId,
+          receipt?.cursor,
+          receipt?.chatJid,
+          undefined,
+          agentId,
+        );
+      } else {
+        finalizeHeld?.(virtualChatJid);
+      }
     },
     virtualChatJid,
     undefined,
@@ -1152,6 +1160,9 @@ async function handleAgentConversationMessage(
       coveredCursors: [{ timestamp, id: messageId }],
       cursor: { timestamp, id: messageId },
     },
+    undefined,
+    (receipt) =>
+      preAdmitRoute?.(agent.group_folder, null, receipt, agentId) ?? false,
   );
   if (agentSendResult === 'sent') {
     deps.advanceNextPullCursorOnly(virtualChatJid, {

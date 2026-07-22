@@ -43,6 +43,8 @@ import { rm } from 'fs/promises';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
 import type { StreamingSession } from './im-channel.js';
+import type { StreamingCardLifecycle } from './feishu-streaming-card.js';
+import type { StreamingCardRecord } from './channel-reliability-store.js';
 import {
   getRegisteredGroup,
   getDefaultChannelAccount,
@@ -214,6 +216,52 @@ export class IMConnectionManager {
   private credentialClaims = new Map<string, string>();
   private connectionCredentialClaims = new Map<string, string>();
   private feishuGroupSyncs = new Map<string, Promise<number>>();
+  private channelReadyListeners = new Set<
+    (event: {
+      userId: string;
+      channelType: string;
+      accountId: string | null;
+    }) => void
+  >();
+  /**
+   * Process-wide inbound admission gate used by graceful shutdown. It stops
+   * every account-scoped callback without disconnecting the underlying IM
+   * clients, so active runs can still use those clients to terminalize cards
+   * and flush outbound acknowledgements before transport teardown.
+   */
+  private inboundPaused = false;
+  private inboundDeferred = false;
+
+  pauseInbound(): void {
+    this.inboundPaused = true;
+    logger.info('IM inbound callbacks paused');
+  }
+
+  resumeInbound(): void {
+    this.inboundPaused = false;
+    logger.info('IM inbound callbacks resumed');
+  }
+
+  deferInbound(): void {
+    this.inboundDeferred = true;
+    logger.info('Durable IM inbound execution deferred for recovery');
+  }
+
+  resumeDeferredInbound(): void {
+    this.inboundDeferred = false;
+    logger.info('Durable IM inbound execution resumed after recovery');
+  }
+
+  onChannelReady(
+    listener: (event: {
+      userId: string;
+      channelType: string;
+      accountId: string | null;
+    }) => void,
+  ): () => void {
+    this.channelReadyListeners.add(listener);
+    return () => this.channelReadyListeners.delete(listener);
+  }
 
   private channelKey(channelType: string, accountId?: string | null): string {
     return accountId ? `${channelType}\u0000${accountId}` : channelType;
@@ -268,6 +316,7 @@ export class IMConnectionManager {
     const scope = (jid: string) =>
       accountId ? scopeChannelJid(jid, accountId) : jid;
     const inboundAllowed = (): boolean => {
+      if (this.inboundPaused) return false;
       if (userId && this.sealedUsers.has(userId)) return false;
       // Most lifecycle unit tests intentionally use the manager without a DB.
       // The production process always initializes SQLite before connecting IM.
@@ -296,6 +345,10 @@ export class IMConnectionManager {
     };
     return {
       ...opts,
+      shouldDeferInbound: () =>
+        this.inboundDeferred ||
+        this.inboundPaused ||
+        opts.shouldDeferInbound?.() === true,
       normalizeIncomingJid: scope,
       onNewChat: (jid, name) => {
         if (inboundAllowed()) opts.onNewChat(scope(jid), name);
@@ -433,7 +486,12 @@ export class IMConnectionManager {
             resolveFeishuConversationPlan: (
               jid: string,
               meta: ChannelMessageMeta,
-            ) => opts.resolveFeishuConversationPlan!(scope(jid), meta),
+            ) => {
+              if (!inboundAllowed()) {
+                throw new ChannelRouteRejectedError(scope(jid));
+              }
+              return opts.resolveFeishuConversationPlan!(scope(jid), meta);
+            },
           }
         : {}),
       ...(opts.isGroupOwnerMessage
@@ -640,6 +698,16 @@ export class IMConnectionManager {
             return false;
           }
           conn.channels.set(channelKey, channel);
+          for (const listener of this.channelReadyListeners) {
+            try {
+              listener({ userId, channelType, accountId: accountId ?? null });
+            } catch (error) {
+              logger.warn(
+                { error, userId, channelType, accountId },
+                'IM channel-ready listener failed',
+              );
+            }
+          }
           logger.info(
             { userId, channelType, accountId },
             'IM channel connected',
@@ -869,6 +937,7 @@ export class IMConnectionManager {
   async createStreamingSession(
     jid: string,
     onCardCreated?: (messageId: string) => void,
+    lifecycle?: StreamingCardLifecycle,
   ): Promise<StreamingSession | undefined> {
     const channelType = getChannelType(jid);
     if (
@@ -905,9 +974,59 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.createStreamingSession) {
-      return channel.createStreamingSession(chatId, onCardCreated);
+      return channel.createStreamingSession(chatId, onCardCreated, lifecycle);
     }
     return undefined;
+  }
+
+  /**
+   * Reconcile a persisted Feishu card only through its recorded Bot account.
+   * A different connected Bot must never update a card it did not create.
+   */
+  async reconcileStreamingCard(record: StreamingCardRecord): Promise<{
+    version: number;
+    method: 'cardkit' | 'message_patch';
+  }> {
+    if (record.provider !== 'feishu') {
+      throw new Error(
+        `Unsupported streaming card provider: ${record.provider}`,
+      );
+    }
+    const scopedAccountId = parseChannelAddress(
+      record.sourceJid,
+    )?.channelAccountId;
+    if (scopedAccountId && scopedAccountId !== record.accountId) {
+      throw new ChannelRouteRejectedError(
+        `Streaming card account mismatch: ${scopedAccountId} != ${record.accountId}`,
+      );
+    }
+    const group = getRegisteredGroup(channelConversationJid(record.sourceJid));
+    const ownerId = group?.created_by;
+    const channel = ownerId
+      ? this.connections
+          .get(ownerId)
+          ?.channels.get(this.channelKey('feishu', record.accountId))
+      : undefined;
+    if (
+      !ownerId ||
+      !this.isOutboundConnectionAllowed(ownerId, 'feishu', record.accountId)
+    ) {
+      throw new ChannelRouteRejectedError(
+        `Recorded Feishu Bot is not authorized: account=${record.accountId}`,
+      );
+    }
+    if (!channel?.isConnected() || !channel.reconcileStreamingCard) {
+      throw new Error(
+        `Recorded Feishu Bot is not ready: account=${record.accountId}`,
+      );
+    }
+    return channel.reconcileStreamingCard({
+      messageId: record.messageId,
+      cardId: record.cardId,
+      version: record.version,
+      snapshot: record.snapshot,
+      reason: '上次服务中断，本次任务未完成',
+    });
   }
 
   /**

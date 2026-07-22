@@ -19,8 +19,10 @@ import { formatFeishuTokenSummary } from '../feishu-usage-display.js';
  *    - Must be unique within a card
  *  Keep every value below under 20 chars.
  *
- *  Streaming runtime panels (each with an outer `*_PANEL` collapsible and an
- *  inner `*_CONTENT` markdown patchable independently via cardElement.content).
+ *  Streaming runtime panels (normally an outer `*_PANEL` collapsible and an
+ *  inner `*_CONTENT` markdown patchable via cardElement.content). ASK_CONTENT
+ *  is intentionally a standalone blank slot so no waiting panel appears
+ *  before a real AskUserQuestion call.
  *  Final card uses a distinct set suffixed `_final` so both can coexist when
  *  transitioning from streaming to completed.
  */
@@ -41,7 +43,6 @@ export const CARD_ELEMENT_IDS = {
   THINKING_PANEL: 'thinking_live',
   THINKING_CONTENT: 'thinking_live_md',
   // Phase F — aligning with web StreamingDisplay
-  ASK_PANEL: 'ask_panel',
   ASK_CONTENT: 'ask_md',
   TIMELINE_PANEL: 'timeline_panel',
   TIMELINE_CONTENT: 'timeline_md',
@@ -79,7 +80,6 @@ const PANEL_ICON = {
 const PANEL_TINT = {
   thinking: 'blue-50', // light blue
   tools: 'wathet-50', // light cyan/sky
-  ask: 'orange-50', // light amber
 } as const;
 
 type El = Record<string, unknown>;
@@ -600,7 +600,6 @@ export interface StreamingPanelsInit {
   expandProgress?: boolean;
   expandTools?: boolean;
   expandThinking?: boolean;
-  expandAsk?: boolean;
   expandTimeline?: boolean;
 }
 
@@ -608,7 +607,8 @@ export interface StreamingPanelsInit {
  * Build the full runtime panel column for the streaming skeleton (ordered).
  *
  * Panel order aligns with the web StreamingDisplay component:
- *   status banner → ask (if any) → progress → tasks → tools → thinking → timeline
+ *   status banner → ask slot (invisible until a real question exists) →
+ *   progress → tasks → tools → thinking → timeline
  * Each panel's inner markdown has its own element_id so the controller can
  * patch it via cardElement.content() without touching the panel structure.
  */
@@ -619,14 +619,16 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       element_id: CARD_ELEMENT_IDS.STATUS_BANNER,
       content: init.statusBanner ?? buildStatusBannerText({ phase: 'idle' }),
     },
-    buildRuntimePanel({
-      elementId: CARD_ELEMENT_IDS.ASK_PANEL,
-      contentElementId: CARD_ELEMENT_IDS.ASK_CONTENT,
-      title: '**❓ 等待你的回复**',
-      expanded: init.expandAsk ?? true,
-      backgroundColor: PANEL_TINT.ask,
-      content: init.askContent ?? "<font color='grey'>暂无提问</font>",
-    }),
+    // Keep one patchable markdown slot in the streaming skeleton, but do not
+    // render a fake 「等待你的回复 / 暂无提问」panel before the agent
+    // has actually invoked AskUserQuestion. CardKit streaming mode can patch
+    // element content but cannot safely insert/remove a collapsible panel, so
+    // the real prompt (including its heading) is written into this blank slot.
+    {
+      tag: 'markdown',
+      element_id: CARD_ELEMENT_IDS.ASK_CONTENT,
+      content: init.askContent ?? '',
+    },
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.PROGRESS_PANEL,
       contentElementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,

@@ -69,6 +69,7 @@ import {
 } from './runtime-mcp-policy.js';
 import {
   IpcTurnDeliveryTracker,
+  IpcTurnOutputCorrelation,
   isHealthyInputTurnCompletion,
   latestIpcDeliveryId,
   latestIpcInputMessage,
@@ -142,6 +143,10 @@ let hadCompaction = false;
 // Module-level session ID so SIGTERM handler can emit it before exit.
 // Updated in main() whenever a query returns a new session.
 let latestSessionId: string | undefined;
+// Durable identity of the SDK input turn that currently owns runner output.
+// writeOutput snapshots it into every frame so direct status/error/session
+// frames cannot silently lose correlation just because they bypass emit().
+let activeOutputInputTurnId: string | undefined;
 
 const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -793,8 +798,11 @@ const OUTPUT_START_MARKER = '---HAPPYCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---HAPPYCLAW_OUTPUT_END---';
 
 function writeOutput(output: ContainerOutput): void {
+  const correlatedOutput: ContainerOutput = activeOutputInputTurnId
+    ? { ...output, inputTurnId: output.inputTurnId ?? activeOutputInputTurnId }
+    : output;
   console.log(OUTPUT_START_MARKER);
-  console.log(JSON.stringify(output));
+  console.log(JSON.stringify(correlatedOutput));
   console.log(OUTPUT_END_MARKER);
 }
 
@@ -1652,6 +1660,7 @@ async function runQueryAttempt(
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
   initialIpcMessages: IpcInputMessage[] = [],
+  mcpToolsContext?: McpContext,
 ): Promise<{
   newSessionId?: string;
   lastAssistantUuid?: string;
@@ -1684,6 +1693,36 @@ async function runQueryAttempt(
   // name in the return type, this includes the initial startup/idle-drain batch
   // as well as messages piped while the query is active.
   const ipcDeliveryTracker = new IpcTurnDeliveryTracker(initialIpcMessages);
+  const coldInputTurnId = containerInput.turnId || generateTurnId();
+  const outputCorrelation = new IpcTurnOutputCorrelation(
+    ipcDeliveryTracker,
+    coldInputTurnId,
+  );
+  const activateCurrentInputTurn = (
+    fallbackInputTurnId: string = outputCorrelation.currentInputTurnId,
+  ): void => {
+    const currentMessages = ipcDeliveryTracker.currentTurnMessages;
+    const currentMessage = latestIpcInputMessage(currentMessages);
+    const currentInputTurnId =
+      outputCorrelation.syncCurrentTurn(fallbackInputTurnId);
+    if (!emitOutput) return;
+    activeOutputInputTurnId = currentInputTurnId;
+    if (mcpToolsContext) {
+      mcpToolsContext.currentInputTurnId = currentInputTurnId;
+      if (currentMessage) {
+        mcpToolsContext.currentTaskId = currentMessage.taskId ?? null;
+      }
+    }
+    if (currentMessage) {
+      setCurrentChannelTurn(
+        containerInput,
+        currentMessage.sourceJid,
+        currentMessage.channelContext,
+      );
+      containerInput.messageTaskId = currentMessage.taskId ?? undefined;
+    }
+  };
+  activateCurrentInputTurn(coldInputTurnId);
   const pipedMessagesDuringQuery = ipcDeliveryTracker.unacknowledgedMessages;
   const providerFallbackTurns = new ProviderFallbackTurnLedger({
     prompt,
@@ -1719,18 +1758,20 @@ async function runQueryAttempt(
   });
   const emit = (output: ContainerOutput): void => {
     if (output.streamEvent) {
-      output = {
+      output = outputCorrelation.correlate({
         ...output,
         streamEvent: decorateStreamEvent(output.streamEvent),
         turnId: containerInput.turnId,
         sessionId: newSessionId || sessionId,
-      };
+      });
     } else if (output.status === 'success' || output.status === 'error') {
-      output = {
+      output = outputCorrelation.correlate({
         ...output,
         turnId: containerInput.turnId,
         sessionId: newSessionId || sessionId,
-      };
+      });
+    } else {
+      output = outputCorrelation.correlate(output);
     }
     if (emitOutput) writeOutput(output);
   };
@@ -1986,15 +2027,24 @@ async function runQueryAttempt(
       ipcDeliveryTracker.acceptTurn([msg]);
       if (becomesCurrentTurn) {
         providerFallbackTurns.acceptCurrentTurn([msg]);
+        activateCurrentInputTurn(
+          msg.receipt?.deliveryId || containerInput.turnId || generateTurnId(),
+        );
       }
       // A new user turn arrived after a prior result. Cancel that result's
       // post-timeout so the stream cannot close before this turn completes.
       resultReceivedAt = null;
-      setCurrentChannelTurn(containerInput, msg.sourceJid, msg.channelContext);
+      // Build this queued turn with its own channel context, but do not mutate
+      // the runner/MCP "current" context while an older SDK turn still owns
+      // output. That ownership changes only after completeNextTurn().
+      const queuedChannelContext = normalizeChannelTurnContext(
+        msg.channelContext,
+        msg.sourceJid ||
+          containerInput.currentSourceJid ||
+          containerInput.chatJid,
+      );
       const rejected = stream.push(msg.text, msg.images, (message) =>
-        anchorUserTurn(
-          decorateChannelUserTurn(message, containerInput.channelContext),
-        ),
+        anchorUserTurn(decorateChannelUserTurn(message, queuedChannelContext)),
       );
       for (const reason of rejected) {
         emit({
@@ -2910,6 +2960,13 @@ async function runQueryAttempt(
             `Result #${resultCount} emitted; keeping stream open for ${ipcDeliveryTracker.pendingTurnCount} accepted follow-up turn(s)`,
           );
         }
+        // The completed result, its usage, and any immediately-derived status
+        // above all belong to the old turn. Only now may an already accepted
+        // steer become the active output/MCP turn. This prevents a slow A
+        // result from being attributed to B merely because B arrived first.
+        if (inputTurnCompleted && ipcDeliveryTracker.hasPendingTurns) {
+          activateCurrentInputTurn(containerInput.turnId);
+        }
       }
     }
 
@@ -3093,6 +3150,7 @@ async function runQuery(
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
   initialIpcMessages: IpcInputMessage[] = [],
+  mcpToolsContext?: McpContext,
 ): Promise<RunQueryResult> {
   const first = await runQueryAttempt(
     prompt,
@@ -3107,6 +3165,7 @@ async function runQuery(
     images,
     sourceKindOverride,
     initialIpcMessages,
+    mcpToolsContext,
   );
   const failed = first.providerFailureTurn;
   if (!failed) return first;
@@ -3140,6 +3199,7 @@ async function runQuery(
     failed.images,
     sourceKindOverride,
     failed.ipcMessages,
+    mcpToolsContext,
   );
 }
 
@@ -3171,6 +3231,10 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    // A cold turn without a durable IPC receipt is correlated by the original
+    // host turn ID. Keep that fallback stable for every frame in this run.
+    containerInput.turnId ||= generateTurnId();
+    activeOutputInputTurnId = containerInput.turnId;
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
@@ -3313,9 +3377,8 @@ async function main(): Promise<void> {
       latestPendingMessage?.sourceJid,
       latestPendingMessage?.channelContext,
     );
-    mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
-      pendingDrain.messages,
-    );
+    mcpToolsConfig.currentInputTurnId =
+      latestIpcDeliveryId(pendingDrain.messages) ?? containerInput.turnId;
     // Likewise carry the task identity. A group-mode scheduled task injected
     // into this cold-start window (process registered, SDK transport not yet
     // ready) arrives via IPC with a taskId; without propagating it here the
@@ -3386,6 +3449,7 @@ async function main(): Promise<void> {
         promptImages,
         undefined,
         currentIpcMessages,
+        mcpToolsConfig,
       );
       currentIpcMessages = queryResult.pipedMessagesDuringQuery;
       if (queryResult.newSessionId) {
@@ -3557,9 +3621,8 @@ async function main(): Promise<void> {
         promptImages = nextMessage.images;
         currentIpcMessages = nextMessage.messages;
         containerInput.turnId = generateTurnId();
-        mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
-          nextMessage.messages,
-        );
+        mcpToolsConfig.currentInputTurnId =
+          latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
         containerInput.messageTaskId =
@@ -3663,6 +3726,8 @@ async function main(): Promise<void> {
             undefined,
             undefined,
             'auto_continue',
+            [],
+            mcpToolsConfig,
           );
           if (autoContResult.newSessionId) {
             sessionId = autoContResult.newSessionId;
@@ -3785,6 +3850,7 @@ async function main(): Promise<void> {
           undefined,
           'truncation_continue',
           truncationIpcMessages,
+          mcpToolsConfig,
         );
         truncationIpcMessages = contResult.pipedMessagesDuringQuery;
         currentIpcMessages = truncationIpcMessages;
@@ -3883,9 +3949,8 @@ async function main(): Promise<void> {
       promptImages = nextMessage.images;
       currentIpcMessages = nextMessage.messages;
       containerInput.turnId = generateTurnId();
-      mcpToolsConfig.currentInputTurnId = latestIpcDeliveryId(
-        nextMessage.messages,
-      );
+      mcpToolsConfig.currentInputTurnId =
+        latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
       // Clear per-turn task attribution: the previous query may have been a
       // scheduled-task turn, but this new IPC message is a regular follow-up
       // unless it explicitly carried a taskId (see nextMessage.taskId below).

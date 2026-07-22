@@ -709,7 +709,8 @@ describe('buildStreamingAgentCard', () => {
     const header = card.header as Record<string, unknown>;
     expect(header.template).toBe('blue');
 
-    // Rich skeleton: STATUS_BANNER + 3 collapsible panels + MAIN_CONTENT + BUTTON + FOOTER_NOTE
+    // Rich skeleton: STATUS_BANNER + invisible ASK slot + 5 collapsible
+    // runtime panels + MAIN_CONTENT + BUTTON + FOOTER_NOTE.
     const ids = new Set(collectElementIds(card));
     for (const required of [
       CARD_ELEMENT_IDS.STATUS_BANNER,
@@ -729,9 +730,12 @@ describe('buildStreamingAgentCard', () => {
     }
   });
 
-  test('rich streaming card contains 6 collapsible panels (ask/task/timeline included)', () => {
+  test('rich streaming card keeps ask invisible until a real question exists', () => {
     const card = buildStreamingAgentCard({ initialText: 'x' });
-    expect(countTag(card, 'collapsible_panel')).toBe(6);
+    const serialized = JSON.stringify(card);
+    expect(countTag(card, 'collapsible_panel')).toBe(5);
+    expect(serialized).not.toContain('等待你的回复');
+    expect(serialized).not.toContain('暂无提问');
   });
 
   test('legacy (rich:false) streaming card keeps 5-slot flat layout', () => {
@@ -1050,18 +1054,17 @@ describe('buildTimelineText', () => {
 });
 
 describe('buildStreamingAgentCard rich skeleton (Phase F)', () => {
-  test('includes ASK and TIMELINE panels', () => {
+  test('includes an invisible ASK content slot and the TIMELINE panel', () => {
     const card = buildStreamingAgentCard({ initialText: 'x' });
     const ids = new Set(collectElementIds(card));
-    expect(ids.has(CARD_ELEMENT_IDS.ASK_PANEL)).toBe(true);
     expect(ids.has(CARD_ELEMENT_IDS.ASK_CONTENT)).toBe(true);
     expect(ids.has(CARD_ELEMENT_IDS.TIMELINE_PANEL)).toBe(true);
     expect(ids.has(CARD_ELEMENT_IDS.TIMELINE_CONTENT)).toBe(true);
   });
 
-  test('rich skeleton now has 6 collapsible panels', () => {
+  test('rich skeleton has 5 collapsible panels while ask remains hidden', () => {
     const card = buildStreamingAgentCard({ initialText: 'x' });
-    expect(countTag(card, 'collapsible_panel')).toBe(6);
+    expect(countTag(card, 'collapsible_panel')).toBe(5);
   });
 });
 

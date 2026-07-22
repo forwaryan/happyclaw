@@ -62,6 +62,9 @@ import type {
 } from './feishu-capability.js';
 import {
   StreamingCardController,
+  reconcileInterruptedStreamingCard,
+  type InterruptedStreamingCardInput,
+  type StreamingCardLifecycle,
   type StreamingCardOptions,
 } from './feishu-streaming-card.js';
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
@@ -158,6 +161,8 @@ export interface IMChannelConnectOpts {
   onP2pSender?: (senderOpenId: string) => void;
   /** Canonicalize an inbound provider JID before persistence/callbacks. */
   normalizeIncomingJid?: (jid: string) => string;
+  /** Persist the provider event but postpone policy/routing execution. */
+  shouldDeferInbound?: () => boolean;
   /** WeChat iLink authorization/transport lifecycle. */
   onWeChatConnectionStateChange?: (state: WeChatConnectionState) => void;
 }
@@ -191,7 +196,12 @@ export interface IMChannel {
   createStreamingSession?(
     chatId: string,
     onCardCreated?: (messageId: string) => void,
+    lifecycle?: StreamingCardLifecycle,
   ): Promise<StreamingSession | undefined>;
+  /** Reconcile a non-terminal card through this exact connected Bot. */
+  reconcileStreamingCard?(
+    input: InterruptedStreamingCardInput,
+  ): Promise<{ version: number; method: 'cardkit' | 'message_patch' }>;
   getChatInfo?(chatId: string): Promise<{
     avatar?: string;
     name?: string;
@@ -268,6 +278,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onCardInterrupt: opts.onCardInterrupt,
         onP2pSender: opts.onP2pSender,
         normalizeIncomingJid: opts.normalizeIncomingJid,
+        shouldDeferInbound: opts.shouldDeferInbound,
       });
       return connected;
     },
@@ -358,6 +369,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     async createStreamingSession(
       chatId: string,
       onCardCreated?: (messageId: string) => void,
+      lifecycle?: StreamingCardLifecycle,
     ): Promise<StreamingSession | undefined> {
       if (!inner) return undefined;
       const larkClient = inner.getLarkClient();
@@ -369,6 +381,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         replyToMsgId: inner.getLastMessageId(chatId),
         replyInThread: target.replyInThread,
         onCardCreated,
+        lifecycle,
         // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
         // 终态收口与静态消息兜底分别由 schedulePatch 的 best-effort patch
         // 和 index.ts 的 result 路径负责，这里只补日志。
@@ -379,6 +392,13 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
           ),
       };
       return new StreamingCardController(opts);
+    },
+
+    async reconcileStreamingCard(input) {
+      if (!inner) throw new Error('Feishu channel is not connected');
+      const larkClient = inner.getLarkClient();
+      if (!larkClient) throw new Error('Feishu Bot client is not ready');
+      return reconcileInterruptedStreamingCard(larkClient, input);
     },
   };
 

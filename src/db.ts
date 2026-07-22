@@ -74,9 +74,13 @@ import {
   normalizeAgentProfilePrompts,
   promptModeFromLegacyPreset,
 } from './agent-profile-prompts.js';
+import {
+  bindChannelReliabilityDatabase,
+  createChannelReliabilitySchema,
+} from './channel-reliability-store.js';
 
 let db: InstanceType<typeof Database>;
-const CURRENT_SCHEMA_VERSION = 59;
+const CURRENT_SCHEMA_VERSION = 60;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -2194,6 +2198,12 @@ export function initDatabase(): void {
     SET usage_date = date(created_at, 'localtime')
     WHERE usage_date IS NULL OR usage_date = '';
   `);
+
+  // v59 -> v60: durable, provider-neutral channel inbox / Agent turn /
+  // per-artifact outbox / streaming-card state. The store module owns the
+  // schema and fenced APIs; db.ts only binds it to this process connection.
+  createChannelReliabilitySchema(db);
+  bindChannelReliabilityDatabase(db);
 
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
@@ -6374,6 +6384,34 @@ export function getSession(
   return row?.session_id;
 }
 
+function sessionChannelOwnerKey(
+  groupFolder: string,
+  agentId?: string | null,
+): string {
+  return `channel_session_owner:${groupFolder}:${agentId || 'main'}`;
+}
+
+/** The first native transport that owns a logical warm Session. */
+export function getSessionChannelOwner(
+  groupFolder: string,
+  agentId?: string | null,
+): string | undefined {
+  return getRouterState(sessionChannelOwnerKey(groupFolder, agentId));
+}
+
+/** Persist-once: later Web or sibling IM inputs cannot steal ownership. */
+export function setSessionChannelOwnerOnce(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  sourceJid: string,
+): string {
+  const key = sessionChannelOwnerKey(groupFolder, agentId);
+  db.prepare(
+    'INSERT OR IGNORE INTO router_state (key, value) VALUES (?, ?)',
+  ).run(key, sourceJid);
+  return getRouterState(key) ?? sourceJid;
+}
+
 export function setSession(
   groupFolder: string,
   sessionId: string,
@@ -6420,6 +6458,21 @@ export function deleteSession(
       'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
     ).run(groupFolder, effectiveAgentId);
   })();
+}
+
+/**
+ * Forget the transport identity of a logical conversation. SDK/provider resume
+ * resets must not call this: the first native channel remains the Session
+ * owner across model/profile recovery. Only explicit conversation deletion or
+ * user-requested reset starts a new channel-ownership lifecycle.
+ */
+export function clearSessionChannelOwner(
+  groupFolder: string,
+  agentId?: string | null,
+): void {
+  db.prepare('DELETE FROM router_state WHERE key = ?').run(
+    sessionChannelOwnerKey(groupFolder, agentId),
+  );
 }
 
 /** Invalidate every SDK resume token associated with a workspace. */
@@ -6481,6 +6534,9 @@ export function deleteAllSessionsForFolder(groupFolder: string): void {
     db.prepare(
       'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
     ).run(groupFolder);
+    db.prepare('DELETE FROM router_state WHERE key LIKE ?').run(
+      `channel_session_owner:${groupFolder}:%`,
+    );
   })();
 }
 
@@ -12412,6 +12468,7 @@ export function tryIncrementRedeemCodeUsage(
 export function closeDatabase(): void {
   _stmts = null;
   _newMsgStmtCache.clear();
+  bindChannelReliabilityDatabase(null);
   if (db) {
     db.close();
   }

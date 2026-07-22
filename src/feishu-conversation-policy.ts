@@ -105,10 +105,13 @@ export function resolveFeishuConversationPlan(
   );
   const topicChat = isFeishuTopicChat(input.chatMode);
 
-  // An existing durable binding means the bot is already present in this
-  // topic. Reuse its canonical identity even if Feishu later starts supplying
-  // a thread_id that was absent on the root event.
-  if (input.activeContext && (topicChat || mentionRequired)) {
+  // A real Feishu topic/thread keeps its durable identity even when the user
+  // mentions the bot again inside that topic. Mentions inside an established
+  // thread must never create nested conversation agents.
+  if (
+    input.activeContext &&
+    (topicChat || (mentionRequired && input.threadId))
+  ) {
     return {
       disabled: false,
       allowWithoutMention: true,
@@ -139,6 +142,30 @@ export function resolveFeishuConversationPlan(
     };
   }
 
+  // Feishu can deliver the first bot mention from an already-existing native
+  // thread before HappyClaw has created its durable context binding. Preserve
+  // that native thread identity instead of anchoring a second, nested topic to
+  // the triggering message. Once admitted, subsequent messages resolve via
+  // the active-context branch above and no longer require another mention.
+  if (mentionRequired && input.threadId) {
+    if (!input.mentionedBot) {
+      return {
+        disabled: false,
+        allowWithoutMention: false,
+        independentContext: false,
+        reason: 'mention_required',
+      };
+    }
+    return {
+      disabled: false,
+      allowWithoutMention: false,
+      independentContext: true,
+      contextId: input.threadId,
+      rootMessageId: input.rootId || input.messageId,
+      reason: 'new_native_topic',
+    };
+  }
+
   if (!mentionRequired) {
     return {
       disabled: false,
@@ -149,6 +176,19 @@ export function resolveFeishuConversationPlan(
   }
 
   if (!input.mentionedBot) {
+    // Feishu may omit thread_id on an early follow-up while still supplying
+    // root_id. The durable binding is authoritative for an unmentioned
+    // follow-up, so it remains in the already-active topic.
+    if (input.activeContext) {
+      return {
+        disabled: false,
+        allowWithoutMention: true,
+        independentContext: true,
+        contextId: input.activeContext.contextId,
+        rootMessageId: input.activeContext.rootMessageId,
+        reason: 'active_context',
+      };
+    }
     return {
       disabled: false,
       allowWithoutMention: false,
@@ -157,10 +197,12 @@ export function resolveFeishuConversationPlan(
     };
   }
 
-  // In an ordinary group, a mention starts a Feishu topic. A mention already
-  // located in a reply chain adopts that chain's root; a main-timeline mention
-  // anchors itself, so every new top-level mention gets a fresh Agent session.
-  const rootMessageId = input.rootId || input.messageId;
+  // In an ordinary group, every valid mention outside a real Feishu thread
+  // starts a new topic anchored to the mentioned message itself. A native
+  // root_id here can describe an ordinary reply chain; inheriting it would
+  // incorrectly merge the new request into an older Agent session. The old
+  // chain remains useful only as bounded referenced context.
+  const rootMessageId = input.messageId;
   return {
     disabled: false,
     allowWithoutMention: false,
