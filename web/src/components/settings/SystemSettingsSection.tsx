@@ -325,6 +325,9 @@ export function SystemSettingsSection({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // fallbackModel 是自由字符串，独立于数值 field 抽象；仅在 runtime scope 展示。
+  const [fallbackModel, setFallbackModel] = useState('');
+  const [initialFallbackModel, setInitialFallbackModel] = useState('');
 
   const loadSettings = useCallback(async () => {
     if (!canManage) return;
@@ -336,6 +339,8 @@ export function SystemSettingsSection({
       setSettings(data);
       setValues(nextValues);
       setInitialValues(nextValues);
+      setFallbackModel(data.fallbackModel ?? '');
+      setInitialFallbackModel(data.fallbackModel ?? '');
       setTouched({});
       setSubmitted(false);
     } catch (error) {
@@ -369,14 +374,18 @@ export function SystemSettingsSection({
     ) as Partial<Record<NumericSettingKey, string>>;
   }, [activeFields, values]);
 
+  const fallbackModelDirty =
+    scope === 'runtime' && fallbackModel.trim() !== initialFallbackModel.trim();
+
   const dirty = useMemo(
     () =>
-      !!values &&
-      !!initialValues &&
-      activeFields.some(
-        (field) => values[field.key] !== initialValues[field.key],
-      ),
-    [activeFields, initialValues, values],
+      (!!values &&
+        !!initialValues &&
+        activeFields.some(
+          (field) => values[field.key] !== initialValues[field.key],
+        )) ||
+      fallbackModelDirty,
+    [activeFields, initialValues, values, fallbackModelDirty],
   );
 
   const handleSave = async () => {
@@ -388,6 +397,9 @@ export function SystemSettingsSection({
     for (const field of activeFields) {
       payload[field.key] = field.toStored(Number(values[field.key]));
     }
+    if (scope === 'runtime') {
+      payload.fallbackModel = fallbackModel.trim();
+    }
 
     setSaving(true);
     try {
@@ -396,6 +408,8 @@ export function SystemSettingsSection({
       setSettings(data);
       setValues(nextValues);
       setInitialValues(nextValues);
+      setFallbackModel(data.fallbackModel ?? '');
+      setInitialFallbackModel(data.fallbackModel ?? '');
       setTouched({});
       setSubmitted(false);
       toast.success('系统参数已保存，将应用于后续启动的任务');
@@ -478,6 +492,32 @@ export function SystemSettingsSection({
           </section>
         ))}
       </div>
+
+      {scope === 'runtime' && (
+        <section className="border-t border-border py-6">
+          <header className="mb-5 max-w-2xl">
+            <h2 className="text-base font-semibold text-foreground">
+              额度墙回退模型
+            </h2>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              主模型在一轮里撞到账号用量上限（如「You've reached your Fable 5
+              limit」）时，用该模型在同一轮无缝重跑一次，上限通知不外发给用户。填模型别名或完整
+              ID（如 <code>opus</code>、<code>claude-opus-4-8</code>
+              ）。留空关闭，保留原行为。同一 OAuth
+              账号下不同模型有独立额度桶，因此 fable→opus
+              这类回退无需额外配置第二个 provider。
+            </p>
+          </header>
+          <Input
+            type="text"
+            value={fallbackModel}
+            onChange={(e) => setFallbackModel(e.target.value)}
+            placeholder="留空 = 关闭（如 opus / claude-opus-4-8）"
+            className="max-w-xs"
+            aria-label="额度墙回退模型"
+          />
+        </section>
+      )}
 
       <div className="sticky bottom-0 z-10 -mx-4 mt-2 flex min-h-16 items-center justify-between gap-4 border-t border-border bg-background/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/85">
         <p className="text-xs text-muted-foreground" aria-live="polite">

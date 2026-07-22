@@ -816,6 +816,23 @@ export function prepareHostPlugins(
   return loadUserPlugins(ownerId, { runtime: 'host' });
 }
 
+/**
+ * Force ANTHROPIC_MODEL to `modelOverride` (drops any existing line first so the
+ * override wins regardless of source order). No-op when override is empty.
+ * Used by the same-turn fallback-model retry (see runAgentWithModelFallback).
+ */
+function applyModelOverrideToEnvLines(
+  envLines: string[],
+  modelOverride?: string,
+): void {
+  const model = modelOverride?.trim();
+  if (!model) return;
+  for (let i = envLines.length - 1; i >= 0; i--) {
+    if (envLines[i].startsWith('ANTHROPIC_MODEL=')) envLines.splice(i, 1);
+  }
+  envLines.push(`ANTHROPIC_MODEL=${model}`);
+}
+
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
@@ -826,6 +843,7 @@ export function buildVolumeMounts(
   resolvedProvider?: ResolvedProvider,
   ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
+  modelOverride?: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -1108,6 +1126,9 @@ export function buildVolumeMounts(
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
+  // Fallback-model retry: force ANTHROPIC_MODEL to the override so the same turn
+  // re-runs on a different model tier (see runAgentWithModelFallback).
+  applyModelOverrideToEnvLines(envLines, modelOverride);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -1251,6 +1272,7 @@ export async function runContainerAgent(
   ) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
+  modelOverride?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
   const sessionAgentId = input.sessionAgentId ?? input.agentId;
@@ -1298,6 +1320,7 @@ export async function runContainerAgent(
       resolvedProvider,
       input.agentId,
       input.agentProfile,
+      modelOverride,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -1722,6 +1745,7 @@ export async function runHostAgent(
   ) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
+  modelOverride?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
   const sessionAgentId = input.sessionAgentId ?? input.agentId;
@@ -1979,6 +2003,11 @@ export async function runHostAgent(
       if (eqIdx > 0) {
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
+    }
+    // Fallback-model retry: force the model tier for this respawn (see
+    // runAgentWithModelFallback). Overrides whatever the provider config set.
+    if (modelOverride?.trim()) {
+      hostEnv['ANTHROPIC_MODEL'] = modelOverride.trim();
     }
 
     // Third-party provider: unless this provider explicitly injects
@@ -2408,4 +2437,80 @@ export async function runHostAgent(
       providerPool.releaseSession(hostSelectedProfileId);
     }
   }
+}
+
+/** A concrete agent runner (Docker or host) — both share this signature. */
+export type AgentRunner = typeof runContainerAgent | typeof runHostAgent;
+
+/**
+ * Run one agent turn with same-turn model fallback.
+ *
+ * When the primary model returns an account usage-limit notice (surfaced as
+ * `providerFailure`, e.g. "You've reached your Fable 5 limit"), and
+ * SystemSettings.fallbackModel is configured, the turn is transparently re-run
+ * once with the fallback model. The limit notice from the first attempt is
+ * swallowed so the user only ever sees the fallback model's real reply.
+ *
+ * Same OAuth account, different model tier = separate usage quota bucket, so
+ * fable→opus works on a single provider without reconfiguring the pool. The
+ * first attempt still reports the failure to ProviderPool, so subsequent *new*
+ * turns also skip the exhausted tier until it recovers.
+ *
+ * No fallback configured, or the retry also hits a limit → behaves exactly like
+ * calling the runner directly.
+ */
+export async function runAgentWithModelFallback(
+  runFn: AgentRunner,
+  group: RegisteredGroup,
+  input: ContainerInput,
+  onProcess: (
+    proc: ChildProcess,
+    identifier: string,
+    selectedProviderId: string | null,
+  ) => void,
+  onOutput?: (output: ContainerOutput) => Promise<void>,
+  ownerHomeFolder?: string,
+): Promise<ContainerOutput> {
+  const fallbackModel = getSystemSettings().fallbackModel?.trim();
+  if (!fallbackModel) {
+    return runFn(group, input, onProcess, onOutput, ownerHomeFolder);
+  }
+
+  // Attempt 1 on the primary model. Gate onOutput so the limit notice is not
+  // surfaced — the second attempt will produce the real reply. Non-failure
+  // output (init/status/partial deltas) still passes through.
+  const gatedOnOutput = onOutput
+    ? async (output: ContainerOutput): Promise<void> => {
+        if (output.providerFailure) return;
+        await onOutput(output);
+      }
+    : undefined;
+
+  const first = await runFn(
+    group,
+    input,
+    onProcess,
+    gatedOnOutput,
+    ownerHomeFolder,
+  );
+  if (!first.providerFailure) {
+    return first;
+  }
+
+  logger.warn(
+    { group: group.name, fallbackModel },
+    'Primary model hit account usage limit; retrying same turn with fallback model',
+  );
+
+  // Attempt 2 forces the fallback model tier, resuming the same session. Full
+  // pass-through this time — whatever it produces (including another limit
+  // notice) is the final, user-visible result.
+  return runFn(
+    group,
+    input,
+    onProcess,
+    onOutput,
+    ownerHomeFolder,
+    fallbackModel,
+  );
 }

@@ -509,6 +509,7 @@ export const SystemSettingsSchema = z
         'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
       )
       .optional(),
+    fallbackModel: z.string().max(64).optional(),
   })
   .strict();
 

@@ -49,6 +49,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
+  runAgentWithModelFallback,
   willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -6206,7 +6207,8 @@ async function runAgent(
         );
         return { status: 'error', error: HOST_EXECUTION_FORBIDDEN_ERROR };
       }
-      output = await runHostAgent(
+      output = await runAgentWithModelFallback(
+        runHostAgent,
         group,
         {
           prompt,
@@ -6228,7 +6230,8 @@ async function runAgent(
         ownerHomeFolder,
       );
     } else {
-      output = await runContainerAgent(
+      output = await runAgentWithModelFallback(
+        runContainerAgent,
         group,
         {
           prompt,
@@ -10547,7 +10550,8 @@ async function processAgentConversation(
         );
         throw new Error(HOST_EXECUTION_FORBIDDEN_ERROR);
       }
-      output = await runHostAgent(
+      output = await runAgentWithModelFallback(
+        runHostAgent,
         effectiveGroup,
         containerInput,
         onProcessCb,
@@ -10555,7 +10559,8 @@ async function processAgentConversation(
         ownerHomeFolder,
       );
     } else {
-      output = await runContainerAgent(
+      output = await runAgentWithModelFallback(
+        runContainerAgent,
         effectiveGroup,
         containerInput,
         onProcessCb,
