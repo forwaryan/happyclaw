@@ -232,6 +232,7 @@ interface PendingProviderSessionInvalidation {
 
 const PROVIDER_INVALIDATION_STATE_PREFIX =
   'provider_session_invalidation_pending:';
+const PROVIDER_RUNTIME_SAFETY_SOURCE = 'provider-config-mutation';
 const volatilePendingProviderSessionInvalidations = new Map<
   string,
   PendingProviderSessionInvalidation
@@ -363,6 +364,7 @@ function restorePendingProviderRuntimeSafetyBlocks(): void {
   deps.queue.blockGroupsForRuntimeSafety(
     runtimeJids,
     `provider session invalidation pending after restart: ${pendingProviderIds.size}`,
+    PROVIDER_RUNTIME_SAFETY_SOURCE,
   );
 }
 
@@ -563,6 +565,7 @@ async function mutateClaudeConfigForAllGroups<T>(
           deps.queue.blockGroupsForRuntimeSafety?.(
             runtimeJids,
             `${reason}: post-commit provider runtime cleanup failed`,
+            PROVIDER_RUNTIME_SAFETY_SOURCE,
           );
           if (
             options?.clearSessionsForProviderId &&
@@ -604,6 +607,7 @@ async function mutateClaudeConfigForAllGroups<T>(
             deps.queue.blockGroupsForRuntimeSafety?.(
               knownRuntimeJids,
               `${reason}: provider config persisted but follow-up failed`,
+              PROVIDER_RUNTIME_SAFETY_SOURCE,
             );
           }
           throw error;
@@ -620,7 +624,10 @@ async function mutateClaudeConfigForAllGroups<T>(
       );
     }
     if (!hasPendingProviderSessionInvalidations()) {
-      deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
+      deps.queue.unblockGroupsForRuntimeSafety?.(
+        result.runtimeJids,
+        PROVIDER_RUNTIME_SAFETY_SOURCE,
+      );
     }
     const applied: ClaudeApplyResultPayload = {
       success: true,
@@ -971,6 +978,7 @@ configRoutes.patch(
             if (!hasPendingProviderSessionInvalidations()) {
               deps?.queue?.unblockGroupsForRuntimeSafety?.(
                 getKnownClaudeRuntimeJids(),
+                PROVIDER_RUNTIME_SAFETY_SOURCE,
               );
             }
           }

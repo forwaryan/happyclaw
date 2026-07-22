@@ -360,6 +360,7 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(blockGroupsForRuntimeSafety).toHaveBeenCalledWith(
       [jid],
       expect.stringContaining('post-commit provider runtime cleanup failed'),
+      'provider-config-mutation',
     );
     expect(unblockGroupsForRuntimeSafety).not.toHaveBeenCalled();
 
@@ -435,7 +436,10 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       runtimeConfig.getProviders().find((item) => item.id === target.id)
         ?.enabled,
     ).toBe(false);
-    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
+    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith(
+      [jid],
+      'provider-config-mutation',
+    );
   });
 
   test('unblocks a restarted workspace after a disabled provider repairs pending session cleanup', async () => {
@@ -565,7 +569,38 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(
       db.getRouterState(`provider_session_invalidation_pending:${target.id}`),
     ).toBeUndefined();
-    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
+    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith(
+      [jid],
+      'provider-config-mutation',
+    );
+  });
+
+  test('does not release a runtime safety block owned by another mutation source', async () => {
+    const folder = unique('cross-source-runtime-block');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    const queue = new GroupQueue();
+    liveQueue = queue;
+    bindDeps({ [jid]: group }, queue);
+    queue.blockGroupsForRuntimeSafety(
+      [jid],
+      'capability mutation requires manual repair',
+    );
+    const provider = runtimeConfig.createProvider({
+      name: unique('cross-source-provider'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://same.example.test',
+      anthropicAuthToken: 'test-token',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(queue.isGroupRuntimeSafetyBlocked(jid)).toBe(true);
   });
 
   test('serializes manual apply with a concurrent provider mutation', async () => {
