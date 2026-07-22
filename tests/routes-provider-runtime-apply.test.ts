@@ -107,6 +107,17 @@ async function patchProvider(
   });
 }
 
+async function setProviderEnabled(
+  providerId: string,
+  enabled: boolean,
+): Promise<Response> {
+  return app.request(`/api/config/claude/providers/${providerId}/toggle`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
@@ -288,10 +299,11 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     ).toBe('old-model');
   });
 
-  test('reports a persisted update when the post-commit quiesce pass fails', async () => {
+  test('repairs a stale provider session on an exact retry after post-commit quiesce fails', async () => {
     const folder = unique('post-commit-failure');
     const jid = `web:${folder}`;
     const group = registerWorkspace(jid, folder);
+    const staleSessionId = unique('stale-session');
     let stopCalls = 0;
     const blockGroupsForRuntimeSafety = vi.fn();
     const unblockGroupsForRuntimeSafety = vi.fn();
@@ -304,6 +316,10 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       stopGroup: vi.fn(async () => {
         stopCalls += 1;
         if (stopCalls === 2) {
+          // Reproduce a runner finishing late after the transactional cleanup
+          // and writing its old provider session back into SQLite.
+          db.setSession(folder, staleSessionId);
+          db.setSessionProviderId(folder, '', provider.id);
           throw new Error('simulated post-commit stop failure');
         }
       }),
@@ -311,12 +327,13 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     bindDeps({ [jid]: group }, queue);
     const provider = runtimeConfig.createProvider({
       name: unique('partially-applied-provider'),
-      type: 'third_party',
-      anthropicBaseUrl: 'https://old.example.test',
-      anthropicAuthToken: 'test-token',
+      type: 'official',
+      anthropicApiKey: 'official-key',
       anthropicModel: 'old-model',
       enabled: true,
     });
+    db.setSession(folder, unique('initial-session'));
+    db.setSessionProviderId(folder, '', provider.id);
 
     const response = await patchProvider(provider.id, {
       anthropicModel: 'persisted-model',
@@ -333,21 +350,86 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       runtimeConfig.getProviders().find((item) => item.id === provider.id)
         ?.anthropicModel,
     ).toBe('persisted-model');
+    expect(db.getSession(folder)).toBe(staleSessionId);
     expect(blockGroupsForRuntimeSafety).toHaveBeenCalledWith(
       [jid],
       expect.stringContaining('post-commit provider runtime cleanup failed'),
     );
     expect(unblockGroupsForRuntimeSafety).not.toHaveBeenCalled();
 
+    // A process restart creates a fresh in-memory queue. The durable pending
+    // marker must rebuild its safety block when web dependencies are injected.
+    const restartedQueue = new GroupQueue();
+    liveQueue = restartedQueue;
+    bindDeps({ [jid]: group }, restartedQueue);
+    expect(restartedQueue.isGroupRuntimeSafetyBlocked(jid)).toBe(true);
+
+    // The desired value is already persisted. The retry must still replay the
+    // pending invalidation instead of treating this as a no-op.
     const retryResponse = await patchProvider(provider.id, {
-      anthropicModel: 'retry-succeeded-model',
+      anthropicModel: 'persisted-model',
     });
     expect(retryResponse.status).toBe(200);
-    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
+    expect(restartedQueue.isGroupRuntimeSafetyBlocked(jid)).toBe(false);
+    expect(db.getSession(folder)).toBeUndefined();
     expect(
       runtimeConfig.getProviders().find((item) => item.id === provider.id)
         ?.anthropicModel,
-    ).toBe('retry-succeeded-model');
+    ).toBe('persisted-model');
+  });
+
+  test('retries a persisted provider toggle idempotently instead of reversing it', async () => {
+    const folder = unique('toggle-retry');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    let stopCalls = 0;
+    const blockGroupsForRuntimeSafety = vi.fn();
+    const unblockGroupsForRuntimeSafety = vi.fn();
+    bindDeps(
+      { [jid]: group },
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 6 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        blockGroupsForRuntimeSafety,
+        unblockGroupsForRuntimeSafety,
+        stopGroup: vi.fn(async () => {
+          stopCalls += 1;
+          if (stopCalls === 2) {
+            throw new Error('simulated post-toggle stop failure');
+          }
+        }),
+      },
+    );
+    const target = runtimeConfig.createProvider({
+      name: unique('toggle-target'),
+      type: 'official',
+      anthropicApiKey: 'target-key',
+      enabled: true,
+    });
+    runtimeConfig.createProvider({
+      name: unique('toggle-fallback'),
+      type: 'official',
+      anthropicApiKey: 'fallback-key',
+      enabled: true,
+    });
+
+    const firstResponse = await setProviderEnabled(target.id, false);
+    expect(firstResponse.status).toBe(503);
+    expect(firstResponse.ok).toBe(false);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === target.id)
+        ?.enabled,
+    ).toBe(false);
+    expect(blockGroupsForRuntimeSafety).toHaveBeenCalled();
+
+    const retryResponse = await setProviderEnabled(target.id, false);
+    expect(retryResponse.status).toBe(200);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === target.id)
+        ?.enabled,
+    ).toBe(false);
+    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith([jid]);
   });
 
   test('serializes manual apply with a concurrent provider mutation', async () => {
@@ -404,6 +486,44 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(applyResponse.status).toBe(200);
     expect(stopCalls).toBe(4);
   });
+
+  test.each([
+    { label: 'pre-commit', failAt: 1, persisted: false },
+    { label: 'post-commit', failAt: 2, persisted: true },
+  ])(
+    'returns a non-2xx status when manual apply fails in the $label pass',
+    async ({ failAt, persisted }) => {
+      const folder = unique('manual-apply-failure');
+      const jid = `web:${folder}`;
+      const group = registerWorkspace(jid, folder);
+      let stopCalls = 0;
+      bindDeps(
+        { [jid]: group },
+        {
+          listDescendantJids: () => [],
+          pauseGroupsForMutation: () => ({ id: 7 }),
+          resumeGroupsAfterMutation: vi.fn(),
+          blockGroupsForRuntimeSafety: vi.fn(),
+          unblockGroupsForRuntimeSafety: vi.fn(),
+          stopGroup: vi.fn(async () => {
+            stopCalls += 1;
+            if (stopCalls === failAt) {
+              throw new Error('simulated manual apply failure');
+            }
+          }),
+        },
+      );
+
+      const response = await app.request('/api/config/claude/apply', {
+        method: 'POST',
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(503);
+      expect(response.ok).toBe(false);
+      expect(body).toMatchObject({ success: false, persisted });
+    },
+  );
 });
 
 describe('provider session invalidation only removes attributable sessions', () => {
@@ -473,6 +593,95 @@ describe('provider session invalidation only removes attributable sessions', () 
 
     expect(response.status).toBe(200);
     expect(db.getSession(folder)).toBe(sessionId);
+  });
+
+  test('clears an unbound session when credentials override but the changed model does not', async () => {
+    const folder = unique('credential-only-override');
+    const jid = `web:${folder}`;
+    const sessionId = unique('credential-override-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    runtimeConfig.saveContainerEnvConfig(folder, {
+      anthropicAuthToken: 'workspace-token',
+    });
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'old-global-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'new-global-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBeUndefined();
+  });
+
+  test('clears an unbound session unless every changed protocol field is overridden', async () => {
+    const folder = unique('partial-protocol-override');
+    const jid = `web:${folder}`;
+    const sessionId = unique('partial-override-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    runtimeConfig.saveContainerEnvConfig(folder, {
+      anthropicModel: 'workspace-model',
+    });
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicBaseUrl: 'https://old-global.example.test',
+      anthropicModel: 'old-global-model',
+      enabled: true,
+    });
+
+    const response = await patchProvider(provider.id, {
+      anthropicBaseUrl: 'https://new-global.example.test',
+      anthropicModel: 'new-global-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBeUndefined();
+  });
+
+  test('repairs a corrupt durable invalidation marker instead of leaving a permanent gate', async () => {
+    const folder = unique('corrupt-pending-marker');
+    const jid = `web:${folder}`;
+    const sessionId = unique('corrupt-marker-session');
+    const group = registerWorkspace(jid, folder);
+    db.setSession(folder, sessionId);
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'unchanged-model',
+      enabled: true,
+    });
+    db.setSessionProviderId(folder, '', provider.id);
+    db.setRouterState(
+      `provider_session_invalidation_pending:${provider.id}`,
+      '{corrupt-json',
+    );
+    const restartedQueue = new GroupQueue();
+    liveQueue = restartedQueue;
+    bindDeps({ [jid]: group }, restartedQueue, {
+      [folder]: sessionId,
+    });
+
+    expect(restartedQueue.isGroupRuntimeSafetyBlocked(jid)).toBe(true);
+    const response = await patchProvider(provider.id, {
+      anthropicModel: 'unchanged-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(restartedQueue.isGroupRuntimeSafetyBlocked(jid)).toBe(false);
+    expect(
+      db.getRouterState(`provider_session_invalidation_pending:${provider.id}`),
+    ).toBeUndefined();
   });
 
   test('preserves ambiguous unbound sessions when another provider is configured but disabled', async () => {
@@ -549,5 +758,69 @@ describe('provider session invalidation only removes attributable sessions', () 
     expect(response.status).toBe(200);
     expect(db.getSession(folder)).toBe(sessionId);
     expect(db.getSessionProviderId(folder)).toBe(provider.id);
+  });
+
+  test('does not clear a provider session when the requested config is invalid', async () => {
+    const folder = unique('invalid-provider-patch');
+    const jid = `web:${folder}`;
+    const sessionId = unique('invalid-patch-session');
+    bindIdleWorkspace(jid, folder, sessionId);
+    db.setSession(folder, sessionId);
+    const provider = runtimeConfig.createProvider({
+      name: unique('official'),
+      type: 'official',
+      anthropicApiKey: 'official-key',
+      anthropicBaseUrl: 'https://valid.example.test',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+    db.setSessionProviderId(folder, '', provider.id);
+
+    const response = await patchProvider(provider.id, {
+      anthropicBaseUrl: 'not-a-url',
+    });
+
+    expect(response.status).toBe(400);
+    expect(db.getSession(folder)).toBe(sessionId);
+    expect(db.getSessionProviderId(folder)).toBe(provider.id);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.anthropicBaseUrl,
+    ).toBe('https://valid.example.test');
+  });
+
+  test('keeps the main-session cache when only a target-provider agent session is invalidated', async () => {
+    const folder = unique('agent-only-invalidation');
+    const jid = `web:${folder}`;
+    const mainSessionId = unique('main-session');
+    const agentSessionId = unique('agent-session');
+    const sessions = bindIdleWorkspace(jid, folder, mainSessionId);
+    db.setSession(folder, mainSessionId);
+    const target = runtimeConfig.createProvider({
+      name: unique('official-target'),
+      type: 'official',
+      anthropicApiKey: 'target-key',
+      anthropicModel: 'old-model',
+      enabled: true,
+    });
+    const other = runtimeConfig.createProvider({
+      name: unique('other-provider'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://other.example.test',
+      anthropicAuthToken: 'other-token',
+      enabled: false,
+    });
+    db.setSessionProviderId(folder, '', other.id);
+    db.setSession(folder, agentSessionId, 'agent-a');
+    db.setSessionProviderId(folder, 'agent-a', target.id);
+
+    const response = await patchProvider(target.id, {
+      anthropicModel: 'new-model',
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.getSession(folder)).toBe(mainSessionId);
+    expect(db.getSession(folder, 'agent-a')).toBeUndefined();
+    expect(sessions[folder]).toBe(mainSessionId);
   });
 });

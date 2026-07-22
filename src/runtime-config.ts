@@ -1503,7 +1503,10 @@ export function updateProviderSecrets(
   return updated;
 }
 
-export function toggleProvider(id: string): UnifiedProvider {
+export function setProviderEnabled(
+  id: string,
+  enabled: boolean,
+): UnifiedProvider {
   const state = readStoredStateV4();
   if (!state) throw new Error('Claude 配置不存在');
 
@@ -1511,20 +1514,26 @@ export function toggleProvider(id: string): UnifiedProvider {
   if (idx < 0) throw new Error('未找到指定供应商');
 
   const provider = state.providers[idx];
-  const newEnabled = !provider.enabled;
+  if (provider.enabled === enabled) return provider;
 
   // Prevent disabling the last enabled provider
-  if (!newEnabled && state.providers.filter((p) => p.enabled).length <= 1) {
+  if (!enabled && state.providers.filter((p) => p.enabled).length <= 1) {
     throw new Error('至少需要保留一个启用的供应商');
   }
 
   state.providers[idx] = {
     ...provider,
-    enabled: newEnabled,
+    enabled,
     updatedAt: new Date().toISOString(),
   };
   writeStoredStateV4(state.providers, state.balancing);
   return state.providers[idx];
+}
+
+export function toggleProvider(id: string): UnifiedProvider {
+  const provider = getProviders().find((item) => item.id === id);
+  if (!provider) throw new Error('未找到指定供应商');
+  return setProviderEnabled(id, !provider.enabled);
 }
 
 export function deleteProvider(id: string): void {

@@ -106,7 +106,11 @@ export function ClaudeProviderSection({
     async (provider: ProviderWithHealth) => {
       setTogglingId(provider.id);
       try {
-        await api.post(`/api/config/claude/providers/${provider.id}/toggle`);
+        await api.post(
+          `/api/config/claude/providers/${provider.id}/toggle`,
+          { enabled: !provider.enabled },
+          120_000,
+        );
         await loadProviders();
         setNotice(
           provider.enabled
@@ -114,6 +118,10 @@ export function ClaudeProviderSection({
             : `已启用「${provider.name}」`,
         );
       } catch (err) {
+        // A 503 can mean the target state was persisted but runtime teardown
+        // failed afterward. Reload instead of leaving a stale toggle that a
+        // user might click again and accidentally reverse.
+        await loadProviders().catch(() => {});
         setError(getErrorMessage(err, '切换提供商状态失败'));
       } finally {
         setTogglingId(null);

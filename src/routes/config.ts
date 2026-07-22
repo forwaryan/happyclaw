@@ -29,7 +29,13 @@ import {
   logAuthEvent,
   clearSenderAllowlist,
   deleteWorkspaceSessions,
-  deleteSessionsByProviderId,
+  deleteSessionsByProviderIdAroundCommit,
+  getSession,
+  getRouterState,
+  getRouterStateByPrefix,
+  setRouterState,
+  deleteRouterState,
+  isDatabaseInitialized,
   VALID_ACTIVATION_MODES,
   getDefaultChannelAccount,
   getLegacyChannelAccount,
@@ -69,7 +75,7 @@ import {
   createProvider,
   updateProvider,
   updateProviderSecrets,
-  toggleProvider,
+  setProviderEnabled,
   deleteProvider,
   providerToConfig,
   toPublicProvider,
@@ -177,6 +183,7 @@ function countOtherEnabledImChannels(
 let deps: any = null;
 export function injectConfigDeps(d: any) {
   deps = d;
+  restorePendingProviderRuntimeSafetyBlocks();
 }
 
 function createTelegramApiAgent(proxyUrl?: string): HttpsAgent | ProxyAgent {
@@ -215,6 +222,148 @@ interface ApplyOptions {
     modelChanged: boolean;
     baseUrlChanged: boolean;
   };
+}
+
+interface PendingProviderSessionInvalidation {
+  providerId: string;
+  modelChanged: boolean;
+  baseUrlChanged: boolean;
+}
+
+const PROVIDER_INVALIDATION_STATE_PREFIX =
+  'provider_session_invalidation_pending:';
+const volatilePendingProviderSessionInvalidations = new Map<
+  string,
+  PendingProviderSessionInvalidation
+>();
+
+function providerInvalidationStateKey(providerId: string): string {
+  return `${PROVIDER_INVALIDATION_STATE_PREFIX}${providerId}`;
+}
+
+function getPendingProviderSessionInvalidation(
+  providerId: string,
+): PendingProviderSessionInvalidation | undefined {
+  const raw = getRouterState(providerInvalidationStateKey(providerId));
+  const volatile = volatilePendingProviderSessionInvalidations.get(providerId);
+  let durable: PendingProviderSessionInvalidation | undefined;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(
+        raw,
+      ) as Partial<PendingProviderSessionInvalidation>;
+      if (parsed.providerId === providerId) {
+        durable = {
+          providerId,
+          modelChanged: parsed.modelChanged === true,
+          baseUrlChanged: parsed.baseUrlChanged === true,
+        };
+      } else {
+        durable = {
+          providerId,
+          modelChanged: true,
+          baseUrlChanged: true,
+        };
+      }
+    } catch {
+      // A corrupt marker must remain repairable rather than becoming a
+      // permanent global gate. Conservatively replay both invalidations when
+      // this provider is next PATCHed.
+      durable = {
+        providerId,
+        modelChanged: true,
+        baseUrlChanged: true,
+      };
+    }
+  }
+  if (!durable) return volatile;
+  if (!volatile) return durable;
+  return {
+    providerId,
+    modelChanged: durable.modelChanged || volatile.modelChanged,
+    baseUrlChanged: durable.baseUrlChanged || volatile.baseUrlChanged,
+  };
+}
+
+function setPendingProviderSessionInvalidation(
+  pending: PendingProviderSessionInvalidation,
+): void {
+  const previous = getPendingProviderSessionInvalidation(pending.providerId);
+  const merged = {
+    providerId: pending.providerId,
+    modelChanged: pending.modelChanged || previous?.modelChanged === true,
+    baseUrlChanged: pending.baseUrlChanged || previous?.baseUrlChanged === true,
+  };
+  // Keep an in-process repair path even if durable state persistence fails.
+  volatilePendingProviderSessionInvalidations.set(pending.providerId, merged);
+  setRouterState(
+    providerInvalidationStateKey(pending.providerId),
+    JSON.stringify(merged),
+  );
+}
+
+function clearPendingProviderSessionInvalidation(providerId: string): void {
+  deleteRouterState(providerInvalidationStateKey(providerId));
+  volatilePendingProviderSessionInvalidations.delete(providerId);
+}
+
+function hasPendingProviderSessionInvalidations(): boolean {
+  return (
+    volatilePendingProviderSessionInvalidations.size > 0 ||
+    getRouterStateByPrefix(PROVIDER_INVALIDATION_STATE_PREFIX).length > 0
+  );
+}
+
+/**
+ * Runtime-safety blocks live in memory, while incomplete provider session
+ * invalidations are durable. Rebuild the gate when web dependencies are
+ * injected after a process restart so no stale session can resume before an
+ * exact provider PATCH repairs the pending cleanup.
+ */
+function restorePendingProviderRuntimeSafetyBlocks(): void {
+  if (!deps || !isDatabaseInitialized()) return;
+  const durableRows = getRouterStateByPrefix(
+    PROVIDER_INVALIDATION_STATE_PREFIX,
+  );
+  const configuredProviderIds = new Set(
+    getProviders().map((provider) => provider.id),
+  );
+  const pendingProviderIds = new Set([
+    ...durableRows.map((row) =>
+      row.key.slice(PROVIDER_INVALIDATION_STATE_PREFIX.length),
+    ),
+    ...volatilePendingProviderSessionInvalidations.keys(),
+  ]);
+  for (const providerId of pendingProviderIds) {
+    if (providerId && configuredProviderIds.has(providerId)) continue;
+    if (providerId) {
+      const cleanup = deleteSessionsByProviderIdAroundCommit(
+        providerId,
+        undefined,
+        () => undefined,
+      );
+      syncProviderSessionCaches(cleanup.affectedFolders);
+    }
+    deleteRouterState(providerInvalidationStateKey(providerId));
+    volatilePendingProviderSessionInvalidations.delete(providerId);
+    pendingProviderIds.delete(providerId);
+    logger.warn(
+      { providerId },
+      'Removed orphaned provider session invalidation marker during startup',
+    );
+  }
+  if (pendingProviderIds.size === 0) return;
+  const runtimeJids = Array.from(
+    new Set(
+      getClaudeRuntimeTargets().flatMap((target) =>
+        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+      ),
+    ),
+  );
+  deps.queue.blockGroupsForRuntimeSafety(
+    runtimeJids,
+    `provider session invalidation pending after restart: ${pendingProviderIds.size}`,
+  );
 }
 
 interface ClaudeMutationResult<T> {
@@ -286,23 +435,17 @@ function hasWorkspaceProviderOverride(
   folder: string,
   invalidation?: ApplyOptions['sessionInvalidation'],
 ): boolean {
+  if (!invalidation) return false;
   const override = getContainerEnvConfig(folder);
-  const hasCredentialOrEndpointOverride = !!(
-    override.anthropicBaseUrl ||
-    override.anthropicAuthToken ||
-    override.anthropicApiKey ||
-    override.claudeCodeOauthToken ||
-    override.claudeOAuthCredentials
-  );
-  // A workspace-level model still uses the global provider endpoint. It only
-  // makes a legacy NULL session unattributable for a model-only global change;
-  // a simultaneous Base URL change still affects that workspace.
-  const hasRelevantModelOverride = !!(
-    invalidation?.modelChanged &&
-    !invalidation.baseUrlChanged &&
-    override.anthropicModel
-  );
-  return hasCredentialOrEndpointOverride || hasRelevantModelOverride;
+  // Shadowing is field-specific. Credentials do not protect a workspace from
+  // inheriting a changed global model or Base URL, and when both fields change
+  // the workspace must override both before its legacy NULL-bound session is
+  // safe to preserve.
+  const modelChangeIsShadowed =
+    !invalidation.modelChanged || !!override.anthropicModel;
+  const baseUrlChangeIsShadowed =
+    !invalidation.baseUrlChanged || !!override.anthropicBaseUrl;
+  return modelChangeIsShadowed && baseUrlChangeIsShadowed;
 }
 
 function getSafeLegacyUnboundFolders(
@@ -330,24 +473,42 @@ function getSafeLegacyUnboundFolders(
   );
 }
 
-function clearProviderSessions(
+function getProviderSessionCleanupOptions(
   providerId: string,
   invalidation?: ApplyOptions['sessionInvalidation'],
-): number {
-  if (!deps) return 0;
-  const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
-    providerId,
-    {
-      includeUnboundFolders: getSafeLegacyUnboundFolders(
-        providerId,
-        invalidation,
-      ),
-    },
-  );
+): { includeUnboundFolders: string[] } {
+  return {
+    includeUnboundFolders: getSafeLegacyUnboundFolders(
+      providerId,
+      invalidation,
+    ),
+  };
+}
+
+function syncProviderSessionCaches(affectedFolders: string[]): void {
+  if (!deps) return;
   for (const folder of affectedFolders) {
-    delete deps.sessions[folder];
+    const remainingMainSession = getSession(folder);
+    if (remainingMainSession !== undefined) {
+      deps.sessions[folder] = remainingMainSession;
+    } else {
+      delete deps.sessions[folder];
+    }
   }
-  return deletedCount;
+}
+
+function commitProviderConfigWithSessionInvalidation<T>(
+  providerId: string,
+  invalidation: ApplyOptions['sessionInvalidation'],
+  commit: () => T,
+): { value: T; clearedSessionsCount: number } {
+  const result = deleteSessionsByProviderIdAroundCommit(
+    providerId,
+    getProviderSessionCleanupOptions(providerId, invalidation),
+    commit,
+  );
+  syncProviderSessionCaches(result.affectedFolders);
+  return { value: result.value, clearedSessionsCount: result.deletedCount };
 }
 
 function getClaudeRuntimeTargets(): Array<{
@@ -369,7 +530,7 @@ function getClaudeRuntimeTargets(): Array<{
 async function mutateClaudeConfigForAllGroups<T>(
   actor: string,
   metadata: Record<string, unknown> | undefined,
-  commit: () => T | Promise<T>,
+  commit: () => T,
   options?: ApplyOptions,
 ): Promise<ClaudeMutationResult<T>> {
   if (!deps) throw new Error('Server not initialized');
@@ -389,26 +550,50 @@ async function mutateClaudeConfigForAllGroups<T>(
       targets,
       {
         reason,
-        onPostCommitFailure: (runtimeJids) =>
+        onPostCommitFailure: (runtimeJids) => {
+          // Establish the in-memory fail-closed gate before any durable marker
+          // I/O. Focused test fixtures may omit the optional method, while the
+          // production WebDeps queue is a concrete GroupQueue that implements
+          // it and startup restoration below requires it when pending exists.
           deps.queue.blockGroupsForRuntimeSafety?.(
             runtimeJids,
             `${reason}: post-commit provider runtime cleanup failed`,
-          ),
+          );
+          if (
+            options?.clearSessionsForProviderId &&
+            options.sessionInvalidation
+          ) {
+            try {
+              setPendingProviderSessionInvalidation({
+                providerId: options.clearSessionsForProviderId,
+                ...options.sessionInvalidation,
+              });
+            } catch (error) {
+              // The volatile marker was set before SQLite persistence, so an
+              // exact retry in this process can still repair and unblock.
+              logger.error(
+                { error, providerId: options.clearSessionsForProviderId },
+                'Failed to persist pending provider session invalidation',
+              );
+            }
+          }
+        },
       },
       async () => {
-        // Invalidate attributable resume state before persisting protocol
-        // changes. If cleanup fails the provider file remains unchanged, so a
-        // same-value retry cannot accidentally skip the unfinished cleanup and
-        // release a runtime-safety gate.
-        const clearedSessionsCount = options?.clearSessionsForProviderId
-          ? clearProviderSessions(
+        let value: T;
+        let clearedSessionsCount: number | undefined;
+        try {
+          if (options?.clearSessionsForProviderId) {
+            const committed = commitProviderConfigWithSessionInvalidation(
               options.clearSessionsForProviderId,
               options.sessionInvalidation,
-            )
-          : undefined;
-        let value: T;
-        try {
-          value = await commit();
+              commit,
+            );
+            value = committed.value;
+            clearedSessionsCount = committed.clearedSessionsCount;
+          } else {
+            value = commit();
+          }
         } catch (error) {
           if (error instanceof ClaudeConfigPersistedError) {
             deps.queue.blockGroupsForRuntimeSafety?.(
@@ -424,7 +609,14 @@ async function mutateClaudeConfigForAllGroups<T>(
     // A successful retry proves every runtime now observes the persisted
     // provider config, so it may repair a fail-closed gate left by an earlier
     // post-commit teardown failure.
-    deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
+    if (options?.clearSessionsForProviderId) {
+      clearPendingProviderSessionInvalidation(
+        options.clearSessionsForProviderId,
+      );
+    }
+    if (!hasPendingProviderSessionInvalidations()) {
+      deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
+    }
     const applied: ClaudeApplyResultPayload = {
       success: true,
       stoppedCount: result.runtimeJids.length,
@@ -716,11 +908,19 @@ configRoutes.patch(
           validation.data.anthropicModel !== previous.anthropicModel
         );
         const protocolFieldChanged = baseUrlChanged || modelChanged;
+        const pendingInvalidation = getPendingProviderSessionInvalidation(id);
+        const sessionInvalidation = {
+          modelChanged:
+            modelChanged || pendingInvalidation?.modelChanged === true,
+          baseUrlChanged:
+            baseUrlChanged || pendingInvalidation?.baseUrlChanged === true,
+        };
         // Preserve this PR's model/base-URL resume behavior for third-party
         // gateways. We do not have a reproducible third-party backend failure
         // proving that their sessions must be invalidated.
         const shouldClearSessions =
-          protocolFieldChanged && previous.type === 'official';
+          !!pendingInvalidation ||
+          (protocolFieldChanged && previous.type === 'official');
         const metadata = {
           trigger: 'provider_update',
           providerId: id,
@@ -747,15 +947,23 @@ configRoutes.patch(
             shouldClearSessions
               ? {
                   clearSessionsForProviderId: id,
-                  sessionInvalidation: { modelChanged, baseUrlChanged },
+                  sessionInvalidation,
                 }
               : undefined,
           );
         } else {
-          const clearedSessionsCount = shouldClearSessions
-            ? clearProviderSessions(id, { modelChanged, baseUrlChanged })
-            : undefined;
-          const updated = commit();
+          const committed = shouldClearSessions
+            ? commitProviderConfigWithSessionInvalidation(
+                id,
+                sessionInvalidation,
+                commit,
+              )
+            : { value: commit(), clearedSessionsCount: undefined };
+          const updated = committed.value;
+          const clearedSessionsCount = committed.clearedSessionsCount;
+          if (shouldClearSessions) {
+            clearPendingProviderSessionInvalidation(id);
+          }
           mutation = {
             value: updated,
             applied: {
@@ -925,6 +1133,10 @@ configRoutes.post(
   async (c) => {
     const { id } = c.req.param();
     const actor = (c.get('user') as AuthUser).username;
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body.enabled !== 'boolean') {
+      return c.json({ error: 'enabled must be a boolean' }, 400);
+    }
 
     try {
       return await withClaudeConfigMutationLock(async () => {
@@ -932,7 +1144,7 @@ configRoutes.post(
           actor,
           { trigger: 'provider_toggle', providerId: id },
           () => {
-            const updated = toggleProvider(id);
+            const updated = setProviderEnabled(id, body.enabled);
             appendClaudeConfigAuditBestEffort(actor, 'toggle_provider', [
               `id:${id}`,
               `enabled:${updated.enabled}`,
@@ -1054,7 +1266,7 @@ configRoutes.post(
           trigger: 'manual_provider_apply',
         });
         if (!result.success) {
-          return c.json(result, 207);
+          return c.json(result, 503);
         }
         return c.json(result);
       });
