@@ -7536,29 +7536,77 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
  * Returns the affected `group_folder` values so callers can also evict the
  * in-memory sessions cache and the row count for telemetry.
  */
-export function deleteSessionsByProviderId(providerId: string): {
+function deleteSessionsByProviderIdInCurrentTransaction(
+  providerId: string,
+  options?: { includeUnboundFolders?: string[] },
+): {
   deletedCount: number;
   affectedFolders: string[];
 } {
-  const tx = db.transaction((id: string) => {
-    const rows = db
-      .prepare(
-        'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?',
-      )
-      .all(id) as Array<{ group_folder: string }>;
-    const affectedFolders = rows.map((r) => r.group_folder);
-    db.prepare(
-      'DELETE FROM workspace_runtime_sessions WHERE provider_id = ?',
-    ).run(id);
-    const result = db
-      .prepare('DELETE FROM sessions WHERE provider_id = ?')
-      .run(id);
-    return {
-      deletedCount: result.changes,
-      affectedFolders,
-    };
-  });
-  return tx(providerId);
+  const includeUnboundFolders = Array.from(
+    new Set(
+      (options?.includeUnboundFolders ?? []).filter(
+        (folder): folder is string => typeof folder === 'string' && !!folder,
+      ),
+    ),
+  );
+  const placeholders = includeUnboundFolders.map(() => '?').join(', ');
+  const unboundClause = includeUnboundFolders.length
+    ? ` OR (provider_id IS NULL AND group_folder IN (${placeholders}))`
+    : '';
+  const params = [providerId, ...includeUnboundFolders];
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?${unboundClause}`,
+    )
+    .all(...params) as Array<{ group_folder: string }>;
+  db.prepare(
+    `DELETE FROM workspace_runtime_sessions WHERE provider_id = ?${unboundClause}`,
+  ).run(...params);
+  const result = db
+    .prepare(`DELETE FROM sessions WHERE provider_id = ?${unboundClause}`)
+    .run(...params);
+  return {
+    deletedCount: result.changes,
+    affectedFolders: rows.map((r) => r.group_folder),
+  };
+}
+
+export function deleteSessionsByProviderId(
+  providerId: string,
+  options?: { includeUnboundFolders?: string[] },
+): {
+  deletedCount: number;
+  affectedFolders: string[];
+} {
+  return db.transaction(() =>
+    deleteSessionsByProviderIdInCurrentTransaction(providerId, options),
+  )();
+}
+
+/**
+ * Delete attributable provider sessions and execute a synchronous config
+ * commit in one SQLite transaction. If config validation/persistence throws,
+ * session deletion rolls back, so an invalid provider PATCH cannot destroy a
+ * still-valid resume token.
+ */
+export function deleteSessionsByProviderIdAroundCommit<T>(
+  providerId: string,
+  options: { includeUnboundFolders?: string[] } | undefined,
+  commit: () => T,
+): {
+  value: T;
+  deletedCount: number;
+  affectedFolders: string[];
+} {
+  return db.transaction(() => {
+    const cleanup = deleteSessionsByProviderIdInCurrentTransaction(
+      providerId,
+      options,
+    );
+    const value = commit();
+    return { value, ...cleanup };
+  })();
 }
 
 export function getAllSessions(): Record<string, string> {

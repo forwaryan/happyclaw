@@ -953,11 +953,27 @@ export const BugReportSubmitSchema = z.object({
 
 // ─── 统一供应商 (V4) ────────────────────────────────────────
 
+const ProviderBaseUrlSchema = z
+  .string()
+  .max(2000)
+  .refine(
+    (value) => {
+      if (!value.trim()) return true;
+      try {
+        const parsed = new URL(value.trim());
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      } catch {
+        return false;
+      }
+    },
+    { message: 'Base URL must be an HTTP(S) URL' },
+  );
+
 export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
     type: z.enum(['official', 'third_party']),
-    anthropicBaseUrl: z.string().max(2000).optional(),
+    anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
     anthropicModel: z.string().max(128).optional(),
     anthropicApiKey: z.string().max(2000).optional(),
@@ -984,7 +1000,7 @@ export const UnifiedProviderCreateSchema = z
 export const UnifiedProviderPatchSchema = z
   .object({
     name: z.string().min(1).max(64).optional(),
-    anthropicBaseUrl: z.string().max(2000).optional(),
+    anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),

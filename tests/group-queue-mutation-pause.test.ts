@@ -403,4 +403,37 @@ describe('GroupQueue mutation pause', () => {
     expect(queue.isGroupRuntimeSafetyBlocked(WEB_JID)).toBe(false);
     expect(runs).toBe(1);
   });
+
+  test('runtime safety sources release independently and drain only after the final source', async () => {
+    let runs = 0;
+    queue.setProcessMessagesFn(async () => {
+      runs++;
+      return true;
+    });
+    queue.blockGroupsForRuntimeSafety(
+      [WEB_JID, IM_JID],
+      'capability repair pending',
+    );
+    queue.blockGroupsForRuntimeSafety(
+      [WEB_JID, IM_JID],
+      'provider repair pending',
+      'provider-config-mutation',
+    );
+    queue.enqueueMessageCheck(IM_JID);
+
+    queue.unblockGroupsForRuntimeSafety(
+      [WEB_JID, IM_JID],
+      'provider-config-mutation',
+    );
+    await tick();
+    await tick();
+    expect(queue.isGroupRuntimeSafetyBlocked(WEB_JID)).toBe(true);
+    expect(runs).toBe(0);
+
+    queue.unblockGroupsForRuntimeSafety([WEB_JID, IM_JID]);
+    await tick();
+    await tick();
+    expect(queue.isGroupRuntimeSafetyBlocked(WEB_JID)).toBe(false);
+    expect(runs).toBe(1);
+  });
 });

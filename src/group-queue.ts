@@ -128,8 +128,10 @@ export class GroupQueue {
   private waitingGroups = new Set<string>();
   private mutationPauseCounts = new Map<string, number>();
   /** Persistent fail-closed gates used when a security-sensitive mutation was
-   * committed but the old runtime could not be confirmed stopped. */
-  private runtimeSafetyBlocks = new Map<string, string>();
+   * committed but the old runtime could not be confirmed stopped. Each
+   * mutation source independently owns its gate so one subsystem cannot
+   * release another subsystem's fail-closed state. */
+  private runtimeSafetyBlocks = new Map<string, Map<string, string>>();
   private mutationPauseTokens = new Map<number, string[]>();
   private terminalDiscardMutationKeys = new Set<string>();
   private mutationBaseKeyAliases = new Map<string, string>();
@@ -252,20 +254,36 @@ export class GroupQueue {
     return paused;
   }
 
-  blockGroupsForRuntimeSafety(groupJids: string[], reason: string): void {
+  blockGroupsForRuntimeSafety(
+    groupJids: string[],
+    reason: string,
+    source = 'default',
+  ): void {
     for (const jid of groupJids) {
       const key = this.getMutationPauseKey(jid);
       this.getGroup(jid).mutationKey = key;
       this.mutationBaseKeyAliases.set(this.getMutationBaseJid(jid), key);
-      this.runtimeSafetyBlocks.set(key, reason);
+      let sourceBlocks = this.runtimeSafetyBlocks.get(key);
+      if (!sourceBlocks) {
+        sourceBlocks = new Map<string, string>();
+        this.runtimeSafetyBlocks.set(key, sourceBlocks);
+      }
+      // Re-blocking the same source is idempotent (for example repeated deps
+      // injection during startup); only the latest diagnostic reason changes.
+      sourceBlocks.set(source, reason);
     }
   }
 
-  unblockGroupsForRuntimeSafety(groupJids: string[]): void {
+  unblockGroupsForRuntimeSafety(groupJids: string[], source = 'default'): void {
     const released = new Set<string>();
     for (const jid of groupJids) {
       const key = this.getMutationPauseKey(jid);
-      if (this.runtimeSafetyBlocks.delete(key)) released.add(key);
+      const sourceBlocks = this.runtimeSafetyBlocks.get(key);
+      if (!sourceBlocks?.delete(source)) continue;
+      if (sourceBlocks.size === 0) {
+        this.runtimeSafetyBlocks.delete(key);
+        released.add(key);
+      }
     }
     if (released.size === 0) return;
     for (const [jid, state] of this.groups) {
