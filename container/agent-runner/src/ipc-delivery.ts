@@ -16,6 +16,32 @@ export interface IpcInputMessage {
   receipt?: IpcDeliveryReceipt;
 }
 
+/**
+ * Restore durable arrival order after draining IPC files. Requeued messages
+ * can receive newer filenames than messages written while a query is tearing
+ * down, so filename order alone can invert two accepted user turns. When the
+ * whole batch has receipts, the database cursor is the authoritative order.
+ * Mixed legacy batches keep their existing order because receipt-less inputs
+ * cannot be placed against durable cursors without guessing.
+ */
+export function orderIpcInputMessages(
+  messages: IpcInputMessage[],
+): IpcInputMessage[] {
+  if (messages.length < 2 || messages.some((message) => !message.receipt)) {
+    return [...messages];
+  }
+
+  return [...messages].sort((a, b) => {
+    const aCursor = a.receipt!.cursor;
+    const bCursor = b.receipt!.cursor;
+    if (aCursor.timestamp !== bCursor.timestamp) {
+      return aCursor.timestamp < bCursor.timestamp ? -1 : 1;
+    }
+    if (aCursor.id === bCursor.id) return 0;
+    return aCursor.id < bCursor.id ? -1 : 1;
+  });
+}
+
 export function parseIpcReceipt(
   value: unknown,
 ): IpcDeliveryReceipt | undefined {
@@ -131,6 +157,16 @@ export class IpcTurnDeliveryTracker {
 
   get hasPendingTurns(): boolean {
     return this.turns.length > 0;
+  }
+
+  /** Exact IPC batch owned by the SDK turn that will complete next. */
+  get currentTurnMessages(): IpcInputMessage[] {
+    return [...(this.turns[0] ?? [])];
+  }
+
+  /** Accepted follow-up turns after the current one, kept in delivery order. */
+  get laterTurnMessages(): IpcInputMessage[] {
+    return this.turns.slice(1).flatMap((turn) => turn);
   }
 
   /**

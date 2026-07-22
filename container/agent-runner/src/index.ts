@@ -67,6 +67,7 @@ import {
   isHealthyInputTurnCompletion,
   latestIpcDeliveryId,
   latestIpcInputMessage,
+  orderIpcInputMessages,
   parseIpcReceipt,
   requeueIpcInputMessages,
   type IpcDeliveryReceipt,
@@ -77,7 +78,15 @@ import {
   resolveAutoCompactWindow,
   resolveLegacyAutoCompactWindow,
 } from './context-window.js';
-import { resolveClaudeProviderRuntime } from './provider-runtime.js';
+import {
+  resolveClaudeProviderRuntime,
+  resolveClaudeQueryModelRuntime,
+} from './provider-runtime.js';
+import {
+  ProviderFallbackModelState,
+  ProviderFallbackTurnLedger,
+  type ProviderFallbackRetryTurn,
+} from './provider-fallback.js';
 import {
   createResultUsageState,
   extractResultUsage,
@@ -114,7 +123,10 @@ const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 // 第三方端点必须显式配置模型，官方 Claude 则允许 SDK/CLI 选择默认模型。
 // host/docker runner 会注入权威端点类型；旧运行环境仍可由 base URL 兼容推断。
 const CLAUDE_PROVIDER_RUNTIME = resolveClaudeProviderRuntime(process.env);
-const CLAUDE_MODEL = CLAUDE_PROVIDER_RUNTIME.model;
+const PROVIDER_FALLBACK_MODELS = new ProviderFallbackModelState(
+  CLAUDE_PROVIDER_RUNTIME.model,
+  process.env.HAPPYCLAW_FALLBACK_MODEL,
+);
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -1367,6 +1379,7 @@ function drainIpcInput(): IpcDrainResult {
         }
       }
     }
+    result.messages = orderIpcInputMessages(result.messages);
   } catch (err) {
     log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1576,7 +1589,7 @@ function pruneProcessedHistoryImagesInTranscript(
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
  */
-async function runQuery(
+async function runQueryAttempt(
   prompt: string,
   sessionId: string | undefined,
   mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
@@ -1606,7 +1619,12 @@ async function runQuery(
   };
   pipedMessagesDuringQuery: IpcInputMessage[];
   suspectTruncatedTail?: string;
+  providerFailureTurn?: ProviderFallbackRetryTurn;
 }> {
+  const queryModelRuntime = resolveClaudeQueryModelRuntime(
+    CLAUDE_PROVIDER_RUNTIME,
+    PROVIDER_FALLBACK_MODELS.activeModelOverride,
+  );
   const stream = new MessageStream();
   // Track messages piped into this query.  When the query is interrupted,
   // these messages would otherwise be lost (consumed by the aborted query).
@@ -1617,6 +1635,13 @@ async function runQuery(
   // as well as messages piped while the query is active.
   const ipcDeliveryTracker = new IpcTurnDeliveryTracker(initialIpcMessages);
   const pipedMessagesDuringQuery = ipcDeliveryTracker.unacknowledgedMessages;
+  const providerFallbackTurns = new ProviderFallbackTurnLedger({
+    prompt,
+    images,
+    sessionId,
+    resumeAt,
+  });
+  let providerFailureTurn: ProviderFallbackRetryTurn | undefined;
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   const assistantTextTracker = new AssistantTextTracker();
@@ -1735,7 +1760,7 @@ async function runQuery(
         modelUsage: resultMessage.modelUsage as
           | Record<string, SdkModelUsage>
           | undefined,
-        fallbackModelKey: CLAUDE_PROVIDER_RUNTIME.usageModelKey,
+        fallbackModelKey: queryModelRuntime.usageModelKey,
       },
       resultUsageState,
     );
@@ -1904,7 +1929,11 @@ async function runQuery(
       log(
         `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
       );
+      const becomesCurrentTurn = !ipcDeliveryTracker.hasPendingTurns;
       ipcDeliveryTracker.acceptTurn([msg]);
+      if (becomesCurrentTurn) {
+        providerFallbackTurns.acceptCurrentTurn([msg]);
+      }
       // A new user turn arrived after a prior result. Cancel that result's
       // post-timeout so the stream cannot close before this turn completes.
       resultReceivedAt = null;
@@ -2050,7 +2079,7 @@ async function runQuery(
     10,
   );
   const percentageWindow = resolveAutoCompactWindow(
-    CLAUDE_MODEL,
+    queryModelRuntime.model,
     autoCompactPercentage,
   );
   const legacyAutoCompactWindow = parseInt(
@@ -2058,7 +2087,7 @@ async function runQuery(
     10,
   );
   const safeLegacyAutoCompactWindow = resolveLegacyAutoCompactWindow(
-    CLAUDE_MODEL,
+    queryModelRuntime.model,
     legacyAutoCompactWindow,
   );
   const flagSettings: Record<string, unknown> = {};
@@ -2079,7 +2108,7 @@ async function runQuery(
     flagSettings.autoCompactWindow = safeLegacyAutoCompactWindow;
     if (safeLegacyAutoCompactWindow !== legacyAutoCompactWindow) {
       log(
-        `[WARN] AUTO_COMPACT_WINDOW=${legacyAutoCompactWindow} exceeds the safe window for ${CLAUDE_MODEL}; clamped to ${safeLegacyAutoCompactWindow}`,
+        `[WARN] AUTO_COMPACT_WINDOW=${legacyAutoCompactWindow} exceeds the safe window for ${queryModelRuntime.model}; clamped to ${safeLegacyAutoCompactWindow}`,
       );
     }
   }
@@ -2155,7 +2184,7 @@ async function runQuery(
   try {
     const sdkCompat = withHappyClawSubagentContract({
       ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
-      ...CLAUDE_PROVIDER_RUNTIME.queryModelOptions,
+      ...queryModelRuntime.queryModelOptions,
       cwd: WORKSPACE_GROUP,
       additionalDirectories: extraDirs,
       resume: sessionId,
@@ -2232,6 +2261,11 @@ async function runQuery(
       ipcPolling = false;
     }
     for await (const message of q) {
+      if (providerFailureTurn) {
+        // The failed turn and any already-accepted later turns will be replayed
+        // from the pre-failure anchor by runQuery(); suppress this spent stream.
+        continue;
+      }
       // 流式事件处理
       if (message.type === 'stream_event') {
         // 重放消息是完整消息、不产生 partial stream_event——见到 stream_event
@@ -2480,7 +2514,7 @@ async function runQuery(
         // 静默退回（例如 200K），在此立即暴露而非等到溢出。push 进 warnings 会让下方
         // emit 的 displayLevel 自动升为 'primary'，在前端醒目展示。
         if (
-          isExtendedContextModel(CLAUDE_MODEL) &&
+          isExtendedContextModel(queryModelRuntime.model) &&
           contextUsage &&
           contextUsage.maxTokens > 0 &&
           contextUsage.maxTokens < 900_000
@@ -2615,6 +2649,43 @@ async function runQuery(
           };
         }
 
+        // Claude can surface an exhausted account/model quota as a nominal
+        // success result. Switch the warm runner to its fallback tier and end
+        // this SDK stream without completing the input receipt. The wrapper
+        // below retries only this exact turn; later accepted IPC turns are put
+        // back on disk and remain ordered behind it.
+        if (
+          textResult &&
+          PROVIDER_FALLBACK_MODELS.activateForResult(textResult)
+        ) {
+          providerFailureTurn = providerFallbackTurns.snapshotFailure({
+            ipcMessages: ipcDeliveryTracker.currentTurnMessages,
+            laterIpcMessages: ipcDeliveryTracker.laterTurnMessages,
+            turnId: containerInput.turnId,
+          });
+          log(
+            `Primary model hit account usage limit; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
+          );
+          writeOutput({
+            status: 'stream',
+            result: null,
+            providerFailure: true,
+            providerFailureRetrying: true,
+            turnId: containerInput.turnId,
+            sessionId: newSessionId || sessionId,
+          });
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
+          assistantBatchFlushedSinceLastResult = false;
+          processor.discardPendingTextOutput();
+          assistantTextTracker.reset();
+          canonicalAssistantUuid = undefined;
+          stream.end();
+          ipcPolling = false;
+          ipcQueryWatcher.close();
+          // Do not process or emit the limit notice as an assistant result.
+          continue;
+        }
+
         // processResult 的调用保留其副作用（flush 流式缓冲、重置 fullTextAccumulator），
         // 但定稿正文不再取"全量拼接与 SDK result 的更长者"——那会把工具调用之间的
         // 过程旁白混进最终回复。改走 tracker 的选择链：最终段 → SDK result → 末段旁白。
@@ -2696,6 +2767,8 @@ async function runQuery(
         const queryIdle =
           inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
         const completedTurnId = containerInput.turnId || generateTurnId();
+        const completedAssistantUuid =
+          canonicalAssistantUuid || lastAssistantUuid;
         emit({
           status: 'success',
           result: finalText,
@@ -2717,6 +2790,12 @@ async function runQuery(
         // another result is emitted within the same query (e.g. user sent
         // a follow-up via IPC mid-query), it won't overwrite this one (#214).
         containerInput.turnId = generateTurnId();
+        const nextTurnMessages = ipcDeliveryTracker.currentTurnMessages;
+        providerFallbackTurns.completeHealthyTurn({
+          sessionId: newSessionId || sessionId,
+          resumeAt: completedAssistantUuid,
+          nextTurnMessages,
+        });
         // 同步重置已累积的 assistant 文本分段：单次 query 内若产生第二条 result
         // （mid-query follow-up），tracker 不应携带上一 turn 的文本，
         // 否则第二条回复会重复前一 turn 的内容前缀（与 turnId 轮转对称）。
@@ -2786,9 +2865,30 @@ async function runQuery(
       cancelledIpcReceipts,
       pipedMessagesDuringQuery,
       suspectTruncatedTail,
+      providerFailureTurn,
     };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+
+    // Ending the spent primary stream after a quota notice can make the SDK
+    // throw while it tears down. The retry payload is already authoritative;
+    // never let a transport-close error erase it.
+    if (providerFailureTurn) {
+      log(
+        `Ignoring SDK teardown error after provider fallback handoff: ${errorMessage}`,
+      );
+      processor.discardPendingTextOutput();
+      processor.cleanup();
+      return {
+        newSessionId,
+        lastAssistantUuid,
+        closedDuringQuery,
+        interruptedDuringQuery,
+        cancelledIpcReceipts,
+        pipedMessagesDuringQuery,
+        providerFailureTurn,
+      };
+    }
 
     // 检测上下文溢出错误
     if (isContextOverflowError(errorMessage)) {
@@ -2909,6 +3009,68 @@ async function runQuery(
     ipcPolling = false;
     ipcQueryWatcher.close();
   }
+}
+
+type RunQueryResult = Awaited<ReturnType<typeof runQueryAttempt>>;
+
+/**
+ * Run one logical query, retrying only its failed input turn when the primary
+ * model quota is exhausted. The model state remains on fallback afterwards,
+ * so later warm IPC turns do not first replay against the exhausted tier.
+ */
+async function runQuery(
+  prompt: string,
+  sessionId: string | undefined,
+  mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
+  containerInput: ContainerInput,
+  memoryRecall: string,
+  resumeAt?: string,
+  emitOutput = true,
+  allowedTools: string[] = DEFAULT_ALLOWED_TOOLS,
+  disallowedTools?: string[],
+  images?: Array<{ data: string; mimeType?: string }>,
+  sourceKindOverride?: ContainerOutput['sourceKind'],
+  initialIpcMessages: IpcInputMessage[] = [],
+): Promise<RunQueryResult> {
+  const first = await runQueryAttempt(
+    prompt,
+    sessionId,
+    mcpServerConfig,
+    containerInput,
+    memoryRecall,
+    resumeAt,
+    emitOutput,
+    allowedTools,
+    disallowedTools,
+    images,
+    sourceKindOverride,
+    initialIpcMessages,
+  );
+  const failed = first.providerFailureTurn;
+  if (!failed) return first;
+
+  if (failed.laterIpcMessages.length > 0) {
+    log(
+      `Re-enqueueing ${failed.laterIpcMessages.length} later IPC message(s) behind provider fallback retry`,
+    );
+    requeueIpcInputMessages(IPC_INPUT_DIR, failed.laterIpcMessages);
+  }
+
+  containerInput.turnId = failed.turnId;
+  return runQueryAttempt(
+    failed.prompt,
+    failed.sessionIdBeforeTurn,
+    mcpServerConfig,
+    containerInput,
+    memoryRecall,
+    failed.resumeAt,
+    emitOutput,
+    allowedTools,
+    disallowedTools,
+    failed.images,
+    sourceKindOverride,
+    failed.ipcMessages,
+  );
 }
 
 /**

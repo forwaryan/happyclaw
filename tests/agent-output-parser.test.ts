@@ -5,7 +5,9 @@ import {
   isApiError,
   isProviderFailureResult,
   createStdoutParserState,
+  createStderrState,
   attachStdoutHandler,
+  handleNonZeroExit,
 } from '../src/agent-output-parser.js';
 import type { ContainerOutput } from '../src/container-runner.js';
 
@@ -144,11 +146,74 @@ describe('isApiError — stderr classification still detects provider issues', (
   });
 });
 
+describe('handleNonZeroExit — provider failure lifecycle', () => {
+  test.each([
+    {
+      label: 'SIGTERM',
+      code: null,
+      signal: 'SIGTERM' as const,
+      status: 'success',
+    },
+    {
+      label: 'SIGKILL',
+      code: null,
+      signal: 'SIGKILL' as const,
+      status: 'success',
+    },
+    { label: 'code 137', code: 137, signal: null, status: 'success' },
+    { label: 'code 143', code: 143, signal: null, status: 'error' },
+  ])(
+    'preserves providerFailure when docker stop closes with $label',
+    async ({ code, signal, status }) => {
+      const stdoutState = createStdoutParserState();
+      stdoutState.hasSuccessOutput = true;
+      stdoutState.hasProviderFailureOutput = true;
+      stdoutState.newSessionId = 'session-after-limit';
+      const resolved: ContainerOutput[] = [];
+
+      expect(
+        handleNonZeroExit(
+          {
+            groupName: 'fallback-test',
+            label: 'Container',
+            filePrefix: 'container',
+            identifier: 'container-id',
+            logsDir: '/tmp',
+            input: { prompt: 'prompt', isMain: true },
+            stdoutState,
+            stderrState: createStderrState(),
+            onOutput: async () => {},
+            resolvePromise: (output) => resolved.push(output),
+            startTime: Date.now(),
+            timeoutMs: 1_000,
+          },
+          code,
+          signal,
+          10,
+          '/tmp/fallback-test.log',
+        ),
+      ).toBe(true);
+
+      await stdoutState.outputChain;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0]).toMatchObject({
+        status,
+        providerFailure: true,
+      });
+      if (status === 'success') {
+        expect(resolved[0]).toMatchObject({
+          result: null,
+          newSessionId: 'session-after-limit',
+        });
+      }
+    },
+  );
+});
+
 describe('attachStdoutHandler — framed output parsing (marker collision)', () => {
   // Helper: feed chunks through the parser and collect emitted outputs.
-  async function runParser(
-    chunks: string[],
-  ): Promise<ContainerOutput[]> {
+  async function runParser(chunks: string[]): Promise<ContainerOutput[]> {
     const stream = new PassThrough();
     const state = createStdoutParserState();
     const collected: ContainerOutput[] = [];

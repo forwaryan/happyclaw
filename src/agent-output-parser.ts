@@ -525,7 +525,12 @@ export function handleNonZeroExit(
       ctx.groupName,
       `${ctx.filePrefix} interrupt path`,
       () => {
-        ctx.resolvePromise({ status: 'success', result: null, newSessionId });
+        ctx.resolvePromise({
+          status: 'success',
+          result: null,
+          newSessionId,
+          providerFailure: ctx.stdoutState.hasProviderFailureOutput,
+        });
       },
     );
     return true;
@@ -558,6 +563,7 @@ export function handleNonZeroExit(
             status: 'success',
             result: null,
             newSessionId,
+            providerFailure: ctx.stdoutState.hasProviderFailureOutput,
           });
         },
       );
@@ -599,6 +605,7 @@ export function handleNonZeroExit(
       status: 'error',
       result: enriched.result,
       error: enriched.error,
+      providerFailure: ctx.stdoutState.hasProviderFailureOutput,
     });
   };
 

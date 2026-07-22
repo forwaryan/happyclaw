@@ -10,6 +10,25 @@ export interface ClaudeProviderRuntime {
   missingRequiredModel: boolean;
 }
 
+export interface ClaudeQueryModelRuntime {
+  model: string;
+  queryModelOptions: { model?: string };
+  usageModelKey: string;
+}
+
+/** Resolve a model at query time so a warm runner can switch tiers without respawn. */
+export function resolveClaudeQueryModelRuntime(
+  providerRuntime: ClaudeProviderRuntime,
+  modelOverride?: string,
+): ClaudeQueryModelRuntime {
+  const model = modelOverride?.trim() || providerRuntime.model;
+  return {
+    model,
+    queryModelOptions: model ? { model } : {},
+    usageModelKey: model || 'default',
+  };
+}
+
 /**
  * Resolve the provider/model contract once at runner startup.
  *

@@ -107,6 +107,7 @@ describe('buildClaudeEnvLines', () => {
         customEnv: {
           ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-model',
           CLAUDE_CODE_AUTO_COMPACT_WINDOW: '42',
+          HAPPYCLAW_FALLBACK_MODEL: 'workspace-fallback',
           PROJECT_ENV: 'kept',
         },
       },
@@ -117,6 +118,7 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
     expect(lines).not.toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=stale-model');
     expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=42');
+    expect(lines).not.toContain('HAPPYCLAW_FALLBACK_MODEL=workspace-fallback');
     expect(lines).toContain('PROJECT_ENV=kept');
   });
 
