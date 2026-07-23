@@ -1,9 +1,18 @@
 # Agent-first Architecture Plan
 
+> **Status: implemented architecture record.**
+>
+> This document preserves the migration rationale and acceptance criteria that
+> led to the current Agent-first model. It is not a live API or schema
+> reference. For current behavior use `CLAUDE.md`, `docs/API.md`,
+> `src/channel-mount-service.ts`, and `src/db.ts`. Sections named “Current
+> Findings” describe the state at the time of the migration unless they
+> explicitly say otherwise.
+
 ## Executive Summary
 
-This branch establishes an Agent-first product surface while retaining compatibility with the
-existing group/session runtime. The product model and the persisted runtime model must remain
+The migration established an Agent-first product surface while retaining compatibility with the
+existing group/session runtime. The product model and the persisted runtime model remain
 explicitly distinct:
 
 - Agent is the top-level product identity and policy owner.

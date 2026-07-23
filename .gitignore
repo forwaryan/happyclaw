@@ -41,6 +41,13 @@ bun.lockb
 .build-sentinel
 .docker-build-sentinel
 *.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+
+# Local verification artifacts (not product/documentation assets)
+/admin-mail-*.png
+/inbox-after-readall.png
 
 # Local tooling metadata
 .claude/
@@ -52,7 +59,6 @@ bun.lockb
 .agents/
 skills-lock.json
 --connect
-log/
 .playwright-mcp/
 
 # OS

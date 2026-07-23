@@ -2563,9 +2563,9 @@ async function runQueryAttempt(
             assistantMsg.message as Record<string, unknown> | undefined
           )?.content;
           if (Array.isArray(msgContent)) {
-            // 按 content block 顺序分段累积：text 进当前段，top-level tool_use
-            // 把当前段轮转为旁白。turn 结束时 tracker 的最终段 = 最后一次工具
-            // 调用之后的文本，过程旁白不再混进定稿正文（见 AssistantTextTracker）。
+            // 以整条 AssistantMessage 为原子分类：只要含 top-level
+            // tool_use，该消息全部 text 都是过程旁白；完全不含工具的消息
+            // 才能在 SDK Result 缺失时作为候选正文。
             const sawText = assistantTextTracker.addContentBlocks(
               msgContent as Array<{ type: string; text?: string }>,
             );
@@ -2800,7 +2800,8 @@ async function runQueryAttempt(
 
         // processResult 的调用保留其副作用（flush 流式缓冲、重置 fullTextAccumulator），
         // 但定稿正文不再取"全量拼接与 SDK result 的更长者"——那会把工具调用之间的
-        // 过程旁白混进最终回复。改走 tracker 的选择链：最终段 → SDK result → 末段旁白。
+        // 过程旁白混进最终回复。选择链固定为：非空 SDK Result → 最近一条
+        // 完全不含 top-level tool_use 的 AssistantMessage；旁白绝不兜底。
         processor.processResult(textResult);
         const finalText = assistantTextTracker.pickFinalText(textResult);
         // ── emit 前置计算：截断指纹 + 后台任务数 ──

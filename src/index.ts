@@ -27,6 +27,11 @@ import {
   type IpcReplyTurnTracker,
 } from './reply-delivery.js';
 import {
+  ActiveTurnOutputRegistry,
+  TurnOutputCoordinator,
+} from './turn-output-coordinator.js';
+import { routeHostIpcOutput } from './host-ipc-output-router.js';
+import {
   buildInterruptedReply,
   buildSteeredReply,
   buildStoppedReply,
@@ -496,6 +501,10 @@ export function feedStreamEventToCard(
       break;
     case 'tool_use_start':
       if (se.toolUseId && se.toolName) {
+        // Tool-only/model-reasoning turns may legally emit no text_delta for
+        // minutes. Create the primary projection from deterministic host
+        // activity instead of leaving the user with no card until Result.
+        session.setThinking();
         session.startTool(se.toolUseId, se.toolName);
         // Feishu streaming card wants richer metadata (skillName / nested /
         // raw toolInput for AskUserQuestion). Attach separately so the
@@ -511,6 +520,7 @@ export function feedStreamEventToCard(
           });
         }
         const label = se.skillName ? `技能 ${se.skillName}` : se.toolName;
+        session.setSystemStatus(`正在使用 ${label}…`);
         session.pushRecentEvent(`🔄 ${label}`);
       }
       break;
@@ -552,6 +562,7 @@ export function feedStreamEventToCard(
       break;
     case 'status':
       if (se.statusText && se.statusText !== 'interrupted') {
+        session.setThinking();
         session.setSystemStatus(
           se.statusText === 'requesting'
             ? '正在处理…'
@@ -578,6 +589,7 @@ export function feedStreamEventToCard(
       break;
     case 'task_start':
       if (se.toolUseId) {
+        session.setThinking();
         const label = se.taskDescription
           ? `Task: ${se.taskDescription.slice(0, 40)}`
           : 'Task';
@@ -590,6 +602,11 @@ export function feedStreamEventToCard(
           });
         }
         session.startTool(se.toolUseId, label);
+        session.setSystemStatus(
+          se.taskDescription
+            ? `正在执行任务：${se.taskDescription.slice(0, 80)}`
+            : '正在执行子任务…',
+        );
         session.pushRecentEvent(`🚀 ${label}`);
       }
       break;
@@ -1150,6 +1167,11 @@ const activeImReplyRoutes = new Map<string, string | null>();
 // only the currently running object avoids stale timestamps/message-id reuse
 // across later turns and sibling JIDs that share one folder.
 const activeIpcReplyTurnTrackers = new Map<string, IpcReplyTurnTracker>();
+
+// Foreground send_message(progress/final) joins the one host-owned primary
+// reply instead of creating an independent provider message. Bindings are
+// exact to (workspace/agent scope, immutable input turn).
+const activeTurnOutputs = new ActiveTurnOutputRegistry();
 
 // Host-owned current-turn registry. Agent Builder authorization never trusts
 // turn/chat/task claims from the runner's writable IPC JSON.
@@ -5249,6 +5271,48 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
   const admittedWarmMainInputs = new Map<string, AdmittedWarmMainInput>();
   const mainAdmissionKey = channelTurnScope(effectiveGroup.folder);
+  const turnOutputCoordinators = new Map<string, TurnOutputCoordinator>();
+  const bindTurnOutputCoordinator = (
+    inputTurnId: string,
+  ): TurnOutputCoordinator => {
+    const existing = turnOutputCoordinators.get(inputTurnId);
+    if (existing) return existing;
+    const coordinator = activeTurnOutputs.bind(mainAdmissionKey, inputTurnId, {
+      onProgress: (text) => {
+        const projection = channelStreamingSessionsByInput.get(inputTurnId);
+        if (projection?.session.isActive()) {
+          projection.session.setThinking();
+          projection.session.setSystemStatus(text.slice(0, 160));
+          projection.session.pushRecentEvent(
+            `🔄 ${text.replace(/\s+/g, ' ').slice(0, 80)}`,
+          );
+        }
+        broadcastStreamEvent(chatJid, {
+          eventType: 'status',
+          agentScope: 'system',
+          statusText: text.slice(0, 160),
+          summary: text.slice(0, 500),
+          isSynthetic: true,
+          displayLevel: 'primary',
+          turnId: inputTurnId,
+          sessionId: activeSessionId,
+        });
+        return true;
+      },
+      onFinalCandidate: (text) => {
+        streamingAccumulatedText = text;
+        const projection = channelStreamingSessionsByInput.get(inputTurnId);
+        if (projection?.session.isActive()) {
+          projection.session.append(heldCardBaseText() + text);
+          projection.session.setSystemStatus('正在完成最终回复…');
+        }
+        return true;
+      },
+    });
+    turnOutputCoordinators.set(inputTurnId, coordinator);
+    return coordinator;
+  };
+  bindTurnOutputCoordinator(lastProcessed.id);
   activeRouteAdmissions.set(
     mainAdmissionKey,
     (newSourceJid, inputTurnId, inputCursor) => {
@@ -5369,6 +5433,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (!isCurrentOrNewer) return;
         if (inputCursor) currentInputCursor = inputCursor;
         setIpcReplyInputTurn(ipcReplyTurnTracker, inputTurnId);
+        bindTurnOutputCoordinator(inputTurnId);
         acceptedNewInput = true;
       }
       // Web is a public control surface, not a transport ownership change. A
@@ -5867,19 +5932,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               };
               pendingLedgerUsageBatch = null;
             }
+            const streamInputTurnId = result.inputTurnId ?? lastProcessed.id;
+            const streamTurnCoordinator =
+              turnOutputCoordinators.get(streamInputTurnId) ??
+              bindTurnOutputCoordinator(streamInputTurnId);
+            const answerProjection = streamTurnCoordinator.reduceStreamEvent(
+              result.streamEvent,
+            );
+            if (answerProjection.visibleAnswerChanged) {
+              streamingAccumulatedText = answerProjection.visibleAnswerText;
+            }
+
             broadcastStreamEvent(chatJid, result.streamEvent);
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
             // 仅累积主 Agent 文本（无 parentToolUseId）。子 Agent（SDK Task）的
             // 中间文本带 parentToolUseId，混入会污染飞书主卡片正文与 interrupt_partial。
             // 与 Web 端 chat.ts 对带 parentToolUseId 的 text_delta 隔离到 Task 块的逻辑对齐。
-            if (
-              result.streamEvent.eventType === 'text_delta' &&
-              result.streamEvent.text &&
-              !result.streamEvent.parentToolUseId
-            ) {
-              streamingAccumulatedText += result.streamEvent.text;
-            }
+            // Main text remains provisional until the enclosing
+            // AssistantMessage reaches message_stop. Interrupt persistence
+            // follows the exact user-visible projection on every delta and
+            // rolls back immediately if that message later calls a tool.
             if (
               result.streamEvent.eventType === 'thinking_delta' &&
               result.streamEvent.text &&
@@ -5922,6 +5995,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             if (streamingSession) {
               const se = result.streamEvent;
               if (
+                answerProjection.visibleAnswerChanged &&
+                streamingSession.isActive()
+              ) {
+                streamingSession.append(
+                  heldCardBaseText() + answerProjection.visibleAnswerText,
+                );
+              }
+              if (
                 se.eventType === 'usage' &&
                 se.usage &&
                 heldCardParts.length > 0
@@ -5943,7 +6024,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   : se.usage;
                 heldCardUsage = null;
                 void target.patchUsageNote(merged);
-              } else {
+              } else if (
+                !(se.eventType === 'text_delta' && !se.parentToolUseId)
+              ) {
                 feedStreamEventToCard(
                   streamingSession,
                   se,
@@ -6278,6 +6361,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             );
             resetIdleTimer();
             return;
+          }
+
+          // Merge SDK Result and any send_message(final) candidate into the
+          // same primary answer slot. A non-empty SDK Result stays
+          // authoritative; the staged MCP candidate is only a fallback for a
+          // genuinely empty Result, never an independently delivered message.
+          if (
+            result.status === 'success' &&
+            (result.sourceKind ?? 'sdk_final') === 'sdk_final'
+          ) {
+            const resultInputTurnId = result.inputTurnId ?? lastProcessed.id;
+            const coordinator =
+              turnOutputCoordinators.get(resultInputTurnId) ??
+              bindTurnOutputCoordinator(resultInputTurnId);
+            const resolved = coordinator.resolvePrimaryAnswer(result.result);
+            result.result = resolved.text;
           }
 
           // Streaming output callback — called for each agent result
@@ -6783,6 +6882,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 })
               ) {
                 genuineReplyDelivered = true;
+                const completedCoordinator = turnOutputCoordinators.get(
+                  outputChannelScope.inputId,
+                );
+                completedCoordinator?.markFinalized();
               }
               // Clear streaming snapshot so the next turn starts fresh.
               // Without this, saveInterruptedStreamingMessages() would merge
@@ -6859,6 +6962,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       ipcReplyTurnTracker
     ) {
       activeIpcReplyTurnTrackers.delete(effectiveGroup.folder);
+    }
+    for (const [inputTurnId, coordinator] of turnOutputCoordinators) {
+      activeTurnOutputs.unbind(mainAdmissionKey, inputTurnId, coordinator);
     }
 
     // ── 检测中断：有累积文本但从未发送回复 ──
@@ -8317,7 +8423,71 @@ function startIpcWatcher(): void {
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = getIpcDeliveryTargetGroup(data.chatJid);
               let messageDelivered = false;
-              if (
+              let messageStaged = false;
+              let stagedDisposition:
+                | 'staged_progress'
+                | 'staged_final'
+                | undefined;
+              const isTaskIpcMessage = !!(
+                data.isScheduledTask ||
+                data.taskId ||
+                ipcTaskId
+              );
+              const authorized = canSendCrossGroupMessage(
+                isAdminHome,
+                isHome,
+                sourceGroup,
+                sourceGroupEntry,
+                targetGroup,
+              );
+              const hostOutputRoute = routeHostIpcOutput(
+                {
+                  sourceGroup,
+                  agentId: ipcAgentId,
+                  inputTurnId: data.inputTurnId,
+                  text: data.text,
+                  deliveryRole: data.deliveryRole,
+                  authorized,
+                  scheduledTask: isTaskIpcMessage,
+                },
+                activeTurnOutputs,
+              );
+              const stagingAttempted =
+                hostOutputRoute.path === 'primary_projection';
+              if (hostOutputRoute.path === 'primary_projection') {
+                messageDelivered = hostOutputRoute.delivered;
+                messageStaged = hostOutputRoute.staged;
+                stagedDisposition = hostOutputRoute.disposition;
+                if (hostOutputRoute.stageResult.accepted) {
+                  logger.info(
+                    {
+                      sourceGroup,
+                      agentId: ipcAgentId,
+                      inputTurnId: data.inputTurnId,
+                      deliveryRole: hostOutputRoute.deliveryRole,
+                      duplicate: hostOutputRoute.stageResult.duplicate,
+                    },
+                    'IPC send_message joined the active primary reply',
+                  );
+                } else {
+                  logger.warn(
+                    {
+                      sourceGroup,
+                      agentId: ipcAgentId,
+                      inputTurnId: data.inputTurnId,
+                      deliveryRole: hostOutputRoute.deliveryRole,
+                      reason: hostOutputRoute.stageResult.reason,
+                    },
+                    'IPC send_message could not join its exact active primary reply',
+                  );
+                }
+              }
+              if (messageStaged || stagingAttempted) {
+                // Staged progress/final text intentionally has no independent
+                // DB/IM side effect. SDK Result will finalize the same primary
+                // answer; a failed staging attempt must not fall through into
+                // the legacy separate-message path.
+              } else if (
                 isRetryDuplicateIpcSend(sourceGroup, data.chatJid, data.text)
               ) {
                 // The deduplicator only records confirmed deliveries, so a
@@ -8328,20 +8498,7 @@ function startIpcWatcher(): void {
                   { sourceGroup, chatJid: data.chatJid },
                   'Duplicate IPC send_message suppressed (retry replay window)',
                 );
-              } else if (
-                canSendCrossGroupMessage(
-                  isAdminHome,
-                  isHome,
-                  sourceGroup,
-                  sourceGroupEntry,
-                  targetGroup,
-                )
-              ) {
-                const isTaskIpcMessage = !!(
-                  data.isScheduledTask ||
-                  data.taskId ||
-                  ipcTaskId
-                );
+              } else if (authorized) {
                 if (
                   isTaskIpcMessage &&
                   durableTaskRunId &&
@@ -8543,6 +8700,7 @@ function startIpcWatcher(): void {
               );
               if (
                 messageDelivered &&
+                !messageStaged &&
                 isMainUserTurnReply &&
                 typeof data.inputTurnId === 'string' &&
                 data.inputTurnId
@@ -8557,7 +8715,10 @@ function startIpcWatcher(): void {
                 messageResultsDir,
                 messageRequestId,
                 messageDelivered
-                  ? { success: true }
+                  ? {
+                      success: true,
+                      disposition: stagedDisposition ?? 'delivered_separately',
+                    }
                   : {
                       success: false,
                       error: 'Message could not be delivered to its target.',
@@ -11616,6 +11777,52 @@ async function processAgentConversation(
   }
   const admittedWarmAgentInputs = new Map<string, AdmittedWarmAgentInput>();
   const agentAdmissionKey = channelTurnScope(effectiveGroup.folder, agentId);
+  const agentTurnOutputCoordinators = new Map<string, TurnOutputCoordinator>();
+  const bindAgentTurnOutputCoordinator = (
+    inputTurnId: string,
+  ): TurnOutputCoordinator => {
+    const existing = agentTurnOutputCoordinators.get(inputTurnId);
+    if (existing) return existing;
+    const coordinator = activeTurnOutputs.bind(agentAdmissionKey, inputTurnId, {
+      onProgress: (text) => {
+        const projection = agentStreamingSessionsByInput.get(inputTurnId);
+        if (projection?.session.isActive()) {
+          projection.session.setThinking();
+          projection.session.setSystemStatus(text.slice(0, 160));
+          projection.session.pushRecentEvent(
+            `🔄 ${text.replace(/\s+/g, ' ').slice(0, 80)}`,
+          );
+        }
+        broadcastStreamEvent(
+          chatJid,
+          {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: text.slice(0, 160),
+            summary: text.slice(0, 500),
+            isSynthetic: true,
+            displayLevel: 'primary',
+            turnId: inputTurnId,
+            sessionId: currentAgentSessionId,
+          },
+          agentId,
+        );
+        return true;
+      },
+      onFinalCandidate: (text) => {
+        agentStreamingAccText = text;
+        const projection = agentStreamingSessionsByInput.get(inputTurnId);
+        if (projection?.session.isActive()) {
+          projection.session.append(heldAgentBaseText() + text);
+          projection.session.setSystemStatus('正在完成最终回复…');
+        }
+        return true;
+      },
+    });
+    agentTurnOutputCoordinators.set(inputTurnId, coordinator);
+    return coordinator;
+  };
+  bindAgentTurnOutputCoordinator(lastProcessed.id);
   activeRouteAdmissions.set(agentAdmissionKey, (newSourceJid, inputTurnId) => {
     if (admittedWarmAgentInputs.has(inputTurnId)) return false;
     const targetSourceJid = resolveStickyChannelOwner(
@@ -11725,6 +11932,7 @@ async function processAgentConversation(
     }
     if (inputTurnId) {
       activeAgentInputTurnId = inputTurnId;
+      bindAgentTurnOutputCoordinator(inputTurnId);
       healthyAgentInputTurnCompleted = false;
       cursorCommitted = false;
       lastAgentReplyMsgId = undefined;
@@ -12054,23 +12262,29 @@ async function processAgentConversation(
         };
         pendingAgentLedgerUsageBatch = null;
       }
-      broadcastStreamEvent(chatJid, output.streamEvent, agentId);
-
-      // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
-      // 仅累积主 Agent 文本（无 parentToolUseId）：子 Agent（SDK Task）的中间
-      // 文本混入会污染飞书 agent 卡正文与 interrupt_partial 落库内容。
-      // 与主会话路径（processGroupMessages）的同名过滤保持一致。
-      if (
-        output.streamEvent.eventType === 'text_delta' &&
-        output.streamEvent.text &&
-        !output.streamEvent.parentToolUseId
-      ) {
-        agentStreamingAccText += output.streamEvent.text;
+      const agentStreamInputTurnId = output.inputTurnId ?? lastProcessed.id;
+      const agentTurnCoordinator =
+        agentTurnOutputCoordinators.get(agentStreamInputTurnId) ??
+        bindAgentTurnOutputCoordinator(agentStreamInputTurnId);
+      const agentAnswerProjection = agentTurnCoordinator.reduceStreamEvent(
+        output.streamEvent,
+      );
+      if (agentAnswerProjection.visibleAnswerChanged) {
+        agentStreamingAccText = agentAnswerProjection.visibleAnswerText;
       }
+      broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
       // ── Feed stream events into Feishu streaming card ──
       if (agentStreamingSession) {
         const se = output.streamEvent;
+        if (
+          agentAnswerProjection.visibleAnswerChanged &&
+          agentStreamingSession.isActive()
+        ) {
+          agentStreamingSession.append(
+            heldAgentBaseText() + agentAnswerProjection.visibleAnswerText,
+          );
+        }
         if (se.eventType === 'usage' && se.usage && heldAgentParts.length > 0) {
           // 挂起中：累计 usage 增量，不喂卡（定稿后合并补丁）
           heldAgentUsage = mergeHeldUsage(heldAgentUsage, se.usage);
@@ -12086,7 +12300,7 @@ async function processAgentConversation(
             : se.usage;
           heldAgentUsage = null;
           void agentStreamingSession.patchUsageNote(merged);
-        } else {
+        } else if (!(se.eventType === 'text_delta' && !se.parentToolUseId)) {
           feedStreamEventToCard(
             agentStreamingSession,
             se,
@@ -12262,6 +12476,17 @@ async function processAgentConversation(
       );
       resetIdleTimer();
       return;
+    }
+
+    if (
+      output.status === 'success' &&
+      (output.sourceKind ?? 'sdk_final') === 'sdk_final'
+    ) {
+      const resultInputTurnId = output.inputTurnId ?? lastProcessed.id;
+      const coordinator =
+        agentTurnOutputCoordinators.get(resultInputTurnId) ??
+        bindAgentTurnOutputCoordinator(resultInputTurnId);
+      output.result = coordinator.resolvePrimaryAnswer(output.result).text;
     }
 
     // Agent reply
@@ -12682,6 +12907,16 @@ async function processAgentConversation(
           for (const inputId of acknowledgedInputIds) {
             agentPhysicalDeliveryAckByInput.set(inputId, true);
             agentReplySentByInput.set(inputId, true);
+            if (
+              !holdReason &&
+              isGenuineReplyResult({
+                holdReason,
+                sourceKind: output.sourceKind,
+                finalizationReason: output.finalizationReason,
+              })
+            ) {
+              agentTurnOutputCoordinators.get(inputId)?.markFinalized();
+            }
           }
         }
 
@@ -12970,6 +13205,9 @@ async function processAgentConversation(
     // ── Streaming card cleanup ──
     activeHeldCardFinalizers.delete(virtualChatJid);
     activeRouteAdmissions.delete(agentAdmissionKey);
+    for (const [inputTurnId, coordinator] of agentTurnOutputCoordinators) {
+      activeTurnOutputs.unbind(agentAdmissionKey, inputTurnId, coordinator);
+    }
     if (agentStreamingSession) {
       if (agentStreamingSession.isActive()) {
         // Symmetric with the main session's five-way finalize (index.ts ~3804):

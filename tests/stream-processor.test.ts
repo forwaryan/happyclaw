@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { StreamEventProcessor } from '../container/agent-runner/src/stream-processor.js';
 import type { ContainerOutput } from '../container/agent-runner/src/types.js';
 
@@ -12,6 +12,106 @@ function makeProcessor() {
 }
 
 describe('StreamEventProcessor observability mapping', () => {
+  test('emits assistant message boundaries for host-side answer-lane classification', () => {
+    const { processor, outputs } = makeProcessor();
+
+    processor.processStreamEvent({
+      type: 'stream_event',
+      uuid: 'assistant-frame-1',
+      session_id: 'session-1',
+      event: {
+        type: 'message_start',
+        message: { id: 'api-message-1' },
+      },
+    });
+    processor.processStreamEvent({
+      type: 'stream_event',
+      uuid: 'assistant-frame-1',
+      session_id: 'session-1',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'short buffered final' },
+      },
+    });
+    processor.processStreamEvent({
+      type: 'stream_event',
+      uuid: 'assistant-frame-1',
+      session_id: 'session-1',
+      event: { type: 'message_stop' },
+    });
+
+    const events = outputs.map((output) => output.streamEvent).filter(Boolean);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: 'raw_sdk_event',
+          rawType: 'stream_event/message_start',
+          messageUuid: 'assistant-frame-1',
+          sessionId: 'session-1',
+        }),
+        expect.objectContaining({
+          eventType: 'raw_sdk_event',
+          rawType: 'stream_event/message_stop',
+          messageUuid: 'assistant-frame-1',
+          sessionId: 'session-1',
+        }),
+      ]),
+    );
+    expect(
+      events.findIndex((event) => event?.eventType === 'text_delta'),
+    ).toBeLessThan(
+      events.findIndex(
+        (event) => event?.rawType === 'stream_event/message_stop',
+      ),
+    );
+  });
+
+  test('coalesces thinking_tokens into a low-frequency semantic heartbeat', () => {
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValue(1_000);
+    const { processor, outputs } = makeProcessor();
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'thinking_tokens',
+      estimated_tokens: 10,
+      estimated_tokens_delta: 10,
+      uuid: 'thinking-1',
+      session_id: 'session-1',
+    });
+    now.mockReturnValue(1_500);
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'thinking_tokens',
+      estimated_tokens: 20,
+      estimated_tokens_delta: 10,
+      uuid: 'thinking-1',
+      session_id: 'session-1',
+    });
+    now.mockReturnValue(3_100);
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'thinking_tokens',
+      estimated_tokens: 30,
+      estimated_tokens_delta: 10,
+      uuid: 'thinking-1',
+      session_id: 'session-1',
+    });
+
+    const heartbeats = outputs
+      .map((output) => output.streamEvent)
+      .filter((event) => event?.statusText === '正在深入分析…');
+    expect(heartbeats).toHaveLength(2);
+    expect(heartbeats[0]).toMatchObject({
+      eventType: 'status',
+      isSynthetic: true,
+      agentScope: 'system',
+    });
+    expect(JSON.stringify(heartbeats)).not.toContain('estimated_tokens');
+    now.mockRestore();
+  });
+
   test('detached local bash does not block input receipt, while finite background Agent still does', () => {
     const { processor } = makeProcessor();
 

@@ -13,7 +13,7 @@
  * - Code-block-safe text splitting (no truncation inside fenced code blocks)
  * - Schema 2.0 card format with body.elements
  * - Multi-card support for extremely long outputs (auto-split at ~45 elements)
- * - 100K character single-element support in streaming mode
+ * - Conservative 30K character live-element budget with full-content finalization
  */
 import * as lark from '@larksuiteoapi/node-sdk';
 import { createHash } from 'crypto';
@@ -403,7 +403,25 @@ const STREAMING_CONFIG = {
   print_strategy: 'fast' as const,
 };
 
-const MAX_STREAMING_CONTENT = 100000; // cardElement.content() supports 100K chars
+/**
+ * CardKit may accept larger values, but the official SDK uses a conservative
+ * 30K live-element budget. Staying below it also leaves room for Markdown
+ * fence repair and avoids a late provider rejection after a long run.
+ * Finalization still renders the complete accumulated text across cards.
+ */
+const MAX_STREAMING_CONTENT = 30000;
+const STREAMING_PLACEHOLDER = '> 正在分析请求，最终结论完成后会显示在这里。';
+
+function limitStreamingContent(text: string): string {
+  if (text.length <= MAX_STREAMING_CONTENT) return text;
+  const hint = '\n\n> ⚠️ 内容较长，完成后将展示完整结果';
+  // Reserve space for splitCodeBlockSafe's synthetic closing fence.
+  const [head] = splitCodeBlockSafe(
+    text,
+    MAX_STREAMING_CONTENT - hint.length - 16,
+  );
+  return `${head}${hint}`;
+}
 
 // ─── Tool Progress & Elapsed Helpers ─────────────────────────
 
@@ -675,7 +693,7 @@ function buildStreamingCard(
   // a fixed status word ("生成中"), never the reply's first line: keeping the
   // body intact (first line stays in MAIN_CONTENT) means the streaming→terminal
   // transition no longer shuffles the first line between header and body.
-  const optimized = optimizeMarkdownStyle(text || '...', 2);
+  const optimized = optimizeMarkdownStyle(text || STREAMING_PLACEHOLDER, 2);
   const streamingTitle = statusHeadline('running');
   const elements: Array<Record<string, unknown>> = [
     {
@@ -744,6 +762,17 @@ function buildSchema2Card(
     splitCodeBlockSafe,
     overrideTitle,
   );
+  if (
+    state === 'streaming' &&
+    text === STREAMING_PLACEHOLDER &&
+    contentElements.length === 0
+  ) {
+    contentElements.push({
+      tag: 'markdown',
+      content: STREAMING_PLACEHOLDER,
+      element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
+    });
+  }
   const displayTitle = titlePrefix ? `${titlePrefix}${title}` : title;
 
   // Build final elements array with auxiliary sections
@@ -933,10 +962,68 @@ function quickHash(data: string): string {
   return createHash('md5').update(data).digest('hex');
 }
 
+class CardKitRejectedError extends Error {
+  readonly code: number;
+
+  constructor(operation: string, code: number, message: string) {
+    super(
+      `${operation} was rejected by CardKit (code=${code}, msg=${message})`,
+    );
+    this.name = 'CardKitRejectedError';
+    this.code = code;
+  }
+}
+
+function assertCardKitAcknowledged(response: unknown, operation: string): void {
+  const envelope = response as { code?: unknown; msg?: unknown } | undefined;
+  if (
+    envelope?.code !== undefined &&
+    envelope.code !== null &&
+    Number(envelope.code) !== 0
+  ) {
+    throw new CardKitRejectedError(
+      operation,
+      Number(envelope.code),
+      String(envelope.msg ?? ''),
+    );
+  }
+}
+
+function cardMutationUuid(
+  cardId: string,
+  sequence: number,
+  operation: string,
+  payloadHash: string,
+): string {
+  return `hc_${quickHash(`${cardId}:${sequence}:${operation}:${payloadHash}`)}`;
+}
+
+function collectElementContentHashes(
+  value: unknown,
+  hashes: Map<string, string>,
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectElementContentHashes(item, hashes);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.element_id === 'string' &&
+    typeof record.content === 'string'
+  ) {
+    hashes.set(record.element_id, quickHash(record.content));
+  }
+  for (const child of Object.values(record)) {
+    collectElementContentHashes(child, hashes);
+  }
+}
+
 class CardKitBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
   private sequence = 0;
+  private acknowledgedSequence = 0;
   private lastContentHash = '';
   private readonly client: lark.Client;
   /**
@@ -969,7 +1056,7 @@ class CardKitBackend {
   }
 
   getSequence(): number {
-    return this.sequence;
+    return this.acknowledgedSequence;
   }
 
   /**
@@ -995,6 +1082,7 @@ class CardKitBackend {
 
     this.cardId = cardId;
     this.sequence = 1;
+    this.acknowledgedSequence = 1;
     this.lastContentHash = quickHash(JSON.stringify(cardJson));
     logger.debug({ cardId }, 'CardKit card created');
     return cardId;
@@ -1058,14 +1146,17 @@ class CardKitBackend {
       const hash = quickHash(dataStr);
       if (hash === this.lastContentHash) return; // no change
 
-      this.sequence++;
-      await this.client.cardkit.v1.card.update({
+      const sequence = ++this.sequence;
+      const response = await this.client.cardkit.v1.card.update({
         path: { card_id: this.cardId! },
         data: {
           card: { type: 'card_json', data: dataStr },
-          sequence: this.sequence,
+          sequence,
+          uuid: cardMutationUuid(this.cardId!, sequence, 'card.update', hash),
         },
       });
+      assertCardKitAcknowledged(response, 'card.update');
+      this.acknowledgedSequence = sequence;
 
       this.lastContentHash = hash;
     });
@@ -1078,6 +1169,7 @@ class CardKitBackend {
     this.cardId = cardId;
     this._messageId = messageId;
     this.sequence = sequence;
+    this.acknowledgedSequence = sequence;
   }
 }
 
@@ -1087,6 +1179,8 @@ class StreamingModeBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
   private sequence = 0;
+  /** Highest provider-acknowledged sequence exposed to durable lifecycle. */
+  private acknowledgedSequence = 0;
   private lastMainHash = '';
   private lastAuxBeforeHash = '';
   private lastAuxAfterHash = '';
@@ -1123,11 +1217,22 @@ class StreamingModeBackend {
   }
 
   getSequence(): number {
-    return this.sequence;
+    return this.acknowledgedSequence;
   }
 
   private nextSequence(): number {
     return ++this.sequence;
+  }
+
+  private mutationIdentity(
+    operation: string,
+    payloadHash: string,
+  ): { sequence: number; uuid: string } {
+    const sequence = this.nextSequence();
+    return {
+      sequence,
+      uuid: cardMutationUuid(this.cardId!, sequence, operation, payloadHash),
+    };
   }
 
   /**
@@ -1152,6 +1257,13 @@ class StreamingModeBackend {
 
     this.cardId = cardId;
     this.sequence = 1;
+    this.acknowledgedSequence = 1;
+    collectElementContentHashes(cardJson, this.richSlotHashes);
+    this.lastMainHash = this.richSlotHashes.get(ELEMENT_IDS.MAIN_CONTENT) ?? '';
+    this.lastAuxBeforeHash =
+      this.richSlotHashes.get(ELEMENT_IDS.AUX_BEFORE) ?? '';
+    this.lastAuxAfterHash =
+      this.richSlotHashes.get(ELEMENT_IDS.AUX_AFTER) ?? '';
     logger.debug({ cardId }, 'Streaming mode card created');
     return cardId;
   }
@@ -1202,22 +1314,25 @@ class StreamingModeBackend {
   async streamContent(text: string): Promise<void> {
     if (!this.cardId) return;
 
-    // Truncate at 100K char limit (hint at end, slice adjusted for hint length)
-    const truncHint = `\n\n> ⚠️ 输出已截断（超过 ${MAX_STREAMING_CONTENT} 字符）`;
-    const content =
-      text.length > MAX_STREAMING_CONTENT
-        ? text.slice(0, MAX_STREAMING_CONTENT - truncHint.length) + truncHint
-        : text;
+    // Bound the live element conservatively. Finalization uses accumulatedText
+    // and therefore still publishes the complete answer across cards.
+    const content = limitStreamingContent(text);
 
     return this.enqueue(async () => {
       const hash = quickHash(content);
       if (hash === this.lastMainHash) return;
+      const mutation = this.mutationIdentity(
+        `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}`,
+        hash,
+      );
 
       try {
-        await this.client.cardkit.v1.cardElement.content({
+        const response = await this.client.cardkit.v1.cardElement.content({
           path: { card_id: this.cardId!, element_id: ELEMENT_IDS.MAIN_CONTENT },
-          data: { content, sequence: this.nextSequence() },
+          data: { content, ...mutation },
         });
+        assertCardKitAcknowledged(response, 'cardElement.content');
+        this.acknowledgedSequence = mutation.sequence;
         this.lastMainHash = hash;
       } catch (err: any) {
         const code = err?.code ?? err?.response?.data?.code;
@@ -1230,14 +1345,24 @@ class StreamingModeBackend {
           // Raw call (not the public wrapper) — we're already inside the chain;
           // enqueueing here would deadlock on ourselves.
           await this.enableStreamingModeRaw();
-          // Retry once
-          await this.client.cardkit.v1.cardElement.content({
+          // Re-enabling consumed a newer sequence, so the replacement content
+          // must use a sequence after that settings mutation. Error 200850 /
+          // 300309 is an explicit "streaming closed" rejection, not an
+          // ambiguous transport timeout; the first content mutation was not
+          // accepted.
+          const retryMutation = this.mutationIdentity(
+            `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}:reenabled`,
+            hash,
+          );
+          const response = await this.client.cardkit.v1.cardElement.content({
             path: {
               card_id: this.cardId!,
               element_id: ELEMENT_IDS.MAIN_CONTENT,
             },
-            data: { content, sequence: this.nextSequence() },
+            data: { content, ...retryMutation },
           });
+          assertCardKitAcknowledged(response, 'cardElement.content retry');
+          this.acknowledgedSequence = retryMutation.sequence;
           this.lastMainHash = hash;
         } else {
           throw err;
@@ -1270,10 +1395,16 @@ class StreamingModeBackend {
         text_size: 'notation',
       });
 
-      await this.client.cardkit.v1.cardElement.update({
+      const mutation = this.mutationIdentity(
+        `cardElement.update:${elementId}`,
+        hash,
+      );
+      const response = await this.client.cardkit.v1.cardElement.update({
         path: { card_id: this.cardId!, element_id: elementId },
-        data: { element, sequence: this.nextSequence() },
+        data: { element, ...mutation },
       });
+      assertCardKitAcknowledged(response, 'cardElement.update');
+      this.acknowledgedSequence = mutation.sequence;
       this[hashField] = hash;
     });
   }
@@ -1291,11 +1422,132 @@ class StreamingModeBackend {
     return this.enqueue(async () => {
       const hash = quickHash(content);
       if (this.richSlotHashes.get(elementId) === hash) return;
-      await this.client.cardkit.v1.cardElement.content({
+      const mutation = this.mutationIdentity(
+        `cardElement.content:${elementId}`,
+        hash,
+      );
+      const response = await this.client.cardkit.v1.cardElement.content({
         path: { card_id: this.cardId!, element_id: elementId },
-        data: { content, sequence: this.nextSequence() },
+        data: { content, ...mutation },
       });
+      assertCardKitAcknowledged(response, 'cardElement.content');
+      this.acknowledgedSequence = mutation.sequence;
       this.richSlotHashes.set(elementId, hash);
+    });
+  }
+
+  /**
+   * Update a set of rich markdown slots on the shared per-card queue. Each
+   * slot is acknowledged independently so one malformed optional panel cannot
+   * suppress later critical status/footer updates.
+   */
+  async updateMarkdownContents(
+    patches: ReadonlyArray<{ elementId: string; content: string }>,
+  ): Promise<{ updated: string[]; failed: string[] }> {
+    if (!this.cardId) return { updated: [], failed: [] };
+    return this.enqueue(async () => {
+      const changed = patches
+        .map((patch) => ({ ...patch, hash: quickHash(patch.content) }))
+        .filter(
+          (patch) => this.richSlotHashes.get(patch.elementId) !== patch.hash,
+        );
+      if (changed.length === 0) return { updated: [], failed: [] };
+
+      // Normal path: one CardKit mutation for every auxiliary slot. This
+      // prevents a single semantic event from becoming an 8-request QPS burst.
+      const actions = JSON.stringify(
+        changed.map((patch) => ({
+          action: 'partial_update_element',
+          params: {
+            element_id: patch.elementId,
+            partial_element: JSON.stringify({ content: patch.content }),
+          },
+        })),
+      );
+      const mutation = this.mutationIdentity(
+        'card.batchUpdate:rich-slots',
+        quickHash(actions),
+      );
+      const runBatch = async (): Promise<void> => {
+        const response = await this.client.cardkit.v1.card.batchUpdate({
+          path: { card_id: this.cardId! },
+          data: { actions, ...mutation },
+        });
+        assertCardKitAcknowledged(response, 'card.batchUpdate');
+      };
+
+      let batchFailure: unknown;
+      try {
+        await runBatch();
+      } catch (firstError) {
+        if (firstError instanceof CardKitRejectedError) {
+          // A non-zero response code is a deterministic provider rejection.
+          // Sending the identical batch again only burns QPS.
+          batchFailure = firstError;
+        } else {
+          try {
+            // Same logical request, same sequence and UUID: safe when the first
+            // call reached CardKit but its acknowledgement was lost.
+            await runBatch();
+          } catch (retryError) {
+            batchFailure = retryError;
+          }
+        }
+      }
+
+      if (batchFailure !== undefined) {
+        logger.debug(
+          {
+            err: batchFailure,
+            cardId: this.cardId,
+            slots: changed.map((patch) => patch.elementId),
+          },
+          'CardKit rich-slot batch failed; isolating slots',
+        );
+        // Diagnostic fallback: update slots independently. One invalid
+        // optional panel then cannot block status/footer visibility.
+        const updated: string[] = [];
+        const failed: string[] = [];
+        for (const patch of changed) {
+          const slotMutation = this.mutationIdentity(
+            `cardElement.content:${patch.elementId}:batch-fallback`,
+            patch.hash,
+          );
+          try {
+            const response = await this.client.cardkit.v1.cardElement.content({
+              path: {
+                card_id: this.cardId!,
+                element_id: patch.elementId,
+              },
+              data: { content: patch.content, ...slotMutation },
+            });
+            assertCardKitAcknowledged(response, 'cardElement.content');
+            this.acknowledgedSequence = slotMutation.sequence;
+            this.richSlotHashes.set(patch.elementId, patch.hash);
+            updated.push(patch.elementId);
+          } catch (error) {
+            failed.push(patch.elementId);
+            logger.debug(
+              {
+                err: error,
+                cardId: this.cardId,
+                elementId: patch.elementId,
+              },
+              'CardKit rich slot update failed; continuing remaining slots',
+            );
+          }
+        }
+        return { updated, failed };
+      }
+
+      this.acknowledgedSequence = mutation.sequence;
+      for (const patch of changed) {
+        this.richSlotHashes.set(patch.elementId, patch.hash);
+      }
+      return {
+        updated: changed.map((patch) => patch.elementId),
+        failed: [],
+      };
     });
   }
 
@@ -1306,31 +1558,45 @@ class StreamingModeBackend {
   async replaceElement(elementId: string, elementJson: object): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
-      await this.client.cardkit.v1.cardElement.update({
+      const element = JSON.stringify(elementJson);
+      const mutation = this.mutationIdentity(
+        `cardElement.update:${elementId}`,
+        quickHash(element),
+      );
+      const response = await this.client.cardkit.v1.cardElement.update({
         path: { card_id: this.cardId!, element_id: elementId },
         data: {
-          element: JSON.stringify(elementJson),
-          sequence: this.nextSequence(),
+          element,
+          ...mutation,
         },
       });
+      assertCardKitAcknowledged(response, 'cardElement.update');
+      this.acknowledgedSequence = mutation.sequence;
     });
   }
 
   /** Enable streaming mode via card.settings() — chain-internal raw call. */
   private async enableStreamingModeRaw(): Promise<void> {
     if (!this.cardId) return;
-    await this.client.cardkit.v1.card.settings({
-      path: { card_id: this.cardId },
-      data: {
-        settings: JSON.stringify({
-          config: {
-            streaming_mode: true,
-            streaming_config: STREAMING_CONFIG,
-          },
-        }),
-        sequence: this.nextSequence(),
+    const settings = JSON.stringify({
+      config: {
+        streaming_mode: true,
+        streaming_config: STREAMING_CONFIG,
       },
     });
+    const mutation = this.mutationIdentity(
+      'card.settings:enable',
+      quickHash(settings),
+    );
+    const response = await this.client.cardkit.v1.card.settings({
+      path: { card_id: this.cardId },
+      data: {
+        settings,
+        ...mutation,
+      },
+    });
+    assertCardKitAcknowledged(response, 'card.settings enable');
+    this.acknowledgedSequence = mutation.sequence;
   }
 
   /**
@@ -1347,15 +1613,22 @@ class StreamingModeBackend {
   async disableStreamingMode(): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
-      await this.client.cardkit.v1.card.settings({
+      const settings = JSON.stringify({
+        config: { streaming_mode: false },
+      });
+      const mutation = this.mutationIdentity(
+        'card.settings:disable',
+        quickHash(settings),
+      );
+      const response = await this.client.cardkit.v1.card.settings({
         path: { card_id: this.cardId! },
         data: {
-          settings: JSON.stringify({
-            config: { streaming_mode: false },
-          }),
-          sequence: this.nextSequence(),
+          settings,
+          ...mutation,
         },
       });
+      assertCardKitAcknowledged(response, 'card.settings disable');
+      this.acknowledgedSequence = mutation.sequence;
     });
   }
 
@@ -1365,14 +1638,22 @@ class StreamingModeBackend {
   async updateCardFull(cardJson: object): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
-      await this.client.cardkit.v1.card.update({
+      const data = JSON.stringify(cardJson);
+      const mutation = this.mutationIdentity('card.update', quickHash(data));
+      const response = await this.client.cardkit.v1.card.update({
         path: { card_id: this.cardId! },
         data: {
-          card: { type: 'card_json', data: JSON.stringify(cardJson) },
-          sequence: this.nextSequence(),
+          card: { type: 'card_json', data },
+          ...mutation,
         },
       });
+      assertCardKitAcknowledged(response, 'card.update');
+      this.acknowledgedSequence = mutation.sequence;
     });
+  }
+
+  async drain(): Promise<void> {
+    await this.chain;
   }
 }
 
@@ -1794,6 +2075,7 @@ export class StreamingCardController {
   private streamingBackend: StreamingModeBackend | null = null;
   private textFlushCtrl: FlushController | null = null;
   private auxFlushCtrl: FlushController | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   /** True when finalize split content across multiple cards — patchUsageNote
    * must not rebuild a single card or it would overwrite the first card. */
   private finalizedAsSplit = false;
@@ -2199,6 +2481,7 @@ export class StreamingCardController {
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
+    this.stopHeartbeat();
 
     try {
       if (this.backendMode === 'streaming' && this.streamingBackend) {
@@ -2271,6 +2554,7 @@ export class StreamingCardController {
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
+    this.stopHeartbeat();
 
     if (reason) {
       this.accumulatedText += `\n\n---\n*${reason}*`;
@@ -2331,12 +2615,15 @@ export class StreamingCardController {
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
+    this.stopHeartbeat();
   }
 
   // ─── Internal Methods ──────────────────────────────────
 
   private async createInitialCard(): Promise<void> {
-    const initialText = this.accumulatedText || (this.thinking ? '' : '...');
+    const initialText = limitStreamingContent(
+      this.accumulatedText || STREAMING_PLACEHOLDER,
+    );
 
     // ── Level 0: Try streaming mode (cardElement.content typewriter) ──
     try {
@@ -2478,9 +2765,16 @@ export class StreamingCardController {
     }
 
     this.state = 'streaming';
+    if (this.backendMode === 'streaming') this.startHeartbeat();
     this.emitLifecycle('streaming');
     if (this.messageId) {
       this.onCardCreated?.(this.messageId);
+    }
+
+    if (this.backendMode === 'streaming') {
+      // Replace the skeleton's neutral preparation state with the current
+      // deterministic phase even when the model has emitted no text delta.
+      this.scheduleAuxFlush();
     }
 
     // If text accumulated while creating, schedule a flush/patch
@@ -2542,6 +2836,33 @@ export class StreamingCardController {
     };
   }
 
+  /**
+   * The canonical reducer is allowed to retract provisional narration back to
+   * an empty string when the same assistant message turns into a tool call.
+   * Provider projections must keep a visible neutral surface during that
+   * transition without mutating canonical accumulatedText.
+   */
+  private liveDisplayText(): string {
+    return this.accumulatedText || STREAMING_PLACEHOLDER;
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.state !== 'streaming') return;
+      // Elapsed time is bucketed by buildRichPanelPatches(), so this remains a
+      // low-frequency liveness signal rather than an update storm.
+      this.scheduleAuxFlush();
+    }, 5000);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) return;
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
   setTraceUrl(url: string | null): void {
     this.traceUrl = url;
   }
@@ -2574,7 +2895,7 @@ export class StreamingCardController {
       // never let a post-finalize failure count toward degradation.
       if (this.state !== 'streaming' || !this.streamingBackend) return;
       try {
-        await this.streamingBackend.streamContent(this.accumulatedText);
+        await this.streamingBackend.streamContent(this.liveDisplayText());
         this.textFlushCtrl!.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
         this.emitLifecycle('streaming');
@@ -2796,59 +3117,59 @@ export class StreamingCardController {
       if (this.state !== 'streaming' || !this.streamingBackend) return;
       const patches = this.buildRichPanelPatches();
 
-      // Every flush goes through cardElement.content() to update the inner
-      // markdown of each panel. We keep the collapsible_panel structure
-      // constant (initial expanded state set at card creation) to avoid
-      // mid-stream structural rewrites, which Feishu's streaming_mode
-      // sometimes rejects. The user can fold/expand each panel manually.
-      try {
-        await this.streamingBackend!.updateMarkdownContent(
-          CARD_ELEMENT_IDS.STATUS_BANNER,
-          patches.statusBanner,
-        );
-        // Always patch the ask slot. When AskUserQuestion ends this clears the
-        // old prompt instead of leaving a stale 「等待你的回复」on the card.
-        await this.streamingBackend!.updateMarkdownContent(
-          CARD_ELEMENT_IDS.ASK_CONTENT,
-          patches.askContent ?? '',
-        );
-        if (patches.progressContent) {
-          await this.streamingBackend!.updateMarkdownContent(
-            CARD_ELEMENT_IDS.PROGRESS_CONTENT,
-            patches.progressContent,
-          );
-        }
-        await this.streamingBackend!.updateMarkdownContent(
-          CARD_ELEMENT_IDS.TASK_CONTENT,
-          patches.taskContent,
-        );
-        await this.streamingBackend!.updateMarkdownContent(
-          CARD_ELEMENT_IDS.TOOLS_CONTENT,
-          patches.toolsContent,
-        );
-        if (patches.thinkingContent) {
-          await this.streamingBackend!.updateMarkdownContent(
-            CARD_ELEMENT_IDS.THINKING_CONTENT,
-            patches.thinkingContent,
-          );
-        }
-        if (patches.timelineContent) {
-          await this.streamingBackend!.updateMarkdownContent(
-            CARD_ELEMENT_IDS.TIMELINE_CONTENT,
-            patches.timelineContent,
-          );
-        }
-        await this.streamingBackend!.updateMarkdownContent(
-          CARD_ELEMENT_IDS.FOOTER_NOTE,
-          patches.footerNote,
-        );
-      } catch (err) {
-        // Aux panels are best-effort decoration — log and move on. (The old
-        // fallback patched AUX_BEFORE/AUX_AFTER, but the rich skeleton has no
-        // such element_ids, so it always failed silently and only burned QPS.)
+      const result = await this.streamingBackend!.updateMarkdownContents([
+        {
+          elementId: CARD_ELEMENT_IDS.STATUS_BANNER,
+          content: patches.statusBanner,
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.ASK_CONTENT,
+          content: patches.askContent ?? '',
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+          content:
+            patches.progressContent ??
+            "<font color='grey'>等待任务规划…</font>",
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.TASK_CONTENT,
+          content: patches.taskContent,
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
+          content: patches.toolsContent,
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
+          content:
+            patches.thinkingContent ??
+            "<font color='grey'>尚未开始思考…</font>",
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.TIMELINE_CONTENT,
+          content:
+            patches.timelineContent ?? "<font color='grey'>暂无调用记录</font>",
+        },
+        {
+          elementId: CARD_ELEMENT_IDS.FOOTER_NOTE,
+          content: patches.footerNote,
+        },
+      ]);
+      if (result.updated.length > 0) {
+        // Persist the provider-acknowledged sequence. Without this, a crash
+        // after heartbeat/auxiliary mutations would leave recovery using an
+        // older sequence that CardKit correctly rejects as stale.
+        this.emitLifecycle('streaming');
+      }
+      if (result.failed.length > 0) {
         logger.debug(
-          { err, chatId: this.chatId, mode: 'streaming' },
-          'Rich panel patch failed (non-fatal)',
+          {
+            chatId: this.chatId,
+            mode: 'streaming',
+            failedSlots: result.failed,
+          },
+          'Some rich panel slots failed to update (non-fatal)',
         );
       }
     });
@@ -2884,6 +3205,7 @@ export class StreamingCardController {
     this.textFlushCtrl = null;
     this.auxFlushCtrl?.dispose();
     this.auxFlushCtrl = null;
+    this.stopHeartbeat();
     this.patchFailCount = 0;
 
     // Set up v1 flush controller
@@ -2945,7 +3267,7 @@ export class StreamingCardController {
     const thinking = this.thinkingText.trim() || undefined;
     return buildAgentReplyCard({
       status,
-      text: this.accumulatedText || '...',
+      text: this.accumulatedText || '> ⚠️ 本次运行没有生成可展示的最终内容。',
       thinking,
       footer: this.traceFooterLink(),
       meta: {
@@ -2972,10 +3294,14 @@ export class StreamingCardController {
     const backend = this.streamingBackend!;
 
     try {
-      // 1. Disable streaming mode (allows header/button changes)
+      // 1. Let any provider mutation already accepted by the shared queue
+      // settle before crossing the terminal boundary.
+      await backend.drain();
+
+      // 2. Disable streaming mode (allows header/button changes)
       await backend.disableStreamingMode();
 
-      // 2. Build structured final card (usage note comes later via patchUsageNote)
+      // 3. Build structured final card (usage note comes later via patchUsageNote)
       const cardJson = this.buildStructuredFinalCard(finalState);
       const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
 
@@ -2983,11 +3309,11 @@ export class StreamingCardController {
         cardSize <= CARD_SIZE_LIMIT &&
         this.accumulatedText.length <= MAX_FINAL_SINGLE_CARD_CHARS
       ) {
-        // 3a. Single card fits (both built JSON and RAW text length — the
+        // 4a. Single card fits (both built JSON and RAW text length — the
         // latter catches ASCII replies whose truncated JSON looks small)
         await backend.updateCardFull(cardJson);
       } else {
-        // 3b. Too large for single card — split on finalize (full content).
+        // 4b. Too large for single card — split on finalize (full content).
         // Set the flag BEFORE awaiting: patchUsageNote may fire mid-split and
         // must not rebuild a single card over the just-created continuations.
         this.finalizedAsSplit = true;
@@ -3091,13 +3417,17 @@ export class StreamingCardController {
     displayState: 'streaming' | 'completed' | 'aborted',
     footerNote?: string,
   ): Promise<void> {
+    const displayText =
+      displayState === 'streaming'
+        ? this.liveDisplayText()
+        : this.accumulatedText;
     if (this.useCardKit && this.multiCard) {
       // CardKit v1 path — pass auxiliary state for rich display
       const auxState =
         displayState === 'streaming' ? this.getAuxiliaryState() : undefined;
       try {
         await this.multiCard.commitContent(
-          this.accumulatedText,
+          displayText,
           displayState,
           auxState,
           footerNote,
@@ -3122,11 +3452,7 @@ export class StreamingCardController {
       // Legacy message.patch path (no auxiliary content)
       if (!this.messageId) return;
 
-      const card = buildStreamingCard(
-        this.accumulatedText,
-        displayState,
-        footerNote,
-      );
+      const card = buildStreamingCard(displayText, displayState, footerNote);
       const content = JSON.stringify(card);
 
       try {
@@ -3183,13 +3509,22 @@ export async function reconcileInterruptedStreamingCard(
   if (input.cardId) {
     let version = Math.max(0, Math.trunc(input.version));
     try {
-      await client.cardkit.v1.card.settings({
+      const settings = JSON.stringify({ config: { streaming_mode: false } });
+      const sequence = ++version;
+      const response = await client.cardkit.v1.card.settings({
         path: { card_id: input.cardId },
         data: {
-          settings: JSON.stringify({ config: { streaming_mode: false } }),
-          sequence: ++version,
+          settings,
+          sequence,
+          uuid: cardMutationUuid(
+            input.cardId,
+            sequence,
+            'reconcile:settings',
+            quickHash(settings),
+          ),
         },
       });
+      assertCardKitAcknowledged(response, 'card.settings reconcile');
     } catch (error) {
       // A provider may report that streaming already expired. The original
       // card can still accept a full update, so do not create a second card.
@@ -3198,13 +3533,22 @@ export async function reconcileInterruptedStreamingCard(
         'Interrupted card streaming disable failed; trying full update',
       );
     }
-    await client.cardkit.v1.card.update({
+    const data = JSON.stringify(card);
+    const sequence = ++version;
+    const response = await client.cardkit.v1.card.update({
       path: { card_id: input.cardId },
       data: {
-        card: { type: 'card_json', data: JSON.stringify(card) },
-        sequence: ++version,
+        card: { type: 'card_json', data },
+        sequence,
+        uuid: cardMutationUuid(
+          input.cardId,
+          sequence,
+          'reconcile:update',
+          quickHash(data),
+        ),
       },
     });
+    assertCardKitAcknowledged(response, 'card.update reconcile');
     return { version, method: 'cardkit' };
   }
 
