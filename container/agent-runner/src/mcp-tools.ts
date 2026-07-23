@@ -497,7 +497,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_image ---
     tool(
       'send_image',
-      'Send an image file from the workspace to the user via IM. Supports PNG/JPEG/GIF/WebP. Optional caption.',
+      'Send an image file from the workspace to the current native IM conversation. Supports PNG/JPEG/GIF/WebP/TIFF/BMP, with a 10MB runner-side limit. Optional caption.',
       {
         file_path: z
           .string()
@@ -551,7 +551,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           };
         }
 
-        // Read file and check size (10MB limit for both Feishu and Telegram)
+        // Read file and enforce the runner-side limit shared by every IM provider.
         const stat = fs.statSync(resolved);
         if (stat.size > 10 * 1024 * 1024) {
           return {
@@ -629,8 +629,8 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_file ---
     tool(
       'send_file',
-      `Send a file to the current chat (the user you're talking to) via IM (Feishu/Telegram/DingTalk/QQ/Discord). The file path is relative to the workspace/group directory.
-Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
+      `Send a file to the current native IM conversation through its bound account (Feishu/Telegram/DingTalk/QQ/Discord/WeChat/WhatsApp). The file path must stay inside the workspace/group directory.
+The actual file types and size limit are enforced by the selected provider.`,
       {
         filePath: z
           .string()
@@ -732,7 +732,7 @@ Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
           content: [
             {
               type: 'text' as const,
-              text: `Sending file "${args.fileName}"...`,
+              text: `File sent: ${args.fileName}`,
             },
           ],
         };
