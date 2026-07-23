@@ -22,7 +22,15 @@ const REQUIRED_FILES = [
   'memory-system.guest.md',
 ];
 
-const REQUIRED_CHANNELS = ['feishu', 'telegram', 'qq', 'dingtalk'];
+const REQUIRED_CHANNELS = [
+  'feishu',
+  'telegram',
+  'qq',
+  'wechat',
+  'dingtalk',
+  'discord',
+  'whatsapp',
+];
 
 function listMarkdownFiles(dir: string): string[] {
   const files: string[] = [];

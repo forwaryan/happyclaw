@@ -27,6 +27,7 @@ import {
   createSdkMcpServer,
   type Query,
   type SDKControlGetContextUsageResponse,
+  type SDKRateLimitInfo,
 } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
@@ -89,6 +90,7 @@ import {
   resolveClaudeQueryModelRuntime,
 } from './provider-runtime.js';
 import {
+  decideProviderLimitAction,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
   type ProviderFallbackRetryTurn,
@@ -1679,6 +1681,7 @@ async function runQueryAttempt(
   pipedMessagesDuringQuery: IpcInputMessage[];
   suspectTruncatedTail?: string;
   providerFailureTurn?: ProviderFallbackRetryTurn;
+  providerAccountFailure?: boolean;
 }> {
   const queryModelRuntime = resolveClaudeQueryModelRuntime(
     CLAUDE_PROVIDER_RUNTIME,
@@ -1731,6 +1734,11 @@ async function runQueryAttempt(
     resumeAt,
   });
   let providerFailureTurn: ProviderFallbackRetryTurn | undefined;
+  let pendingRejectedRateLimit:
+    | {
+        rateLimitType?: SDKRateLimitInfo['rateLimitType'];
+      }
+    | undefined;
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   const assistantTextTracker = new AssistantTextTracker();
@@ -2378,6 +2386,39 @@ async function runQueryAttempt(
         // from the pre-failure anchor by runQuery(); suppress this spent stream.
         continue;
       }
+      // A rejected subscription limit is a structured SDK signal. Record its
+      // blast radius before the CLI emits the human-readable banner/result;
+      // text parsing below remains only an old-CLI compatibility fallback.
+      if (message.type === 'rate_limit_event') {
+        const info: SDKRateLimitInfo = message.rate_limit_info;
+        if (info.status === 'rejected') {
+          pendingRejectedRateLimit = {
+            rateLimitType: info.rateLimitType,
+          };
+          const resetsAt = info.resetsAt
+            ? new Date(info.resetsAt * 1000).toLocaleTimeString()
+            : '未知';
+          processor.emitStatus(`API 限流中，预计 ${resetsAt} 恢复`);
+        } else if (info.status === 'allowed_warning') {
+          processor.emitStatus(`接近 API 限流阈值`);
+        }
+        continue;
+      }
+
+      // The assistant message following a rejected rate_limit_event is the
+      // CLI banner. Suppress it until the result decides whether to retry a
+      // model or quarantine an account. If no fallback exists for a model
+      // limit, the result text is still processed normally below.
+      if (
+        pendingRejectedRateLimit &&
+        (message.type === 'assistant' || message.type === 'stream_event')
+      ) {
+        log(
+          `Suppressing ${message.type} after rejected ${pendingRejectedRateLimit.rateLimitType ?? 'unknown'} rate limit`,
+        );
+        continue;
+      }
+
       // 流式事件处理
       if (message.type === 'stream_event') {
         // 重放消息是完整消息、不产生 partial stream_event——见到 stream_event
@@ -2412,20 +2453,6 @@ async function runQueryAttempt(
           continue;
         }
         processor.processToolUseSummary(message as any);
-        continue;
-      }
-
-      // Rate limit event — notify user and keep activity alive
-      if (message.type === 'rate_limit_event') {
-        const info = (message as any).rate_limit_info;
-        if (info?.status === 'rejected') {
-          const resetsAt = info.resetsAt
-            ? new Date(info.resetsAt * 1000).toLocaleTimeString()
-            : '未知';
-          processor.emitStatus(`API 限流中，预计 ${resetsAt} 恢复`);
-        } else if (info?.status === 'allowed_warning') {
-          processor.emitStatus(`接近 API 限流阈值`);
-        }
         continue;
       }
 
@@ -2563,9 +2590,9 @@ async function runQueryAttempt(
             assistantMsg.message as Record<string, unknown> | undefined
           )?.content;
           if (Array.isArray(msgContent)) {
-            // 按 content block 顺序分段累积：text 进当前段，top-level tool_use
-            // 把当前段轮转为旁白。turn 结束时 tracker 的最终段 = 最后一次工具
-            // 调用之后的文本，过程旁白不再混进定稿正文（见 AssistantTextTracker）。
+            // 以整条 AssistantMessage 为原子分类：只要含 top-level
+            // tool_use，该消息全部 text 都是过程旁白；完全不含工具的消息
+            // 才能在 SDK Result 缺失时作为候选正文。
             const sawText = assistantTextTracker.addContentBlocks(
               msgContent as Array<{ type: string; text?: string }>,
             );
@@ -2687,6 +2714,92 @@ async function runQueryAttempt(
           `Result #${resultCount}: subtype=${resultSubtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
         );
         const resultMsg = message as unknown as Record<string, unknown>;
+        const structuredLimit = pendingRejectedRateLimit;
+        pendingRejectedRateLimit = undefined;
+        const limitDecision = decideProviderLimitAction({
+          structuredRejection: structuredLimit,
+          result: textResult ?? null,
+          canFallback: PROVIDER_FALLBACK_MODELS.canActivateFallback,
+        });
+
+        // Account/session limits apply to every model on this OAuth profile.
+        // Emit an explicit provider failure even if the CLI's final text is
+        // absent or changed; the host will quarantine the profile and retry
+        // elsewhere without ACKing this input turn.
+        if (limitDecision.action === 'provider_failure') {
+          log(
+            `Account rate limit rejected (${structuredLimit?.rateLimitType ?? 'text fallback'}); marking provider unhealthy`,
+          );
+          const providerFailureOutput: ContainerOutput = {
+            status: 'success',
+            result: null,
+            newSessionId,
+            providerFailure: true,
+            finalizationReason: 'error',
+          };
+          if (emitOutput) {
+            emit(providerFailureOutput);
+          } else {
+            // Side queries (memory flush) intentionally suppress assistant
+            // output, but an account-wide rejection must still reach the host.
+            writeOutput({
+              ...providerFailureOutput,
+              turnId: containerInput.turnId,
+              sessionId: newSessionId || sessionId,
+            });
+          }
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
+          assistantBatchFlushedSinceLastResult = false;
+          processor.discardPendingTextOutput();
+          assistantTextTracker.reset();
+          canonicalAssistantUuid = undefined;
+          stream.end();
+          return {
+            newSessionId,
+            lastAssistantUuid,
+            closedDuringQuery,
+            interruptedDuringQuery,
+            cancelledIpcReceipts,
+            pipedMessagesDuringQuery,
+            providerAccountFailure: true,
+          };
+        }
+
+        // A model-specific limit leaves the OAuth profile healthy. If a
+        // fallback model is configured, retry exactly this turn in-process;
+        // otherwise keep processing the original result so the user sees the
+        // model limit instead of having it silently swallowed.
+        if (
+          limitDecision.action === 'model_fallback' &&
+          limitDecision.scope &&
+          PROVIDER_FALLBACK_MODELS.activateForScope(limitDecision.scope)
+        ) {
+          providerFailureTurn = providerFallbackTurns.snapshotFailure({
+            ipcMessages: ipcDeliveryTracker.currentTurnMessages,
+            laterIpcMessages: ipcDeliveryTracker.laterTurnMessages,
+            turnId: containerInput.turnId,
+          });
+          log(
+            `Primary model hit a model-specific limit; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
+          );
+          writeOutput({
+            status: 'stream',
+            result: null,
+            providerFailureRetrying: true,
+            turnId: containerInput.turnId,
+            sessionId: newSessionId || sessionId,
+          });
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
+          assistantBatchFlushedSinceLastResult = false;
+          processor.discardPendingTextOutput();
+          assistantTextTracker.reset();
+          canonicalAssistantUuid = undefined;
+          stream.end();
+          ipcPolling = false;
+          ipcQueryWatcher.close();
+          // Do not process or emit the limit notice as an assistant result.
+          continue;
+        }
 
         // SDK 在某些失败场景会返回 error_* subtype 且不抛异常。
         // 不能把这类结果当 success(null)，否则前端会一直停留在"思考中"。
@@ -2761,46 +2874,10 @@ async function runQueryAttempt(
           };
         }
 
-        // Claude can surface an exhausted account/model quota as a nominal
-        // success result. Switch the warm runner to its fallback tier and end
-        // this SDK stream without completing the input receipt. The wrapper
-        // below retries only this exact turn; later accepted IPC turns are put
-        // back on disk and remain ordered behind it.
-        if (
-          textResult &&
-          PROVIDER_FALLBACK_MODELS.activateForResult(textResult)
-        ) {
-          providerFailureTurn = providerFallbackTurns.snapshotFailure({
-            ipcMessages: ipcDeliveryTracker.currentTurnMessages,
-            laterIpcMessages: ipcDeliveryTracker.laterTurnMessages,
-            turnId: containerInput.turnId,
-          });
-          log(
-            `Primary model hit account usage limit; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
-          );
-          writeOutput({
-            status: 'stream',
-            result: null,
-            providerFailure: true,
-            providerFailureRetrying: true,
-            turnId: containerInput.turnId,
-            sessionId: newSessionId || sessionId,
-          });
-          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
-          assistantBatchFlushedSinceLastResult = false;
-          processor.discardPendingTextOutput();
-          assistantTextTracker.reset();
-          canonicalAssistantUuid = undefined;
-          stream.end();
-          ipcPolling = false;
-          ipcQueryWatcher.close();
-          // Do not process or emit the limit notice as an assistant result.
-          continue;
-        }
-
         // processResult 的调用保留其副作用（flush 流式缓冲、重置 fullTextAccumulator），
         // 但定稿正文不再取"全量拼接与 SDK result 的更长者"——那会把工具调用之间的
-        // 过程旁白混进最终回复。改走 tracker 的选择链：最终段 → SDK result → 末段旁白。
+        // 过程旁白混进最终回复。选择链固定为：非空 SDK Result → 最近一条
+        // 完全不含 top-level tool_use 的 AssistantMessage；旁白绝不兜底。
         processor.processResult(textResult);
         const finalText = assistantTextTracker.pickFinalText(textResult);
         // ── emit 前置计算：截断指纹 + 后台任务数 ──
@@ -2985,6 +3062,7 @@ async function runQueryAttempt(
       pipedMessagesDuringQuery,
       suspectTruncatedTail,
       providerFailureTurn,
+      providerAccountFailure: false,
     };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -3006,6 +3084,7 @@ async function runQueryAttempt(
         cancelledIpcReceipts,
         pipedMessagesDuringQuery,
         providerFailureTurn,
+        providerAccountFailure: false,
       };
     }
 
@@ -3459,6 +3538,11 @@ async function main(): Promise<void> {
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
       }
+      if (queryResult.providerAccountFailure) {
+        log('Account provider failure emitted; exiting runner');
+        forceExitWithSafetyNet(0);
+        return;
+      }
 
       // A startup-context hard limit is a deterministic configuration error,
       // not a transient provider/context-overflow failure. Surface the stable
@@ -3671,6 +3755,11 @@ async function main(): Promise<void> {
         }
         if (flushResult.lastAssistantUuid)
           resumeAt = flushResult.lastAssistantUuid;
+        if (flushResult.providerAccountFailure) {
+          log('Account provider failure during memory flush; exiting runner');
+          forceExitWithSafetyNet(0);
+          return;
+        }
         log('Memory flush completed');
 
         if (flushResult.closedDuringQuery) {
@@ -3735,6 +3824,13 @@ async function main(): Promise<void> {
           }
           if (autoContResult.lastAssistantUuid) {
             resumeAt = autoContResult.lastAssistantUuid;
+          }
+          if (autoContResult.providerAccountFailure) {
+            log(
+              'Account provider failure during auto-continue; exiting runner',
+            );
+            forceExitWithSafetyNet(0);
+            return;
           }
           if (autoContResult.closedDuringQuery) {
             log('Close sentinel during auto-continue, exiting');
@@ -3860,6 +3956,13 @@ async function main(): Promise<void> {
         }
         if (contResult.lastAssistantUuid)
           resumeAt = contResult.lastAssistantUuid;
+        if (contResult.providerAccountFailure) {
+          log(
+            'Account provider failure during truncation-continue; exiting runner',
+          );
+          forceExitWithSafetyNet(0);
+          return;
+        }
         if (contResult.closedDuringQuery) {
           closedDuringTruncationContinue = true;
           break;

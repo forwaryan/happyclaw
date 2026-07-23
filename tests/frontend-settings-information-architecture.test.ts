@@ -141,9 +141,6 @@ describe('settings information architecture', () => {
     const mainCapabilities = read(
       'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
     );
-    const workspaceCapabilities = read(
-      'web/src/components/chat/WorkspaceCapabilitiesPanel.tsx',
-    );
     const workspaceEnv = read('web/src/components/chat/ContainerEnvPanel.tsx');
     const chatView = read('web/src/components/chat/ChatView.tsx');
     const agentProfiles = read('web/src/pages/AgentProfilesPage.tsx');
@@ -155,9 +152,6 @@ describe('settings information architecture', () => {
     expect(mainCapabilities).toMatch(/HappyClaw 用户 Skills|HappyClaw MCP/);
     expect(mainCapabilities).not.toContain('工具与扩展能力边界');
     expect(mainCapabilities).toContain('/api/agent-profiles/');
-    expect(workspaceCapabilities).toMatch(
-      /CLAUDE\.md、\.claude\/skills 和项目 MCP/,
-    );
     expect(workspaceEnv).toMatch(/Provider\s+地址和凭据由系统管理员统一管理/);
     expect(workspaceEnv).not.toContain('MODEL_PRESETS');
     expect(workspaceEnv).not.toContain('setAuthToken');

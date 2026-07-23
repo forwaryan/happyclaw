@@ -229,7 +229,7 @@ export function buildBodyChunks(bodyText: string): El[] {
     return [
       {
         tag: 'markdown',
-        content: '...',
+        content: '> 暂无可展示的内容。',
         element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
       },
     ];

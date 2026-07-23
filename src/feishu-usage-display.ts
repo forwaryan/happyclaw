@@ -36,6 +36,12 @@ export function formatFeishuTokenSummary(usage: FeishuTokenUsage): string {
     cacheReadInputTokens +
     cacheCreationInputTokens +
     reasoningTokens;
+  // Claude Agent SDK/provider adapters sometimes emit a usage envelope with
+  // every class set to zero when billing data was not returned. Rendering that
+  // as an authoritative "0 tokens" is misleading; a real report necessarily
+  // has at least one positive class.
+  if (totalTokens === 0) return 'Token 未上报';
+
   const details = [
     `输入 ${formatFeishuTokenCount(usage.inputTokens)}`,
     `输出 ${formatFeishuTokenCount(usage.outputTokens)}`,

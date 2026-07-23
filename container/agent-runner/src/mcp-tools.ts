@@ -468,12 +468,24 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_message ---
     tool(
       'send_message',
-      "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
-      { text: z.string().describe('The message text to send') },
+      "Publish text through HappyClaw's turn-owned delivery coordinator. In an interactive user turn, delivery_role=progress updates the existing reply status and delivery_role=final stages the primary answer on the existing card; neither creates a second text reply. Use delivery_role=separate only when the user explicitly requested another message. Scheduled/background tasks always deliver separately because their normal SDK final is not published.",
+      {
+        text: z.string().describe('The message text to publish'),
+        delivery_role: z
+          .enum(['progress', 'final', 'separate'])
+          .optional()
+          .describe(
+            'progress updates the active reply, final stages its answer, separate creates an additional message. Defaults to final for interactive turns and separate for scheduled tasks.',
+          ),
+      },
       async (args) => {
+        const deliveryRole = ctx.isScheduledTask
+          ? 'separate'
+          : (args.delivery_role ?? 'final');
         const data = buildSendMessageData(ctx, {
           type: 'message',
           text: args.text,
+          deliveryRole,
           requestId: newRequestId(),
         });
         const result = await pollIpcResult(
@@ -490,14 +502,26 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
               : 'Message delivery failed.',
           );
         }
-        return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+        const disposition =
+          typeof result.disposition === 'string'
+            ? result.disposition
+            : 'delivered_separately';
+        const acknowledgement =
+          disposition === 'staged_progress'
+            ? 'Progress updated on the active reply.'
+            : disposition === 'staged_final'
+              ? 'Final answer staged on the active reply; return the same answer normally so the SDK Result can finalize it.'
+              : 'Message sent separately.';
+        return {
+          content: [{ type: 'text' as const, text: acknowledgement }],
+        };
       },
     ),
 
     // --- send_image ---
     tool(
       'send_image',
-      'Send an image file from the workspace to the user via IM. Supports PNG/JPEG/GIF/WebP. Optional caption.',
+      'Send an image file from the workspace to the current native IM conversation. Supports PNG/JPEG/GIF/WebP/TIFF/BMP, with a 10MB runner-side limit. Optional caption.',
       {
         file_path: z
           .string()
@@ -551,7 +575,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           };
         }
 
-        // Read file and check size (10MB limit for both Feishu and Telegram)
+        // Read file and enforce the runner-side limit shared by every IM provider.
         const stat = fs.statSync(resolved);
         if (stat.size > 10 * 1024 * 1024) {
           return {
@@ -629,8 +653,8 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
     // --- send_file ---
     tool(
       'send_file',
-      `Send a file to the current chat (the user you're talking to) via IM (Feishu/Telegram/DingTalk/QQ/Discord). The file path is relative to the workspace/group directory.
-Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
+      `Send a file to the current native IM conversation through its bound account (Feishu/Telegram/DingTalk/QQ/Discord/WeChat/WhatsApp). The file path must stay inside the workspace/group directory.
+The actual file types and size limit are enforced by the selected provider.`,
       {
         filePath: z
           .string()
@@ -732,7 +756,7 @@ Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
           content: [
             {
               type: 'text' as const,
-              text: `Sending file "${args.fileName}"...`,
+              text: `File sent: ${args.fileName}`,
             },
           ],
         };
