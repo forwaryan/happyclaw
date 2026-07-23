@@ -928,8 +928,10 @@ export function ProviderEditor({
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
               >
                 <option value="">default（默认）</option>
+                <option value="opus">opus</option>
                 <option value="sonnet">sonnet</option>
                 <option value="haiku">haiku</option>
+                <option value="fable">fable</option>
               </select>
               <p className="text-xs text-muted-foreground mt-1">
                 别名自动解析为最新版本，留空使用 default。
