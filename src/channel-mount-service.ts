@@ -60,6 +60,8 @@ export interface RestoreDefaultChannelMountDeps {
     ownerUserId: string,
   ) => (RegisteredGroup & { jid: string }) | undefined;
   getJidsByFolder?: (folder: string) => string[];
+  /** Workspaces that are in the process of being deleted and cannot be targets. */
+  excludedWorkspaceJids?: ReadonlySet<string>;
 }
 
 export interface ThreadMapMountLookupDeps {
@@ -202,13 +204,19 @@ export function buildRestoreDefaultChannelMountUpdate(
       getJidsByFolder: deps.getJidsByFolder,
     });
     const workspace = resolved ? deps.getGroup(resolved) : undefined;
-    if (resolved && workspace?.created_by === effectiveOwner) {
+    if (
+      resolved &&
+      !deps.excludedWorkspaceJids?.has(resolved) &&
+      workspace?.created_by === effectiveOwner
+    ) {
       workspaceJid = resolved;
     }
   }
 
   if (!workspaceJid) {
-    workspaceJid = deps.getHome(effectiveOwner)?.jid ?? null;
+    const homeJid = deps.getHome(effectiveOwner)?.jid ?? null;
+    workspaceJid =
+      homeJid && !deps.excludedWorkspaceJids?.has(homeJid) ? homeJid : null;
   }
   if (!workspaceJid) {
     return { status: 'unavailable', reason: 'missing_default_workspace' };
@@ -262,6 +270,31 @@ export function restoreDefaultChannelMount(
     commitChannelMountUpdate(channelJid, resolved.updated);
   }
   return resolved;
+}
+
+/**
+ * Resolve the channel-account default without committing it.
+ *
+ * Workspace deletion uses this to prepare every channel reroute first, then
+ * persist those updates in the same database transaction as the workspace
+ * deletion. Excluding the disappearing workspace is important when a Bot
+ * account itself names that workspace as its default.
+ */
+export function resolveDefaultChannelMountForWorkspaceDeletion(
+  channelJid: string,
+  group: RegisteredGroup,
+  ownerUserId: string | undefined,
+  excludedWorkspaceJids: ReadonlySet<string>,
+): RestoreDefaultChannelMountResult {
+  return buildRestoreDefaultChannelMountUpdate(channelJid, group, ownerUserId, {
+    getAccount: getChannelAccount,
+    getDefaultAccount: getDefaultChannelAccount,
+    getLegacyAccount: getLegacyChannelAccount,
+    getGroup: getRegisteredGroup,
+    getHome: getUserHomeGroup,
+    getJidsByFolder,
+    excludedWorkspaceJids,
+  });
 }
 
 /**

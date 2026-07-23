@@ -15,7 +15,12 @@ import {
   loadAgentMessageSnapshot,
   saveAgentMessageSnapshot,
 } from '../utils/messageSnapshotCache';
-import type { GroupInfo, AgentInfo, AvailableImGroup } from '../types';
+import type {
+  GroupInfo,
+  AgentInfo,
+  AvailableImGroup,
+  WorkspaceDeleteImpact,
+} from '../types';
 import { applyFollowUpTransition } from '../lib/message-timeline';
 
 export type { GroupInfo, AgentInfo };
@@ -370,7 +375,11 @@ interface ChatState {
   ) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
   togglePin: (jid: string) => Promise<void>;
-  deleteFlow: (jid: string) => Promise<void>;
+  inspectDeleteFlow: (jid: string) => Promise<WorkspaceDeleteImpact>;
+  deleteFlow: (
+    jid: string,
+    options?: { unbindChannels?: boolean },
+  ) => Promise<void>;
   handleStreamEvent: (
     chatJid: string,
     event: StreamEvent,
@@ -2305,10 +2314,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  deleteFlow: async (jid: string) => {
+  inspectDeleteFlow: async (jid: string) =>
+    api.get<WorkspaceDeleteImpact>(
+      `/api/groups/${encodeURIComponent(jid)}/delete-impact`,
+    ),
+
+  deleteFlow: async (jid: string, options = {}) => {
     try {
+      const query = options.unbindChannels ? '?unbind_channels=true' : '';
       await api.delete<{ success: boolean }>(
-        `/api/groups/${encodeURIComponent(jid)}`,
+        `/api/groups/${encodeURIComponent(jid)}${query}`,
       );
       // Workspace 已删除，连带把该 jid 下所有 conversation agent 的 IDB 快照
       // 也清掉，避免 IDB 长期堆积孤儿条目。
@@ -2364,7 +2379,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         apiErr.status === 409 &&
         (apiErr.body?.bound_sessions ||
           apiErr.body?.bound_agents ||
-          apiErr.body?.bound_main_im_groups)
+          apiErr.body?.bound_main_im_groups ||
+          apiErr.body?.bound_thread_contexts)
       ) {
         const e = new Error(
           apiErr.message || 'IM binding conflict',
@@ -2372,10 +2388,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           boundSessions?: unknown;
           boundAgents?: unknown;
           boundMainImGroups?: unknown;
+          boundThreadContexts?: unknown;
         };
         e.boundSessions = apiErr.body.bound_sessions;
         e.boundAgents = apiErr.body.bound_agents;
         e.boundMainImGroups = apiErr.body.bound_main_im_groups;
+        e.boundThreadContexts = apiErr.body.bound_thread_contexts;
         throw e;
       }
       const message =

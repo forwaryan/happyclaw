@@ -21,6 +21,7 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { ChatGroupItem } from '../chat/ChatGroupItem';
+import { DeleteWorkspaceDialog } from '../chat/DeleteWorkspaceDialog';
 import { AgentWorkspaceGroup } from './AgentWorkspaceGroup';
 import { CreateContainerDialog } from '../chat/CreateContainerDialog';
 import { RenameDialog } from '../chat/RenameDialog';
@@ -35,6 +36,7 @@ import {
   isAgentSectionCollapsible,
   partitionAgentWorkspaceSections,
 } from '../../utils/agent-product';
+import { useDeleteWorkspace } from '../../hooks/useDeleteWorkspace';
 
 interface UnifiedSidebarProps {
   collapsed: boolean;
@@ -69,12 +71,6 @@ export function UnifiedSidebar({
     jid: '',
     name: '',
   });
-  const [deleteState, setDeleteState] = useState({
-    open: false,
-    jid: '',
-    name: '',
-  });
-  const [deleteLoading, setDeleteLoading] = useState(false);
   const {
     clearState,
     clearLoading,
@@ -83,16 +79,24 @@ export function UnifiedSidebar({
     handleClearConfirm,
   } = useClearWorkspace();
 
-  const {
-    groups,
-    currentGroup,
-    selectGroup,
-    loadGroups,
-    loading,
-    deleteFlow,
-    togglePin,
-  } = useChatStore();
+  const { groups, currentGroup, selectGroup, loadGroups, loading, togglePin } =
+    useChatStore();
   const runnerStates = useGroupsStore((s) => s.runnerStates);
+  const {
+    deleteState,
+    deleteLoading,
+    openDelete,
+    closeDelete,
+    handleDeleteConfirm,
+  } = useDeleteWorkspace({
+    onDeleted: () => {
+      const nextJid = useChatStore.getState().currentGroup;
+      const nextFolder = nextJid
+        ? useChatStore.getState().groups[nextJid]?.folder
+        : null;
+      navigate(nextFolder ? `/chat/${nextFolder}` : '/chat');
+    },
+  });
 
   useEffect(() => {
     if (isChatRoute) loadGroups();
@@ -131,64 +135,6 @@ export function UnifiedSidebar({
   const handleCreated = (jid: string, folder: string) => {
     selectGroup(jid);
     navigate(`/chat/${folder}`);
-  };
-
-  const handleDeleteConfirm = async () => {
-    setDeleteLoading(true);
-    try {
-      await deleteFlow(deleteState.jid);
-      setDeleteState({ open: false, jid: '', name: '' });
-      const nextJid = useChatStore.getState().currentGroup;
-      const nextFolder = nextJid
-        ? useChatStore.getState().groups[nextJid]?.folder
-        : null;
-      navigate(nextFolder ? `/chat/${nextFolder}` : '/chat');
-    } catch (err: unknown) {
-      const typed = err as {
-        boundSessions?: Array<{
-          sessionName: string;
-          imGroups: Array<{ name: string }>;
-        }>;
-        boundAgents?: Array<{
-          agentName: string;
-          imGroups: Array<{ name: string }>;
-        }>;
-        boundMainImGroups?: Array<{ name: string }>;
-      };
-      const details: string[] = [];
-      const sessions =
-        typed.boundSessions ??
-        typed.boundAgents?.map((a) => ({
-          sessionName: a.agentName,
-          imGroups: a.imGroups,
-        })) ??
-        [];
-      if (typed.boundMainImGroups?.length) {
-        details.push(
-          `当前对话 -> ${typed.boundMainImGroups.map((g) => g.name).join('、')}`,
-        );
-      }
-      if (sessions.length) {
-        details.push(
-          ...sessions.map(
-            (s) =>
-              `会话「${s.sessionName}」 -> ${s.imGroups.map((g) => g.name).join('、')}`,
-          ),
-        );
-      }
-      if (details.length > 0) {
-        alert(
-          `该工作区仍有消息渠道绑定，请先解绑后再删除：\n${details.join('\n')}`,
-        );
-      } else {
-        alert(
-          `删除工作区失败：${err instanceof Error ? err.message : '未知错误'}`,
-        );
-      }
-      setDeleteState({ open: false, jid: '', name: '' });
-    } finally {
-      setDeleteLoading(false);
-    }
   };
 
   const renderAgentSection = (section: (typeof agentSections)[number]) => {
@@ -237,7 +183,7 @@ export function UnifiedSidebar({
             onSelect={handleGroupSelect}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={openClear}
-            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+            onDelete={openDelete}
             onTogglePin={(jid) => togglePin(jid)}
           />
         ))}
@@ -266,7 +212,7 @@ export function UnifiedSidebar({
             onSelect={handleGroupSelect}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={openClear}
-            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+            onDelete={openDelete}
             onTogglePin={(jid) => togglePin(jid)}
           />
         ))}
@@ -484,14 +430,10 @@ export function UnifiedSidebar({
         confirmVariant="danger"
         loading={clearLoading}
       />
-      <ConfirmDialog
-        open={deleteState.open}
-        onClose={() => setDeleteState({ open: false, jid: '', name: '' })}
+      <DeleteWorkspaceDialog
+        state={deleteState}
+        onClose={closeDelete}
         onConfirm={handleDeleteConfirm}
-        title="删除工作区"
-        message={`确认删除「${deleteState.name}」？不可撤销。`}
-        confirmText="删除"
-        confirmVariant="danger"
         loading={deleteLoading}
       />
     </TooltipProvider>

@@ -9455,9 +9455,37 @@ export function deleteImGroupRecord(jid: string): void {
   tx();
 }
 
-export function deleteGroupData(jid: string, folder: string): void {
+export function deleteGroupData(
+  jid: string,
+  folder: string,
+  options: {
+    /**
+     * Channel reroutes committed atomically with the workspace deletion.
+     * Callers update their live routing cache only after this transaction
+     * succeeds.
+     */
+    channelUpdates?: Array<{ jid: string; group: RegisteredGroup }>;
+  } = {},
+): void {
   const tx = db.transaction(() => {
     const legacyMainJid = `web:${folder}`;
+    for (const update of options.channelUpdates ?? []) {
+      setRegisteredGroup(update.jid, update.group);
+    }
+    db.prepare(
+      `UPDATE channel_accounts
+       SET default_workspace_jid = (
+             SELECT home.jid
+             FROM registered_groups AS home
+             WHERE home.created_by = channel_accounts.owner_user_id
+               AND home.is_home = 1
+               AND home.jid != ?
+             ORDER BY home.added_at ASC
+             LIMIT 1
+           ),
+           updated_at = ?
+       WHERE default_workspace_jid = ? OR default_workspace_jid = ?`,
+    ).run(jid, new Date().toISOString(), jid, legacyMainJid);
     db.prepare(
       `UPDATE registered_groups
        SET target_main_jid = NULL, binding_mode = 'single_context'

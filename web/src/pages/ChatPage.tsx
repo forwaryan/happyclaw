@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { UserCog, LogOut, Plus, BarChart3 } from 'lucide-react';
-import { toast } from 'sonner';
 import { useChatStore } from '../stores/chat';
 import { useAuthStore } from '../stores/auth';
 import { useGroupsStore } from '../stores/groups';
 import { ChatView } from '../components/chat/ChatView';
 import { ChatGroupItem } from '../components/chat/ChatGroupItem';
+import { DeleteWorkspaceDialog } from '../components/chat/DeleteWorkspaceDialog';
 import { AgentWorkspaceGroup } from '../components/layout/AgentWorkspaceGroup';
 import { ConfirmDialog } from '../components/common';
 import { CreateContainerDialog } from '../components/chat/CreateContainerDialog';
@@ -27,18 +27,13 @@ import {
   isAgentSectionCollapsible,
   partitionAgentWorkspaceSections,
 } from '../utils/agent-product';
+import { useDeleteWorkspace } from '../hooks/useDeleteWorkspace';
 
 export function ChatPage() {
   const { groupFolder } = useParams<{ groupFolder?: string }>();
   const navigate = useNavigate();
-  const {
-    groups,
-    currentGroup,
-    selectGroup,
-    loadGroups,
-    togglePin,
-    deleteFlow,
-  } = useChatStore();
+  const { groups, currentGroup, selectGroup, loadGroups, togglePin } =
+    useChatStore();
   const {
     clearState,
     clearLoading,
@@ -52,12 +47,15 @@ export function ChatPage() {
     jid: '',
     name: '',
   });
-  const [deleteState, setDeleteState] = useState({
-    open: false,
-    jid: '',
-    name: '',
+  const {
+    deleteState,
+    deleteLoading,
+    openDelete,
+    closeDelete,
+    handleDeleteConfirm,
+  } = useDeleteWorkspace({
+    onDeleted: () => navigate('/chat', { replace: true }),
   });
-  const [deleteLoading, setDeleteLoading] = useState(false);
   const user = useAuthStore((s) => s.user);
   const appearance = useAuthStore((s) => s.appearance);
   const userInitial = (user?.display_name ||
@@ -144,23 +142,6 @@ export function ChatPage() {
     navigate('/chat');
   };
 
-  const handleDeleteConfirm = async () => {
-    setDeleteLoading(true);
-    try {
-      await deleteFlow(deleteState.jid);
-      setDeleteState({ open: false, jid: '', name: '' });
-      toast.success('工作区已删除');
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : '删除失败；如有渠道绑定，请先解绑后重试',
-      );
-    } finally {
-      setDeleteLoading(false);
-    }
-  };
-
   useSwipeBack(chatViewRef, handleBackToList);
 
   const renderMobileAgentSection = (
@@ -214,7 +195,7 @@ export function ChatPage() {
             }}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={openClear}
-            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+            onDelete={openDelete}
             onTogglePin={(jid) => void togglePin(jid)}
           />
         ))}
@@ -248,7 +229,7 @@ export function ChatPage() {
             onSelect={selectWorkspace}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={openClear}
-            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+            onDelete={openDelete}
             onTogglePin={(jid) => void togglePin(jid)}
           />
         ))}
@@ -408,15 +389,10 @@ export function ChatPage() {
         currentName={renameState.name}
         onClose={() => setRenameState({ open: false, jid: '', name: '' })}
       />
-      <ConfirmDialog
-        open={deleteState.open}
-        onClose={() => setDeleteState({ open: false, jid: '', name: '' })}
+      <DeleteWorkspaceDialog
+        state={deleteState}
+        onClose={closeDelete}
         onConfirm={handleDeleteConfirm}
-        title="删除工作区"
-        message={`确认删除「${deleteState.name}」？工作区文件、会话和运行数据将被永久删除。`}
-        confirmText="删除工作区"
-        cancelText="取消"
-        confirmVariant="danger"
         loading={deleteLoading}
       />
       <CreateContainerDialog

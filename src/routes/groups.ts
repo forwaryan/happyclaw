@@ -80,6 +80,11 @@ import {
 import { clearTargetAgentBindingsForDeletedAgents } from '../im-context-isolation.js';
 import { getChannelType } from '../im-channel.js';
 import {
+  buildNativeThreadWorkspaceUpdate,
+  buildUnmountUpdate,
+  resolveDefaultChannelMountForWorkspaceDeletion,
+} from '../channel-mount-service.js';
+import {
   loadMountAllowlist,
   findAllowedRoot,
   matchesBlockedPattern,
@@ -121,6 +126,134 @@ const groupRoutes = new Hono<{ Variables: Variables }>();
 function normalizeGroupName(name: unknown): string {
   if (typeof name !== 'string') return '';
   return name.trim().slice(0, MAX_GROUP_NAME_LEN);
+}
+
+interface WorkspaceDeleteBindingSummary {
+  boundSessions: Array<{
+    sessionId: string;
+    sessionName: string;
+    imGroups: Array<{ jid: string; name: string }>;
+  }>;
+  mainImGroups: Array<{ jid: string; name: string }>;
+  threadContextBindings: Array<{
+    jid: string;
+    name: string;
+    context_id: string;
+  }>;
+  /** Channels whose current route must move before the workspace disappears. */
+  mountedChannelJids: string[];
+  channelBindingCount: number;
+  hasChannelBindings: boolean;
+}
+
+function collectWorkspaceDeleteBindings(
+  jid: string,
+  existing: RegisteredGroup,
+): WorkspaceDeleteBindingSummary {
+  const agents = listAgentsByJid(jid);
+  const sessionNameById = new Map(
+    agents
+      .filter((agent) => agent.kind === 'conversation')
+      .map((agent) => [agent.id, agent.name] as const),
+  );
+  const sessionBindings = new Map<
+    string,
+    Map<string, { jid: string; name: string }>
+  >();
+  const mainBindings = new Map<string, { jid: string; name: string }>();
+
+  for (const mount of listChannelMountsByWorkspace(jid)) {
+    const imGroup = getRegisteredGroup(mount.channel_jid);
+    const item = {
+      jid: mount.channel_jid,
+      name: imGroup?.name ?? mount.channel_jid,
+    };
+    if (mount.session_id) {
+      const items = sessionBindings.get(mount.session_id) ?? new Map();
+      items.set(item.jid, item);
+      sessionBindings.set(mount.session_id, items);
+    } else {
+      mainBindings.set(item.jid, item);
+    }
+  }
+
+  for (const agent of agents) {
+    if (agent.kind !== 'conversation') continue;
+    const items = sessionBindings.get(agent.id) ?? new Map();
+    for (const linked of getGroupsByTargetAgent(agent.id)) {
+      items.set(linked.jid, { jid: linked.jid, name: linked.group.name });
+    }
+    if (items.size > 0) sessionBindings.set(agent.id, items);
+  }
+
+  const legacyMainJid = `web:${existing.folder}`;
+  const mainBoundByJid = getGroupsByTargetMainJid(jid);
+  const mainBoundByFolder =
+    legacyMainJid !== jid ? getGroupsByTargetMainJid(legacyMainJid) : [];
+  for (const linked of [...mainBoundByJid, ...mainBoundByFolder]) {
+    mainBindings.set(linked.jid, {
+      jid: linked.jid,
+      name: linked.group.name,
+    });
+  }
+
+  const boundSessions = Array.from(sessionBindings.entries()).map(
+    ([sessionId, imGroups]) => ({
+      sessionId,
+      sessionName: sessionNameById.get(sessionId) ?? sessionId,
+      imGroups: Array.from(imGroups.values()),
+    }),
+  );
+  const mainImGroups = Array.from(mainBindings.values());
+  const threadContextBindings = listImContextBindingsByWorkspace(jid).map(
+    (binding) => {
+      const imGroup = getRegisteredGroup(binding.source_jid);
+      return {
+        jid: binding.source_jid,
+        name: imGroup?.name ?? binding.source_jid,
+        context_id: binding.context_id,
+      };
+    },
+  );
+  const mountedChannelJids = Array.from(
+    new Set([
+      ...mainImGroups.map((item) => item.jid),
+      ...boundSessions.flatMap((session) =>
+        session.imGroups.map((item) => item.jid),
+      ),
+    ]),
+  );
+  const allChannelJids = new Set([
+    ...mountedChannelJids,
+    ...threadContextBindings.map((item) => item.jid),
+  ]);
+
+  return {
+    boundSessions,
+    mainImGroups,
+    threadContextBindings,
+    mountedChannelJids,
+    channelBindingCount: allChannelJids.size,
+    hasChannelBindings: allChannelJids.size > 0,
+  };
+}
+
+function workspaceDeleteImpactPayload(
+  summary: WorkspaceDeleteBindingSummary,
+): Record<string, unknown> {
+  return {
+    has_channel_bindings: summary.hasChannelBindings,
+    channel_binding_count: summary.channelBindingCount,
+    bound_sessions: summary.boundSessions,
+    // Compatibility for clients that still call conversation sessions Agents.
+    bound_agents: summary.boundSessions.map((session) => ({
+      agentId: session.sessionId,
+      agentName: session.sessionName,
+      imGroups: session.imGroups,
+    })),
+    bound_main_im_groups: summary.mainImGroups,
+    bound_thread_contexts: summary.threadContextBindings,
+  };
 }
 
 interface GroupPayloadItem {
@@ -1140,6 +1273,31 @@ groupRoutes.post('/:jid/reset-owner', authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
+// GET /api/groups/:jid/delete-impact - 删除前检查渠道绑定
+groupRoutes.get('/:jid/delete-impact', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const existing = getRegisteredGroup(jid);
+  if (!existing) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canDeleteGroup({ id: authUser.id, role: authUser.role }, existing)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!jid.startsWith('web:')) {
+    return c.json({ error: 'This group cannot be deleted here' }, 400);
+  }
+  if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
+  return c.json(
+    workspaceDeleteImpactPayload(collectWorkspaceDeleteBindings(jid, existing)),
+  );
+});
+
 // DELETE /api/groups/:jid - 删除群组
 groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   const deps = getWebDeps();
@@ -1182,102 +1340,14 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  // Block deletion if any IM channel is mounted to this workspace or one of its sessions.
-  const agents = listAgentsByJid(jid);
-  const sessionNameById = new Map(
-    agents
-      .filter((a) => a.kind === 'conversation')
-      .map((a) => [a.id, a.name] as const),
-  );
-  const boundSessions: Array<{
-    sessionId: string;
-    sessionName: string;
-    imGroups: Array<{ jid: string; name: string }>;
-  }> = [];
-  const sessionBindings = new Map<
-    string,
-    Array<{ jid: string; name: string }>
-  >();
-  const mainBindings = new Map<string, { jid: string; name: string }>();
-
-  for (const mount of listChannelMountsByWorkspace(jid)) {
-    const imGroup = getRegisteredGroup(mount.channel_jid);
-    const item = {
-      jid: mount.channel_jid,
-      name: imGroup?.name ?? mount.channel_jid,
-    };
-    if (mount.session_id) {
-      const items = sessionBindings.get(mount.session_id) ?? [];
-      items.push(item);
-      sessionBindings.set(mount.session_id, items);
-    } else {
-      mainBindings.set(mount.channel_jid, item);
-    }
-  }
-
-  for (const a of agents) {
-    if (a.kind === 'conversation') {
-      const linked = getGroupsByTargetAgent(a.id);
-      const items = sessionBindings.get(a.id) ?? [];
-      for (const l of linked) {
-        if (!items.some((item) => item.jid === l.jid)) {
-          items.push({ jid: l.jid, name: l.group.name });
-        }
-      }
-      if (items.length > 0) {
-        sessionBindings.set(a.id, items);
-      }
-    }
-  }
-  // Search by actual JID; also check legacy folder-based format for backward compat
-  const mainBoundByJid = getGroupsByTargetMainJid(jid);
-  const legacyMainJid = `web:${existing.folder}`;
-  const mainBoundByFolder =
-    legacyMainJid !== jid ? getGroupsByTargetMainJid(legacyMainJid) : [];
-  const mainBoundJids = new Set(mainBoundByJid.map((l) => l.jid));
-  const mainBound = [
-    ...mainBoundByJid,
-    ...mainBoundByFolder.filter((l) => !mainBoundJids.has(l.jid)),
-  ];
-  for (const l of mainBound) {
-    mainBindings.set(l.jid, { jid: l.jid, name: l.group.name });
-  }
-
-  for (const [sessionId, imGroups] of sessionBindings.entries()) {
-    boundSessions.push({
-      sessionId,
-      sessionName: sessionNameById.get(sessionId) ?? sessionId,
-      imGroups,
-    });
-  }
-
-  const threadContextBindings = listImContextBindingsByWorkspace(jid).map(
-    (binding) => {
-      const imGroup = getRegisteredGroup(binding.source_jid);
-      return {
-        jid: binding.source_jid,
-        name: imGroup?.name ?? binding.source_jid,
-        context_id: binding.context_id,
-      };
-    },
-  );
-  const mainImGroups = Array.from(mainBindings.values());
-  if (
-    boundSessions.length > 0 ||
-    mainImGroups.length > 0 ||
-    threadContextBindings.length > 0
-  ) {
+  const confirmedChannelUnbind = c.req.query('unbind_channels') === 'true';
+  const initialBindingSummary = collectWorkspaceDeleteBindings(jid, existing);
+  if (initialBindingSummary.hasChannelBindings && !confirmedChannelUnbind) {
     return c.json(
       {
         error: '该工作区绑定了 IM 群组，请先解绑后再删除。',
-        bound_sessions: boundSessions,
-        bound_agents: boundSessions.map((s) => ({
-          agentId: s.sessionId,
-          agentName: s.sessionName,
-          imGroups: s.imGroups,
-        })),
-        bound_main_im_groups: mainImGroups,
-        bound_thread_contexts: threadContextBindings,
+        requires_unbind_confirmation: true,
+        ...workspaceDeleteImpactPayload(initialBindingSummary),
       },
       409,
     );
@@ -1322,16 +1392,102 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       );
     }
 
-    deleteGroupData(jid, existing.folder);
+    // Binding APIs are independent from the message queue and may have changed
+    // while runners were stopping. Re-read after the await so an unconfirmed
+    // delete never absorbs a newly-created channel binding.
+    const freshExisting = getRegisteredGroup(jid);
+    if (!freshExisting) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    const freshBindingSummary = collectWorkspaceDeleteBindings(
+      jid,
+      freshExisting,
+    );
+    if (freshBindingSummary.hasChannelBindings && !confirmedChannelUnbind) {
+      return c.json(
+        {
+          error: '该工作区新增了渠道绑定，请确认解绑后再删除。',
+          requires_unbind_confirmation: true,
+          ...workspaceDeleteImpactPayload(freshBindingSummary),
+        },
+        409,
+      );
+    }
+
+    const excludedWorkspaceJids = new Set([jid, `web:${freshExisting.folder}`]);
+    const channelUpdates: Array<{
+      jid: string;
+      group: RegisteredGroup;
+    }> = [];
+    const nativeThreadTargets = new Set<string>();
+    if (confirmedChannelUnbind) {
+      for (const channelJid of freshBindingSummary.mountedChannelJids) {
+        const channelGroup = getRegisteredGroup(channelJid);
+        if (!channelGroup) continue;
+        const restored = resolveDefaultChannelMountForWorkspaceDeletion(
+          channelJid,
+          channelGroup,
+          channelGroup.created_by ?? authUser.id,
+          excludedWorkspaceJids,
+        );
+        if (restored.status === 'resolved') {
+          channelUpdates.push({
+            jid: channelJid,
+            group: restored.updated,
+          });
+          if (restored.routingMode === 'thread_map') {
+            nativeThreadTargets.add(restored.workspaceJid);
+          }
+        } else {
+          // A damaged legacy account may have no viable default workspace.
+          // Clearing its route is still safer than leaving a dangling pointer
+          // to the workspace that is about to disappear.
+          channelUpdates.push({
+            jid: channelJid,
+            group: buildUnmountUpdate(channelGroup),
+          });
+        }
+      }
+    }
+
+    deleteGroupData(jid, freshExisting.folder, { channelUpdates });
     deleteCommitted = true;
 
-    delete deps.getRegisteredGroups()[jid];
-    delete deps.getSessions()[existing.folder];
+    const registeredGroups = deps.getRegisteredGroups();
+    for (const update of channelUpdates) {
+      if (registeredGroups[update.jid]) {
+        registeredGroups[update.jid] = update.group;
+      }
+    }
+    for (const targetJid of nativeThreadTargets) {
+      const target = getRegisteredGroup(targetJid);
+      if (!target || targetJid === jid) continue;
+      const updatedTarget = buildNativeThreadWorkspaceUpdate(target);
+      setRegisteredGroup(targetJid, updatedTarget);
+      if (registeredGroups[targetJid]) {
+        registeredGroups[targetJid] = updatedTarget;
+      }
+    }
+    delete registeredGroups[jid];
+    delete deps.getSessions()[freshExisting.folder];
     deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
 
-    removeFlowArtifacts(existing.folder);
+    removeFlowArtifacts(freshExisting.folder);
 
-    return c.json({ success: true });
+    logger.info(
+      {
+        jid,
+        userId: authUser.id,
+        channelBindingCount: freshBindingSummary.channelBindingCount,
+        reroutedChannels: channelUpdates.length,
+      },
+      'Workspace deleted with confirmed channel cleanup',
+    );
+
+    return c.json({
+      success: true,
+      unbound_channel_count: channelUpdates.length,
+    });
   } finally {
     if (deleteCommitted) {
       deps.queue.discardGroupsAfterMutation(deletePauseToken);

@@ -345,3 +345,26 @@ export interface AvailableImGroup {
   conversation_kind?: 'direct' | 'group' | 'unknown';
   sender_allowlist_locked?: boolean;
 }
+
+export interface WorkspaceDeleteBindingGroup {
+  jid: string;
+  name: string;
+}
+
+export interface WorkspaceDeleteBindingSession {
+  sessionId: string;
+  sessionName: string;
+  imGroups: WorkspaceDeleteBindingGroup[];
+}
+
+export interface WorkspaceDeleteThreadContext extends WorkspaceDeleteBindingGroup {
+  context_id: string;
+}
+
+export interface WorkspaceDeleteImpact {
+  has_channel_bindings: boolean;
+  channel_binding_count: number;
+  bound_sessions: WorkspaceDeleteBindingSession[];
+  bound_main_im_groups: WorkspaceDeleteBindingGroup[];
+  bound_thread_contexts: WorkspaceDeleteThreadContext[];
+}

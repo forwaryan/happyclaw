@@ -263,6 +263,8 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
   const JID = 'web:mounted-delete-block';
   const FOLDER = 'mounted-delete-block';
   const IM_JID = 'telegram:mounted-delete-block';
+  const HOME_JID = 'web:mounted-delete-home';
+  const HOME_FOLDER = 'mounted-delete-home';
 
   beforeEach(() => {
     db.setRegisteredGroup(JID, {
@@ -289,10 +291,19 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
       activation_mode: 'auto',
       owner_im_id: null,
     });
+    db.setRegisteredGroup(HOME_JID, {
+      name: 'Owner Home',
+      folder: HOME_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: true,
+    } as any);
   });
 
   afterEach(() => {
-    for (const jid of [JID, IM_JID]) {
+    for (const jid of [JID, IM_JID, HOME_JID]) {
+      delete webDepsCache[jid];
       try {
         db.deleteRegisteredGroup(jid);
       } catch {
@@ -311,6 +322,81 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
     expect(body.bound_main_im_groups).toEqual([
       { jid: IM_JID, name: 'Mounted Telegram' },
     ]);
+  });
+
+  test('preflight reports the channels that will be detached', async () => {
+    asUser(OWNER_ID, 'member');
+    const res = await groupRoutes.request(
+      `/${encodeURIComponent(JID)}/delete-impact`,
+    );
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      has_channel_bindings: true,
+      channel_binding_count: 1,
+      bound_main_im_groups: [{ jid: IM_JID, name: 'Mounted Telegram' }],
+    });
+  });
+
+  test('confirmed delete reroutes channels and account defaults atomically', async () => {
+    const accountId = 'delete-workspace-telegram-account';
+    db.createChannelAccount({
+      id: accountId,
+      owner_user_id: OWNER_ID,
+      provider: 'telegram',
+      name: 'Delete workspace test Bot',
+      secret_ref: 'test-secret',
+      default_workspace_jid: JID,
+    });
+    const imGroup = db.getRegisteredGroup(IM_JID)!;
+    db.setRegisteredGroup(IM_JID, {
+      ...imGroup,
+      channel_account_id: accountId,
+      target_main_jid: JID,
+      binding_mode: 'single_context',
+    });
+    for (const jid of [JID, IM_JID, HOME_JID]) {
+      webDepsCache[jid] = db.getRegisteredGroup(jid)!;
+    }
+    const stopGroup = vi.fn(async () => {});
+    const discardGroupsAfterMutation = vi.fn();
+    webContext.setWebDeps({
+      getRegisteredGroups: () => webDepsCache,
+      getSessions: () => ({}),
+      setLastAgentTimestamp: vi.fn(),
+      queue: {
+        pauseGroupsForMutation: () => ({ id: 1 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        discardGroupsAfterMutation,
+        listDescendantJids: () => [],
+        stopGroup,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    try {
+      asUser(OWNER_ID, 'member');
+      const res = await groupRoutes.request(
+        `/${encodeURIComponent(JID)}?unbind_channels=true`,
+        { method: 'DELETE' },
+      );
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({
+        success: true,
+        unbound_channel_count: 1,
+      });
+      expect(db.getRegisteredGroup(JID)).toBeUndefined();
+      expect(db.getRegisteredGroup(IM_JID)?.target_main_jid).toBe(HOME_JID);
+      expect(db.getChannelMount(IM_JID)?.workspace_jid).toBe(HOME_JID);
+      expect(db.getChannelAccount(accountId)?.default_workspace_jid).toBe(
+        HOME_JID,
+      );
+      expect(
+        (webDepsCache[IM_JID] as { target_main_jid?: string }).target_main_jid,
+      ).toBe(HOME_JID);
+      expect(stopGroup).toHaveBeenCalled();
+      expect(discardGroupsAfterMutation).toHaveBeenCalledTimes(1);
+    } finally {
+      db.deleteChannelAccount(accountId, OWNER_ID);
+    }
   });
 });
 
