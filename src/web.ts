@@ -1222,7 +1222,7 @@ app.use(
   serveStatic({ root: './web/dist' }),
 );
 
-// SPA fallback：index.html / sw.js 等必须每次验证
+// SPA shell、manifest 和旧 Service Worker 清理脚本必须每次走网络。
 app.use(
   '/*',
   async (c, next) => {
@@ -1232,6 +1232,7 @@ app.use(
       // 非文件扩展名路径（SPA fallback → index.html）、SW 脚本、manifest 禁止缓存
       if (
         !p.match(/\.\w+$/) ||
+        p === '/index.html' ||
         p === '/sw.js' ||
         p === '/registerSW.js' ||
         p === '/manifest.webmanifest'

@@ -8,7 +8,6 @@ import {
   shouldEmitBackgroundTaskNotice,
   showNotificationPromptToast,
 } from '../utils/toast';
-import { invalidateGroupCache } from '../utils/pwaCache';
 import {
   deleteAgentMessageSnapshot,
   deleteGroupMessageSnapshots,
@@ -2102,9 +2101,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/clear-history`,
       );
 
-      // Invalidate SW cache for this group so the next page load doesn't
-      // serve a stale messages/agents response from before the clear (#467).
-      void invalidateGroupCache(jid);
       void deleteGroupMessageSnapshots(jid);
 
       set((s) => {
@@ -2202,9 +2198,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await api.delete(
         `/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`,
       );
-      // Invalidate SW cache so paginated message responses don't keep serving
-      // the deleted message for up to 24h after deletion (#467).
-      void invalidateGroupCache(jid);
       set((s) => ({
         messages: {
           ...s.messages,

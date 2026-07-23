@@ -64,10 +64,6 @@ vi.mock('../web/src/utils/toast', () => ({
   showNotificationPromptToast: vi.fn(),
 }));
 
-vi.mock('../web/src/utils/pwaCache', () => ({
-  invalidateGroupCache: vi.fn(),
-}));
-
 vi.mock('../web/src/utils/messageSnapshotCache', () => ({
   deleteAgentMessageSnapshot: deleteAgentMessageSnapshotMock,
   deleteGroupMessageSnapshots: deleteGroupMessageSnapshotsMock,
