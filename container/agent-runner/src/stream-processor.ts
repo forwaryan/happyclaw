@@ -59,6 +59,11 @@ export class StreamEventProcessor {
   private seenTextualResult = false;
   private readonly FLUSH_MS = 100;
   private readonly FLUSH_CHARS = 200;
+  // thinking_tokens is intentionally reduced to a low-frequency semantic
+  // heartbeat. Raw frames can arrive thousands of times in one reasoning-heavy
+  // turn and previously froze the Web/card projections when broadcast 1:1.
+  private lastThinkingTokenStatusAt: number | null = null;
+  private readonly THINKING_TOKEN_STATUS_INTERVAL_MS = 2_000;
 
   // Full text accumulator — SDK's result.result only contains the last text block;
   // this accumulates all text_delta to produce the complete response.
@@ -431,6 +436,8 @@ export class StreamEventProcessor {
   processStreamEvent(message: {
     type: string;
     parent_tool_use_id?: string | null;
+    uuid?: string;
+    session_id?: string;
     event: any;
   }): boolean {
     const parentToolUseId =
@@ -440,6 +447,32 @@ export class StreamEventProcessor {
     const isNested = parentToolUseId !== null;
 
     const event = message.event;
+    // A message_stop is the semantic commit boundary for the host-side answer
+    // reducer. Flush any short (< FLUSH_CHARS) delta first; otherwise the stop
+    // would close the message and the timer would later misclassify its text as
+    // a new implicit AssistantMessage.
+    if (event.type === 'message_stop') {
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      this.flushBuffers();
+    }
+    if (event.type === 'message_start' || event.type === 'message_stop') {
+      this.emitStreamEvent({
+        eventType: 'raw_sdk_event',
+        agentScope: isNested ? 'subagent' : 'main',
+        rawType: `stream_event/${event.type}`,
+        title:
+          event.type === 'message_start'
+            ? 'Assistant message started'
+            : 'Assistant message completed',
+        messageUuid: message.uuid || event.message?.id,
+        sessionId: message.session_id,
+        parentToolUseId,
+        displayLevel: 'debug',
+      });
+    }
     // Diagnostic log: print non-delta nested events
     if (isNested && event.type !== 'content_block_delta') {
       const evtType =
@@ -1216,17 +1249,28 @@ export class StreamEventProcessor {
       );
       return true;
     }
-    // `thinking_tokens` is a high-frequency progress counter the CLI (>=2.1.x)
-    // emits once per thinking chunk — ~33 for a trivial reply, thousands for a
-    // reasoning-heavy multi-agent turn. It carries no user-facing content, but
-    // the catch-all below would turn each one into a broadcast raw_sdk_event,
-    // flooding the WS. On the Web client each raw_sdk_event is NOT rAF-batched
-    // (only text/thinking deltas are), so every one triggers a synchronous
-    // Zustand set + saveStreamingToSession (JSON.stringify + sessionStorage) +
-    // StreamingDisplay re-render — starving the batched text/thinking flush so
-    // the streaming card never paints and the UI freezes on "正在思考" until the
-    // flood ends. Drop it at the source.
+    // `thinking_tokens` is a high-frequency approximate counter. Preserve its
+    // liveness semantics without broadcasting the raw counter or chain of
+    // thought: at most one synthesized heartbeat per 2 seconds.
     if (message.subtype === 'thinking_tokens') {
+      const now = Date.now();
+      if (
+        this.lastThinkingTokenStatusAt === null ||
+        now - this.lastThinkingTokenStatusAt >=
+          this.THINKING_TOKEN_STATUS_INTERVAL_MS
+      ) {
+        this.lastThinkingTokenStatusAt = now;
+        this.emitStreamEvent({
+          eventType: 'status',
+          agentScope: 'system',
+          statusText: '正在深入分析…',
+          summary: '模型正在进行推理',
+          isSynthetic: true,
+          displayLevel: 'primary',
+          messageUuid: message.uuid,
+          sessionId: message.session_id,
+        });
+      }
       return true;
     }
     this.emitRawSdkEvent(message);
@@ -1858,6 +1902,7 @@ export class StreamEventProcessor {
         : textResult || null;
     // Reset accumulator for next query loop
     this.fullTextAccumulator = '';
+    this.lastThinkingTokenStatusAt = null;
     return { effectiveResult, seenTextual: !!textResult };
   }
 
@@ -1874,6 +1919,7 @@ export class StreamEventProcessor {
     }
     this.streamBufs.clear();
     this.fullTextAccumulator = '';
+    this.lastThinkingTokenStatusAt = null;
     // Make cleanup clear rather than flush any late buffer from the spent SDK stream.
     this.seenTextualResult = true;
   }
@@ -1991,6 +2037,7 @@ export class StreamEventProcessor {
     this.pendingSubAgentMessages.clear();
     this.taskSummariesByToolUseId.clear();
     this.sdkTaskIdToToolUseId.clear();
+    this.lastThinkingTokenStatusAt = null;
   }
 
   /** Get the accumulated full text (for result comparison). */

@@ -17,7 +17,10 @@ afterEach(() => {
   }
 });
 
-function setupSendTool(toolName = 'send_message') {
+function setupSendTool(
+  toolName = 'send_message',
+  contextPatch: Partial<McpContext> = {},
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-send-ack-'));
   roots.push(root);
   const context: McpContext = {
@@ -31,6 +34,7 @@ function setupSendTool(toolName = 'send_message') {
     workspaceGroup: root,
     workspaceGlobal: root,
     workspaceMemory: root,
+    ...contextPatch,
   };
   const sendTool = createMcpTools(context).find(
     (candidate) => candidate.name === toolName,
@@ -73,14 +77,52 @@ describe('send_message host acknowledgement', () => {
     const request = await readRequest(root);
 
     expect(request.inputTurnId).toBe('delivery-turn-1');
+    expect(request.deliveryRole).toBe('final');
     expect(typeof request.requestId).toBe('string');
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(settled).toBe(false);
 
     writeResult(root, request.requestId as string, { success: true });
     await expect(pending).resolves.toMatchObject({
-      content: [{ type: 'text', text: 'Message sent.' }],
+      content: [{ type: 'text', text: 'Message sent separately.' }],
     });
+  });
+
+  test('passes an explicit progress role and reports host staging', async () => {
+    const { root, sendTool } = setupSendTool();
+    const pending = sendTool.handler(
+      { text: '正在抓取资料', delivery_role: 'progress' },
+      {} as never,
+    );
+    const request = await readRequest(root);
+    expect(request.deliveryRole).toBe('progress');
+
+    writeResult(root, request.requestId as string, {
+      success: true,
+      disposition: 'staged_progress',
+    });
+    await expect(pending).resolves.toMatchObject({
+      content: [
+        { type: 'text', text: 'Progress updated on the active reply.' },
+      ],
+    });
+  });
+
+  test('scheduled tasks always use separate delivery semantics', async () => {
+    const { root, sendTool } = setupSendTool('send_message', {
+      isScheduledTask: true,
+    });
+    const pending = sendTool.handler(
+      { text: '定时报告', delivery_role: 'final' },
+      {} as never,
+    );
+    const request = await readRequest(root);
+    expect(request).toMatchObject({
+      deliveryRole: 'separate',
+      isScheduledTask: true,
+    });
+    writeResult(root, request.requestId as string, { success: true });
+    await expect(pending).resolves.toBeDefined();
   });
 
   test('surfaces a host delivery failure instead of returning a false success', async () => {

@@ -131,4 +131,44 @@ describe('Feishu token usage presentation', () => {
     );
     expect(JSON.stringify(buildMetaRow(usage))).toContain('推理 750');
   });
+
+  test('labels missing or all-zero SDK usage as unreported, never zero tokens', () => {
+    expect(formatFeishuTokenSummary({})).toBe('Token 未上报');
+    expect(
+      formatFeishuTokenSummary({
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningTokens: 0,
+      }),
+    ).toBe('Token 未上报');
+
+    const note = formatFeishuUsageNote({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      reasoningTokens: 0,
+      costUSD: 0,
+      durationMs: 296_100,
+      numTurns: 1,
+    });
+    expect(note).toBe('💰 Token 未上报 · 296.1s');
+    expect(note).not.toContain('0 tokens');
+  });
+
+  test('keeps real non-zero classes even when input/output are zero', () => {
+    expect(
+      formatFeishuTokenSummary({
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 199_000,
+        cacheCreationInputTokens: 102_500,
+        reasoningTokens: 5,
+      }),
+    ).toBe(
+      '301.5K tokens（输入 0 · 输出 0 · 缓存读取 199.0K · 缓存写入 102.5K · 推理 5）',
+    );
+  });
 });

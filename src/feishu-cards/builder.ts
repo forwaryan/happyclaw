@@ -141,6 +141,8 @@ export function buildStreamingAgentCard(
   opts: StreamingCardBuildOptions = {},
 ): FeishuCardV2 {
   const initialText = opts.initialText ?? '';
+  const visibleInitialText =
+    initialText.trim() || '> 正在分析请求，最终结论完成后会显示在这里。';
   // Header/summary title follows the same status-driven policy as the terminal
   // card: an explicit title wins, otherwise a minimal status word ("生成中") —
   // never the reply's first line. This keeps the streaming→terminal transition
@@ -159,7 +161,7 @@ export function buildStreamingAgentCard(
 
   const mainContentEl = {
     tag: 'markdown',
-    content: initialText || '...',
+    content: visibleInitialText,
     element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
   };
   const interruptBtn = {
@@ -220,11 +222,11 @@ export function buildStreamingAgentCard(
   }
 
   // Default panel expansion for the streaming skeleton:
-  //   thinking → expanded so the user can watch reasoning stream in as it arrives
-  //   tools / progress → folded to keep the card compact; STATUS_BANNER still
-  //                       surfaces the active tool / todo count at the top.
+  // Runtime diagnostics are folded by default. The always-visible status
+  // banner carries deterministic progress; raw reasoning is secondary detail
+  // and should not dominate the user's answer surface.
   const panelsInit: StreamingPanelsInit = {
-    expandThinking: true,
+    expandThinking: false,
     expandTools: false,
     expandProgress: false,
     ...(opts.panels ?? {}),

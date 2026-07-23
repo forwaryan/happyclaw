@@ -1,0 +1,318 @@
+import crypto from 'node:crypto';
+
+/**
+ * User-visible delivery semantics are deliberately owned by the HappyClaw
+ * host, not inferred from the fact that an MCP tool happened to run.
+ */
+export type TurnMessageDeliveryRole = 'progress' | 'final' | 'separate';
+
+export interface TurnOutputStreamEvent {
+  eventType: string;
+  text?: string;
+  parentToolUseId?: string | null;
+  toolName?: string;
+  messageUuid?: string;
+  rawType?: string;
+}
+
+export interface TurnOutputProjection {
+  answerText: string;
+  answerChanged: boolean;
+  visibleAnswerText: string;
+  visibleAnswerChanged: boolean;
+  narrationDiscarded: boolean;
+  provisionalText: string;
+}
+
+export interface ResolvedPrimaryAnswer {
+  text: string | null;
+  source: 'sdk_final' | 'mcp_final' | 'candidate' | 'empty';
+}
+
+interface PreparedTurnMessage {
+  role: Exclude<TurnMessageDeliveryRole, 'separate'>;
+  text: string;
+  fingerprint: string;
+  duplicate: boolean;
+}
+
+/**
+ * Pure reducer for one user input turn.
+ *
+ * Raw SDK text deltas are provisional until the model either calls a tool or
+ * reaches its final result. If a top-level tool starts after text was emitted,
+ * that text is process narration and is removed from the answer lane. This
+ * mirrors Claude Code's assistant-message semantics while still allowing the
+ * live card to show a provisional candidate and roll it back deterministically.
+ */
+export class TurnOutputCoordinator {
+  private answerCandidate = '';
+  private readonly narrationSegments: string[] = [];
+  private activeMessage:
+    | {
+        id: string;
+        text: string;
+        hasTopLevelTool: boolean;
+      }
+    | undefined;
+  private implicitMessageCounter = 0;
+  private stagedFinal: string | null = null;
+  private finalized = false;
+  private readonly stagedFingerprints = new Set<string>();
+
+  reduceStreamEvent(event: TurnOutputStreamEvent): TurnOutputProjection {
+    const before = this.answerCandidate;
+    const beforeVisible = this.visibleAnswerText;
+    let narrationDiscarded = false;
+    const isMessageStart =
+      event.eventType === 'raw_sdk_event' &&
+      event.rawType === 'stream_event/message_start' &&
+      !event.parentToolUseId;
+    const isMessageStop =
+      event.eventType === 'raw_sdk_event' &&
+      event.rawType === 'stream_event/message_stop' &&
+      !event.parentToolUseId;
+
+    if (isMessageStart) {
+      this.activeMessage = {
+        id: event.messageUuid || `implicit-${++this.implicitMessageCounter}`,
+        text: '',
+        hasTopLevelTool: false,
+      };
+    }
+
+    if (
+      event.eventType === 'text_delta' &&
+      event.text &&
+      !event.parentToolUseId
+    ) {
+      const message = this.ensureActiveMessage(event.messageUuid);
+      message.text += event.text;
+    } else if (event.eventType === 'tool_use_start' && !event.parentToolUseId) {
+      const message = this.ensureActiveMessage(event.messageUuid);
+      message.hasTopLevelTool = true;
+    }
+
+    if (isMessageStop && this.activeMessage) {
+      if (this.activeMessage.hasTopLevelTool) {
+        if (this.activeMessage.text.trim()) {
+          this.narrationSegments.push(this.activeMessage.text);
+        }
+        this.answerCandidate = '';
+        narrationDiscarded = true;
+      } else {
+        this.answerCandidate = this.activeMessage.text;
+      }
+      this.activeMessage = undefined;
+    }
+
+    return {
+      answerText: this.answerCandidate,
+      answerChanged: before !== this.answerCandidate,
+      visibleAnswerText: this.visibleAnswerText,
+      visibleAnswerChanged: beforeVisible !== this.visibleAnswerText,
+      narrationDiscarded,
+      provisionalText: this.activeMessage?.text ?? '',
+    };
+  }
+
+  private ensureActiveMessage(
+    messageUuid?: string,
+  ): NonNullable<TurnOutputCoordinator['activeMessage']> {
+    if (!this.activeMessage) {
+      this.activeMessage = {
+        id: messageUuid || `implicit-${++this.implicitMessageCounter}`,
+        text: '',
+        hasTopLevelTool: false,
+      };
+    }
+    return this.activeMessage;
+  }
+
+  get candidateText(): string {
+    return this.answerCandidate;
+  }
+
+  /**
+   * The live card may render a tool-free message provisionally. Once the same
+   * AssistantMessage reveals a top-level tool call, this immediately rolls
+   * back to the last committed candidate; canonical persistence still waits
+   * for message_stop.
+   */
+  get visibleAnswerText(): string {
+    if (this.activeMessage && !this.activeMessage.hasTopLevelTool) {
+      return this.activeMessage.text;
+    }
+    return this.answerCandidate;
+  }
+
+  get lastNarration(): string | null {
+    return this.narrationSegments.at(-1) ?? null;
+  }
+
+  /**
+   * Stage a non-separate MCP message into this turn. Returns false after the
+   * primary answer has finalized, so a late/replayed IPC file cannot create a
+   * sibling answer.
+   */
+  stageMessage(
+    role: Exclude<TurnMessageDeliveryRole, 'separate'>,
+    text: string,
+  ): { accepted: boolean; duplicate: boolean } {
+    const prepared = this.prepareMessage(role, text);
+    if (!prepared) {
+      return { accepted: false, duplicate: false };
+    }
+    if (!prepared.duplicate) this.commitPreparedMessage(prepared);
+    return { accepted: true, duplicate: prepared.duplicate };
+  }
+
+  prepareMessage(
+    role: Exclude<TurnMessageDeliveryRole, 'separate'>,
+    text: string,
+  ): PreparedTurnMessage | null {
+    if (this.finalized || !text.trim()) return null;
+    const fingerprint = crypto
+      .createHash('sha256')
+      .update(`${role}\0${text}`)
+      .digest('hex');
+    return {
+      role,
+      text,
+      fingerprint,
+      duplicate: this.stagedFingerprints.has(fingerprint),
+    };
+  }
+
+  commitPreparedMessage(prepared: PreparedTurnMessage): void {
+    if (prepared.duplicate) return;
+    this.stagedFingerprints.add(prepared.fingerprint);
+    if (prepared.role === 'final') {
+      this.stagedFinal = prepared.text;
+      this.answerCandidate = prepared.text;
+    }
+  }
+
+  /** SDK Result is authoritative when it contains a real final answer. */
+  resolvePrimaryAnswer(
+    sdkResult: string | null | undefined,
+  ): ResolvedPrimaryAnswer {
+    const sdkText = sdkResult?.trim() ? sdkResult : null;
+    // Result.success.result is the SDK's authoritative answer. Never reject
+    // it based on a heuristic comparison with earlier process narration.
+    if (sdkText) {
+      return { text: sdkText, source: 'sdk_final' };
+    }
+    if (this.stagedFinal?.trim()) {
+      return { text: this.stagedFinal, source: 'mcp_final' };
+    }
+    if (this.answerCandidate.trim()) {
+      return { text: this.answerCandidate, source: 'candidate' };
+    }
+    return { text: null, source: 'empty' };
+  }
+
+  markFinalized(): void {
+    this.finalized = true;
+  }
+}
+
+export interface ActiveTurnOutputCallbacks {
+  onProgress: (text: string) => boolean;
+  onFinalCandidate: (text: string) => boolean;
+}
+
+interface ActiveTurnOutputBinding {
+  coordinator: TurnOutputCoordinator;
+  callbacks: ActiveTurnOutputCallbacks;
+}
+
+export interface StageTurnMessageInput {
+  scopeKey: string;
+  inputTurnId: string;
+  role: Exclude<TurnMessageDeliveryRole, 'separate'>;
+  text: string;
+}
+
+export interface StageTurnMessageResult {
+  accepted: boolean;
+  duplicate: boolean;
+  reason?: 'inactive_turn' | 'finalized' | 'projection_unavailable';
+}
+
+/**
+ * Process-local bridge between the IPC watcher and the foreground Agent turn.
+ * The durable Turn/Outbox remains the authority for physical side effects;
+ * this registry only ensures progress/final text joins the existing primary
+ * projection instead of becoming a second provider message.
+ */
+export class ActiveTurnOutputRegistry {
+  private readonly bindings = new Map<string, ActiveTurnOutputBinding>();
+
+  private key(scopeKey: string, inputTurnId: string): string {
+    return `${scopeKey}\0${inputTurnId}`;
+  }
+
+  bind(
+    scopeKey: string,
+    inputTurnId: string,
+    callbacks: ActiveTurnOutputCallbacks,
+    coordinator = new TurnOutputCoordinator(),
+  ): TurnOutputCoordinator {
+    this.bindings.set(this.key(scopeKey, inputTurnId), {
+      coordinator,
+      callbacks,
+    });
+    return coordinator;
+  }
+
+  get(
+    scopeKey: string,
+    inputTurnId: string,
+  ): TurnOutputCoordinator | undefined {
+    return this.bindings.get(this.key(scopeKey, inputTurnId))?.coordinator;
+  }
+
+  stage(input: StageTurnMessageInput): StageTurnMessageResult {
+    const binding = this.bindings.get(
+      this.key(input.scopeKey, input.inputTurnId),
+    );
+    if (!binding) {
+      return {
+        accepted: false,
+        duplicate: false,
+        reason: 'inactive_turn',
+      };
+    }
+    const prepared = binding.coordinator.prepareMessage(input.role, input.text);
+    if (!prepared) {
+      return { accepted: false, duplicate: false, reason: 'finalized' };
+    }
+    if (prepared.duplicate) return { accepted: true, duplicate: true };
+    const projected =
+      input.role === 'progress'
+        ? binding.callbacks.onProgress(input.text)
+        : binding.callbacks.onFinalCandidate(input.text);
+    if (!projected) {
+      return {
+        accepted: false,
+        duplicate: false,
+        reason: 'projection_unavailable',
+      };
+    }
+    binding.coordinator.commitPreparedMessage(prepared);
+    return { accepted: true, duplicate: false };
+  }
+
+  unbind(
+    scopeKey: string,
+    inputTurnId: string,
+    coordinator?: TurnOutputCoordinator,
+  ): void {
+    const key = this.key(scopeKey, inputTurnId);
+    if (coordinator && this.bindings.get(key)?.coordinator !== coordinator) {
+      return;
+    }
+    this.bindings.delete(key);
+  }
+}

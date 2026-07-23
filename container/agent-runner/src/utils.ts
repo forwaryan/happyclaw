@@ -308,65 +308,53 @@ export interface AssistantContentBlock {
 }
 
 /**
- * Turn 内 assistant 文本分段追踪：把「工具调用之间的过程旁白」与「最后一次
- * 工具调用之后的最终回复」分开。
+ * Turn 内 assistant 文本按 AssistantMessage 边界分类。
  *
- * SDK 把 assistant 输出按 tool_use 切成多条消息（text → tool_use → text → …）。
- * 旧实现把 turn 内所有 top-level text block 无分隔拼接为定稿正文，导致模型在
- * 每次工具调用前输出的过程叙述（"我先检查 X"、"现在打开 Y"）混进最终回复，
- * 且句子之间无缝粘连。本类按 content block 顺序维护：遇到 top-level tool_use
- * 时把已累积文本归入 narration（旁白，不进定稿正文）；turn 结束时
- * currentSegment 即最后一次工具调用之后的文本——与 SDK result 字段 /
- * Claude Code 的最终回复语义一致。
+ * 只要一整条 top-level AssistantMessage 含 tool_use，该消息里的所有 text
+ * 都是过程旁白——无论 block 顺序是 [text, tool_use]、[tool_use, text]，
+ * 或 text/tool 交错。只有整条消息完全不含 top-level tool_use 时，它的完整
+ * text 才能成为 SDK Result 缺失时的候选答案。
  */
 export class AssistantTextTracker {
-  private currentSegment = '';
-  private narrationSegments: string[] = [];
+  private answerCandidate = '';
 
   /**
-   * 按顺序处理一条 top-level assistant 消息的 content blocks。
+   * 原子处理一整条 top-level AssistantMessage 的 content blocks。
    * 返回该消息是否含文本（调用方据此更新 canonical uuid）。
    */
   addContentBlocks(blocks: AssistantContentBlock[]): boolean {
-    let sawText = false;
+    let messageText = '';
+    let hasTopLevelTool = false;
     for (const block of blocks) {
       if (
         block.type === 'text' &&
         typeof block.text === 'string' &&
         block.text
       ) {
-        this.currentSegment += block.text;
-        sawText = true;
+        messageText += block.text;
       } else if (block.type === 'tool_use') {
-        this.rotateSegment();
+        hasTopLevelTool = true;
       }
     }
-    return sawText;
-  }
-
-  private rotateSegment(): void {
-    if (this.currentSegment.trim()) {
-      this.narrationSegments.push(this.currentSegment);
+    if (!hasTopLevelTool && messageText.trim()) {
+      this.answerCandidate = messageText;
     }
-    this.currentSegment = '';
+    return messageText.length > 0;
   }
 
   /**
-   * 定稿正文选择链：最终段 → SDK result → 最后一段旁白。
-   * 旁白兜底针对「模型以工具调用收尾」的 turn（如挂起序列的中间 turn 派完
-   * 后台任务即停），此时最后一段旁白通常是对用户有意义的状态说明
-   * （"三个调研任务已派出，等待完成"）。
+   * 非空 SDK Result 是唯一权威。只有 SDK Result 缺失时，才回退到最近一条
+   * 完全不含 top-level tool_use 的 AssistantMessage；过程旁白绝不兜底成
+   * 最终答复。
    */
   pickFinalText(sdkResult: string | null | undefined): string | null {
-    if (this.currentSegment.trim()) return this.currentSegment;
     if (sdkResult && sdkResult.trim()) return sdkResult;
-    return this.narrationSegments.at(-1) ?? null;
+    return this.answerCandidate.trim() ? this.answerCandidate : null;
   }
 
   /** mid-query follow-up 产生第二条 result 时与 turnId 一起重置。 */
   reset(): void {
-    this.currentSegment = '';
-    this.narrationSegments = [];
+    this.answerCandidate = '';
   }
 }
 
