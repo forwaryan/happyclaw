@@ -136,6 +136,19 @@ describe('settings information architecture', () => {
     expect(settings).toContain('toast.error(message)');
   });
 
+  test('offers official model aliases that work without SDK dialog consent', () => {
+    const provider = read('web/src/components/settings/ProviderEditor.tsx');
+    const officialModels = provider.slice(
+      provider.indexOf('/* ─── 官方模型选择 ─── */'),
+      provider.indexOf('/* ─── 环境变量 ─── */'),
+    );
+
+    expect(officialModels).toMatch(
+      /value="">default（默认）[\s\S]*value="opus">opus[\s\S]*value="sonnet">sonnet[\s\S]*value="haiku">haiku/,
+    );
+    expect(officialModels).not.toContain('value="fable"');
+  });
+
   test('keeps Agent add-ons, project context, and Provider settings in distinct layers', () => {
     const settings = read('web/src/pages/SettingsPage.tsx');
     const mainCapabilities = read(
