@@ -32,9 +32,16 @@ describe('provider fallback source contracts', () => {
     );
   });
 
-  test('first failure reports usage and activates fallback for later warm turns', () => {
+  test('structured model limits report usage and activate fallback for later warm turns', () => {
     expect(agentRunner).toContain(
-      'PROVIDER_FALLBACK_MODELS.activateForResult(textResult)',
+      'const info: SDKRateLimitInfo = message.rate_limit_info',
+    );
+    expect(agentRunner).toContain('structuredRejection: structuredLimit');
+    expect(agentRunner).toContain(
+      "limitDecision.action === 'provider_failure'",
+    );
+    expect(agentRunner).toContain(
+      'PROVIDER_FALLBACK_MODELS.activateForScope(limitDecision.scope)',
     );
     expect(agentRunner).toContain(
       'PROVIDER_FALLBACK_MODELS.activeModelOverride',
@@ -44,12 +51,15 @@ describe('provider fallback source contracts', () => {
     );
   });
 
-  test('host consumes the hidden marker and does not undo provider health', () => {
+  test('host consumes the hidden model retry marker without quarantining provider', () => {
     expect(
       hostRunner.match(/if \(output\.providerFailureRetrying\)/g),
     ).toHaveLength(2);
     expect(hostRunner).toContain('!providerFailureReported &&');
     expect(hostRunner).toContain('!hostProviderFailureReported &&');
     expect(hostRunner).not.toContain('ownerHomeFolder,\n    fallbackModel');
+    expect(agentRunner).not.toMatch(
+      /providerFailure:\s*true,\s*providerFailureRetrying:\s*true/,
+    );
   });
 });
