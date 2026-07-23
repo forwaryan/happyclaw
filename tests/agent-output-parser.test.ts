@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { PassThrough } from 'node:stream';
 
 import {
+  classifyProviderLimitNotice,
   isApiError,
   isProviderFailureResult,
   createStdoutParserState,
@@ -41,6 +42,34 @@ describe('isProviderFailureResult — positive (genuine Claude limit notices)', 
     expect(isProviderFailureResult("You've reached your usage limit.")).toBe(
       true,
     );
+  });
+
+  test('detects known multi-word account limit labels', () => {
+    expect(
+      classifyProviderLimitNotice(
+        "You've hit your monthly spend limit · resets 12am (UTC)",
+      ),
+    ).toBe('account');
+    expect(
+      classifyProviderLimitNotice("You've reached your org monthly limit."),
+    ).toBe('account');
+    expect(
+      classifyProviderLimitNotice(
+        "You've reached your organization monthly limit.",
+      ),
+    ).toBe('account');
+  });
+
+  test('classifies model-specific banners without quarantining the account', () => {
+    const fable = "You've reached your Fable 5 limit. /model to switch models.";
+    expect(classifyProviderLimitNotice(fable)).toBe('model');
+    expect(classifyProviderLimitNotice("You've hit your Opus limit.")).toBe(
+      'model',
+    );
+    expect(classifyProviderLimitNotice("You've hit your Sonnet limit.")).toBe(
+      'model',
+    );
+    expect(isProviderFailureResult(fable)).toBe(false);
   });
 
   test('detects "usage limit reached" notice with reset time', () => {
@@ -127,6 +156,17 @@ describe('isProviderFailureResult — negative (normal replies must NOT be flagg
 
   test('does not flag a short reply mentioning a request limit reached', () => {
     const msg = 'Heads up: the per-minute request limit reached 100% briefly.';
+    expect(isProviderFailureResult(msg)).toBe(false);
+  });
+
+  test.each([
+    "You've hit your rate limit.",
+    "You've reached your storage limit.",
+    "You've reached your character limit.",
+    "You've hit your project limit.",
+    "You've reached your speed limit.",
+  ])('does not accept an arbitrary short qualifier: %s', (msg) => {
+    expect(classifyProviderLimitNotice(msg)).toBeNull();
     expect(isProviderFailureResult(msg)).toBe(false);
   });
 
@@ -263,6 +303,22 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
     ]);
     expect(out).toHaveLength(1);
     expect(out[0].result).toBe('hi');
+  });
+
+  test('preserves an explicit structured provider failure with no banner text', async () => {
+    const out = await runParser([
+      `${S}${JSON.stringify({
+        status: 'success',
+        result: null,
+        providerFailure: true,
+      })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      status: 'success',
+      result: null,
+      providerFailure: true,
+    });
   });
 
   test('does NOT drop a result whose payload contains the literal END marker', async () => {

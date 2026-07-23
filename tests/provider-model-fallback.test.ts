@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  classifyProviderLimitNotice,
+  classifyProviderRateLimitType,
+  decideProviderLimitAction,
   isProviderLimitNotice,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
@@ -13,7 +16,10 @@ import {
   IpcTurnDeliveryTracker,
   type IpcInputMessage,
 } from '../container/agent-runner/src/ipc-delivery.js';
-import { isProviderFailureResult } from '../src/agent-output-parser.js';
+import {
+  classifyProviderLimitNotice as classifyHostProviderLimitNotice,
+  isProviderFailureResult,
+} from '../src/agent-output-parser.js';
 import { applyFallbackModelToEnvLines } from '../src/container-runner.js';
 
 function message(id: string, text = `prompt-${id}`): IpcInputMessage {
@@ -29,7 +35,7 @@ function message(id: string, text = `prompt-${id}`): IpcInputMessage {
 }
 
 describe('provider model fallback lifecycle', () => {
-  test('recognizes only standalone Claude account-limit notices', () => {
+  test('recognizes only standalone Claude account/model-limit notices', () => {
     const samples = [
       ["You're out of extra usage · resets 2:10am (Asia/Shanghai)", true],
       ["You've hit your limit", true],
@@ -38,29 +44,48 @@ describe('provider model fallback lifecycle', () => {
       ["You've hit your session limit · resets 11:10pm (Asia/Singapore)", true],
       ["You've hit your weekly limit · resets 3am (America/New_York)", true],
       ['Claude usage limit reached. Your limit will reset at 3pm.', true],
+      ["You've reached your Fable 5 limit. /model to switch models.", true],
       [
         'To avoid a rate limit, retry the request with exponential backoff.',
         false,
       ],
       ['The database quota was exhausted by leaked connections.', false],
+      ["You've hit your rate limit.", false],
+      ["You've reached your storage limit.", false],
+      ["You've reached your character limit.", false],
+      ["You've hit your project limit.", false],
+      ["You've reached your speed limit.", false],
     ] as const;
 
     for (const [text, expected] of samples) {
       expect(isProviderLimitNotice(text)).toBe(expected);
-      expect(isProviderFailureResult(text)).toBe(expected);
+      expect(classifyHostProviderLimitNotice(text)).toBe(
+        classifyProviderLimitNotice(text),
+      );
+      expect(isProviderFailureResult(text)).toBe(
+        classifyProviderLimitNotice(text) === 'account',
+      );
     }
   });
 
-  test('switches once and keeps later warm queries on the fallback model', () => {
+  test('switches only for model limits and keeps later queries on fallback', () => {
     const state = new ProviderFallbackModelState(
       'primary-model',
       'fallback-model',
     );
     expect(state.activeModelOverride).toBeUndefined();
 
-    expect(state.activateForResult("You've hit your limit")).toBe(true);
+    expect(state.activateForResult("You've hit your session limit.")).toBe(
+      false,
+    );
+    expect(state.activeModelOverride).toBeUndefined();
+    expect(
+      state.activateForResult(
+        "You've reached your Fable 5 limit. /model to switch models.",
+      ),
+    ).toBe(true);
     expect(state.activeModelOverride).toBe('fallback-model');
-    expect(state.activateForResult("You've hit your limit")).toBe(false);
+    expect(state.activateForResult("You've hit your Opus limit.")).toBe(false);
 
     const provider = resolveClaudeProviderRuntime({
       HAPPYCLAW_CLAUDE_ENDPOINT_KIND: 'official',
@@ -78,14 +103,55 @@ describe('provider model fallback lifecycle', () => {
   test('does not retry when fallback is empty or identical to primary', () => {
     expect(
       new ProviderFallbackModelState('same', '').activateForResult(
-        "You've hit your limit",
+        "You've hit your Opus limit.",
       ),
     ).toBe(false);
     expect(
       new ProviderFallbackModelState('same', 'same').activateForResult(
-        "You've hit your limit",
+        "You've hit your Opus limit.",
       ),
     ).toBe(false);
+  });
+
+  test('maps structured SDK rate limits to the correct blast radius', () => {
+    expect(classifyProviderRateLimitType(undefined)).toBe('account');
+    expect(classifyProviderRateLimitType('five_hour')).toBe('account');
+    expect(classifyProviderRateLimitType('seven_day')).toBe('account');
+    expect(classifyProviderRateLimitType('overage')).toBe('account');
+    expect(classifyProviderRateLimitType('seven_day_opus')).toBe('model');
+    expect(classifyProviderRateLimitType('seven_day_sonnet')).toBe('model');
+    // Current Claude Code emits this type for Fable 5's model-specific wall.
+    expect(classifyProviderRateLimitType('seven_day_overage_included')).toBe(
+      'model',
+    );
+  });
+
+  test('structured rejection wins over text and preserves model-only errors without fallback', () => {
+    expect(
+      decideProviderLimitAction({
+        structuredRejection: {},
+        result: 'wording introduced by a future Claude Code release',
+        canFallback: true,
+      }),
+    ).toEqual({ scope: 'account', action: 'provider_failure' });
+
+    expect(
+      decideProviderLimitAction({
+        structuredRejection: { rateLimitType: 'seven_day_opus' },
+        result: "You've hit your session limit.",
+        canFallback: true,
+      }),
+    ).toEqual({ scope: 'model', action: 'model_fallback' });
+
+    expect(
+      decideProviderLimitAction({
+        structuredRejection: {
+          rateLimitType: 'seven_day_overage_included',
+        },
+        result: "You've reached your Fable 5 limit.",
+        canFallback: false,
+      }),
+    ).toEqual({ scope: 'model', action: 'surface_result' });
   });
 
   test('warm failure keeps only the current receipt and leaves later turns ordered', () => {
