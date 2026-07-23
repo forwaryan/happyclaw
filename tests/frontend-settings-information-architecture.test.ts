@@ -136,7 +136,7 @@ describe('settings information architecture', () => {
     expect(settings).toContain('toast.error(message)');
   });
 
-  test('offers official model aliases that work without SDK dialog consent', () => {
+  test('offers supported official model aliases', () => {
     const provider = read('web/src/components/settings/ProviderEditor.tsx');
     const officialModels = provider.slice(
       provider.indexOf('/* ─── 官方模型选择 ─── */'),
@@ -144,9 +144,8 @@ describe('settings information architecture', () => {
     );
 
     expect(officialModels).toMatch(
-      /value="">default（默认）[\s\S]*value="opus">opus[\s\S]*value="sonnet">sonnet[\s\S]*value="haiku">haiku/,
+      /value="">default（默认）[\s\S]*value="opus">opus[\s\S]*value="sonnet">sonnet[\s\S]*value="haiku">haiku[\s\S]*value="fable">fable/,
     );
-    expect(officialModels).not.toContain('value="fable"');
   });
 
   test('keeps Agent add-ons, project context, and Provider settings in distinct layers', () => {
