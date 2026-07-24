@@ -1682,6 +1682,7 @@ async function runQueryAttempt(
   suspectTruncatedTail?: string;
   providerFailureTurn?: ProviderFallbackRetryTurn;
   providerAccountFailure?: boolean;
+  orphanedAgentTaskIds?: Set<string>;
 }> {
   const queryModelRuntime = resolveClaudeQueryModelRuntime(
     CLAUDE_PROVIDER_RUNTIME,
@@ -1835,6 +1836,13 @@ async function runQueryAttempt(
   let sawPendingBackgroundTasks = false;
   let backgroundSummaryForceAttempts = 0;
   const MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS = 2;
+  // Background task heartbeat: periodically emit a lightweight status while
+  // holding the stream open for pending background tasks. This resets
+  // the host-side output-idle timeout (containerTimeout / idleTimeout),
+  // preventing the runner from being killed while background agents are
+  // still running. The heartbeat is invisible to the user (displayLevel: 'debug').
+  const BG_HEARTBEAT_INTERVAL_MS = 60_000;
+  let bgHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   // SDK scopes vary by implementation: the official SDK exposes cumulative
   // root/model totals, while compatible proxies may reset the root per result.
   // Assistant message usage is the primary Kaboo-compatible source; this
@@ -3023,6 +3031,38 @@ async function runQueryAttempt(
               displayLevel: 'primary',
             },
           });
+          // Start heartbeat timer to keep host-side timeout alive while
+          // background tasks are running. Each heartbeat emits a minimal
+          // output marker that resets containerTimeout / idleTimeout via
+          // the existing onOutput → resetTimeout chain on the host side.
+          // Only considers "blocking" pending tasks (finite Agent/Workflow),
+          // NOT detached local_bash (dev servers etc.) which are designed
+          // to be reclaimed by timeout as documented in the comment above.
+          if (!bgHeartbeatTimer) {
+            bgHeartbeatTimer = setInterval(() => {
+              const currentBlocking =
+                processor.getBlockingPendingSdkTaskCount();
+              if (currentBlocking <= 0) {
+                clearInterval(bgHeartbeatTimer!);
+                bgHeartbeatTimer = null;
+                return;
+              }
+              emit({
+                status: 'stream',
+                result: null,
+                streamEvent: {
+                  eventType: 'status',
+                  agentScope: 'system',
+                  statusText: '__bg_keepalive',
+                  summary: `${currentBlocking} 个后台任务运行中`,
+                  displayLevel: 'debug',
+                },
+              });
+              log(
+                `[bg-heartbeat] emitted keepalive (${currentBlocking} blocking task(s))`,
+              );
+            }, BG_HEARTBEAT_INTERVAL_MS);
+          }
         } else if (!ipcDeliveryTracker.hasPendingTurns) {
           sawPendingBackgroundTasks = false;
           backgroundSummaryForceAttempts = 0;
@@ -3048,6 +3088,14 @@ async function runQueryAttempt(
     }
 
     // Cleanup residual state（IPC watcher 统一由下方 finally 关闭）
+    if (bgHeartbeatTimer) {
+      clearInterval(bgHeartbeatTimer);
+      bgHeartbeatTimer = null;
+    }
+    // Collect orphaned agent notifications before cleanup
+    const orphanedAgentTaskIds = processor.hasOrphanedAgentNotifications()
+      ? processor.consumeOrphanedAgentTaskIds()
+      : undefined;
     processor.cleanup();
 
     log(
@@ -3063,6 +3111,7 @@ async function runQueryAttempt(
       suspectTruncatedTail,
       providerFailureTurn,
       providerAccountFailure: false,
+      orphanedAgentTaskIds,
     };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -3206,6 +3255,11 @@ async function runQueryAttempt(
     // 定时器，以及旧 watcher 抢先 drain 本应进入新 query 的 IPC 消息。
     ipcPolling = false;
     ipcQueryWatcher.close();
+    // Ensure heartbeat timer is always cleaned up (covers catch/early-return paths)
+    if (bgHeartbeatTimer) {
+      clearInterval(bgHeartbeatTimer);
+      bgHeartbeatTimer = null;
+    }
   }
 }
 
@@ -3481,6 +3535,11 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   let consecutiveCompactions = 0;
   const MAX_CONSECUTIVE_COMPACTIONS = 3;
+  // Orphaned background agent recovery: track which orphaned task IDs we've
+  // already auto-continued for, to prevent repeated triggers across resumes.
+  const handledOrphanTaskIds = new Set<string>();
+  let orphanContinueAttempts = 0;
+  const MAX_ORPHAN_CONTINUE_ATTEMPTS = 2;
   // 暂存的会话历史上下文：当 auto-continue 阶段发生 sessionResumeFailed 时，
   // 历史无法直接拼到 auto-continue prompt（因为 fall-through 等下一条 IPC 消息后才重启 query），
   // 需要在下一轮主循环 query 之前消费它，避免新会话完全丢失上下文。
@@ -3771,6 +3830,95 @@ async function main(): Promise<void> {
 
       // Emit session update so host can track it
       writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+
+      // ── Orphaned background agent recovery ──
+      // If SDK detected orphaned background agents during resume (agents that
+      // were running when the previous process was killed), inject an auto-continue
+      // prompt so the main conversation doesn't get stuck at waitForIpcMessage().
+      // Deduplication: each orphan taskId is handled at most once, with a global
+      // attempt cap to prevent infinite loops.
+      if (
+        queryResult.orphanedAgentTaskIds &&
+        queryResult.orphanedAgentTaskIds.size > 0 &&
+        orphanContinueAttempts < MAX_ORPHAN_CONTINUE_ATTEMPTS
+      ) {
+        const newOrphans = [...queryResult.orphanedAgentTaskIds].filter(
+          (id) => !handledOrphanTaskIds.has(id),
+        );
+        if (newOrphans.length > 0) {
+          for (const id of newOrphans) handledOrphanTaskIds.add(id);
+          orphanContinueAttempts++;
+          log(
+            `[orphan-recovery] Detected ${newOrphans.length} new orphaned background agent(s), injecting auto-continue (attempt ${orphanContinueAttempts}/${MAX_ORPHAN_CONTINUE_ATTEMPTS})`,
+          );
+          const orphanPrompt = [
+            '系统通知：上次会话结束时，以下后台任务还在运行、未能完成：',
+            ...newOrphans.map(
+              (id) => `- 任务 ${id.slice(0, 12)}（进程退出时被中断）`,
+            ),
+            '\n请简要告知用户这些后台任务在上次会话中被中断了，并询问是否需要重新发起。',
+            '注意：不要假装已经完成了这些任务的结果。',
+          ].join('\n');
+          containerInput.turnId = generateTurnId();
+          const orphanResult = await runQuery(
+            orphanPrompt,
+            sessionId,
+            mcpServerConfig,
+            containerInput,
+            memoryRecallPrompt,
+            resumeAt,
+            true,
+            DEFAULT_ALLOWED_TOOLS,
+            undefined,
+            undefined,
+            'auto_continue',
+            [],
+            mcpToolsConfig,
+          );
+          if (orphanResult.newSessionId) {
+            sessionId = orphanResult.newSessionId;
+            latestSessionId = sessionId;
+          }
+          if (orphanResult.lastAssistantUuid) {
+            resumeAt = orphanResult.lastAssistantUuid;
+          }
+          if (orphanResult.closedDuringQuery) {
+            log('Close sentinel during orphan recovery, exiting');
+            writeOutput({ status: 'closed', result: null });
+            break;
+          }
+          if (orphanResult.unrecoverableTranscriptError) {
+            log(
+              'WARN: Unrecoverable transcript error during orphan recovery, signaling reset',
+            );
+            writeOutput({
+              status: 'error',
+              result:
+                '会话历史中包含无法处理的数据，会话需要重置。',
+              newSessionId: sessionId,
+            });
+            break;
+          }
+          if (orphanResult.sessionResumeFailed) {
+            log(
+              'WARN: Session resume failed during orphan recovery, clearing session',
+            );
+            if (sessionId) {
+              const historyContext = extractSessionHistory(sessionId);
+              if (historyContext) {
+                pendingHistoryContext = historyContext;
+                log(
+                  'Stashed session history context for next user-initiated query (orphan recovery)',
+                );
+              }
+            }
+            sessionId = undefined;
+            latestSessionId = undefined;
+            resumeAt = undefined;
+            mcpServerConfig = buildMcpServerConfig();
+          }
+        }
+      }
 
       // ── Non-blocking compaction: auto-continue after context compaction ──
       // Instead of waiting for user to send "继续", automatically start a

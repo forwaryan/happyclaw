@@ -561,7 +561,11 @@ export function feedStreamEventToCard(
       }
       break;
     case 'status':
-      if (se.statusText && se.statusText !== 'interrupted') {
+      if (
+        se.statusText &&
+        se.statusText !== 'interrupted' &&
+        se.statusText !== '__bg_keepalive'
+      ) {
         session.setThinking();
         session.setSystemStatus(
           se.statusText === 'requesting'

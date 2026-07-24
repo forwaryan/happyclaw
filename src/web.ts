@@ -2402,7 +2402,8 @@ function isInternalLifecycleStatus(statusText?: string | null): boolean {
     statusText === 'requesting' ||
     statusText === 'compacting' ||
     statusText === 'idle' ||
-    statusText === 'interrupted'
+    statusText === 'interrupted' ||
+    statusText === '__bg_keepalive'
   );
 }
 

@@ -153,6 +153,12 @@ export class StreamEventProcessor {
   // Background Task tool_use_ids (run_in_background: true)
   private readonly backgroundTaskToolUseIds = new Set<string>();
 
+  // Orphaned background agent notifications detected during resume.
+  // SDK emits these when a background agent had no completion record from the
+  // previous session (process was killed while it was still running).
+  // Keyed by taskId to enable deduplication across multiple resumes.
+  private readonly orphanedAgentTaskIds = new Set<string>();
+
   // SDK internal task_id → API tool_use_id mapping.
   // Built from task_started/task_progress system messages so that
   // task_notification (which carries SDK task_id) can be translated
@@ -1823,6 +1829,20 @@ export class StreamEventProcessor {
     });
     if (message.summary)
       this.taskSummariesByToolUseId.set(effectiveToolUseId, message.summary);
+    // Detect orphaned background agent notifications from SDK resume.
+    // These indicate a background agent was killed when the previous process exited.
+    // SDK error format: "No completion record was found for background agent \"...\"
+    // from the previous session." — require "No completion record" as primary signal.
+    if (
+      (message.status === 'failed' || message.status === 'stopped') &&
+      message.summary &&
+      message.summary.includes('No completion record')
+    ) {
+      this.orphanedAgentTaskIds.add(effectiveToolUseId);
+      this.log(
+        `[orphan-detect] Background agent orphaned: ${effectiveToolUseId} — "${message.summary.slice(0, 80)}"`,
+      );
+    }
     this.cleanupTaskTools(effectiveToolUseId);
     this.backgroundTaskToolUseIds.delete(effectiveToolUseId);
     this.workflowRunsByToolUseId.delete(effectiveToolUseId);
@@ -1877,6 +1897,18 @@ export class StreamEventProcessor {
     return [...this.pendingSdkTasks.values()].map((pending) =>
       shorten(pending.description, 80),
     );
+  }
+
+  /** Returns true if SDK orphaned-agent notifications were detected during this query. */
+  hasOrphanedAgentNotifications(): boolean {
+    return this.orphanedAgentTaskIds.size > 0;
+  }
+
+  /** Consume and clear orphaned agent task IDs (returns them for dedup in the main loop). */
+  consumeOrphanedAgentTaskIds(): Set<string> {
+    const ids = new Set(this.orphanedAgentTaskIds);
+    this.orphanedAgentTaskIds.clear();
+    return ids;
   }
 
   /**
