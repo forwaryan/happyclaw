@@ -976,9 +976,77 @@ function trimSessionJsonl(jsonlPath: string): void {
       }
     }
 
-    // Keep entries from trimStartPos onwards
-    const trimmedLines = nonEmptyLines.slice(trimStartPos).map((e) => e.line);
-    const removedCount = trimStartPos;
+    // Preserve entries for background agents that haven't completed yet.
+    // SDK resume scans the transcript for async_launched without a corresponding
+    // task-notification; if we trim the launch entry, SDK marks the agent as
+    // orphaned ("No completion record"). Fix: scan the region being removed,
+    // collect async_launched entries whose agentId has no completion in the
+    // ENTIRE transcript, and prepend them to the kept portion.
+    const removedRegion = nonEmptyLines.slice(0, trimStartPos);
+    const keptRegion = nonEmptyLines.slice(trimStartPos);
+
+    // Collect all async_launched agentIds from the region we're about to remove
+    const pendingAsyncLaunches: { agentId: string; line: string }[] = [];
+    for (const entry of removedRegion) {
+      try {
+        const parsed = JSON.parse(entry.line);
+        if (
+          parsed.toolUseResult?.status === 'async_launched' &&
+          parsed.toolUseResult?.agentId
+        ) {
+          pendingAsyncLaunches.push({
+            agentId: parsed.toolUseResult.agentId,
+            line: entry.line,
+          });
+        }
+      } catch {
+        /* skip unparseable */
+      }
+    }
+
+    // Check if any of these have a completion in the full transcript
+    let preservedLaunchLines: string[] = [];
+    if (pendingAsyncLaunches.length > 0) {
+      const completedAgentIds = new Set<string>();
+      for (const entry of nonEmptyLines) {
+        try {
+          const parsed = JSON.parse(entry.line);
+          // task-notification as user message content or queue-operation
+          const content =
+            typeof parsed.message?.content === 'string'
+              ? parsed.message.content
+              : Array.isArray(parsed.message?.content)
+                ? parsed.message.content
+                    .map((c: { text?: string }) => c.text || '')
+                    .join('')
+                : parsed.content || '';
+          if (content.includes('<task-notification>')) {
+            for (const launch of pendingAsyncLaunches) {
+              if (content.includes(`<task-id>${launch.agentId}</task-id>`)) {
+                completedAgentIds.add(launch.agentId);
+              }
+            }
+          }
+        } catch {
+          /* skip */
+        }
+      }
+      preservedLaunchLines = pendingAsyncLaunches
+        .filter((l) => !completedAgentIds.has(l.agentId))
+        .map((l) => l.line);
+      if (preservedLaunchLines.length > 0) {
+        log(
+          `Session trim: preserving ${preservedLaunchLines.length} pending async_launched entries to prevent orphan detection`,
+        );
+      }
+    }
+
+    // Keep preserved launches + entries from trimStartPos onwards
+    const trimmedLines = [
+      ...preservedLaunchLines,
+      ...keptRegion.map((e) => e.line),
+    ];
+    const removedCount = trimStartPos - preservedLaunchLines.length;
 
     const TRIM_MIN_ENTRIES = 50; // Skip trimming if fewer entries before boundary (not worth the I/O)
     if (removedCount < TRIM_MIN_ENTRIES) {
