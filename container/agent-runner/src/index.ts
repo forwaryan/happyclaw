@@ -3893,8 +3893,7 @@ async function main(): Promise<void> {
             );
             writeOutput({
               status: 'error',
-              result:
-                '会话历史中包含无法处理的数据，会话需要重置。',
+              result: '会话历史中包含无法处理的数据，会话需要重置。',
               newSessionId: sessionId,
             });
             break;
