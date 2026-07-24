@@ -985,19 +985,19 @@ function trimSessionJsonl(jsonlPath: string): void {
     const removedRegion = nonEmptyLines.slice(0, trimStartPos);
     const keptRegion = nonEmptyLines.slice(trimStartPos);
 
-    // Collect all async_launched agentIds from the region we're about to remove
+    // Collect all async_launched/remote_launched agentIds from the region we're about to remove
     const pendingAsyncLaunches: { agentId: string; line: string }[] = [];
     for (const entry of removedRegion) {
       try {
         const parsed = JSON.parse(entry.line);
+        const status = parsed.toolUseResult?.status;
+        const agentId =
+          parsed.toolUseResult?.agentId || parsed.toolUseResult?.taskId;
         if (
-          parsed.toolUseResult?.status === 'async_launched' &&
-          parsed.toolUseResult?.agentId
+          (status === 'async_launched' || status === 'remote_launched') &&
+          agentId
         ) {
-          pendingAsyncLaunches.push({
-            agentId: parsed.toolUseResult.agentId,
-            line: entry.line,
-          });
+          pendingAsyncLaunches.push({ agentId, line: entry.line });
         }
       } catch {
         /* skip unparseable */
@@ -1019,7 +1019,13 @@ function trimSessionJsonl(jsonlPath: string): void {
                 ? parsed.message.content
                     .map((c: { text?: string }) => c.text || '')
                     .join('')
-                : parsed.content || '';
+                : typeof parsed.content === 'string'
+                  ? parsed.content
+                  : Array.isArray(parsed.content)
+                    ? parsed.content
+                        .map((c: { text?: string }) => c.text || '')
+                        .join('')
+                    : '';
           if (content.includes('<task-notification>')) {
             for (const launch of pendingAsyncLaunches) {
               if (content.includes(`<task-id>${launch.agentId}</task-id>`)) {
